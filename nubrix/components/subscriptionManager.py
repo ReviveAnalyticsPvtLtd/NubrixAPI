@@ -188,6 +188,7 @@ def _sendSubscriptionWarningMail(edgeFunctionUrl: str, email: str, fullName: str
                 "name": fullName,
                 "trialStartDate": subscriptionStart
             },
+            headers={"Authorization": f"Bearer {os.environ.get('SUPABASE_KEY_OLD', '')}"},
             timeout = 10
         )
         if response.status_code >= 300:
