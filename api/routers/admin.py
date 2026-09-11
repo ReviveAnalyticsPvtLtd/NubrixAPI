@@ -5,6 +5,8 @@ from api.adminModels import (
     AdminAuditEventView,
     AdminFreeTrialExtensionRequest,
     AdminFreeTrialExtensionResponse,
+    AdminFreeTrialReductionRequest,
+    AdminFreeTrialReductionResponse,
     AdminLoginRequest,
     AdminLoginResponse,
     AdminLogoutResponse,
@@ -45,6 +47,10 @@ from api.services.adminOverviewService import (
 from api.services.adminTrialExtensionService import (
     AdminTrialExtensionService,
     getAdminTrialExtensionService,
+)
+from api.services.adminTrialReductionService import (
+    AdminTrialReductionService,
+    getAdminTrialReductionService,
 )
 from api.services.userErasureService import (
     UserErasureService,
@@ -176,6 +182,21 @@ def extendFreeTrials(
     service: AdminTrialExtensionService = Depends(getAdminTrialExtensionService),
 ):
     return service.extend(payload, idempotencyKey, admin)
+
+
+@router.post(
+    "/free-trial/reductions",
+    response_model=AdminFreeTrialReductionResponse,
+)
+def reduceFreeTrial(
+    payload: AdminFreeTrialReductionRequest,
+    idempotencyKey: str = Header(alias="Idempotency-Key"),
+    admin: AdminContext = Depends(verifyAdmin),
+    service: AdminTrialReductionService = Depends(
+        getAdminTrialReductionService
+    ),
+):
+    return service.reduce(payload, idempotencyKey, admin)
 
 
 @router.get("/audit", response_model=list[AdminAuditEventView])

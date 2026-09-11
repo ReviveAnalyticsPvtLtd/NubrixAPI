@@ -313,3 +313,35 @@ def test_create_request_rolls_back_and_closes_on_database_error():
     assert connection.commits == 0
     assert connection.rollbacks == 1
     assert connection.closed == 1
+
+
+def test_database_erasure_deletes_trial_reduction_ledger_before_subscription():
+    from api.services.userErasureRepository import UserErasureRepository
+
+    connection = FakeConnection()
+
+    class RecordingRepository(UserErasureRepository):
+        def __init__(self):
+            super().__init__(connectionFactory=lambda: connection)
+            self.deletedTables = []
+
+        def _tableExists(self, _cursor, _tableName):
+            return False
+
+        def _deleteByUser(
+            self, _cursor, tableName, _columnName, _userId
+        ):
+            self.deletedTables.append(tableName)
+
+    repository = RecordingRepository()
+
+    repository.deleteDatabaseData("request-1", "user-1", [])
+
+    assert connection.state["executed"][0] == (
+        "select pg_advisory_xact_lock(hashtextextended(%s, 0))",
+        ("user-1",),
+    )
+    assert "admin_free_trial_reductions" in repository.deletedTables
+    assert repository.deletedTables.index(
+        "admin_free_trial_reductions"
+    ) < repository.deletedTables.index("subscriptions")

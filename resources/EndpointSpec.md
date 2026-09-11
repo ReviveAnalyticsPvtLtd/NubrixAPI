@@ -2211,7 +2211,79 @@ a different payload with the same key returns `409`.
 **Errors:** `401`, `409`, `422`, or `500` when the extension operation cannot be
 persisted.
 
-### 15.4 `GET /api/latest/admin/overview/user-signups`
+### 15.4 `POST /api/latest/admin/free-trial/reductions`
+
+Remove 1–30 days from one active free trial without changing its plan, status,
+start date, entitlements, or credits. This endpoint cannot end a trial
+immediately.
+
+**Headers:**
+
+- `Authorization: Bearer <admin-token>`
+- `Idempotency-Key: <UUID>`
+
+**Request:**
+
+```json
+{
+  "userId": "free-user",
+  "days": 3,
+  "reason": "Abuse remediation",
+  "confirmation": "REDUCE"
+}
+```
+
+`userId` is required, trimmed, must not be blank, and is limited to 128
+characters. `days` must be a strict JSON integer from 1 through 30. `reason`
+is required, trimmed, must not be blank, and is limited to 1,000 characters.
+`confirmation` must be the exact, case-sensitive string `REDUCE`.
+
+Only subscriptions with `billing_mode=none`, `plan_type=free`, status `trial`,
+and a future `current_period_end` qualify. The service subtracts exact 24-hour
+periods from the existing expiry. If the resulting expiry would be at or before
+the current UTC time, it returns a durable `FAILED` result and leaves the
+subscription unchanged. Expired trials cannot be reduced or reactivated.
+
+**Response (200):**
+
+```json
+{
+  "reductionId": "9e3d768e-9f92-45f4-b816-2a9937ec97f8",
+  "userId": "free-user",
+  "outcome": "REDUCED",
+  "daysRemoved": 3,
+  "previousExpiry": "2026-09-20T10:00:00+00:00",
+  "newExpiry": "2026-09-17T10:00:00+00:00",
+  "accessStillBanned": false,
+  "errorCode": null
+}
+```
+
+A successful operation updates `current_period_end`, `renewal_due_at`, the
+lifecycle snapshot, and the subscription version in one transaction. It does
+not refresh or reduce credits, alter the trial start, or remove an access ban.
+The per-user advisory lock is shared with trial extensions, so concurrent
+extension, reduction, and erasure operations serialize safely.
+
+`outcome` is `REDUCED` or `FAILED`. Failure codes are `USER_NOT_FOUND`,
+`SUBSCRIPTION_NOT_FOUND`, `USER_ERASURE_PENDING`,
+`PAID_SUBSCRIPTION_NOT_ELIGIBLE`, `FREE_TRIAL_NOT_ACTIVE`,
+`INVALID_TRIAL_EXPIRY`, `REDUCTION_WOULD_EXPIRE_TRIAL`, and
+`REDUCTION_FAILED`. The same idempotency key and canonical payload replay
+safely; a different payload with the same key returns `409`.
+
+Before a ledger row is admitted, a missing user returns `404 User not found`
+and an erasure-fenced user returns `409 User erasure is in progress`. These
+pre-admission rejections deliberately create neither a reduction ledger nor a
+targeted reduction audit event, preventing a request from recreating an
+identity-bearing record after erasure. The same conditions discovered after
+admission remain durable `FAILED` outcomes.
+
+**Errors:** `401`; `404 User not found`; `409 Idempotency key is already in
+use`; `409 User erasure is in progress`; `422`; or `500` when the reduction
+operation cannot be persisted.
+
+### 15.5 `GET /api/latest/admin/overview/user-signups`
 
 Return new-user signup counts bucketed over a trailing time period, shaped for a
 line chart. Values are computed fresh on every request, so the frontend can poll
@@ -2267,7 +2339,7 @@ the response was computed, for a freshness indicator between polls.
 **Errors:** `401`, `422` for an unsupported `period`, or a safe `500` read
 failure.
 
-### 15.5 `GET /api/latest/admin/overview/token-usage`
+### 15.6 `GET /api/latest/admin/overview/token-usage`
 
 Return provider-reported LLM token usage from Langfuse, bucketed for the same
 line-chart filters as the signup overview. Values are queried fresh on every

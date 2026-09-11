@@ -472,6 +472,10 @@ class UserErasureRepository:
         connection = self.connectionFactory()
         try:
             with connection.cursor() as cursor:
+                cursor.execute(
+                    "select pg_advisory_xact_lock(hashtextextended(%s, 0))",
+                    (userId,),
+                )
                 if self._tableExists(cursor, "Invoices"):
                     cursor.execute(
                         """
@@ -530,6 +534,12 @@ class UserErasureRepository:
                     "user_id",
                     userId,
                 )
+                self._deleteByUser(
+                    cursor,
+                    "admin_free_trial_reductions",
+                    "user_id",
+                    userId,
+                )
                 self._deleteByUser(cursor, "Projects", '"ownerUserId"', userId)
                 self._deleteByUser(cursor, "Workspaces", '"ownerId"', userId)
                 self._deleteByUser(cursor, "credit_balances", "user_id", userId)
@@ -560,6 +570,7 @@ class UserErasureRepository:
             ("billing_events", "user_id"),
             ("WebhookEvents", "user_id"),
             ("admin_free_trial_extensions", "user_id"),
+            ("admin_free_trial_reductions", "user_id"),
         )
         residuals = {}
         connection = self.connectionFactory()

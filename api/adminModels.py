@@ -145,6 +145,29 @@ class AdminFreeTrialExtensionResponse(_StrictModel):
     errorCode: str | None = None
 
 
+class AdminFreeTrialReductionRequest(_StrictModel):
+    userId: str = Field(min_length=1, max_length=128)
+    days: int = Field(ge=1, le=30, strict=True)
+    reason: str = Field(min_length=1, max_length=1000)
+    confirmation: Literal["REDUCE"]
+
+    @field_validator("userId", "reason", mode="before")
+    @classmethod
+    def normalizeRequiredText(cls, value):
+        return value.strip() if isinstance(value, str) else value
+
+
+class AdminFreeTrialReductionResponse(_StrictModel):
+    reductionId: str
+    userId: str
+    outcome: Literal["REDUCED", "FAILED"]
+    daysRemoved: int | None = Field(default=None, ge=1, le=30)
+    previousExpiry: str | None = None
+    newExpiry: str | None = None
+    accessStillBanned: bool
+    errorCode: str | None = None
+
+
 class AdminSubscriptionPatch(_StrictModel):
     status: AdminSubscriptionStatus | None = None
     subscribed_experts: str | None = None

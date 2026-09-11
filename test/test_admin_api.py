@@ -24,6 +24,7 @@ from api.adminErrors import AdminApiError
 from api.adminModels import (
     AdminAuditEventView,
     AdminFreeTrialExtensionResponse,
+    AdminFreeTrialReductionResponse,
     AdminLoginRequest,
     AdminLoginResponse,
     AdminLogoutResponse,
@@ -47,6 +48,7 @@ from api.services.adminAuditService import getAdminAuditService
 from api.services.adminManagementService import getAdminManagementService
 from api.services.adminOverviewService import AdminOverviewService, getAdminOverviewService
 from api.services.adminTrialExtensionService import getAdminTrialExtensionService
+from api.services.adminTrialReductionService import getAdminTrialReductionService
 from api.services.userErasureService import getUserErasureService
 from main import (
     admin_exception_handler,
@@ -248,6 +250,31 @@ class FakeAdminTrialExtensionService:
         }
 
 
+class FakeAdminTrialReductionService:
+    calls: list[dict] = []
+
+    def reduce(self, payload, idempotencyKey, admin):
+        if payload.userId == "missing":
+            raise AdminApiError(404, "User not found")
+        if payload.userId == "erasing":
+            raise AdminApiError(409, "User erasure is in progress")
+        FakeAdminTrialReductionService.calls.append({
+            "payload": payload,
+            "idempotencyKey": idempotencyKey,
+            "admin": admin,
+        })
+        return {
+            "reductionId": idempotencyKey,
+            "userId": payload.userId,
+            "outcome": "REDUCED",
+            "daysRemoved": payload.days,
+            "previousExpiry": "2026-09-20T10:00:00+00:00",
+            "newExpiry": "2026-09-17T10:00:00+00:00",
+            "accessStillBanned": False,
+            "errorCode": None,
+        }
+
+
 SIGNUP_OVERVIEW_VIEW = {
     "period": "30d",
     "granularity": "day",
@@ -345,6 +372,9 @@ def client():
     app.dependency_overrides[getAdminOverviewService] = FakeAdminOverviewService
     app.dependency_overrides[getAdminTrialExtensionService] = (
         FakeAdminTrialExtensionService
+    )
+    app.dependency_overrides[getAdminTrialReductionService] = (
+        FakeAdminTrialReductionService
     )
     app.dependency_overrides[getUserErasureService] = FakeUserErasureService
     app.dependency_overrides[verifyAdmin] = fakeVerifyAdmin
@@ -496,6 +526,103 @@ def test_free_trial_extension_requires_auth_and_idempotency_header(client):
     assert withoutIdempotency.json()["message"] == "Validation failed"
 
 
+def test_free_trial_reduction_processes_one_user_with_explicit_confirmation(client):
+    FakeAdminTrialReductionService.calls.clear()
+    idempotencyKey = "9e3d768e-9f92-45f4-b816-2a9937ec97f8"
+
+    response = client.post(
+        "/admin/free-trial/reductions",
+        json={
+            "userId": "free-user",
+            "days": 3,
+            "reason": "Abuse remediation",
+            "confirmation": "REDUCE",
+        },
+        headers={**_adminHeaders(), "Idempotency-Key": idempotencyKey},
+    )
+
+    assert response.status_code == 200
+    assert response.json() == {
+        "reductionId": idempotencyKey,
+        "userId": "free-user",
+        "outcome": "REDUCED",
+        "daysRemoved": 3,
+        "previousExpiry": "2026-09-20T10:00:00+00:00",
+        "newExpiry": "2026-09-17T10:00:00+00:00",
+        "accessStillBanned": False,
+        "errorCode": None,
+    }
+    call = FakeAdminTrialReductionService.calls[-1]
+    assert call["idempotencyKey"] == idempotencyKey
+    assert call["payload"].reason == "Abuse remediation"
+    assert call["payload"].confirmation == "REDUCE"
+    assert call["admin"] == ADMIN_CONTEXT
+
+
+def test_free_trial_reduction_requires_all_safety_controls(client):
+    body = {
+        "userId": "free-user",
+        "days": 3,
+        "reason": "Abuse remediation",
+        "confirmation": "REDUCE",
+    }
+    key = "9e3d768e-9f92-45f4-b816-2a9937ec97f8"
+
+    withoutAuth = client.post(
+        "/admin/free-trial/reductions",
+        json=body,
+        headers={"Idempotency-Key": key},
+    )
+    withoutKey = client.post(
+        "/admin/free-trial/reductions",
+        json=body,
+        headers=_adminHeaders(),
+    )
+    withoutReason = client.post(
+        "/admin/free-trial/reductions",
+        json={key: value for key, value in body.items() if key != "reason"},
+        headers={**_adminHeaders(), "Idempotency-Key": key},
+    )
+    wrongConfirmation = client.post(
+        "/admin/free-trial/reductions",
+        json={**body, "confirmation": "reduce"},
+        headers={**_adminHeaders(), "Idempotency-Key": key},
+    )
+
+    assert withoutAuth.status_code == 401
+    assert withoutKey.status_code == 422
+    assert withoutReason.status_code == 422
+    assert wrongConfirmation.status_code == 422
+
+
+@pytest.mark.parametrize(
+    ("userId", "expectedStatus", "expectedBody"),
+    [
+        ("missing", 404, {"message": "User not found"}),
+        ("erasing", 409, {"message": "User erasure is in progress"}),
+    ],
+)
+def test_free_trial_reduction_pre_admission_errors_are_flat(
+    client, userId, expectedStatus, expectedBody
+):
+    response = client.post(
+        "/admin/free-trial/reductions",
+        json={
+            "userId": userId,
+            "days": 3,
+            "reason": "Abuse remediation",
+            "confirmation": "REDUCE",
+        },
+        headers={
+            **_adminHeaders(),
+            "Idempotency-Key": "9e3d768e-9f92-45f4-b816-2a9937ec97f8",
+        },
+    )
+
+    assert response.status_code == expectedStatus
+    assert response.json() == expectedBody
+
+
 def test_subscription_routes_return_only_public_response_fields(client):
     listed = client.get("/admin/subscriptions", headers=_adminHeaders())
     assert listed.status_code == 200
@@ -620,6 +747,8 @@ def test_admin_routes_declare_strict_response_allowlists():
         ("/admin/users/{userId}/erasure", "POST"): AdminUserErasureAcceptedView,
         ("/admin/free-trial/extensions", "POST"):
             AdminFreeTrialExtensionResponse,
+        ("/admin/free-trial/reductions", "POST"):
+            AdminFreeTrialReductionResponse,
         ("/admin/subscriptions", "GET"): list[AdminSubscriptionView],
         ("/admin/subscriptions/{subscriptionId}", "PATCH"): AdminSubscriptionView,
     }
@@ -649,6 +778,17 @@ def test_free_trial_extension_route_runs_blocking_work_in_threadpool():
         for route in app.routes
         if isinstance(route, APIRoute)
         and route.path == "/admin/free-trial/extensions"
+    )
+
+    assert inspect.iscoroutinefunction(route.endpoint) is False
+
+
+def test_free_trial_reduction_route_runs_blocking_work_in_threadpool():
+    route = next(
+        route
+        for route in app.routes
+        if isinstance(route, APIRoute)
+        and route.path == "/admin/free-trial/reductions"
     )
 
     assert inspect.iscoroutinefunction(route.endpoint) is False
