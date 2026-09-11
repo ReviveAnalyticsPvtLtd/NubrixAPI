@@ -805,7 +805,7 @@ class SubscriptionService:
                     "name": name
                 },
                 headers={
-                    "Authorization": f"Bearer {os.environ.get('SUPABASE_KEY', '')}"
+                    "Authorization": f"Bearer {os.environ.get('SUPABASE_KEY_OLD', '')}"
                 },
                 timeout=10
             )

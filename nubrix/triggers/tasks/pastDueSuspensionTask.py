@@ -256,7 +256,7 @@ class PastDueSuspensionTask:
             response = requests.post(
                 url=emailUrl,
                 json=payload,
-                headers={"Authorization": f"Bearer {os.environ.get('SUPABASE_KEY', '')}"},
+                headers={"Authorization": f"Bearer {os.environ.get('SUPABASE_KEY_OLD', '')}"},
                 timeout=10,
             )
             if response.status_code >= 400:

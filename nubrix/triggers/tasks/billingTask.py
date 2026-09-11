@@ -394,7 +394,7 @@ class DailyBillingTask:
             requests.post(
                 url=emailUrl,
                 data=json.dumps(payload),
-                headers={"Authorization": f"Bearer {os.environ['SUPABASE_KEY']}"},
+                headers={"Authorization": f"Bearer {os.environ['SUPABASE_KEY_OLD']}"},
                 timeout=10,
             )
         except Exception as e:
