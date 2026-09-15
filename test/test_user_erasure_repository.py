@@ -345,3 +345,31 @@ def test_database_erasure_deletes_trial_reduction_ledger_before_subscription():
     assert repository.deletedTables.index(
         "admin_free_trial_reductions"
     ) < repository.deletedTables.index("subscriptions")
+
+
+def test_database_erasure_casts_transformation_project_ids_to_uuid_array():
+    from api.services.userErasureRepository import UserErasureRepository
+
+    connection = FakeConnection()
+
+    class TransformationsOnlyRepository(UserErasureRepository):
+        def _tableExists(self, _cursor, tableName):
+            return tableName == "transformations"
+
+    repository = TransformationsOnlyRepository(
+        connectionFactory=lambda: connection
+    )
+    projectIds = [
+        "5842d2f3-37f3-4d3a-94c3-e70601809ddc",
+        "cfc854e5-bde4-4a2a-9c55-6f2b8976e5ef",
+    ]
+
+    repository.deleteDatabaseData("request-1", "user-1", projectIds)
+
+    transformationDelete = next(
+        call
+        for call in connection.state["executed"]
+        if "delete from public.transformations" in call[0]
+    )
+    assert "project_id = any(%s::uuid[])" in transformationDelete[0]
+    assert transformationDelete[1] == (projectIds,)

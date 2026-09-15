@@ -517,7 +517,10 @@ class UserErasureRepository:
                     )
                 if projectIds and self._tableExists(cursor, "transformations"):
                     cursor.execute(
-                        "delete from public.transformations where project_id = any(%s)",
+                        """
+                        delete from public.transformations
+                        where project_id = any(%s::uuid[])
+                        """,
                         (projectIds,),
                     )
                 if self._tableExists(cursor, "message_store"):
