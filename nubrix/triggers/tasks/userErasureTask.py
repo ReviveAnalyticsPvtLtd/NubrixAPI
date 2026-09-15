@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+import math
 import os
+import time
 import uuid
 
 from api.commons import client as supabaseClient
@@ -39,21 +41,50 @@ class UserErasureExternalCleanup:
         redisClient=None,
         cacheInvalidator=None,
         razorpayClient=None,
+        redisCleanupTimeoutSeconds: float | None = None,
+        monotonic=None,
     ):
         self.client = client if client is not None else supabaseClient
         self.redis = redisClient if redisClient is not None else self._buildRedis()
         self.cacheInvalidator = cacheInvalidator or invalidate_data_cache
         self.razorpayClient = razorpayClient
+        self.redisCleanupTimeoutSeconds = (
+            float(redisCleanupTimeoutSeconds)
+            if redisCleanupTimeoutSeconds is not None
+            else float(
+                os.environ.get(
+                    "USER_ERASURE_REDIS_CLEANUP_TIMEOUT_SECONDS", "240"
+                )
+            )
+        )
+        leaseSeconds = float(os.environ.get("USER_ERASURE_LEASE_SECONDS", "300"))
+        if (
+            not math.isfinite(self.redisCleanupTimeoutSeconds)
+            or self.redisCleanupTimeoutSeconds <= 0
+            or not math.isfinite(leaseSeconds)
+            or leaseSeconds <= 0
+            or self.redisCleanupTimeoutSeconds >= leaseSeconds
+        ):
+            raise ValueError(
+                "Redis cleanup timeout must be finite, positive, and shorter than lease"
+            )
+        self.monotonic = monotonic or time.monotonic
 
     @staticmethod
     def _buildRedis():
         import redis
 
+        socketTimeout = float(
+            os.environ.get("USER_ERASURE_REDIS_SOCKET_TIMEOUT_SECONDS", "10")
+        )
         return redis.Redis(
             host=os.environ.get("REDIS_HOST", "localhost"),
             port=int(os.environ.get("REDIS_PORT", 6379)),
             password=os.environ.get("REDIS_PASSWORD"),
             decode_responses=True,
+            socket_connect_timeout=socketTimeout,
+            socket_timeout=socketTimeout,
+            health_check_interval=30,
         )
 
     def revokeAccess(self, userId: str) -> None:
@@ -149,33 +180,70 @@ class UserErasureExternalCleanup:
         return len(paths)
 
     def deleteTransientState(self, userId: str, projectIds: list[str]) -> dict:
-        patterns = self._redisPatterns(userId, projectIds)
+        deadline = self.monotonic() + self.redisCleanupTimeoutSeconds
+
+        def ensureWithinDeadline() -> None:
+            if self.monotonic() >= deadline:
+                raise TimeoutError("Redis cleanup deadline exceeded")
+
+        logger.info(
+            "User erasure transient cleanup started — projects={}",
+            len(projectIds),
+        )
         for projectId in projectIds:
             self.cacheInvalidator(projectId)
 
+        exactKeys = sorted({
+            f"credits:v3:{userId}",
+            *(f"semaphore:{projectId}" for projectId in projectIds),
+        })
+        prefixes = tuple(
+            prefix
+            for projectId in projectIds
+            for prefix in (
+                f"{projectId}::",
+                f"transformation-preview:{projectId}:",
+            )
+        )
+
+        ensureWithinDeadline()
+        deleted = int(self.redis.unlink(*exactKeys) or 0)
+
+        def scanKeys():
+            cursor = 0
+            while True:
+                ensureWithinDeadline()
+                cursor, batch = self.redis.scan(cursor=cursor, count=500)
+                ensureWithinDeadline()
+                for key in batch:
+                    yield key
+                if int(cursor) == 0:
+                    return
+
         keys = set()
-        for pattern in patterns:
-            keys.update(self.redis.scan_iter(match=pattern, count=500))
+        for key in scanKeys():
+            if key.startswith(prefixes):
+                keys.add(key)
+        ensureWithinDeadline()
+        logger.info(
+            "User erasure transient cleanup scan completed — keys={}",
+            len(keys),
+        )
         keysList = list(keys)
         for start in range(0, len(keysList), 500):
-            self.redis.delete(*keysList[start : start + 500])
-        for pattern in patterns:
-            if next(iter(self.redis.scan_iter(match=pattern, count=1)), None) is not None:
-                raise RuntimeError("transient state remains")
-        return {"keysDeleted": len(keysList)}
-
-    @staticmethod
-    def _redisPatterns(userId: str, projectIds: list[str]) -> list[str]:
-        patterns = [f"credits:v3:{userId}"]
-        for projectId in projectIds:
-            patterns.extend(
-                (
-                    f"{projectId}::*",
-                    f"semaphore:{projectId}",
-                    f"transformation-preview:{projectId}:*",
-                )
+            ensureWithinDeadline()
+            deleted += int(
+                self.redis.unlink(*keysList[start : start + 500]) or 0
             )
-        return patterns
+        ensureWithinDeadline()
+        if self.redis.exists(*exactKeys):
+            raise RuntimeError("transient state remains")
+        ensureWithinDeadline()
+        logger.info(
+            "User erasure transient cleanup completed — keys={}",
+            deleted,
+        )
+        return {"keysDeleted": deleted}
 
     def deleteAuthIdentity(self, userId: str) -> None:
         try:
@@ -193,9 +261,6 @@ class UserErasureExternalCleanup:
             for path in self._listPaths("userProfileImages", "")
         ):
             raise RuntimeError("profile storage remains")
-        for pattern in self._redisPatterns(userId, projectIds):
-            if next(iter(self.redis.scan_iter(match=pattern, count=1)), None) is not None:
-                raise RuntimeError("transient state remains")
         try:
             result = self.client.auth.admin.get_user_by_id(userId)
             if getattr(result, "user", None) is not None:
