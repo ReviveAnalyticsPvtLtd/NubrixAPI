@@ -651,6 +651,32 @@ def test_ban_remains_enforced_when_native_auth_sync_fails(stubDurableAudit):
     assert "secret" not in repr(result)
 
 
+def test_ban_skips_missing_native_auth_identity_without_warning(stubDurableAudit):
+    class MissingAuthUserError(RuntimeError):
+        status_code = 404
+
+    patchModel = getattr(adminModels, "AdminUserAccessPatch")
+    client = FakeClient([userRow()])
+    client.auth.admin.update_user_by_id.side_effect = MissingAuthUserError(
+        "User not found"
+    )
+
+    result = AdminManagementService(
+        client=client,
+        auditService=stubDurableAudit,
+    ).setUserAccess(
+        "user-1",
+        patchModel.model_validate({"banned": True}),
+        ADMIN_CONTEXT,
+    )
+
+    assert client.rows["Users"][0]["isBanned"] is True
+    assert result["supabaseAuthSynced"] is False
+    assert result["warnings"] == []
+    assert stubDurableAudit.calls[-1]["outcome"] == "success"
+    assert stubDurableAudit.calls[-1]["details"]["failedSideEffects"] == []
+
+
 def test_set_user_access_returns_404_for_missing_user(stubDurableAudit):
     patchModel = getattr(adminModels, "AdminUserAccessPatch")
 

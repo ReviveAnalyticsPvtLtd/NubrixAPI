@@ -113,6 +113,11 @@ def _escapeIlikeLiteral(value: str) -> str:
     return value.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
 
 
+def _isMissingSupabaseAuthUser(exc: Exception) -> bool:
+    status = getattr(exc, "status", None) or getattr(exc, "status_code", None)
+    return status == 404 or "not found" in str(exc).casefold()
+
+
 class AdminManagementService:
     def __init__(
         self,
@@ -598,10 +603,11 @@ class AdminManagementService:
                 {"ban_duration": "876000h" if patch.banned else "none"},
             )
             supabaseAuthSynced = True
-        except Exception:
+        except Exception as exc:
             supabaseAuthSynced = False
-            warnings.append("Supabase Auth synchronization failed")
-            failedSideEffects.append("supabase_auth_sync")
+            if not _isMissingSupabaseAuthUser(exc):
+                warnings.append("Supabase Auth synchronization failed")
+                failedSideEffects.append("supabase_auth_sync")
 
         outcome = "side_effect_failed" if warnings else "success"
         self._auditUserAccess(
