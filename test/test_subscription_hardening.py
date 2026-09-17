@@ -343,6 +343,83 @@ class SubscriptionHardeningTests(unittest.TestCase):
             futureEnd,
         )
 
+    def test_subscription_manager_outbox_mode_enqueues_without_sending_http(self):
+        periodEnd = (datetime.now(timezone.utc) + timedelta(days=2)).isoformat()
+        fakeClient = _FakeClient({
+            "subscriptions": [
+                _subscription(status="trial", billingMode="none", periodEnd=periodEnd)
+            ],
+            "Users": [{"userId": "u1"}],
+        })
+        fakeService = types.SimpleNamespace(
+            enqueueEligible=lambda *_args, **_kwargs: (
+                {"id": "delivery-1", "status": "PENDING"},
+                True,
+            )
+        )
+
+        with patch.dict(os.environ, {"TRIAL_EXPIRY_EMAIL_MODE": "outbox"}), \
+                patch.object(subscriptionManager, "create_client", return_value=fakeClient), \
+                patch.object(
+                    subscriptionManager,
+                    "getTrialExpiryNotificationService",
+                    return_value=fakeService,
+                ), \
+                patch.object(subscriptionManager, "_sendSubscriptionWarningMail") as send:
+            summary = subscriptionManager.recalculateSubscriptionDays()
+
+        self.assertEqual(summary["enqueued"], 1)
+        self.assertEqual(summary["errors"], 0)
+        send.assert_not_called()
+
+    def test_subscription_manager_legacy_mode_sends_without_enqueueing(self):
+        periodEnd = (datetime.now(timezone.utc) + timedelta(days=2)).isoformat()
+        fakeClient = _FakeClient({
+            "subscriptions": [
+                _subscription(status="trial", billingMode="none", periodEnd=periodEnd)
+            ],
+            "Users": [{
+                "userId": "u1",
+                "email": "user@example.test",
+                "fullName": "Test User",
+            }],
+        })
+
+        with patch.dict(os.environ, {"TRIAL_EXPIRY_EMAIL_MODE": "legacy"}), \
+                patch.object(subscriptionManager, "create_client", return_value=fakeClient), \
+                patch.object(
+                    subscriptionManager,
+                    "getTrialExpiryNotificationService",
+                ) as serviceFactory, \
+                patch.object(subscriptionManager, "_sendSubscriptionWarningMail") as send:
+            summary = subscriptionManager.recalculateSubscriptionDays()
+
+        self.assertEqual(summary["enqueued"], 0)
+        serviceFactory.assert_not_called()
+        send.assert_called_once()
+
+    def test_subscription_manager_disabled_mode_neither_enqueues_nor_sends(self):
+        periodEnd = (datetime.now(timezone.utc) + timedelta(days=2)).isoformat()
+        fakeClient = _FakeClient({
+            "subscriptions": [
+                _subscription(status="trial", billingMode="none", periodEnd=periodEnd)
+            ],
+            "Users": [{"userId": "u1"}],
+        })
+
+        with patch.dict(os.environ, {"TRIAL_EXPIRY_EMAIL_MODE": "disabled"}), \
+                patch.object(subscriptionManager, "create_client", return_value=fakeClient), \
+                patch.object(
+                    subscriptionManager,
+                    "getTrialExpiryNotificationService",
+                ) as serviceFactory, \
+                patch.object(subscriptionManager, "_sendSubscriptionWarningMail") as send:
+            summary = subscriptionManager.recalculateSubscriptionDays()
+
+        self.assertEqual(summary["enqueued"], 0)
+        serviceFactory.assert_not_called()
+        send.assert_not_called()
+
     @patch("api.services.subscriptions.subscriptionService.jwt.decode", return_value={"userId": "u1", "email": "u@example.test"})
     def test_create_subscription_rejects_cancelled_but_unexpired_subscription(self, _mockDecode):
         service = SubscriptionService()

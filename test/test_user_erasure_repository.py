@@ -58,6 +58,13 @@ class FakeCursor:
                 "status": "PENDING",
                 "created_at": "2026-08-24T10:00:00+00:00",
             }
+        elif normalized.startswith("select to_regclass"):
+            tableName = str(params[0]).split(".")[-1].strip('"')
+            self.current = (
+                (params[0],)
+                if tableName in self.state.get("tables", set())
+                else (None,)
+            )
         elif "from public.user_erasure_requests" in normalized:
             self.current = self.state.get("requestRow")
         else:
@@ -89,6 +96,7 @@ class FakeConnection:
                 "banReason": None,
             },
             "sessionCount": 2,
+            "tables": {"notification_deliveries"},
             **overrides,
         }
         self.commits = 0
@@ -154,6 +162,13 @@ def test_create_request_persists_all_steps_and_freezes_billing_transactionally()
     assert not any(
         "admin_free_trial_extension_items" in query
         or "admin_free_trial_extension_batches" in query
+        for query, _params in connection.state["executed"]
+    )
+    assert any(
+        "update public.notification_deliveries" in query
+        and "status = case" in query
+        and "user_id = null" in query
+        and "subscription_id = null" in query
         for query, _params in connection.state["executed"]
     )
 

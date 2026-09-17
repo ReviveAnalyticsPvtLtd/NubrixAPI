@@ -24,6 +24,9 @@ from api.services.subscriptions.paymentValidationService import (
     normalizeChurnedSubscription,
     parseUtc,
 )
+from api.services.notifications.trialExpiryNotificationService import (
+    getTrialExpiryNotificationService,
+)
 import requests
 import os
 
@@ -52,29 +55,46 @@ def _auditSubscriptionIntegrityIssue(client, userId: str, reason: str, metadata:
         logger.error(f"Failed to write subscription integrity audit log for user {userId}: {e}")
 
 
-def recalculateSubscriptionDays() -> None:
+def recalculateSubscriptionDays() -> dict:
     """
     Recalculates subscription lifecycle status from canonical subscriptions rows.
 
     Expired subscriptions are immediately set to expired status (no grace period).
-    Sends warning emails when exactly 2 days are remaining until current_period_end.
+    Enqueues durable expiry warnings in outbox mode. Legacy synchronous delivery
+    remains available only for the staged rollout.
 
     Annual prepaid subscriptions are managed by dedicated renewal schedulers,
     except cancelled rows, which are expired here once their paid period ends.
 
     Returns:
-        None
+        dict: Sweep counts for lifecycle and notification processing.
 
     Raises:
         Exception: For any errors during the recalculation process.
     """
+    emailMode = os.environ.get("TRIAL_EXPIRY_EMAIL_MODE", "legacy").strip().lower()
+    if emailMode not in {"legacy", "outbox", "disabled"}:
+        raise RuntimeError(
+            "TRIAL_EXPIRY_EMAIL_MODE must be legacy, outbox, or disabled"
+        )
+
     edgeFunctionUrl = os.environ.get("FREE_TRIAL_EXPIRY_WARNING_EMAIL_URL", "")
     client = create_client(os.environ["SUPABASE_URL"], os.environ["SUPABASE_KEY"])
     now = datetime.now(timezone.utc)
+    notificationService = (
+        getTrialExpiryNotificationService() if emailMode == "outbox" else None
+    )
     subscriptions = client.table("subscriptions") \
         .select("id, user_id, current_period_start, current_period_end, status, billing_mode, billing_state, erasure_pending") \
         .not_.is_("current_period_end", "null") \
         .execute().data
+    summary = {
+        "scanned": len(subscriptions),
+        "expired": 0,
+        "enqueued": 0,
+        "duplicates": 0,
+        "errors": 0,
+    }
 
     subscriptionUserIds = {s.get("user_id") for s in subscriptions if s.get("user_id")}
     try:
@@ -122,6 +142,7 @@ def recalculateSubscriptionDays() -> None:
                 if currentStatus not in ("expired", "suspended"):
                     updatePayload["status"] = "expired"
                     updatePayload["plan_type"] = mapBillingModeToPlanType(billingMode, "expired")
+                    summary["expired"] += 1
 
             client.table("subscriptions").update(updatePayload).eq("id", subscription["id"]).execute()
 
@@ -139,7 +160,17 @@ def recalculateSubscriptionDays() -> None:
             if billingMode == "annual_prepaid" and currentStatus != "cancelled":
                 continue
 
-            if deltaDays == 2 and edgeFunctionUrl:
+            if emailMode == "outbox":
+                delivery, created = notificationService.enqueueEligible(
+                    subscription,
+                    now,
+                )
+                if delivery is not None:
+                    counter = "enqueued" if created else "duplicates"
+                    summary[counter] += 1
+                continue
+
+            if emailMode == "legacy" and deltaDays == 2 and edgeFunctionUrl:
                 userData = client.table("Users") \
                     .select("email, fullName") \
                     .eq("userId", subscription["user_id"]) \
@@ -159,12 +190,13 @@ def recalculateSubscriptionDays() -> None:
                     subscriptionStart = subscription.get("current_period_start")
                 )
         except Exception as e:
+            summary["errors"] += 1
             logger.error(
                 f"Failed to process subscription {subscription.get('id', '?')}: {e}"
             )
 
-    logger.info("Subscription days recalculation completed (UTC)")
-    return
+    logger.info(f"Subscription days recalculation completed (UTC): {summary}")
+    return summary
 
 
 def _sendSubscriptionWarningMail(edgeFunctionUrl: str, email: str, fullName: str, subscriptionStart: str) -> None:

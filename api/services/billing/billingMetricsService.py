@@ -39,6 +39,16 @@ _UNRESOLVED_ATTEMPTS_THRESHOLD = int(
 _METRICS_WINDOW_HOURS = int(
     os.environ.get("BILLING_METRICS_WINDOW_HOURS", "24")
 )
+_NOTIFICATION_PENDING_MAX_AGE_MINUTES = int(
+    os.environ.get("NOTIFICATION_PENDING_MAX_AGE_MINUTES", "15")
+)
+_NOTIFICATION_ACCEPTED_MAX_AGE_HOURS = int(
+    os.environ.get("NOTIFICATION_ACCEPTED_MAX_AGE_HOURS", "6")
+)
+_NOTIFICATION_FAILURE_RATE_THRESHOLD = float(
+    os.environ.get("NOTIFICATION_FAILURE_RATE_THRESHOLD", "0.1")
+)
+_EXPIRY_SWEEP_MAX_AGE_HOURS = 26
 
 
 
@@ -52,8 +62,18 @@ class BillingMetricsService:
     alert thresholds.
     """
 
-    def __init__(self):
-        self.client = client
+    def __init__(self, client=None, notificationRepository=None, now=None):
+        self.client = client if client is not None else globals()["client"]
+        if notificationRepository is None:
+            from api.services.notifications.notificationDeliveryRepository import (
+                getNotificationDeliveryRepository,
+            )
+
+            notificationRepository = getNotificationDeliveryRepository()
+        self.notificationRepository = notificationRepository
+        self._now = now or (
+            lambda: datetime.datetime.now(datetime.timezone.utc)
+        )
 
     def collectMetrics(self) -> dict:
         """
@@ -63,7 +83,7 @@ class BillingMetricsService:
         Returns:
             dict: Metric values keyed by category.
         """
-        now = datetime.datetime.now(datetime.timezone.utc)
+        now = self._now()
         windowStart = (
             now - datetime.timedelta(hours=_METRICS_WINDOW_HOURS)
         ).isoformat()
@@ -76,6 +96,10 @@ class BillingMetricsService:
             "tokenPrecheckFailures": self._collectTokenPrecheckFailures(windowStart),
             "reconciliation": self._collectReconciliationMetrics(),
             "webhookBacklog": self._collectWebhookBacklog(),
+            "notificationDelivery": (
+                self.notificationRepository.collectHealth(now.isoformat())
+            ),
+            "expirySweep": self._collectExpirySweepHeartbeat(),
         }
 
         logger.info(
@@ -133,6 +157,85 @@ class BillingMetricsService:
                 "message": (
                     f"Unresolved payment attempts ({unresolvedCount}) exceeds "
                     f"threshold ({_UNRESOLVED_ATTEMPTS_THRESHOLD})"
+                ),
+            })
+
+        notification = metrics["notificationDelivery"]
+        lastSweepAt = self._parseUtc(
+            metrics["expirySweep"].get("lastCompletedAt")
+        )
+        sweepAgeHours = (
+            None
+            if lastSweepAt is None
+            else (self._now() - lastSweepAt).total_seconds() / 3600
+        )
+        if sweepAgeHours is None or sweepAgeHours > _EXPIRY_SWEEP_MAX_AGE_HOURS:
+            alerts.append({
+                "alertType": "expiry_sweep_stale",
+                "severity": "HIGH",
+                "threshold": _EXPIRY_SWEEP_MAX_AGE_HOURS,
+                "actualValue": (
+                    None if sweepAgeHours is None else round(sweepAgeHours, 2)
+                ),
+                "message": "No successful subscription expiry sweep within 26 hours",
+            })
+
+        oldestPendingMinutes = int(
+            notification.get("oldestPendingMinutes") or 0
+        )
+        expiredLeases = int(notification.get("expiredLeases") or 0)
+        if (
+            oldestPendingMinutes > _NOTIFICATION_PENDING_MAX_AGE_MINUTES
+            or expiredLeases > 0
+        ):
+            alerts.append({
+                "alertType": "notification_backlog_stale",
+                "severity": "HIGH" if expiredLeases else "MEDIUM",
+                "threshold": _NOTIFICATION_PENDING_MAX_AGE_MINUTES,
+                "actualValue": oldestPendingMinutes,
+                "message": (
+                    "Notification backlog is stale "
+                    f"(oldest={oldestPendingMinutes} minutes, "
+                    f"expiredLeases={expiredLeases})"
+                ),
+            })
+
+        acceptedUnresolved = int(
+            notification.get("acceptedUnresolved") or 0
+        )
+        oldestAcceptedHours = (
+            self._collectOldestAcceptedAgeHours(self._now())
+            if acceptedUnresolved
+            else 0.0
+        )
+        if oldestAcceptedHours > _NOTIFICATION_ACCEPTED_MAX_AGE_HOURS:
+            alerts.append({
+                "alertType": "notification_delivery_unresolved",
+                "severity": "MEDIUM",
+                "threshold": _NOTIFICATION_ACCEPTED_MAX_AGE_HOURS,
+                "actualValue": round(oldestAcceptedHours, 2),
+                "message": (
+                    "Accepted notification remains unresolved for "
+                    f"{oldestAcceptedHours:.1f} hours"
+                ),
+            })
+
+        delivered = int(notification.get("delivered") or 0)
+        terminalFailures = int(notification.get("terminalFailures") or 0)
+        terminalTotal = delivered + terminalFailures
+        notificationFailureRate = (
+            terminalFailures / terminalTotal if terminalTotal else 0.0
+        )
+        if notificationFailureRate > _NOTIFICATION_FAILURE_RATE_THRESHOLD:
+            alerts.append({
+                "alertType": "notification_terminal_failure_rate",
+                "severity": "HIGH",
+                "threshold": _NOTIFICATION_FAILURE_RATE_THRESHOLD,
+                "actualValue": round(notificationFailureRate, 4),
+                "message": (
+                    "Notification terminal failure rate "
+                    f"{notificationFailureRate:.1%} exceeds threshold "
+                    f"{_NOTIFICATION_FAILURE_RATE_THRESHOLD:.1%}"
                 ),
             })
 
@@ -233,6 +336,58 @@ class BillingMetricsService:
         backlogCount = backlog.count if hasattr(backlog, "count") and backlog.count is not None else len(backlog.data)
 
         return {"count": backlogCount}
+
+    def _collectExpirySweepHeartbeat(self) -> dict:
+        result = (
+            self.client.table("billing_events")
+            .select("occurred_at")
+            .eq("event_type", "subscription.expiry_sweep.completed")
+            .eq("event_status", "COMPLETED")
+            .order("occurred_at", desc=True)
+            .limit(1)
+            .execute()
+        )
+        rows = result.data or []
+        return {
+            "lastCompletedAt": rows[0].get("occurred_at") if rows else None
+        }
+
+    def _collectOldestAcceptedAgeHours(
+        self,
+        now: datetime.datetime,
+    ) -> float:
+        result = (
+            self.client.table("notification_deliveries")
+            .select("accepted_at")
+            .eq("status", "ACCEPTED")
+            .order("accepted_at")
+            .limit(1)
+            .execute()
+        )
+        rows = result.data or []
+        acceptedAt = self._parseUtc(
+            rows[0].get("accepted_at") if rows else None
+        )
+        if acceptedAt is None:
+            return 0.0
+        return max(0.0, (now - acceptedAt).total_seconds() / 3600)
+
+    @staticmethod
+    def _parseUtc(value) -> datetime.datetime | None:
+        if isinstance(value, datetime.datetime):
+            parsed = value
+        elif value:
+            try:
+                parsed = datetime.datetime.fromisoformat(
+                    str(value).replace("Z", "+00:00")
+                )
+            except ValueError:
+                return None
+        else:
+            return None
+        if parsed.tzinfo is None:
+            parsed = parsed.replace(tzinfo=datetime.timezone.utc)
+        return parsed.astimezone(datetime.timezone.utc)
 
     def _countLogEvents(self, eventType: str, windowStart: str) -> int:
         """

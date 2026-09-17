@@ -175,6 +175,7 @@ class UserErasureRepository:
                     """,
                     (userId,),
                 )
+                self._scrubNotificationDeliveries(cursor, userId)
                 cursor.execute(
                     """
                     update public.admin_free_trial_extensions
@@ -476,6 +477,7 @@ class UserErasureRepository:
                     "select pg_advisory_xact_lock(hashtextextended(%s, 0))",
                     (userId,),
                 )
+                self._scrubNotificationDeliveries(cursor, userId)
                 if self._tableExists(cursor, "Invoices"):
                     cursor.execute(
                         """
@@ -700,6 +702,32 @@ class UserErasureRepository:
     def _tableExists(cursor, tableName: str) -> bool:
         cursor.execute("select to_regclass(%s)", (f'public."{tableName}"',))
         return cursor.fetchone()[0] is not None
+
+    def _scrubNotificationDeliveries(self, cursor, userId: str) -> None:
+        if not self._tableExists(cursor, "notification_deliveries"):
+            return
+        cursor.execute(
+            """
+            update public.notification_deliveries
+            set status = case
+                    when status in ('PENDING', 'RETRY_PENDING', 'SENDING')
+                        then 'CANCELLED'
+                    else status
+                end,
+                terminal_at = case
+                    when status in ('PENDING', 'RETRY_PENDING', 'SENDING')
+                        then now()
+                    else terminal_at
+                end,
+                user_id = null,
+                subscription_id = null,
+                lease_owner = null,
+                lease_expires_at = null,
+                updated_at = now()
+            where user_id = %s
+            """,
+            (userId,),
+        )
 
     def _deleteByUser(
         self, cursor, tableName: str, columnName: str, userId: str

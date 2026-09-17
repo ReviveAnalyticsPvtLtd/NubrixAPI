@@ -1,11 +1,7 @@
 name: Subscription Expiry Manager
 
 on:
-  # Run automatically every day
-  schedule:
-    - cron: "0 1 * * *"   # every day at 01:00 UTC
-
-  # Allow manual execution if needed
+  # Manual diagnostic only. Celery Beat owns the recurring expiry schedule.
   workflow_dispatch:
 
 jobs:
