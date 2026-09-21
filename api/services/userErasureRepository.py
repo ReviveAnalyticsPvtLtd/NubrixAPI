@@ -701,7 +701,11 @@ class UserErasureRepository:
     @staticmethod
     def _tableExists(cursor, tableName: str) -> bool:
         cursor.execute("select to_regclass(%s)", (f'public."{tableName}"',))
-        return cursor.fetchone()[0] is not None
+        row = cursor.fetchone()
+        if row is None:
+            return False
+        value = next(iter(row.values())) if isinstance(row, dict) else row[0]
+        return value is not None
 
     def _scrubNotificationDeliveries(self, cursor, userId: str) -> None:
         if not self._tableExists(cursor, "notification_deliveries"):
