@@ -414,6 +414,7 @@ class AuthenticationService:
                 "userId": dataSlice["userId"],
                 "email": loginDetails.email,
                 "sessionStartTime": str(sessionStartTime),
+                "exp": int(expiresAt.timestamp()),
                 "sub_status": (subscription.get("status") or "none").lower(),
                 "plan_type": subscriptionPlan,
             }
@@ -553,6 +554,7 @@ class AuthenticationService:
                 "userId": userData["userId"],
                 "email": userData["email"],
                 "sessionStartTime": str(sessionStartTime),
+                "exp": int(expiresAt.timestamp()),
                 "sub_status": (subscription.get("status") or "none").lower(),
                 "plan_type": subscriptionPlan,
             }

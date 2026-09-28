@@ -9,7 +9,7 @@ from fastapi.security import HTTPAuthorizationCredentials
 from jose import jwt
 
 from api.models import Login, LoginWithProvider
-from api.services.authenticationService import AuthenticationService
+from api.services.authenticationService import AuthenticationService, DEFAULT_PROFILE_IMAGE
 from utils.exceptionHandler import CustomException
 
 
@@ -96,6 +96,92 @@ def authenticationService(client):
     service = AuthenticationService.__new__(AuthenticationService)
     service.client = client
     return service
+
+
+def successfulAuthenticationService(client):
+    service = authenticationService(client)
+    subscription = {
+        "status": "active",
+        "billing_mode": "monthly",
+        "current_period_start": "2026-09-01T00:00:00+00:00",
+        "current_period_end": "2026-10-01T00:00:00+00:00",
+    }
+    service._ensureSubscriptionSnapshot = lambda _userId: subscription
+    service._refreshLifecycleSnapshot = lambda _userId, _subscription: 2
+    service._getCreditSnapshot = lambda _userId: {
+        "monthlyQuota": 100,
+        "monthlyUsed": 0,
+        "monthlyRemaining": 100,
+        "topupRemaining": 0,
+        "totalRemaining": 100,
+    }
+    return service
+
+
+def assertTokenExpiresWithStoredSession(accessToken, session):
+    payload = jwt.decode(
+        accessToken,
+        os.environ["SECRET_KEY"],
+        algorithms=["HS256"],
+    )
+    sessionStart = datetime.datetime.fromisoformat(payload["sessionStartTime"])
+    storedExpiry = datetime.datetime.fromisoformat(session["expiresAt"])
+
+    assert isinstance(payload["exp"], int)
+    assert payload["exp"] == int(storedExpiry.timestamp())
+    assert payload["exp"] - int(sessionStart.timestamp()) == 24 * 60 * 60
+
+
+def test_password_login_jwt_expires_with_stored_session():
+    email = "active@example.com"
+    password = "correct-password"
+    hashed = hashlib.md5(
+        (password + os.environ["SECRET_KEY"]).encode("utf-8")
+    ).hexdigest()
+    authUser = SimpleNamespace(
+        id="user-1",
+        email=email,
+        email_confirmed_at="2026-01-01T00:00:00+00:00",
+        confirmed_at="2026-01-01T00:00:00+00:00",
+    )
+    client = FakeClient([{
+        "userId": "user-1",
+        "email": email,
+        "password": hashed,
+        "onboarded": True,
+        "currentWorkspaceId": "workspace-1",
+        "profileImage": None,
+        "isBanned": False,
+    }], authUser=authUser)
+
+    response = successfulAuthenticationService(client).login(
+        Login(email=email, password=password)
+    )
+
+    assertTokenExpiresWithStoredSession(response["accessToken"], client.rows["Sessions"][0])
+
+
+def test_provider_login_jwt_expires_with_stored_session():
+    email = "provider@example.com"
+    client = FakeClient([{
+        "userId": "user-1",
+        "email": email,
+        "password": "provider-password",
+        "onboarded": True,
+        "currentWorkspaceId": "workspace-1",
+        "profileImage": DEFAULT_PROFILE_IMAGE,
+        "isBanned": False,
+    }])
+
+    response = successfulAuthenticationService(client).loginWithProvider(
+        LoginWithProvider(
+            email=email,
+            provider="google",
+            sub="provider-subject",
+        )
+    )
+
+    assertTokenExpiresWithStoredSession(response["accessToken"], client.rows["Sessions"][0])
 
 
 def test_password_login_rejects_banned_user_after_valid_credentials():
