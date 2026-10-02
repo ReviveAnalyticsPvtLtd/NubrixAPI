@@ -16,7 +16,7 @@ from utils.exceptionHandler import CustomException
 from pymongo.mongo_client import MongoClient
 from pymongo.server_api import ServerApi
 from fastapi import Form, UploadFile
-from sqlalchemy import create_engine
+from sqlalchemy import URL, create_engine
 from urllib.request import urlopen
 from utils.logger import logger
 from api.commons import client
@@ -383,7 +383,14 @@ class DataLoadService:
                     statusCode=400,
                     uiMessage="Missing required DB connection fields."
                 )
-            connStr = f"mysql+pymysql://{connection.user}:{connection.password}@{connection.host}:{connection.port}/{connection.db}"
+            connStr = URL.create(
+                "mysql+pymysql",
+                username=connection.user,
+                password=connection.password,
+                host=connection.host,
+                port=connection.port,
+                database=connection.db,
+            )
             engine = create_engine(connStr)
             sanitizedTable = self._sanitizeFileName(connection.table)
             from api.services.managementService import managementService
@@ -431,7 +438,14 @@ class DataLoadService:
                     statusCode=400,
                     uiMessage="Missing required DB connection fields."
                 )
-            connStr = f"postgresql+psycopg2://{connection.user}:{connection.password}@{connection.host}:{connection.port}/{connection.db}"
+            connStr = URL.create(
+                "postgresql+psycopg2",
+                username=connection.user,
+                password=connection.password,
+                host=connection.host,
+                port=connection.port,
+                database=connection.db,
+            )
             engine = create_engine(connStr)
             sanitizedTable = self._sanitizeFileName(connection.table)
             from api.services.managementService import managementService

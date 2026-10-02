@@ -13,7 +13,7 @@ from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor
 from api.commons import updateProjectModifiedAt
 from utils.exceptionHandler import CustomException
 from utils.codeExecutor import replManager, _remove_code_fences
-from sqlalchemy import create_engine
+from sqlalchemy import URL, create_engine
 from urllib.request import urlopen
 from utils.logger import logger
 from api.commons import client
@@ -468,7 +468,14 @@ class DashboardService:
             CustomException: For any errors during data retrieval or connection issues.
         """
         if connection.get("type") == "MySQL/PostgreSQL":
-            connStr = f'mysql+pymysql://{connection.get("user")}:{connection.get("password")}@{connection.get("host")}:{connection.get("port")}/{connection.get("db")}'
+            connStr = URL.create(
+                "mysql+pymysql",
+                username=connection.get("user"),
+                password=connection.get("password"),
+                host=connection.get("host"),
+                port=connection.get("port"),
+                database=connection.get("db"),
+            )
             engine = create_engine(connStr)
             dataFrame = pd.read_sql(f"SELECT * FROM {connection.get('table')}", engine, parse_dates = True)
             return dataFrame
