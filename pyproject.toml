@@ -66,6 +66,7 @@ dependencies = [
     "polars>=1.42.1",
     "pwdlib[argon2]>=0.3.1",
     "email-validator>=2.3.0",
+    "pymysql>=1.2.3",
 ]
 
 [dependency-groups]
