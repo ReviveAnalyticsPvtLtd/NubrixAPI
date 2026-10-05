@@ -130,10 +130,11 @@ class TopupService:
         """
         Determine whether a subscription may purchase top-ups.
 
-        Requires an active Pro or Annual plan: top-ups are an overflow valve for
-        paying customers, not a substitute for one, so free and trial users are
-        pushed to upgrade. The explicit plan_type check is what excludes trials —
-        a trial can carry an active-like status, so status alone is insufficient.
+        Requires a timestamp-valid paid Pro or Annual plan — including a
+        cancelled monthly subscription whose already-paid coverage remains.
+        Top-ups are an overflow valve for paying customers, not a substitute
+        for one: free, trial, and expired users are pushed to upgrade, and
+        stored top-ups never grant paid access.
 
         Args:
             subscription (dict | None): Canonical subscription row.
@@ -144,9 +145,10 @@ class TopupService:
         if not subscription:
             return False
         from api.services.subscriptions.subscriptionService import subscriptionService
+        from api.services.subscriptions.paymentValidationService import isAccessActive
 
         return (
-            subscriptionService._isSubscriptionActive(subscription.get("status"))
+            isAccessActive(subscription)
             and (subscription.get("plan_type") or "") in _ELIGIBLE_PLAN_TYPES
         )
 
@@ -169,7 +171,7 @@ class TopupService:
             userId, _ = self._decodeToken(token)
             subscription = self._subscription(userId)
             eligible = self._isTopupEligible(subscription)
-            billingMode = (subscription or {}).get("billing_mode") or "monthly_recurring"
+            billingMode = (subscription or {}).get("billing_mode") or "monthly_prepaid"
 
             packs = []
             for packId in getTopupPacks():
@@ -220,7 +222,7 @@ class TopupService:
             if pack is None:
                 raise Exception(f"TOPUP_PACK_UNKNOWN: no active top-up pack '{packId}'")
 
-            billingMode = subscription.get("billing_mode") or "monthly_recurring"
+            billingMode = subscription.get("billing_mode") or "monthly_prepaid"
             snapshot = computeTopupSnapshot(packId, billingMode)
             tokens = pack["tokens"]
 

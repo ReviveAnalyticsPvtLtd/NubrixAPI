@@ -86,8 +86,12 @@ class TestTopupEligibilityAndOrder(unittest.TestCase):
         return svc
 
     def _sub(self, status="active", planType="pro"):
+        from datetime import datetime, timedelta, timezone
+        start = (datetime.now(timezone.utc) - timedelta(days=10)).isoformat()
+        end = (datetime.now(timezone.utc) + timedelta(days=20)).isoformat()
         return {"id": "sub_1", "status": status, "plan_type": planType,
-                "billing_mode": "monthly_recurring", "customer_id": "cust_1"}
+                "billing_mode": "monthly_prepaid",
+                "current_period_start": start, "current_period_end": end}
 
     def test_active_pro_is_eligible(self):
         svc = self._service()
@@ -101,9 +105,23 @@ class TestTopupEligibilityAndOrder(unittest.TestCase):
         svc = self._service()
         self.assertFalse(svc._isTopupEligible(self._sub(status="trial", planType="free")))
 
-    def test_cancelled_pro_is_not_eligible(self):
+    def test_cancelled_pro_with_valid_paid_time_remains_eligible(self):
+        # A cancelled monthly subscription whose already-paid coverage
+        # remains valid can still purchase top-ups (design §9.5).
         svc = self._service()
-        self.assertFalse(svc._isTopupEligible(self._sub(status="cancelled")))
+        self.assertTrue(svc._isTopupEligible(self._sub(status="cancelled")))
+
+    def test_expired_period_is_not_eligible_even_with_stored_topups(self):
+        from datetime import datetime, timedelta, timezone
+        svc = self._service()
+        expired = self._sub()
+        expired["current_period_start"] = (
+            datetime.now(timezone.utc) - timedelta(days=40)
+        ).isoformat()
+        expired["current_period_end"] = (
+            datetime.now(timezone.utc) - timedelta(days=10)
+        ).isoformat()
+        self.assertFalse(svc._isTopupEligible(expired))
 
     def test_missing_subscription_is_not_eligible(self):
         svc = self._service()

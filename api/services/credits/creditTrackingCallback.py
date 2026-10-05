@@ -25,7 +25,12 @@ import uuid
 class CreditTrackingCallback(BaseCallbackHandler):
     """
     Post-LLM-call callback that reads ``usage_metadata`` from the
-    model response and deducts credits from the user's balance.
+    model response and settles it against the ADMITTED credit period.
+
+    The admission context (operation ID + credit period) is captured at work
+    start; a delayed ``on_llm_end`` after an expiry/refund/activation
+    boundary settles against that original period exactly once and never
+    debits a newly refilled period.
 
     Usage::
 
@@ -34,15 +39,48 @@ class CreditTrackingCallback(BaseCallbackHandler):
         response = workflow.invoke(inputs, config=config)
     """
 
-    def __init__(self, userId: str, operationType: str):
+    def __init__(self, userId: str, operationType: str, operationId: str | None = None,
+                 creditPeriodId: str | None = None, lifecycleId: str | None = None):
         super().__init__()
         self.userId = userId
         self.operationType = operationType
+        self.operationId = operationId or f"llm:{uuid.uuid4()}"
+        self.creditPeriodId = creditPeriodId
+        self.lifecycleId = lifecycleId
+        self._context = None
+        self._admit()
+
+    def _admit(self) -> None:
+        """Persist the admission context before counted work starts.
+
+        Admission failures are logged, not raised: the LLM call itself is
+        already authorized by the request-time gate, and a missing context
+        falls back to the legacy immediate-deduct path below.
+        """
+        try:
+            from api.services.credits.creditOperationSettlement import (
+                CreditOperationSettlement,
+            )
+
+            settlement = CreditOperationSettlement()
+            self._context = settlement.admitCreditOperation(
+                userId=self.userId,
+                operationType=self.operationType,
+                operationId=self.operationId,
+                lifecycleId=self.lifecycleId or "unknown",
+                creditPeriodId=self.creditPeriodId,
+            )
+        except Exception as admitError:
+            logger.warning(
+                f"Credit operation admission failed — userId={self.userId}, "
+                f"op={self.operationType}: {admitError}"
+            )
+            self._context = None
 
     def on_llm_end(self, response: LLMResult, **kwargs: Any) -> None:
         """
-        Called after every LLM call.  Extracts token counts from the
-        response and deducts credits.
+        Called after every LLM call. Extracts token counts and settles the
+        real usage once against the originally admitted credit period.
         """
         try:
             totalTokens = 0
@@ -62,7 +100,18 @@ class CreditTrackingCallback(BaseCallbackHandler):
                         if isinstance(tokenUsage, dict):
                             totalTokens += tokenUsage.get("total_tokens", 0)
 
-            if totalTokens > 0:
+            if totalTokens > 0 and self._context is not None:
+                from api.services.credits.creditOperationSettlement import (
+                    CreditOperationSettlement,
+                )
+
+                settlement = CreditOperationSettlement()
+                settlement.settleCreditOperation(
+                    context=self._context,
+                    tokensUsed=totalTokens,
+                )
+            elif totalTokens > 0:
+                # No admission context (legacy callers): immediate deduct.
                 from api.services.credits.creditService import creditService
                 creditService.deductTokens(
                     userId=self.userId,
