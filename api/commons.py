@@ -242,8 +242,8 @@ def requirePaidPlan(
 
 def requireCredits(operationType: str):
     """
-    Dependency factory that returns a FastAPI dependency checking whether
-    the user has enough remaining monthly tokens for the specified operation.
+    Dependency factory that returns a FastAPI dependency checking feature
+    eligibility first and then remaining monthly tokens for the operation.
 
     Usage::
 
@@ -251,28 +251,56 @@ def requireCredits(operationType: str):
         async def generateChart(body: ..., user=Depends(requireCredits("reporting_query"))):
             ...
 
-    Raises HTTPException 402 when the user's remaining tokens are below the
-    configured minimum for the operation. Remaining covers both the monthly and
-    the purchased bucket, so a user with a top-up balance passes even once
-    their monthly quota is spent. A remaining value of -1 means the balance is
-    unreadable (Redis and Supabase both unavailable) and is allowed through
-    rather than blocking the user on an infrastructure fault.
+    Order of checks:
+        1. Current feature entitlement (paid coverage or an eligible trial).
+           An expired/cancelled-ended subscription gets the feature-access
+           error even with stored top-ups — top-ups never buy time.
+        2. Remaining tokens against the configured operation minimum. 402
+           when below it; the body carries topupAvailable.
+        3. An unreadable balance (remaining = -1) is a retryable 503, never
+           fail-open access.
 
-    The 402 body carries topupAvailable from the current subscription
-    entitlement so the client knows whether to offer a purchase or an upgrade.
+    Raises HTTPException 402 when the user's remaining tokens are below the
+    configured minimum for the operation.
     """
     def _dependency(user: UserContext = Depends(verifyUser)) -> UserContext:
         from api.services.credits.creditService import creditService
         from api.services.credits.creditConfig import getOperationMinimum
 
+        # 1. Eligibility first — no quota read happens for ineligible users.
+        entitlement = _loadCurrentEntitlement(user)
+        if not entitlement.trialOrAbove:
+            raiseFeatureGateHttpException(
+                statusCode=status.HTTP_403_FORBIDDEN,
+                uiMessage="This feature requires an active subscription.",
+                backendLogMessage=(
+                    f"Credit gate blocked userId={user.userId}, "
+                    f"status={entitlement.status}, planType={entitlement.planType}"
+                ),
+                errorCode="FEATURE_BLOCKED",
+            )
+
         minimum = getOperationMinimum(operationType)
         remaining = creditService.getRemainingTokens(user.userId)
 
-        if remaining != -1 and remaining < minimum:
+        if remaining == -1:
+            raise HTTPException(
+                status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                detail={
+                    "status": "FAILURE",
+                    "message": (
+                        "Your credit balance could not be verified right now. "
+                        "Please try again."
+                    ),
+                    "errorCode": "CREDIT_STATE_UNAVAILABLE",
+                },
+            )
+
+        if remaining < minimum:
             snapshot = creditService.getBalanceSnapshot(user.userId)
             try:
-                entitlement = subscriptionEntitlementService.get(user.userId)
-                topupAvailable = entitlement.topupEligible
+                current = subscriptionEntitlementService.get(user.userId)
+                topupAvailable = current.topupEligible
             except EntitlementUnavailableError:
                 logger.warning(
                     "Top-up eligibility unavailable for userId={}",

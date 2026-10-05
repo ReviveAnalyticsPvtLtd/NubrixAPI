@@ -120,9 +120,38 @@ class TestRequireCreditsMonthly(unittest.TestCase):
             self._run(6000, operationType="transformation_message")
         self.assertEqual(ctx.exception.detail["required"], 10000)
 
-    def test_allows_when_balance_unreadable(self):
-        # -1 means Redis and Supabase are both unavailable: degrade open.
-        self.assertEqual(self._run(-1).userId, "u1")
+    def test_unreadable_balance_is_retryable_503_not_fail_open(self):
+        # -1 means the balance cannot be safely reconstructed: unavailable,
+        # never fail-open paid access.
+        with self.assertRaises(HTTPException) as ctx:
+            self._run(-1)
+        self.assertEqual(ctx.exception.status_code, 503)
+        self.assertEqual(ctx.exception.detail["errorCode"], "CREDIT_STATE_UNAVAILABLE")
+
+    def test_expired_entitlement_is_blocked_before_quota_check(self):
+        # Eligibility first: an expired subscription gets the feature-access
+        # error even with a large stored balance.
+        expired = SubscriptionEntitlement(
+            userId="u1",
+            status="expired",
+            planType="none",
+            currentPeriodEnd=None,
+            activeSubscription=False,
+            trialOrAbove=False,
+            paidPlan=False,
+            topupEligible=False,
+        )
+        dep = requireCredits("reporting_query")
+        with patch("api.services.credits.creditService.creditService.getRemainingTokens",
+                   return_value=10_000_000) as mockRemaining, \
+             patch("api.commons.subscriptionEntitlementService.get",
+                   return_value=expired):
+            with self.assertRaises(HTTPException) as ctx:
+                dep(user=_FakeUser())
+        self.assertEqual(ctx.exception.status_code, 403)
+        self.assertEqual(ctx.exception.detail["errorCode"], "FEATURE_BLOCKED")
+        # quota was never even consulted
+        mockRemaining.assert_not_called()
 
     def test_current_paid_entitlement_offers_topup(self):
         with self.assertRaises(HTTPException) as ctx:
@@ -134,15 +163,13 @@ class TestRequireCreditsMonthly(unittest.TestCase):
             self._run(0, entitlement=_entitlement(False))
         self.assertFalse(ctx.exception.detail["topupAvailable"])
 
-    def test_unavailable_entitlement_keeps_monthly_quota_error(self):
+    def test_unavailable_entitlement_is_retryable_503(self):
+        # Eligibility is checked first: when it cannot be verified, the
+        # request is unavailable rather than fail-open.
         dep = requireCredits("reporting_query")
-        snapshot = {
-            "remainingTokens": 0,
-            "periodEnd": "2026-08-01T00:00:00+00:00",
-        }
         with patch(
             "api.services.credits.creditService.creditService.getBalanceSnapshot",
-            return_value=snapshot,
+            return_value={"remainingTokens": 0, "periodEnd": "2026-08-01T00:00:00+00:00"},
         ), patch(
             "api.services.credits.creditService.creditService.getRemainingTokens",
             return_value=0,
@@ -153,13 +180,14 @@ class TestRequireCreditsMonthly(unittest.TestCase):
             with self.assertRaises(HTTPException) as ctx:
                 dep(user=_FakeUser())
 
-        self.assertEqual(ctx.exception.status_code, 402)
-        self.assertEqual(ctx.exception.detail["errorCode"], "MONTHLY_QUOTA_EXHAUSTED")
-        self.assertFalse(ctx.exception.detail["topupAvailable"])
+        self.assertEqual(ctx.exception.status_code, 503)
+        self.assertEqual(ctx.exception.detail["errorCode"], "ENTITLEMENT_UNAVAILABLE")
         mockGet.assert_called_once_with("u1")
 
     @patch("api.commons.subscriptionEntitlementService.get")
-    def test_successful_credit_check_does_not_load_topup_entitlement(self, mockGet):
+    def test_successful_credit_check_loads_eligibility_exactly_once(self, mockGet):
+        # The new gate loads the entitlement once for eligibility, then
+        # checks quota; success does not load it a second time for topups.
         dep = requireCredits("reporting_query")
         with patch(
             "api.services.credits.creditService.creditService.getRemainingTokens",
@@ -167,7 +195,7 @@ class TestRequireCreditsMonthly(unittest.TestCase):
         ):
             result = dep(user=_FakeUser())
         self.assertEqual(result.userId, "u1")
-        mockGet.assert_not_called()
+        self.assertEqual(mockGet.call_count, 1)
 
     def test_purchased_tokens_alone_satisfy_the_operation_minimum(self):
         self.assertEqual(self._run(5000).userId, "u1")

@@ -116,11 +116,22 @@ def isPeriodExpired(subscription: dict | None, now: datetime.datetime | None = N
 
 
 def isAccessActive(subscription: dict | None, now: datetime.datetime | None = None) -> bool:
-    status = ((subscription or {}).get("status") or "").lower()
-    if status in {"active", "renewal_upcoming", "payment_pending"}:
-        return True
-    if status == "cancelled":
-        return not isPeriodExpired(subscription, now)
+    """Paid access requires timestamp-valid coverage of `now`.
+
+    Status alone is never an access grant: `payment_pending` means an unpaid
+    next-period invoice exists and grants nothing once the current window
+    has elapsed; `cancelled` keeps paid access only while its period end is
+    in the future. At the exact end instant the old period no longer grants
+    access, regardless of scheduler or JWT staleness.
+    """
+    row = subscription or {}
+    status = (row.get("status") or "").lower()
+    periodEnd = parseUtc(row.get("current_period_end"))
+    if periodEnd is None:
+        # No stored coverage window: fail closed.
+        return False
+    if status in {"active", "renewal_upcoming", "payment_pending", "cancelled"}:
+        return not isPeriodExpired(row, now)
     return False
 
 

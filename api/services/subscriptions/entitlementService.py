@@ -54,10 +54,13 @@ def evaluateSubscriptionEntitlement(
         parseUtc(currentPeriodEnd) is not None
         and not isPeriodExpired(row)
     )
-    if status in {"active", "renewal_upcoming", "cancelled"}:
+    if status in {"active", "renewal_upcoming", "cancelled", "payment_pending"}:
+        # Every paid phase — including payment_pending (an unpaid next-period
+        # invoice) — requires timestamp-valid current coverage. Status alone
+        # is never an access grant.
         activeSubscription = isAccessActive(row) and periodEndValid
     else:
-        activeSubscription = status == "payment_pending"
+        activeSubscription = False
     trialPeriodValid = (
         status == "trial"
         and periodEndValid
