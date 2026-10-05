@@ -14,12 +14,15 @@ __all__ = ["router"]
 from api.models import (
     MarkReconciliationInvestigatedRequest,
     ReplayWebhookEventRequest,
+    SubscriptionRefundInitiateRequest,
+    SubscriptionRefundQuoteRequest,
 )
 from api.services.billing.billingMetricsService import BillingMetricsService
 from api.services.billing.reconciliationService import ReconciliationService
+from api.services.billing.subscriptionRefundService import SubscriptionRefundService
 from utils.exceptionHandler import CustomException, raiseHttpException
 from fastapi.responses import ORJSONResponse
-from fastapi import APIRouter, Depends, HTTPException, status
+from fastapi import APIRouter, Depends, Header, HTTPException, status
 from api.commons import verifyToken
 from utils.logger import logger
 from jose import jwt
@@ -65,6 +68,176 @@ def verifyBillingAdmin(token=Depends(verifyToken)) -> str:
             detail="Billing admin access denied",
         )
     return userId
+
+
+def _loadPaidIntervalsForInvoices(userId: str, invoiceIds: list[str]) -> list[dict]:
+    """Resolve the owned paid-service intervals targeted by a refund case.
+
+    Amounts come from each invoice's frozen snapshot; ownership is enforced
+    against the target user. Top-ups (billing_reason='add_on') are excluded
+    here — their clawback is a separately approved path.
+    """
+    from api.commons import client
+    from api.services.subscriptions.paymentValidationService import parseUtc
+
+    intervals = []
+    if not invoiceIds:
+        return intervals
+    rows = (
+        client.table("Invoices")
+        .select(
+            "id, userId, billing_reason, period_start, period_end, "
+            "total_amount, amount, currency, status, metadata_json"
+        )
+        .eq("userId", userId)
+        .in_("id", invoiceIds)
+        .execute()
+        .data
+    )
+    byId = {row["id"]: row for row in rows or []}
+    for invoiceId in invoiceIds:
+        row = byId.get(invoiceId)
+        if row is None:
+            raise CustomException(
+                ValueError(f"Invoice {invoiceId} not found for user {userId}"),
+                statusCode=404,
+                uiMessage="Target invoice not found.",
+            )
+        if (row.get("billing_reason") or "") == "add_on":
+            continue  # top-up refunds use the separate clawback path
+        if (row.get("status") or "").upper() != "PAID":
+            continue  # only captured money is refundable
+        start = parseUtc(row.get("period_start"))
+        end = parseUtc(row.get("period_end"))
+        if start is None or end is None or end <= start:
+            continue
+        metadata = row.get("metadata_json") or {}
+        manualBilling = (
+            metadata.get("manualBilling") or {} if isinstance(metadata, dict) else {}
+        )
+        coverageState = manualBilling.get("coverageState")
+        kind = "future" if start > _refundNow() else "current"
+        if coverageState == "revoked":
+            kind = "revoked"
+        intervals.append({
+            "invoiceId": row["id"],
+            "paymentId": row.get("razorpayPaymentId"),
+            "start": start,
+            "end": end,
+            "amount": int(row.get("total_amount") or row.get("amount") or 0),
+            "currency": row.get("currency") or "INR",
+            "kind": kind,
+        })
+    return intervals
+
+
+def _refundNow():
+    from datetime import datetime, timezone
+
+    return datetime.now(timezone.utc)
+
+
+@router.post("/refunds/quote")
+async def quoteSubscriptionRefund(
+    payload: SubscriptionRefundQuoteRequest,
+    adminUserId=Depends(verifyBillingAdmin),
+):
+    """
+    Quote a staff-approved unused-time refund: per-payment amounts, cutoff
+    estimate and coverage effects. Quote only — no entitlement change.
+    """
+    try:
+        paidIntervals = _loadPaidIntervalsForInvoices(
+            payload.userId, payload.invoiceIds
+        )
+        service = SubscriptionRefundService()
+        quote = service.quoteUnusedTimeRefund(
+            staffId=adminUserId,
+            payload=payload.dict(),
+            paidIntervals=paidIntervals,
+            subscription={"user_id": payload.userId},
+        )
+        logger.info(
+            f"Refund quote issued by admin={adminUserId} for user="
+            f"{payload.userId} case={payload.caseReference} amount={quote.amount}"
+        )
+        return ORJSONResponse(
+            status_code=200,
+            content={
+                "status": "SUCCESS",
+                "data": {
+                    "quoteId": quote.quoteId,
+                    "userId": quote.userId,
+                    "caseReference": quote.caseReference,
+                    "currency": quote.currency,
+                    "cutoff": quote.cutoff.isoformat(),
+                    "expiresAt": quote.expiresAt.isoformat(),
+                    "amount": quote.amount,
+                    "items": list(quote.items),
+                    "accessExpired": quote.accessExpired,
+                    "currentAccessPreserved": quote.currentAccessPreserved,
+                },
+            },
+        )
+    except CustomException as e:
+        raiseHttpException(e)
+    except Exception as e:
+        raiseHttpException(CustomException(e))
+
+
+@router.post("/refunds/initiate")
+async def initiateSubscriptionRefund(
+    payload: SubscriptionRefundInitiateRequest,
+    adminUserId=Depends(verifyBillingAdmin),
+    idempotencyKey: str | None = Header(default=None, alias="Idempotency-Key"),
+):
+    """
+    Execute an approved unused-time refund: fresh cutoff recomputation under
+    lock, durable reservation, affected coverage closure, then provider
+    submission outside DB locks.
+    """
+    try:
+        if not idempotencyKey or not idempotencyKey.strip():
+            raise CustomException(
+                ValueError("Idempotency-Key header is required"),
+                statusCode=422,
+                uiMessage="Idempotency-Key header is required.",
+            )
+        paidIntervals = _loadPaidIntervalsForInvoices(
+            payload.userId, payload.invoiceIds
+        )
+        service = SubscriptionRefundService()
+        intent = service.initiateUnusedTimeRefund(
+            staffId=adminUserId,
+            payload=payload.dict(),
+            requestKey=idempotencyKey.strip(),
+        )
+        logger.info(
+            f"Refund initiated by admin={adminUserId} for user={payload.userId} "
+            f"case={payload.caseReference} intent={intent.refundIntentId} "
+            f"state={intent.refundState}"
+        )
+        return ORJSONResponse(
+            status_code=200,
+            content={
+                "status": "SUCCESS",
+                "data": {
+                    "refundIntentId": intent.refundIntentId,
+                    "userId": intent.userId,
+                    "refundState": intent.refundState,
+                    "cutoff": intent.cutoff.isoformat(),
+                    "amount": intent.amount,
+                    "items": list(intent.items),
+                    "accessExpired": intent.accessExpired,
+                    "currentAccessPreserved": intent.currentAccessPreserved,
+                    "accessRestored": intent.accessRestored,
+                },
+            },
+        )
+    except CustomException as e:
+        raiseHttpException(e)
+    except Exception as e:
+        raiseHttpException(CustomException(e))
 
 
 @router.get("/reconciliation/report")

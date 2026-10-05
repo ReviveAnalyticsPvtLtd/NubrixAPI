@@ -209,6 +209,20 @@ class VerifyAnnualRenewalPaymentRequest(BaseModel):
 class PrepareRenewalInvoiceRequest(BaseModel):
     pass
 
+class SubscriptionRefundQuoteRequest(BaseModel):
+    userId: str
+    invoiceIds: list[str]
+    caseReference: str
+    reason: str
+
+class SubscriptionRefundInitiateRequest(BaseModel):
+    userId: str
+    invoiceIds: list[str]
+    caseReference: str
+    reason: str
+    quoteId: str
+    expectedTotalAmount: int
+
 class CreateRenewalSessionRequest(BaseModel):
     invoiceId: str
 
