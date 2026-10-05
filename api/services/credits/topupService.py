@@ -85,21 +85,15 @@ class TopupService:
 
     @staticmethod
     def _identity(userId: str, tokenEmail: str) -> dict:
-        """Canonical checkout identity plus a guaranteed Razorpay customer id."""
+        """Checkout identity without any Razorpay Customer dependency.
+
+        Contact details are prefill only — the same contact across separate
+        accounts is never a billing identity. No Customer create/fetch/edit.
+        """
         from api.services.subscriptions.subscriptionService import subscriptionService
-        from api.services.subscriptions.subscriptionFieldUtils import subscriptionCustomerId
 
         identity = subscriptionService._resolveCheckoutIdentity(userId, tokenEmail)
-        subscription = subscriptionService._getCanonicalSubscription(
-            userId=userId, required=True
-        )
-        customerId = subscriptionCustomerId(subscription)
-        if not customerId:
-            customerId = subscriptionService._getOrCreateRazorpayCustomer(
-                userId, identity["email"], identity["name"], identity["contact"]
-            )
-        subscriptionService._syncRazorpayCustomerIdentity(customerId, identity)
-        return {**identity, "customerId": customerId}
+        return dict(identity)
 
     @staticmethod
     def _createInvoice(userId: str, subscriptionId: str | None, snapshot,
@@ -238,7 +232,6 @@ class TopupService:
             order = self.razorpayClient.order.create({
                 "amount": snapshot.total_amount,
                 "currency": snapshot.currency,
-                "customer_id": identity["customerId"],
                 "notes": {
                     "userId": userId,
                     "type": "credit_topup",
@@ -277,7 +270,6 @@ class TopupService:
                 "userEmail": identity["email"],
                 "userName": identity["name"],
                 "userContact": identity["contact"],
-                "customerId": identity["customerId"],
                 "pricingSnapshot": {
                     "pricingVersion": snapshot.pricing_version,
                     "priceSource": snapshot.pricing_reference_snapshot_json["source"],

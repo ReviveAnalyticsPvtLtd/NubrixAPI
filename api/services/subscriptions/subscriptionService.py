@@ -160,9 +160,14 @@ class SubscriptionService:
     def _normalizeBillingMode(billingMode: str | None) -> str:
         """
         Normalize and validate billing mode for subscription purchase flows.
+
+        ``monthly_recurring`` is retained only as a legacy request alias that
+        maps to manual monthly checkout; new storage uses ``monthly_prepaid``.
         """
-        normalized = (billingMode or "monthly_recurring").strip().lower()
-        if normalized not in {"monthly_recurring", "annual_prepaid"}:
+        normalized = (billingMode or "monthly_prepaid").strip().lower()
+        if normalized == "monthly_recurring":
+            normalized = "monthly_prepaid"
+        if normalized not in {"monthly_prepaid", "annual_prepaid"}:
             raise Exception(f"Unsupported billingMode: {billingMode}")
         return normalized
 
@@ -439,6 +444,24 @@ class SubscriptionService:
     def _paymentValidationException(error: PaymentValidationError) -> CustomException:
         return CustomException(error, statusCode=400, uiMessage=str(error))
 
+    def _ensureLifecycleId(self, subscription: dict | None) -> str:
+        """
+        Resolve the immutable purchase lifecycle ID for the canonical row.
+
+        The lifecycle ID lives in ``billing_state.manualBilling.lifecycleId``;
+        it survives routine version bumps and status changes. A new purchase
+        after reset assigns a fresh ID. Missing -> generate (caller persists
+        it with the invoice/subscription mutation).
+        """
+        billingState = subscriptionBillingState(subscription)
+        manualBilling = billingState.get("manualBilling") or {}
+        lifecycleId = manualBilling.get("lifecycleId")
+        if lifecycleId:
+            return str(lifecycleId)
+        import uuid as uuidModule
+
+        return str(uuidModule.uuid4())
+
     def _auditLog(self, userId: str, eventType: str, **kwargs) -> None:
         """
         Insert an audit row into the unified billing ledger.
@@ -472,36 +495,6 @@ class SubscriptionService:
             )
         except Exception as e:
             logger.error(f"billing_events insert failed for user {userId}, event {eventType}: {e}")
-
-    def _getOrCreateRazorpayCustomer(self, userId: str, email: str, name: str, contact: str = "") -> str:
-        """
-        Retrieve existing or create a new Razorpay Customer for the user.
-
-        Args:
-            userId (str): The internal user ID.
-            email (str): The user's email address.
-            name (str): The user's full name.
-            contact (str): The user's phone number.
-
-        Returns:
-            str: The Razorpay Customer ID.
-        """
-        subscription = self._getCanonicalSubscription(userId=userId, required=True)
-        existingCustomerId = subscriptionCustomerId(subscription)
-        if existingCustomerId:
-            return existingCustomerId
-        customer = self.razorpayClient.customer.create({
-            "name": name,
-            "email": email,
-            "contact": contact,
-            "fail_existing": 0
-        })
-        customerId = customer["id"]
-        self.client.table("subscriptions").update({
-            "razorpay_customer_id": customerId
-        }).eq("id", subscription["id"]).execute()
-        logger.info(f"Razorpay customer created for user {userId}: {customerId}")
-        return customerId
 
     def _normalizePhone(self, phone: str) -> str:
         """
@@ -565,47 +558,6 @@ class SubscriptionService:
             "name": canonicalName,
             "contact": canonicalContact,
         }
-
-    def _syncRazorpayCustomerIdentity(self, customerId: str, canonicalIdentity: dict) -> bool:
-        """
-        Sync the Razorpay customer object with canonical identity if drift is detected.
-
-        Fetches the current Razorpay customer and compares email, name, and
-        contact against canonical values. Updates only the fields that have
-        drifted. Failures are logged but do not propagate — checkout can
-        proceed even if the sync fails.
-
-        Args:
-            customerId (str): The Razorpay customer ID.
-            canonicalIdentity (dict): Canonical identity with 'email', 'name', 'contact'.
-
-        Returns:
-            bool: True if a sync update was performed, False otherwise.
-        """
-        try:
-            customer = self.razorpayClient.customer.fetch(customerId)
-        except Exception as e:
-            logger.warning(f"Failed to fetch Razorpay customer {customerId} for identity sync: {e}")
-            return False
-        updates = {}
-        if canonicalIdentity["email"] and customer.get("email") != canonicalIdentity["email"]:
-            updates["email"] = canonicalIdentity["email"]
-        if canonicalIdentity["name"] and customer.get("name") != canonicalIdentity["name"]:
-            updates["name"] = canonicalIdentity["name"]
-        if canonicalIdentity["contact"] and customer.get("contact") != canonicalIdentity["contact"]:
-            updates["contact"] = canonicalIdentity["contact"]
-        if not updates:
-            return False
-        try:
-            self.razorpayClient.customer.edit(customerId, updates)
-            logger.info(
-                f"Razorpay customer {customerId} identity synced: "
-                f"fields updated = {list(updates.keys())}"
-            )
-            return True
-        except Exception as e:
-            logger.error(f"Failed to sync Razorpay customer {customerId}: {e}")
-            return False
 
     def _normalizeAndValidateDomains(self, domains: list[str]) -> list[str]:
         """
@@ -886,16 +838,16 @@ class SubscriptionService:
             logger.error(exception)
             raise exception
 
-    def createSubscription(self, domains: list[str], contact: str, token: str, billingMode: str = "monthly_recurring") -> dict:
+    def createSubscription(self, domains: list[str], contact: str, token: str, billingMode: str = "monthly_prepaid") -> dict:
         """
-        Create a Razorpay Order for tokenization-based subscription checkout.
+        Create a customer-free Razorpay Order for manual subscription checkout.
 
-        The Order captures the user's card details and creates a saved mandate
-        (token) for future recurring charges by the billing engine.
+        Each purchase is a one-time checkout; no Razorpay Customer object is
+        created, fetched, or bound, and no recurring token is enrolled.
 
         Args:
             domains (list[str]): Domain expert names the user is subscribing to.
-            contact (str): User's phone number for Razorpay checkout and RBI compliance.
+            contact (str): User's phone number for checkout prefill only.
             token (str): Authorization token.
 
         Returns:
@@ -914,19 +866,6 @@ class SubscriptionService:
             normalizedContact = self._normalizePhone(contact)
             self.client.table("Users").update({"phoneNumber": normalizedContact}).eq("userId", userId).execute()
             identity = self._resolveCheckoutIdentity(userId, tokenEmail)
-            customerId = self._getOrCreateRazorpayCustomer(
-                userId, identity["email"], identity["name"], identity["contact"]
-            )
-            synced = self._syncRazorpayCustomerIdentity(customerId, identity)
-            self._auditLog(
-                userId, "identity.checkout_resolved",
-                status="SYNCED" if synced else "CURRENT",
-                metadata={
-                    "flow": "createSubscription",
-                    "customerId": customerId,
-                    "synced": synced,
-                }
-            )
             quantity = len(normalizedDomains)
             subscription = self._getCanonicalSubscription(userId=userId, required=False)
             if self._blocksNewCheckout(subscription, utcNow()):
@@ -938,31 +877,37 @@ class SubscriptionService:
                         "billing period ends."
                     )
                 )
-            customerState = None
             snapshot = computeInvoiceSnapshot(
                 billingMode=normalizedBillingMode,
                 billingReason="initial_purchase",
                 domainCount=quantity,
-                customerState=customerState,
+                customerState=None,
             )
+            lifecycleId = self._ensureLifecycleId(subscription)
             invoice = self._createFrozenInvoiceFromSnapshot(
                 userId=userId,
                 subscriptionId=subscription.get("id") if subscription else None,
                 billingReason="initial_purchase",
                 paymentFlow="razorpay_order_checkout",
-                requiresCustomerAuth=(normalizedBillingMode == "annual_prepaid"),
+                requiresCustomerAuth=True,
                 snapshot=snapshot,
                 metadata={
                     "domains": normalizedDomains,
                     "flow": "createSubscription",
                     "billingMode": normalizedBillingMode,
+                    "manualBilling": {
+                        "schemaVersion": 1,
+                        "lifecycleId": lifecycleId,
+                        "purpose": "initial_purchase",
+                        "billingMode": normalizedBillingMode,
+                        "domains": normalizedDomains,
+                        "coverageState": "estimated",
+                    },
                 },
             )
-            farFutureEpoch = int((utcNow() + datetime.timedelta(days=365 * 10)).timestamp())
             orderPayload = {
                 "amount": snapshot.total_amount,
                 "currency": "INR",
-                "customer_id": customerId,
                 "notes": {
                     "userId": userId,
                     "type": "initial_subscription",
@@ -971,13 +916,6 @@ class SubscriptionService:
                     "billingMode": normalizedBillingMode,
                 },
             }
-            if normalizedBillingMode == "monthly_recurring":
-                orderPayload["method"] = "card"
-                orderPayload["token"] = {
-                    "max_amount": 1500000,
-                    "expire_at": farFutureEpoch,
-                    "frequency": "monthly",
-                }
             order = self.razorpayClient.order.create(orderPayload)
             self._attachOrderToInvoice(invoiceId=invoice["id"], orderId=order["id"])
             self._auditLog(
@@ -999,12 +937,18 @@ class SubscriptionService:
                 "userName": identity["name"],
                 "razorpayKey": os.environ["RAZORPAY_KEY_ID"],
                 "orderId": order["id"],
-                "customerId": customerId,
                 "status": order["status"],
                 "quantity": quantity,
                 "domains": normalizedDomains,
                 "invoiceId": invoice["id"],
                 "billingMode": normalizedBillingMode,
+                "expiresAt": None,
+                "state": "payment_pending",
+                "period": {
+                    "start": snapshot.period_start,
+                    "end": snapshot.period_end,
+                    "estimated": True,
+                },
                 "pricingSnapshot": {
                     "pricingVersion": snapshot.pricing_version,
                     "priceSource": snapshot.pricing_reference_snapshot_json.get("source"),
@@ -1090,9 +1034,6 @@ class SubscriptionService:
             )
             payment = self.razorpayClient.payment.fetch(paymentId)
             subscription = self._getCanonicalSubscription(userId=userId, required=True)
-            customerId = subscriptionCustomerId(subscription)
-            if not customerId:
-                raise Exception("No Razorpay customer found — cannot validate token")
             assertInvoiceBelongsToSubscription(invoice, subscription)
             validateOrderPaymentAgainstInvoice(
                 order=order,
@@ -1100,88 +1041,112 @@ class SubscriptionService:
                 invoice=invoice,
                 expectedType="initial_subscription",
                 expectedUserId=userId,
-                expectedCustomerId=customerId,
+                expectedCustomerId=None,
                 requestOrderId=orderId,
                 requireCaptured=True,
             )
-            tokenId = None
-            recurringStatus = ""
-            if billingMode == "monthly_recurring":
-                tokenId = payment.get("token_id")
-                if not tokenId:
-                    raise Exception("Payment did not produce a recurring token (token_id is missing)")
-                tokenEntity = self.razorpayClient.token.fetch(customerId, tokenId)
-                recurringDetails = tokenEntity.get("recurring_details") or {}
-                recurringStatus = recurringDetails.get("status", "")
-                isRecurring = tokenEntity.get("recurring", False)
-                UNUSABLE_STATES = {"cancelled", "expired", "rejected"}
-                if recurringStatus in UNUSABLE_STATES:
-                    raise Exception(
-                        f"Token {tokenId} is not usable for recurring payments "
-                        f"(recurring_details.status={recurringStatus})"
-                    )
-                if not isRecurring:
-                    raise Exception(
-                        f"Token {tokenId} is not recurring-enabled (recurring={isRecurring})"
-                    )
-                logger.info(
-                    f"Token {tokenId} validated for user {userId}: "
-                    f"recurring={isRecurring}, recurring_details.status={recurringStatus}"
-                )
             currentTime = utcNow()
-            if billingMode == "monthly_recurring":
-                anchorDay = currentTime.day
-                expiry = currentTime + relativedelta(months=1)
+            lifecycleId = self._ensureLifecycleId(subscription)
+            if billingMode == "monthly_prepaid":
+                activationAt = currentTime
+                expiry = activationAt + relativedelta(months=1)
                 self._upsertCanonicalSubscription(
                     userId=userId,
-                    billingMode="monthly_recurring",
+                    billingMode="monthly_prepaid",
                     status="active",
-                    currentPeriodStart=currentTime.isoformat(),
-                    currentPeriodEnd=expiry.isoformat(),
-                    renewalDueAt=expiry.isoformat(),
-                    autoRenewEnabled=True,
-                    paymentCollectionMode="silent_token",
-                    subscribedExperts=normalizedDomains,
-                    domainCount=len(normalizedDomains),
-                    razorpayCustomerId=customerId,
-                    razorpayTokenId=tokenId,
-                    subscriptionAnchorDay=anchorDay,
-                    recurringFailures=0,
-                    pendingRemovals=[],
-                    pendingAdditions=[],
-                    planType="pro",
-                )
-            else:
-                expiry = currentTime + relativedelta(years=1)
-                self._upsertCanonicalSubscription(
-                    userId=userId,
-                    billingMode="annual_prepaid",
-                    status="active",
-                    currentPeriodStart=currentTime.isoformat(),
+                    currentPeriodStart=activationAt.isoformat(),
                     currentPeriodEnd=expiry.isoformat(),
                     renewalDueAt=expiry.isoformat(),
                     autoRenewEnabled=False,
                     paymentCollectionMode="authenticated_checkout",
                     subscribedExperts=normalizedDomains,
                     domainCount=len(normalizedDomains),
-                    razorpayCustomerId=customerId,
-                    recurringFailures=0,
+                    pendingRemovals=[],
+                    pendingAdditions=[],
+                    planType="pro",
+                )
+                canonical = self._getCanonicalSubscription(userId=userId, required=True)
+                existingState = dict(subscriptionBillingState(canonical) or {})
+                manualBillingState = existingState.get("manualBilling") or {}
+                manualBillingState.update({
+                    "schemaVersion": 1,
+                    "lifecycleId": lifecycleId,
+                    "activationAt": activationAt.isoformat(),
+                    "finalPaidEnd": expiry.isoformat(),
+                })
+                existingState["manualBilling"] = manualBillingState
+                self.client.table("subscriptions").update({
+                    "billing_state": existingState,
+                    "auto_renew_enabled": False,
+                }).eq("id", canonical["id"]).execute()
+                periodStartIso = activationAt.isoformat()
+                periodEndIso = expiry.isoformat()
+            else:
+                activationAt = currentTime
+                expiry = activationAt + relativedelta(years=1)
+                self._upsertCanonicalSubscription(
+                    userId=userId,
+                    billingMode="annual_prepaid",
+                    status="active",
+                    currentPeriodStart=activationAt.isoformat(),
+                    currentPeriodEnd=expiry.isoformat(),
+                    renewalDueAt=expiry.isoformat(),
+                    autoRenewEnabled=False,
+                    paymentCollectionMode="authenticated_checkout",
+                    subscribedExperts=normalizedDomains,
+                    domainCount=len(normalizedDomains),
                     pendingRemovals=[],
                     pendingAdditions=[],
                     planType="annual",
                 )
-                annualSubscription = self._getCanonicalSubscription(userId=userId, required=True)
+                canonical = self._getCanonicalSubscription(userId=userId, required=True)
+                existingState = dict(subscriptionBillingState(canonical) or {})
+                manualBillingState = existingState.get("manualBilling") or {}
+                manualBillingState.update({
+                    "schemaVersion": 1,
+                    "lifecycleId": lifecycleId,
+                    "activationAt": activationAt.isoformat(),
+                    "finalPaidEnd": expiry.isoformat(),
+                })
+                existingState["manualBilling"] = manualBillingState
                 self.client.table("subscriptions").update({
-                    "razorpay_token_id": None,
-                    "subscription_anchor_day": None,
-                }).eq("id", annualSubscription["id"]).execute()
+                    "billing_state": existingState,
+                    "auto_renew_enabled": False,
+                }).eq("id", canonical["id"]).execute()
+                periodStartIso = activationAt.isoformat()
+                periodEndIso = expiry.isoformat()
             if invoiceId:
-                paidAt = payment.get("captured_at") or payment.get("created_at")
                 self._markInvoicePaid(
                     invoiceId=invoiceId,
                     paymentId=paymentId,
-                    paidAt=str(utcFromTimestamp(paidAt)) if paidAt else None,
+                    paidAt=str(utcNow()),
                 )
+                # Persist actual committed coverage dates + activation identity
+                # on the invoice without changing the frozen amount/tax.
+                invoiceRows = self.client.table("Invoices") \
+                    .select("id, metadata_json") \
+                    .eq("id", invoiceId) \
+                    .limit(1) \
+                    .execute().data
+                if invoiceRows:
+                    existingMetadata = invoiceRows[0].get("metadata_json")
+                    metadata = dict(existingMetadata) if isinstance(existingMetadata, dict) else {}
+                    manualBilling = dict(metadata.get("manualBilling") or {})
+                    manualBilling.update({
+                        "schemaVersion": 1,
+                        "lifecycleId": lifecycleId,
+                        "purpose": "initial_purchase",
+                        "billingMode": billingMode,
+                        "domains": normalizedDomains,
+                        "coverageState": "active",
+                        "activatedAt": activationAt.isoformat(),
+                    })
+                    metadata["manualBilling"] = manualBilling
+                    self.client.table("Invoices").update({
+                        "period_start": periodStartIso,
+                        "period_end": periodEndIso,
+                        "metadata_json": metadata,
+                    }).eq("id", invoiceId).execute()
             self._auditLog(
                 userId, "subscription.verified",
                 paymentId=paymentId,
@@ -1190,14 +1155,13 @@ class SubscriptionService:
                     "orderId": orderId,
                     "invoiceId": invoiceId,
                     "billingMode": billingMode,
-                    "tokenId": tokenId,
-                    "tokenRecurringStatus": recurringStatus,
+                    "lifecycleId": lifecycleId,
                     "domains": normalizedDomains,
                     "quantity": len(normalizedDomains),
-                    "anchorDay": currentTime.day,
+                    "activationAt": activationAt.isoformat(),
                 }
             )
-            planType = "pro" if billingMode == "monthly_recurring" else "annual"
+            planType = "pro" if billingMode == "monthly_prepaid" else "annual"
             try:
                 from api.services.credits.creditService import creditService
                 creditService.initializeCreditBalance(
@@ -1328,25 +1292,8 @@ class SubscriptionService:
             else:
                 subscriptionExpiry = subscriptionExpiry.astimezone(datetime.timezone.utc)
             now = datetime.datetime.now(datetime.timezone.utc)
-            billingMode = self._normalizeBillingMode(subscription.get("billing_mode") or "monthly_recurring")
+            billingMode = self._normalizeBillingMode(subscription.get("billing_mode") or "monthly_prepaid")
             identity = self._resolveCheckoutIdentity(userId, tokenEmail)
-            customerId = subscriptionCustomerId(subscription)
-            if billingMode == "monthly_recurring" and not subscriptionTokenId(subscription):
-                raise Exception("No active recurring token found for monthly add-domain billing")
-            if not customerId:
-                customerId = self._getOrCreateRazorpayCustomer(
-                    userId, identity["email"], identity["name"], identity["contact"]
-                )
-            synced = self._syncRazorpayCustomerIdentity(customerId, identity)
-            self._auditLog(
-                userId, "identity.checkout_resolved",
-                status="SYNCED" if synced else "CURRENT",
-                metadata={
-                    "flow": "addDomains",
-                    "customerId": customerId,
-                    "synced": synced,
-                }
-            )
             snapshot = computeInvoiceSnapshot(
                 billingMode=billingMode,
                 billingReason="proration",
@@ -1374,7 +1321,6 @@ class SubscriptionService:
             order = self.razorpayClient.order.create({
                 "amount": totalProrated,
                 "currency": "INR",
-                "customer_id": customerId,
                 "notes": {
                     "userId": userId,
                     "domains": domainLabel,
@@ -1425,9 +1371,9 @@ class SubscriptionService:
                 "userEmail": identity["email"],
                 "userName": identity["name"],
                 "userContact": identity["contact"],
-                "customerId": customerId,
                 "invoiceId": invoice["id"],
                 "billingMode": billingMode,
+                "expiresAt": subscriptionExpiry.isoformat(),
                 "pricingSnapshot": {
                     "pricingVersion": snapshot.pricing_version,
                     "priceSource": snapshot.pricing_reference_snapshot_json.get("source"),
@@ -1518,14 +1464,6 @@ class SubscriptionService:
                     f"pending domains={pendingDomains}"
                 )
 
-            expectedCustomerId = subscriptionCustomerId(subscription)
-            orderCustomerId = order.get("customer_id")
-            if expectedCustomerId and orderCustomerId and orderCustomerId != expectedCustomerId:
-                raise Exception(
-                    f"Order/customer mismatch: order.customer_id={orderCustomerId}, "
-                        f"subscription.customer_id={expectedCustomerId}"
-                )
-
             invoice = None
             if invoiceId:
                 invoiceRows = self.client.table("Invoices") \
@@ -1567,12 +1505,6 @@ class SubscriptionService:
                     f"Payment/order mismatch: payment.order_id={paymentOrderId}, "
                     f"request.orderId={orderId}"
                 )
-            paymentCustomerId = payment.get("customer_id")
-            if expectedCustomerId and paymentCustomerId and paymentCustomerId != expectedCustomerId:
-                raise Exception(
-                    f"Payment/customer mismatch: payment.customer_id={paymentCustomerId}, "
-                        f"subscription.customer_id={expectedCustomerId}"
-                )
             if invoice:
                 expectedAmount = invoice.get("total_amount") or invoice.get("amount")
                 actualAmount = payment.get("amount")
@@ -1596,11 +1528,10 @@ class SubscriptionService:
                 referenceId=orderId,
             )
             if invoiceId:
-                paidAt = payment.get("captured_at") or payment.get("created_at")
                 self._markInvoicePaid(
                     invoiceId=invoiceId,
                     paymentId=paymentId,
-                    paidAt=str(utcFromTimestamp(paidAt)) if paidAt else None,
+                    paidAt=str(utcNow()),
                 )
             self._auditLog(
                 userId, "domain.upgrade_verified",
@@ -1812,54 +1743,45 @@ class SubscriptionService:
 
     def initiateRefund(self, token: str, paymentId: str, amount: int | None = None) -> dict:
         """
-        Initiate a refund for a Razorpay payment.
+        Compatibility surface for the legacy user-facing refund route.
 
-        Args:
-            token (str): Authorization token.
-            paymentId (str): The Razorpay payment ID to refund.
-            amount (int | None): Amount in paise to refund. None for full refund.
-
-        Returns:
-            dict: The Razorpay refund response.
+        Refunds are exceptional, staff-approved actions following a support
+        email case. Ordinary users never execute refunds here: the endpoint
+        returns the support-contact outcome and executes nothing, even when
+        the payment is owned by the caller. Staff uses the controlled
+        billing-admin refund service.
         """
         try:
             if not paymentId:
                 raise Exception("paymentId is required")
-            if amount is not None and amount <= 0:
-                raise Exception("amount must be greater than 0")
             decodedToken = jwt.decode(
                 token,
                 os.environ["SECRET_KEY"],
-                algorithms = ["HS256"]
+                algorithms=["HS256"]
             )
             userId = decodedToken.get("userId")
             if not userId:
                 raise Exception("Invalid token payload")
-            userRecord = self.client.table("Users").select("userId").eq("userId", userId).execute()
-            if not userRecord.data:
-                raise Exception("User not found")
-            subscription = self._getCanonicalSubscription(userId=userId, required=True)
-            customerId = subscriptionCustomerId(subscription)
-            if not customerId:
-                raise Exception("No Razorpay customer found for this user")
-            payment = self.razorpayClient.payment.fetch(paymentId)
-            paymentCustomerId = payment.get("customer_id")
-            if not paymentCustomerId or paymentCustomerId != customerId:
-                logger.warning(f"Unauthorized refund attempt blocked for user {userId}, payment {paymentId}")
-                raise Exception("Payment does not belong to this user")
-            refundParams = {}
-            if amount is not None:
-                refundParams["amount"] = amount
-            result = self.razorpayClient.payment.refund(paymentId, refundParams)
             self._auditLog(
-                userId, "refund.initiated",
+                userId, "refund.user_request_rejected",
                 paymentId=paymentId,
-                amount=amount or payment.get("amount"),
-                currency=payment.get("currency", "INR"),
-                status="INITIATED"
+                status="SUPPORT_CONTACT_REQUIRED",
+                metadata={
+                    "reason": "self_service_refunds_disabled",
+                    "requestedAmount": amount,
+                }
             )
-            logger.info(f"Refund initiated for payment {paymentId}, user {userId}")
-            return result
+            raise CustomException(
+                ValueError("Subscription refunds require support approval"),
+                statusCode=403,
+                uiMessage=(
+                    "Refunds are handled by our support team after review. "
+                    "Please email support with your reason; approved unused "
+                    "time is returned by our team."
+                ),
+            )
+        except CustomException:
+            raise
         except Exception as e:
             exception = CustomException(e)
             logger.error(exception)
@@ -1960,9 +1882,6 @@ class SubscriptionService:
                     )
 
             identity = self._resolveCheckoutIdentity(userId, tokenEmail)
-            customerId = self._getOrCreateRazorpayCustomer(
-                userId, identity["email"], identity["name"], identity["contact"]
-            )
 
             totalAmount = invoice.get("total_amount") or invoice.get("amount")
             if not totalAmount or int(totalAmount) <= 0:

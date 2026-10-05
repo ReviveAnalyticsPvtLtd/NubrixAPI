@@ -449,6 +449,8 @@ class SubscriptionHardeningTests(unittest.TestCase):
     @patch("api.services.subscriptions.subscriptionService.computeInvoiceSnapshot")
     def test_create_subscription_allows_cancelled_after_period_end(self, mockSnapshot, _mockDecode):
         pastEnd = (datetime.now(timezone.utc) - timedelta(days=1)).isoformat()
+        estimatedStart = datetime.now(timezone.utc).isoformat()
+        estimatedEnd = (datetime.now(timezone.utc) + timedelta(days=31)).isoformat()
         mockSnapshot.return_value = types.SimpleNamespace(
             total_amount=1180,
             currency="INR",
@@ -460,6 +462,8 @@ class SubscriptionHardeningTests(unittest.TestCase):
                 to_dict=lambda: {"tax_amount": 180},
             ),
             amount_before_tax=1000,
+            period_start=estimatedStart,
+            period_end=estimatedEnd,
         )
         service = SubscriptionService()
         service.client = _FakeClient({"Users": [{"userId": "u1"}]})
@@ -472,8 +476,6 @@ class SubscriptionHardeningTests(unittest.TestCase):
             "name": "User",
             "contact": "+919999999999",
         }
-        service._getOrCreateRazorpayCustomer = lambda *_args: "cust_1"
-        service._syncRazorpayCustomerIdentity = lambda *_args, **_kwargs: False
         service._createFrozenInvoiceFromSnapshot = lambda **_kwargs: {"id": "inv_new"}
         service._attachOrderToInvoice = lambda **_kwargs: None
         service._auditLog = lambda *_args, **_kwargs: None
