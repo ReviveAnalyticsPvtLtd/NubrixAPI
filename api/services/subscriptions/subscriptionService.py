@@ -21,14 +21,11 @@ from api.services.subscriptions.subscriptionFieldUtils import (
     CANONICAL_SUBSCRIPTION_SELECT,
     mapBillingModeToPlanType,
     normalizeDomainList,
-    subscriptionAnchorDay,
     subscriptionBillingState,
-    subscriptionCustomerId,
     subscriptionDomainCount,
     subscriptionExperts,
     subscriptionPendingAdditions,
     subscriptionPendingRemovals,
-    subscriptionTokenId,
     toSubscriptionBillingPayload,
 )
 from api.services.subscriptions.paymentValidationService import (
@@ -115,10 +112,6 @@ class SubscriptionService:
         pendingRemovals=None,
         pendingAdditions=None,
         billingState=None,
-        razorpayCustomerId=None,
-        razorpayTokenId=None,
-        subscriptionAnchorDay=None,
-        recurringFailures=None,
         cancellationReason=None,
         planType: str | None = None,
     ) -> None:
@@ -145,10 +138,6 @@ class SubscriptionService:
             pendingRemovals=pendingRemovals,
             pendingAdditions=pendingAdditions,
             billingState=billingState,
-            razorpayCustomerId=razorpayCustomerId,
-            razorpayTokenId=razorpayTokenId,
-            subscriptionAnchorDay=subscriptionAnchorDay,
-            recurringFailures=recurringFailures,
             cancellationReason=cancellationReason,
         ))
         if existing:
@@ -2173,7 +2162,6 @@ class SubscriptionService:
                 "userName": identity["name"],
                 "razorpayKey": os.environ["RAZORPAY_KEY_ID"],
                 "orderId": order["id"],
-                "customerId": customerId,
                 "invoiceId": invoiceId,
                 "amount": totalAmount,
                 "currency": invoice.get("currency", "INR"),
@@ -2290,7 +2278,6 @@ class SubscriptionService:
                 raise Exception("Authenticated user not found during verification")
             subscription = self._getCanonicalSubscription(userId=userId, required=True)
             assertInvoiceBelongsToSubscription(invoice, subscription)
-            expectedCustomerId = subscriptionCustomerId(subscription)
 
             order = self.razorpayClient.order.fetch(orderId)
             orderNotesRaw = order.get("notes", {}) or {}
@@ -2311,12 +2298,6 @@ class SubscriptionService:
                 raise Exception(
                     f"Order/user mismatch: order.userId={noteUserId}, request.userId={userId}"
                 )
-            orderCustomerId = order.get("customer_id")
-            if expectedCustomerId and orderCustomerId and orderCustomerId != expectedCustomerId:
-                raise Exception(
-                    f"Order/customer mismatch: order.customer_id={orderCustomerId}, "
-                        f"subscription.customer_id={expectedCustomerId}"
-                )
 
             payment = self.razorpayClient.payment.fetch(paymentId)
             paymentOrderId = payment.get("order_id")
@@ -2324,12 +2305,6 @@ class SubscriptionService:
                 raise Exception(
                     f"Payment/order mismatch: payment.order_id={paymentOrderId}, "
                     f"request.orderId={orderId}"
-                )
-            paymentCustomerId = payment.get("customer_id")
-            if expectedCustomerId and paymentCustomerId and paymentCustomerId != expectedCustomerId:
-                raise Exception(
-                    f"Payment/customer mismatch: payment.customer_id={paymentCustomerId}, "
-                        f"subscription.customer_id={expectedCustomerId}"
                 )
             paymentNotesRaw = payment.get("notes", {}) or {}
             paymentNotes = paymentNotesRaw if isinstance(paymentNotesRaw, dict) else {}

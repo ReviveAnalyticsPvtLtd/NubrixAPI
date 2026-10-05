@@ -169,10 +169,8 @@ class AuthenticationService:
             "pending_removals": [],
             "pending_additions": [],
             "billing_state": {},
-            "razorpay_customer_id": None,
-            "razorpay_token_id": None,
-            "subscription_anchor_day": None,
-            "recurring_failures": 0,
+            "is_canonical": True,
+            "renewal_opt_out": False,
             "cancellation_reason": None,
         }).execute()
 

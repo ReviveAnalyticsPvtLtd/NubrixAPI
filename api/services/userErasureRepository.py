@@ -414,23 +414,13 @@ class UserErasureRepository:
                     (userId,),
                 )
                 workspaceIds = [str(row[0]) for row in cursor.fetchall()]
-                cursor.execute(
-                    """
-                    select razorpay_customer_id, razorpay_token_id
-                    from public.subscriptions
-                    where user_id = %s
-                    """,
-                    (userId,),
-                )
-                billingCredentials = [
-                    {"customerId": row[0], "tokenId": row[1]}
-                    for row in cursor.fetchall()
-                    if row[0] and row[1]
-                ]
+                # Recurring provider credentials no longer exist in the
+                # runtime schema: manual billing stores no customer/token
+                # state to inventory or clean up.
                 return {
                     "projectIds": projectIds,
                     "workspaceIds": workspaceIds,
-                    "billingCredentials": billingCredentials,
+                    "billingCredentials": [],
                 }
         finally:
             connection.close()
@@ -440,7 +430,7 @@ class UserErasureRepository:
             """
             update public.subscriptions
             set erasure_pending = true, auto_renew_enabled = false,
-                razorpay_token_id = null, renewal_due_at = null,
+                renewal_opt_out = true, renewal_due_at = null,
                 updated_at = now()
             where user_id = %s
             """,

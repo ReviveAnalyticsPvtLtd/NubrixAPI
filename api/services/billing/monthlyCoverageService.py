@@ -133,6 +133,40 @@ class MonthlyCoverageService:
             "reason": None if paid else "outside_period",
         }
 
+    def evaluateAnnualPaidCoverage(
+        self,
+        userId: str,
+        subscription: dict,
+        historicalIntervals: list[dict],
+        now: datetime | None = None,
+    ) -> dict:
+        """Mode-aware coverage adapter for annual rows (design §9.1).
+
+        Annual early renewal rewrites ``current_period_start`` to the
+        previous expiry, which can be future-dated while the earlier annual
+        term is still usable. The stored window alone would deny that
+        existing paid access; this adapter resolves the actual paid coverage
+        from the stored window OR verified historical paid intervals.
+        Unverified rows grant nothing.
+        """
+        current = now or self.now()
+        stored = self.getCoverage(userId, subscription, now=current)
+        if stored["paid"]:
+            return stored
+        for interval in historicalIntervals or []:
+            start = parseUtc(interval.get("start"))
+            end = parseUtc(interval.get("end"))
+            if start is None or end is None:
+                continue
+            if start <= current < end:
+                return {
+                    "paid": True,
+                    "start": start.isoformat(),
+                    "end": end.isoformat(),
+                    "reason": "annual_historical_interval",
+                }
+        return {"paid": False, "reason": stored.get("reason") or "outside_period"}
+
     # -- renewal preparation ------------------------------------------------------
 
     def prepareRenewalInvoice(

@@ -221,7 +221,7 @@ class AdminTrialExtensionRepository:
                         current_period_start = %s, current_period_end = %s,
                         renewal_due_at = %s, auto_renew_enabled = false,
                         payment_collection_mode = 'authenticated_checkout',
-                        recurring_failures = 0, cancellation_reason = null,
+                        cancellation_reason = null,
                         billing_state = jsonb_set(
                             coalesce(billing_state, '{}'::jsonb),
                             '{lifecycle_snapshot}', %s::jsonb, true

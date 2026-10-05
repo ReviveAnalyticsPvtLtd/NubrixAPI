@@ -248,10 +248,8 @@ class AdminSubscriptionView(_StrictModel):
     pending_removals: str
     pending_additions: str
     billing_state: str
-    razorpay_customer_id: str | None = None
-    razorpay_token_id: str | None = None
-    subscription_anchor_day: int | None = None
-    recurring_failures: int
+    is_canonical: bool = False
+    renewal_opt_out: bool = False
     cancellation_reason: str | None = None
     version: int
     plan_type: str

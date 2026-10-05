@@ -20,9 +20,6 @@ from api.commons import client
 from api.services.billing.billingEventService import BillingEventService
 from api.services.subscriptions.subscriptionFieldUtils import (
     CANONICAL_SUBSCRIPTION_SELECT,
-    subscriptionCustomerId,
-    subscriptionRecurringFailures,
-    subscriptionTokenId,
 )
 from api.services.subscriptions.paymentValidationService import (
     normalizeChurnedSubscription,
