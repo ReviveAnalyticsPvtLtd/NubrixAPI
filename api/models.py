@@ -183,7 +183,10 @@ class CancelPendingAdditionRequest(BaseModel):
     domain: str
 
 class CancelSubscriptionRequest(BaseModel):
-    reason: str
+    reason: str | None = None
+
+class ResumeRenewalRequest(BaseModel):
+    pass
 
 class SubscriptionStatus(str, Enum):
     NONE = "NONE"

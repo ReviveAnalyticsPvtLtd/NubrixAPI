@@ -1595,6 +1595,35 @@ class SubscriptionService:
             activeDomains = [d for d in currentExperts if d not in pendingRemovals]
             if len(activeDomains) - len(normalizedDomains) < 1:
                 raise Exception("Cannot remove all domains. At least one must remain active. Use cancel subscription instead.")
+            # A paid next-period selection is immutable: reject edits that
+            # would change a purchased future snapshot.
+            if (subscription.get("billing_mode") or "").lower() == "monthly_prepaid":
+                currentEnd = subscription.get("current_period_end")
+                if currentEnd:
+                    paidFuture = (
+                        self.client.table("Invoices")
+                        .select("id")
+                        .eq("userId", userId)
+                        .eq("billing_reason", "renewal")
+                        .eq("period_start", currentEnd)
+                        .eq("status", "PAID")
+                        .limit(1)
+                        .execute()
+                        .data
+                    )
+                    if paidFuture:
+                        raise CustomException(
+                            ValueError(
+                                "The next period is already paid; its expert "
+                                "selection cannot change."
+                            ),
+                            statusCode=409,
+                            uiMessage=(
+                                "Your next month is already paid with its "
+                                "current experts. Removals apply to an unpaid "
+                                "next period only."
+                            ),
+                        )
             pendingRemovals.extend(normalizedDomains)
             self.client.table("subscriptions").update({
                 "pending_removals": pendingRemovals
@@ -1629,17 +1658,19 @@ class SubscriptionService:
 
     def cancelPendingAddition(self, domain: str, token: str) -> dict:
         """
-        Cancel a pending domain addition request.
+        Cancel an unpaid pending domain addition durably.
 
-        Removes the pending entry from the DB. Razorpay Orders cannot be
-        programmatically cancelled; they expire naturally.
+        The whole shared-order bundle for the original order is closed with
+        a cancelled state (evidence preserved), so a later capture can never
+        activate experts from that attempt. A newly priced attempt may be
+        created for any remaining desired selection.
 
         Args:
             domain (str): The domain to cancel.
             token (str): Authorization token.
 
         Returns:
-            dict: Confirmation of cancellation.
+            dict: Cancellation result with the closed bundle evidence.
         """
         try:
             normalizedDomain = self._normalizeSingleDomain(domain)
@@ -1658,53 +1689,111 @@ class SubscriptionService:
             subscription = self._getCanonicalSubscription(userId=userId, required=True)
             pendingAdditions = subscriptionPendingAdditions(subscription)
             targetItem = None
-            targetIndex = None
-            for i, item in enumerate(pendingAdditions):
-                if item["domain"] == normalizedDomain and item.get("state") not in ("activated",):
+            for item in pendingAdditions:
+                if (
+                    item["domain"] == normalizedDomain
+                    and item.get("state") not in ("activated", "cancelled", "expired")
+                ):
                     targetItem = item
-                    targetIndex = i
                     break
             if targetItem is None:
                 raise Exception(f"No cancellable pending addition found for domain '{normalizedDomain}'")
-            pendingAdditions.pop(targetIndex)
+            if targetItem.get("state") == "paid_captured":
+                raise CustomException(
+                    ValueError("This addition was already paid and captured"),
+                    statusCode=409,
+                    uiMessage=(
+                        "This addition payment was captured and needs support "
+                        "review; contact us for a refund."
+                    ),
+                )
+            cancelledOrderId = targetItem.get("orderId")
+            cancelledAt = utcNow().isoformat()
+            # Close the WHOLE shared-order attempt durably: a later capture
+            # against the old order cannot activate any of its domains.
+            closedDomains = []
+            for item in pendingAdditions:
+                if (
+                    item.get("orderId") == cancelledOrderId
+                    and item.get("state") not in ("activated", "cancelled", "expired")
+                ):
+                    item["state"] = "cancelled"
+                    item["cancelledAt"] = cancelledAt
+                    closedDomains.append(item["domain"])
             self.client.table("subscriptions").update({
                 "pending_additions": pendingAdditions
             }).eq("id", subscription["id"]).execute()
+            # Void the shared invoice so its Pay action disappears and a new
+            # session against it is rejected.
+            if cancelledOrderId:
+                payable = (
+                    self.client.table("Invoices")
+                    .select("id, status, metadata_json")
+                    .eq("razorpay_order_id", cancelledOrderId)
+                    .in_("status", ["UPCOMING", "PAYMENT_PENDING"])
+                    .limit(1)
+                    .execute()
+                    .data
+                )
+                for invoice in payable or []:
+                    existingMetadata = invoice.get("metadata_json")
+                    metadata = dict(existingMetadata) if isinstance(existingMetadata, dict) else {}
+                    metadata["voidReason"] = "pending_addition_cancelled"
+                    metadata["voidedAt"] = cancelledAt
+                    metadata["closedAttemptDomains"] = closedDomains
+                    self.client.table("Invoices").update({
+                        "status": "VOID",
+                        "metadata_json": metadata,
+                    }).eq("id", invoice["id"]).execute()
             self._auditLog(
                 userId, "domain.add_cancelled",
                 status="CANCELLED",
                 metadata={
                     "domain": normalizedDomain,
+                    "closedAttemptDomains": closedDomains,
+                    "orderId": cancelledOrderId,
                     "currentDomainCount": subscriptionDomainCount(subscription),
                     "effectiveAt": "immediate",
+                    "durableClosure": True,
                 }
             )
-            logger.info(f"Pending addition cancelled for domain '{normalizedDomain}', user {userId}")
-            return {"domain": normalizedDomain, "cancelled": True}
+            logger.info(
+                f"Pending addition bundle cancelled for domain '{normalizedDomain}', "
+                f"user {userId}, order {cancelledOrderId}"
+            )
+            return {
+                "domain": normalizedDomain,
+                "cancelled": True,
+                "closedAttemptDomains": closedDomains,
+                "orderId": cancelledOrderId,
+            }
+        except CustomException:
+            raise
         except Exception as e:
             exception = CustomException(e)
             logger.error(exception)
             raise exception
 
-    def cancelSubscription(self, reason: str, token: str) -> dict:
+    def cancelSubscription(self, reason: str | None, token: str) -> dict:
         """
-        Schedule cancellation at the end of the current billing cycle.
+        Explicit cancellation with mode-specific policy.
 
-        Marks canonical subscription as cancelled and disables auto-renew.
-        The current period remains usable until its end, after which billing
-        lifecycle transitions to expired by scheduler logic.
+        Monthly: an explicit opt-out of future renewal with an optional
+        reason. Keeps every already-paid day, voids unpaid renewal attempts,
+        suppresses reminders, and returns the exact final paid end. Status
+        stays in its paid phase; the flag carries the intent.
+
+        Annual: preserves the existing policy — mandatory reason and the
+        cancelled status at cycle end.
 
         Args:
-            reason (str): User-selected reason for cancellation.
+            reason (str | None): Optional monthly reason; required for annual.
             token (str): Authorization token.
 
         Returns:
-            dict: Cancellation confirmation with effective timing.
+            dict: Cancellation confirmation with exact effective end.
         """
         try:
-            if not reason or not isinstance(reason, str) or not reason.strip():
-                raise Exception("Cancellation reason is required")
-            reason = reason.strip()
             decodedToken = jwt.decode(
                 token,
                 os.environ["SECRET_KEY"],
@@ -1713,9 +1802,75 @@ class SubscriptionService:
             userId = decodedToken.get("userId")
             subscription = self._getCanonicalSubscription(userId=userId, required=True)
             currentStatus = (subscription.get("status") or "").lower()
+            billingMode = (subscription.get("billing_mode") or "none").lower()
+
+            if billingMode == "monthly_prepaid":
+                if not self._isSubscriptionActive(currentStatus):
+                    raise Exception("No active subscription found for this user")
+                from api.services.billing.monthlyCoverageService import (
+                    MonthlyCoverageService,
+                )
+
+                result = MonthlyCoverageService().setRenewalOptOut(
+                    userId=userId,
+                    subscription=subscription,
+                    reason=reason,
+                    requestKey=f"cancel:{userId}",
+                )
+                if result["repeated"]:
+                    return {
+                        "cancelled": True,
+                        "repeated": True,
+                        "renewalOptOut": True,
+                        "effectiveAt": result["effectiveAt"],
+                        "cancellationReason": result["cancellationReason"],
+                        "refundInitiated": False,
+                    }
+                manualBillingState = dict(
+                    (subscriptionBillingState(subscription) or {}).get("manualBilling") or {}
+                )
+                manualBillingState.update({
+                    "cancellationAt": utcNow().isoformat(),
+                    "finalPaidEnd": result["effectiveAt"],
+                })
+                self.client.table("subscriptions").update({
+                    "renewal_opt_out": True,
+                    "auto_renew_enabled": False,
+                    "cancellation_reason": result["cancellationReason"],
+                    "billing_state": {
+                        **(subscriptionBillingState(subscription) or {}),
+                        "manualBilling": manualBillingState,
+                    },
+                }).eq("id", subscription["id"]).execute()
+                self._voidPayableMonthlyRenewalInvoices(subscription, userId)
+                self._auditLog(
+                    userId, "subscription.renewal_opt_out",
+                    status="CANCELLED",
+                    metadata={
+                        "cancellationReason": result["cancellationReason"],
+                        "effectiveAt": result["effectiveAt"],
+                        "voidedInvoiceIds": result.get("voidedInvoiceIds") or [],
+                    }
+                )
+                logger.info(
+                    f"Monthly renewal opt-out recorded for user {userId}, "
+                    f"effective {result['effectiveAt']}"
+                )
+                return {
+                    "cancelled": True,
+                    "renewalOptOut": True,
+                    "effectiveAt": result["effectiveAt"],
+                    "cancellationReason": result["cancellationReason"],
+                    "currentPeriod": result["currentPeriod"],
+                    "refundInitiated": False,
+                }
+
+            # Annual: existing policy — mandatory reason, status cancelled.
+            if not reason or not isinstance(reason, str) or not reason.strip():
+                raise Exception("Cancellation reason is required")
+            reason = reason.strip()
             if not self._isSubscriptionActive(currentStatus):
                 raise Exception("No active subscription found for this user")
-            billingMode = (subscription.get("billing_mode") or "none").lower()
             planType = mapBillingModeToPlanType(billingMode, "cancelled")
             self.client.table("subscriptions").update({
                 "status": "cancelled",
@@ -1736,6 +1891,105 @@ class SubscriptionService:
                 "cancellationReason": reason,
                 "accessToken": newToken,
             }
+        except CustomException:
+            raise
+        except Exception as e:
+            exception = CustomException(e)
+            logger.error(exception)
+            raise exception
+
+    def _voidPayableMonthlyRenewalInvoices(self, subscription: dict, userId: str) -> list[str]:
+        """Void unpaid monthly renewal invoices/attempts on cancellation.
+
+        Keeps the audit trail (VOID + reason); never deletes evidence.
+        """
+        payable = (
+            self.client.table("Invoices")
+            .select("id, status, metadata_json")
+            .eq("userId", userId)
+            .eq("billing_reason", "renewal")
+            .in_("status", ["UPCOMING", "PAYMENT_PENDING"])
+            .execute()
+            .data
+        )
+        voided = []
+        for invoice in payable or []:
+            existingMetadata = invoice.get("metadata_json")
+            metadata = dict(existingMetadata) if isinstance(existingMetadata, dict) else {}
+            metadata["voidReason"] = "subscription_cancelled"
+            metadata["voidedAt"] = utcNow().isoformat()
+            self.client.table("Invoices").update({
+                "status": "VOID",
+                "metadata_json": metadata,
+            }).eq("id", invoice["id"]).execute()
+            voided.append(invoice["id"])
+        return voided
+
+    def resumeRenewal(self, token: str) -> dict:
+        """
+        Clear the monthly renewal opt-out before the final paid end.
+
+        Never charges, never reactivates a void order, and never revives
+        refunded coverage. A fresh invoice revision may be prepared when
+        already within the T-7 window.
+        """
+        try:
+            decodedToken = jwt.decode(
+                token,
+                os.environ["SECRET_KEY"],
+                algorithms=["HS256"]
+            )
+            userId = decodedToken.get("userId")
+            subscription = self._getCanonicalSubscription(userId=userId, required=True)
+            if (subscription.get("billing_mode") or "").lower() != "monthly_prepaid":
+                raise CustomException(
+                    ValueError("Resume renewal is a monthly-only action"),
+                    statusCode=403,
+                    uiMessage="Resume renewal applies to monthly subscriptions.",
+                )
+            from api.services.billing.monthlyCoverageService import (
+                MonthlyCoverageService,
+            )
+
+            coverageService = MonthlyCoverageService()
+            result = coverageService.resumeRenewal(
+                userId=userId,
+                subscription=subscription,
+                requestKey=f"resume:{userId}",
+            )
+            if not result["repeated"]:
+                self.client.table("subscriptions").update({
+                    "renewal_opt_out": False,
+                    "cancellation_reason": None,
+                }).eq("id", subscription["id"]).execute()
+                self._auditLog(
+                    userId, "subscription.renewal_resumed",
+                    status="RESUMED",
+                    metadata={"effectiveAt": result["effectiveAt"]},
+                )
+                # Within T-7 and no paid upcoming cycle: prepare a fresh
+                # valid revision immediately.
+                currentEnd = parseUtc(subscription.get("current_period_end"))
+                if currentEnd is not None:
+                    t7 = currentEnd - datetime.timedelta(days=7)
+                    if utcNow() >= t7:
+                        try:
+                            coverageService.prepareRenewalInvoice(
+                                userId=userId,
+                                subscription={
+                                    **subscription,
+                                    "renewal_opt_out": False,
+                                },
+                                now=utcNow(),
+                            )
+                        except Exception as prepareError:
+                            logger.warning(
+                                f"Post-resume renewal preparation failed for "
+                                f"user {userId}: {prepareError}"
+                            )
+            return result
+        except CustomException:
+            raise
         except Exception as e:
             exception = CustomException(e)
             logger.error(exception)

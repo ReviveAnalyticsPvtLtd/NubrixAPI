@@ -10,7 +10,7 @@ __all__ = ["router"]
 
 
 from utils.exceptionHandler import CustomException, raiseHttpException
-from api.models import VerifySubscriptionRequest, CreateSubscriptionRequest, AddDomainsRequest, VerifyDomainUpgradeRequest, RemoveDomainRequest, CancelPendingAdditionRequest, CancelSubscriptionRequest, RefundRequest, CreateAnnualRenewalSessionRequest, VerifyAnnualRenewalPaymentRequest, PrepareRenewalInvoiceRequest, CreateRenewalSessionRequest, VerifyRenewalPaymentRequest
+from api.models import VerifySubscriptionRequest, CreateSubscriptionRequest, AddDomainsRequest, VerifyDomainUpgradeRequest, RemoveDomainRequest, CancelPendingAdditionRequest, CancelSubscriptionRequest, RefundRequest, CreateAnnualRenewalSessionRequest, VerifyAnnualRenewalPaymentRequest, PrepareRenewalInvoiceRequest, CreateRenewalSessionRequest, VerifyRenewalPaymentRequest, ResumeRenewalRequest
 from api.services.subscriptions.subscriptionService import subscriptionService
 from fastapi.responses import ORJSONResponse
 from fastapi import APIRouter, Depends
@@ -366,6 +366,31 @@ async def verifyRenewalPayment(
             content={
                 "status": "SUCCESS",
                 "message": message,
+                "data": result,
+            }
+        )
+    except CustomException as e:
+        raiseHttpException(e)
+
+
+@router.post("/resumeRenewal")
+async def resumeRenewal(
+    _request: ResumeRenewalRequest | None = None,
+    token=Depends(verifyToken),
+):
+    """
+    Clear the monthly renewal opt-out before the final paid end.
+
+    Restores eligibility for manual renewal invoices/reminders. Never
+    charges or reactivates a void order.
+    """
+    try:
+        result = subscriptionService.resumeRenewal(token=token)
+        return ORJSONResponse(
+            status_code=200,
+            content={
+                "status": "SUCCESS",
+                "message": "Renewal resumed.",
                 "data": result,
             }
         )

@@ -61,6 +61,39 @@ class _MemoryStore:
         self.activations.append(activation)
 
 
+class _OptOutStore:
+    """Persistence double for opt-out/resume/cancellation unit tests."""
+
+    def __init__(self):
+        self.subscriptions = {}
+        self.voidedInvoices = []
+        self.audit = []
+
+    def applyOptOut(self, userId, optOut, reason, requestKey):
+        row = self.subscriptions.setdefault(
+            userId,
+            {
+                "renewal_opt_out": False,
+                "cancellation_reason": None,
+            },
+        )
+        row["renewal_opt_out"] = optOut
+        row["cancellation_reason"] = reason if optOut else None
+        return dict(row)
+
+    def voidUnpaidRenewalInvoices(self, userId, reason):
+        voided = []
+        for invoice in self.voidedInvoices:
+            if invoice.get("userId") == userId and invoice.get("status") in (
+                "UPCOMING",
+                "PAYMENT_PENDING",
+            ):
+                invoice["status"] = "VOID"
+                invoice["voidReason"] = reason
+                voided.append(invoice["id"])
+        return voided
+
+
 class MonthlyCoverageService:
     def __init__(self, store=None, now=None):
         self.store = store or _MemoryStore()
@@ -174,6 +207,12 @@ class MonthlyCoverageService:
         currentExperts = list(row.get("subscribed_experts") or [])
         pendingRemovals = set(row.get("pending_removals") or [])
         renewalDomains = [d for d in currentExperts if d not in pendingRemovals]
+        if not renewalDomains:
+            raise ValueError(
+                "REMOVAL_EMPTIES_SELECTION: the next paid period must keep at "
+                "least one expert; schedule removals so one remains or cancel "
+                "the subscription instead"
+            )
         invoice = {
             "id": f"inv-renewal-{cycleStartIso}",
             "userId": userId,
@@ -242,7 +281,189 @@ class MonthlyCoverageService:
             },
         }
 
-    # -- boundary activation ---------------------------------------------------------
+    # -- cancellation / resume ----------------------------------------------------
+
+    def setRenewalOptOut(
+        self,
+        userId: str,
+        subscription: dict,
+        reason: str | None,
+        requestKey: str,
+        now: datetime | None = None,
+    ) -> dict:
+        """Explicit monthly cancellation: opt out of future renewal.
+
+        Accepts an optional reason (monthly). Annual keeps its existing
+        mandatory-reason policy. All already-paid coverage is preserved;
+        the effective end is the end of all contiguous valid paid coverage
+        including a paid upcoming month. Repeated requests are no-ops.
+        """
+        current = now or self.now()
+        row = subscription or {}
+        alreadyOut = bool(row.get("renewal_opt_out"))
+
+        billingMode = (row.get("billing_mode") or "").lower()
+        if billingMode == "annual_prepaid":
+            if not (reason or "").strip():
+                raise ValueError(
+                    "Cancellation reason is required for annual subscriptions"
+                )
+        if reason is not None:
+            reason = reason.strip() or None
+            if reason and len(reason) > 1000:
+                raise ValueError("Cancellation reason exceeds 1000 characters")
+
+        # Effective end: end of all valid contiguous paid coverage.
+        currentEnd = parseUtc(row.get("current_period_end"))
+        manualBillingState = (row.get("billing_state") or {}).get("manualBilling") or {}
+        paidFutureEnd = parseUtc(manualBillingState.get("paidFutureEnd"))
+        if paidFutureEnd is not None and currentEnd is not None and paidFutureEnd > currentEnd:
+            effectiveEnd = paidFutureEnd
+        else:
+            effectiveEnd = currentEnd
+
+        voidedInvoiceIds = []
+        if not alreadyOut:
+            voidedInvoiceIds = self._voidUnpaidRenewals(userId, "subscription_cancelled")
+
+        result = {
+            "renewalOptOut": True,
+            "repeated": alreadyOut,
+            "cancellationReason": reason,
+            "effectiveAt": effectiveEnd.isoformat() if effectiveEnd else None,
+            "currentPeriod": {
+                "start": row.get("current_period_start"),
+                "end": row.get("current_period_end"),
+                "domains": list(row.get("subscribed_experts") or []),
+            },
+            "voidedInvoiceIds": voidedInvoiceIds or None,
+            "state": "cancelled" if not alreadyOut else "already_cancelled",
+            "refundInitiated": False,
+        }
+        store = getattr(self.store, "applyOptOut", None)
+        if callable(store) and not alreadyOut:
+            store(userId, True, reason, requestKey)
+        return result
+
+    def _voidUnpaidRenewals(self, userId: str, reason: str) -> list:
+        voider = getattr(self.store, "voidUnpaidRenewalInvoices", None)
+        if callable(voider):
+            return voider(userId, reason)
+        return []
+
+    def resumeRenewal(
+        self,
+        userId: str,
+        subscription: dict,
+        requestKey: str,
+        now: datetime | None = None,
+    ) -> dict:
+        """Clear the monthly renewal opt-out before the final paid end.
+
+        Resume restores eligibility for manual invoices/reminders only. It
+        never charges, never reactivates a void order, and is unavailable
+        after the final paid end or a terminating refund.
+        """
+        current = now or self.now()
+        row = subscription or {}
+        alreadyIn = not bool(row.get("renewal_opt_out"))
+        currentEnd = parseUtc(row.get("current_period_end"))
+        manualBillingState = (row.get("billing_state") or {}).get("manualBilling") or {}
+        terminatingRefund = manualBillingState.get("terminatingRefundId")
+        if terminatingRefund:
+            raise ValueError(
+                "RESUME_BLOCKED: a support refund terminated this "
+                "subscription's current access; only a new purchase or an "
+                "audited support correction can establish coverage"
+            )
+        finalEnd = currentEnd
+        paidFutureEnd = parseUtc(manualBillingState.get("paidFutureEnd"))
+        if paidFutureEnd is not None and finalEnd is not None and paidFutureEnd > finalEnd:
+            finalEnd = paidFutureEnd
+        if finalEnd is None or current >= finalEnd:
+            raise ValueError(
+                "RESUME_UNAVAILABLE: the final paid end has passed; "
+                "purchase a new subscription instead"
+            )
+        result = {
+            "renewalOptOut": False,
+            "repeated": alreadyIn,
+            "renewalEligible": True,
+            "effectiveAt": finalEnd.isoformat(),
+            "state": "renewal_resumed" if not alreadyIn else "already_opted_in",
+        }
+        store = getattr(self.store, "applyOptOut", None)
+        if callable(store) and not alreadyIn:
+            store(userId, False, None, requestKey)
+        return result
+
+    # -- expert revision safety ------------------------------------------------------
+
+    def validateRemovalAgainstFuture(
+        self,
+        userId: str,
+        subscription: dict,
+        now: datetime | None = None,
+    ) -> dict:
+        """Reject removals targeting an already-paid next-period selection."""
+        current = now or self.now()
+        row = subscription or {}
+        currentEnd = parseUtc(row.get("current_period_end"))
+        if currentEnd is None:
+            raise ValueError("Current period end is missing")
+        paidFuture = self.store.findPaidFutureInvoice(userId, currentEnd.isoformat())
+        if paidFuture is not None:
+            raise ValueError(
+                "PAID_FUTURE_IMMUTABLE: the next period is already paid; its "
+                "expert selection cannot change. Removals apply only to an "
+                "unpaid next period."
+            )
+        currentExperts = list(row.get("subscribed_experts") or [])
+        pendingRemovals = set(row.get("pending_removals") or [])
+        remaining = [d for d in currentExperts if d not in pendingRemovals]
+        if not remaining:
+            raise ValueError(
+                "REMOVAL_EMPTIES_SELECTION: at least one expert must remain "
+                "for the next period; use cancel subscription instead"
+            )
+        return {"allowed": True, "nextDomains": remaining}
+
+    def validateAdditionCapacity(
+        self,
+        subscription: dict,
+        requested: list[str],
+    ) -> dict:
+        """Enforce the four distinct expert limit across active + pending."""
+        row = subscription or {}
+        currentExperts = set(row.get("subscribed_experts") or [])
+        pendingAdditions = {
+            item.get("domain")
+            for item in (row.get("pending_additions") or [])
+            if item.get("state") not in ("failed", "activated", "cancelled", "expired")
+        }
+        requestedSet = set(requested or [])
+        combined = currentExperts | pendingAdditions | requestedSet
+        if len(combined) > 4:
+            raise ValueError(
+                f"MAX_EXPERTS_EXCEEDED: {sorted(combined)} exceeds the "
+                "maximum of four distinct experts"
+            )
+        return {"allowed": True, "combined": sorted(combined)}
+
+    def evaluateCancelledAdditionCapture(
+        self,
+        pendingAddition: dict,
+        capturedNow: datetime | None = None,
+    ) -> dict:
+        """A late capture against a cancelled addition is reconciliation."""
+        state = (pendingAddition or {}).get("state")
+        if state == "cancelled":
+            return {
+                "activate": False,
+                "disposition": "reconciliation",
+                "reason": "cancelled_addition_capture",
+            }
+        return {"activate": True, "disposition": None, "reason": None}
 
     def activateDueCoverage(
         self,
