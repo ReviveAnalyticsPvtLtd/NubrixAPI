@@ -20,6 +20,20 @@ _TERMINAL_STATUSES = {
     "CANCELLED",
 }
 
+# Server-selected template versions for the manual monthly billing types.
+# Template IDs/branding are deployment configuration; a missing configured
+# template surfaces an operator error at dispatch, never a trial-template
+# substitution.
+_BILLING_NOTIFICATION_TEMPLATE_VERSIONS = {
+    "monthly_renewal_ready": "1",
+    "monthly_renewal_reminder": "1",
+    "monthly_subscription_expired": "1",
+    "payment_receipt": "1",
+    "monthly_cancellation_confirmation": "1",
+    "subscription_refund_initiated": "1",
+    "subscription_refund_processed": "1",
+}
+
 
 def _defaultConnection():
     databaseUrl = os.environ.get("DATABASE_URL")
@@ -43,6 +57,55 @@ class NotificationDeliveryRepository:
         dedupeKey: str,
         metadata: dict,
     ) -> tuple[dict, bool]:
+        return self._enqueue(
+            notificationType="trial_expiry_warning",
+            templateVersion="1",
+            userId=userId,
+            subscriptionId=subscriptionId,
+            periodEnd=periodEnd,
+            dedupeKey=dedupeKey,
+            metadata=metadata,
+        )
+
+    def enqueueBillingNotification(
+        self,
+        userId: str,
+        subscriptionId: str | None,
+        notificationType: str,
+        dedupeKey: str,
+        periodEnd: str,
+        metadata: dict,
+    ) -> tuple[dict, bool]:
+        """Idempotently enqueue a committed billing notification intent.
+
+        Uses the same dedupe-key conflict guard as trial expiry; the logical
+        identity (lifecycle + cycle + milestone or payment/receipt id) is
+        the caller's dedupeKey, so replayed bridges create no duplicates.
+        """
+        if notificationType not in _BILLING_NOTIFICATION_TEMPLATE_VERSIONS:
+            raise ValueError(
+                f"Unsupported billing notification type: {notificationType}"
+            )
+        return self._enqueue(
+            notificationType=notificationType,
+            templateVersion=_BILLING_NOTIFICATION_TEMPLATE_VERSIONS[notificationType],
+            userId=userId,
+            subscriptionId=subscriptionId,
+            periodEnd=periodEnd,
+            dedupeKey=dedupeKey,
+            metadata=metadata,
+        )
+
+    def _enqueue(
+        self,
+        notificationType: str,
+        templateVersion: str,
+        userId: str,
+        subscriptionId: str | None,
+        periodEnd: str,
+        dedupeKey: str,
+        metadata: dict,
+    ) -> tuple[dict, bool]:
         connection = self.connectionFactory()
         try:
             with connection.cursor(cursor_factory=RealDictCursor) as cursor:
@@ -57,11 +120,13 @@ class NotificationDeliveryRepository:
                         period_end,
                         metadata_json
                     )
-                    values ('trial_expiry_warning', '1', %s, %s, %s, %s, %s)
+                    values (%s, %s, %s, %s, %s, %s, %s)
                     on conflict (dedupe_key) do nothing
                     returning *
                     """,
                     (
+                        notificationType,
+                        templateVersion,
                         dedupeKey,
                         userId,
                         subscriptionId,
