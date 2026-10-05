@@ -87,8 +87,32 @@ class SubscriptionEntitlementService:
         self.client = dbClient
 
     def get(self, userId: str) -> SubscriptionEntitlement:
+        row = self._resolveCanonicalRow(userId)
+        return evaluateSubscriptionEntitlement(userId, row)
+
+    def _resolveCanonicalRow(self, userId: str) -> dict | None:
+        """
+        Load the user's authoritative subscription row.
+
+        Selection is by the persisted ``is_canonical`` flag, never by
+        ``updated_at`` ordering (a historical row updated later must not
+        become canonical). Until operator-reviewed backfill has promoted
+        canonical rows, a deterministic latest-row fallback keeps legacy
+        accounts readable; the canonical flag wins whenever it exists.
+        """
         try:
-            rows = (
+            canonicalRows = (
+                self.client.table("subscriptions")
+                .select(CANONICAL_SUBSCRIPTION_SELECT)
+                .eq("user_id", userId)
+                .eq("is_canonical", True)
+                .limit(1)
+                .execute()
+                .data
+            )
+            if canonicalRows:
+                return canonicalRows[0]
+            legacyRows = (
                 self.client.table("subscriptions")
                 .select(CANONICAL_SUBSCRIPTION_SELECT)
                 .eq("user_id", userId)
@@ -98,6 +122,7 @@ class SubscriptionEntitlementService:
                 .execute()
                 .data
             )
+            return legacyRows[0] if legacyRows else None
         except Exception as exc:
             logger.error(
                 "Entitlement lookup failed for userId={}: {}",
@@ -107,8 +132,3 @@ class SubscriptionEntitlementService:
             raise EntitlementUnavailableError(
                 f"Entitlement lookup failed for userId={userId}"
             ) from exc
-
-        return evaluateSubscriptionEntitlement(
-            userId,
-            rows[0] if rows else None,
-        )

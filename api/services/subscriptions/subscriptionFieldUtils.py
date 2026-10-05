@@ -47,6 +47,7 @@ CANONICAL_SUBSCRIPTION_SELECT = (
     "id, user_id, billing_mode, status, plan_type, current_period_start, current_period_end, "
     "renewal_due_at, auto_renew_enabled, payment_collection_mode, "
     "default_currency, version, erasure_pending, "
+    "is_canonical, renewal_opt_out, "
     f"{SUBSCRIPTION_BILLING_FIELDS_SELECT}"
 )
 
