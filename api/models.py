@@ -203,6 +203,18 @@ class VerifyAnnualRenewalPaymentRequest(BaseModel):
     razorpayPaymentId: str
     razorpaySignature: str
 
+class PrepareRenewalInvoiceRequest(BaseModel):
+    pass
+
+class CreateRenewalSessionRequest(BaseModel):
+    invoiceId: str
+
+class VerifyRenewalPaymentRequest(BaseModel):
+    invoiceId: str
+    razorpayOrderId: str
+    razorpayPaymentId: str
+    razorpaySignature: str
+
 class ReplayWebhookEventRequest(BaseModel):
     eventId: str
 

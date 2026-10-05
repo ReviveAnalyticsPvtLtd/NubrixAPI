@@ -2200,5 +2200,375 @@ class SubscriptionService:
             logger.error(exception)
             raise exception
 
+    # -- generic manual renewal routes ------------------------------------------
+
+    def prepareRenewalInvoice(self, token: str) -> dict:
+        """
+        Prepare (or read) the next unpaid renewal invoice on explicit request.
+
+        Monthly: on-demand preparation earlier than T-7 is allowed while
+        paid access is valid and renewal has not been declined. Annual:
+        delegates to the existing annual preparation policy.
+        """
+        try:
+            decodedToken = jwt.decode(
+                token, os.environ["SECRET_KEY"], algorithms=["HS256"]
+            )
+            userId = decodedToken.get("userId")
+            subscription = self._getCanonicalSubscription(userId=userId, required=True)
+            billingMode = (subscription.get("billing_mode") or "").lower()
+            if billingMode == "monthly_prepaid":
+                from api.services.billing.monthlyCoverageService import (
+                    MonthlyCoverageService,
+                )
+
+                result = MonthlyCoverageService().prepareRenewalInvoice(
+                    userId=userId,
+                    subscription=subscription,
+                    now=utcNow(),
+                )
+                if result["state"] == "payment_pending":
+                    # Persist the prepared revision so the dashboard can pay it.
+                    self._persistMonthlyRenewalInvoice(userId, subscription, result)
+                return result
+            if billingMode == "annual_prepaid":
+                from api.services.billing.invoiceService import (
+                    createUpcomingRenewalInvoice,
+                )
+
+                userRows = (
+                    self.client.table("Users")
+                    .select("userId, email, fullName")
+                    .eq("userId", userId)
+                    .limit(1)
+                    .execute()
+                    .data
+                )
+                if not userRows:
+                    raise Exception("User not found")
+                invoice = createUpcomingRenewalInvoice(subscription, userRows[0])
+                return {
+                    "invoiceId": (invoice or {}).get("id"),
+                    "state": "invoice_ready" if invoice else "not_eligible",
+                    "creditsRefilled": False,
+                }
+            raise CustomException(
+                ValueError("No active paid subscription for renewal preparation"),
+                statusCode=403,
+                uiMessage="This action requires an active subscription.",
+            )
+        except CustomException:
+            raise
+        except Exception as e:
+            exception = CustomException(e)
+            logger.error(exception)
+            raise exception
+
+    def _persistMonthlyRenewalInvoice(
+        self, userId: str, subscription: dict, prepared: dict
+    ) -> None:
+        """Persist the prepared monthly renewal invoice revision."""
+        nextPeriod = prepared.get("nextPeriod") or {}
+        if not nextPeriod.get("start"):
+            return
+        existing = (
+            self.client.table("Invoices")
+            .select("id")
+            .eq("userId", userId)
+            .eq("billing_reason", "renewal")
+            .eq("period_start", nextPeriod["start"])
+            .in_("status", ["UPCOMING", "PAYMENT_PENDING", "PAID"])
+            .limit(1)
+            .execute()
+            .data
+        )
+        if existing:
+            return
+        lifecycleId = self._ensureLifecycleId(subscription)
+        pendingRemovals = set(subscriptionPendingRemovals(subscription))
+        currentExperts = subscriptionExperts(subscription)
+        renewalDomains = [d for d in currentExperts if d not in pendingRemovals]
+        domainCount = max(len(renewalDomains), 1)
+        snapshot = computeInvoiceSnapshot(
+            billingMode="monthly_prepaid",
+            billingReason="renewal",
+            domainCount=domainCount,
+            customerState=None,
+        )
+        self._createFrozenInvoiceFromSnapshot(
+            userId=userId,
+            subscriptionId=subscription.get("id"),
+            billingReason="renewal",
+            paymentFlow="razorpay_order_checkout",
+            requiresCustomerAuth=True,
+            snapshot=snapshot,
+            metadata={
+                "flow": "prepareRenewalInvoice",
+                "billingMode": "monthly_prepaid",
+                "manualBilling": {
+                    "schemaVersion": 1,
+                    "lifecycleId": lifecycleId,
+                    "purpose": "renewal",
+                    "billingMode": "monthly_prepaid",
+                    "domains": renewalDomains,
+                    "coverageState": "scheduled",
+                    "revision": 1,
+                },
+            },
+        )
+
+    def createRenewalPaymentSession(self, invoiceId: str, token: str) -> dict:
+        """
+        Create a checkout session for an owned renewal invoice.
+
+        Generic across billing modes; the monthly deadline is the current
+        period end and late sessions are rejected. Annual delegates to the
+        annual wrapper policy.
+        """
+        try:
+            decodedToken = jwt.decode(
+                token, os.environ["SECRET_KEY"], algorithms=["HS256"]
+            )
+            userId = decodedToken.get("userId")
+            subscription = self._getCanonicalSubscription(userId=userId, required=True)
+            billingMode = (subscription.get("billing_mode") or "").lower()
+            if billingMode != "monthly_prepaid":
+                return self.createAnnualRenewalPaymentSession(
+                    invoiceId=invoiceId, token=token
+                )
+            invoiceRows = (
+                self.client.table("Invoices")
+                .select(
+                    "id, userId, status, total_amount, amount, currency, "
+                    "razorpay_order_id, period_start, period_end"
+                )
+                .eq("id", invoiceId)
+                .limit(1)
+                .execute()
+                .data
+            )
+            if not invoiceRows:
+                raise Exception(f"Invoice {invoiceId} not found")
+            invoice = invoiceRows[0]
+            if invoice.get("userId") != userId:
+                raise Exception("Invoice does not belong to the authenticated user")
+            status = (invoice.get("status") or "").upper()
+            if status not in ("UPCOMING", "PAYMENT_PENDING"):
+                raise Exception(f"Invoice {invoiceId} is not payable (status={status})")
+            currentEnd = parseUtc(subscription.get("current_period_end"))
+            now = utcNow()
+            if currentEnd is not None and now >= currentEnd:
+                raise CustomException(
+                    ValueError("Renewal window closed at the current period end"),
+                    statusCode=409,
+                    uiMessage=(
+                        "Your subscription period has ended. Purchase again to "
+                        "start a new subscription."
+                    ),
+                )
+            if subscription.get("renewal_opt_out"):
+                raise CustomException(
+                    ValueError("Renewal was declined for this subscription"),
+                    statusCode=409,
+                    uiMessage="You cancelled renewal. Resume renewal first.",
+                )
+            identity = self._resolveCheckoutIdentity(userId, decodedToken.get("email"))
+            totalAmount = invoice.get("total_amount") or invoice.get("amount")
+            order = self.razorpayClient.order.create({
+                "amount": int(totalAmount),
+                "currency": invoice.get("currency", "INR"),
+                "notes": {
+                    "userId": userId,
+                    "type": "manual_renewal",
+                    "invoiceId": invoiceId,
+                    "billingMode": "monthly_prepaid",
+                },
+            })
+            self._attachOrderToInvoice(invoiceId=invoiceId, orderId=order["id"])
+            self._auditLog(
+                userId, "renewal.session_created",
+                status="CREATED",
+                metadata={"invoiceId": invoiceId, "orderId": order["id"], "amount": totalAmount},
+            )
+            return {
+                "userId": userId,
+                "userEmail": identity["email"],
+                "userContact": identity["contact"],
+                "userName": identity["name"],
+                "razorpayKey": os.environ["RAZORPAY_KEY_ID"],
+                "orderId": order["id"],
+                "invoiceId": invoiceId,
+                "amount": totalAmount,
+                "currency": invoice.get("currency", "INR"),
+                "expiresAt": (currentEnd.isoformat() if currentEnd else None),
+                "state": "payment_pending",
+                "period": {
+                    "start": invoice.get("period_start"),
+                    "end": invoice.get("period_end"),
+                    "estimated": False,
+                },
+            }
+        except CustomException:
+            raise
+        except Exception as e:
+            exception = CustomException(e)
+            logger.error(exception)
+            raise exception
+
+    def verifyRenewalPayment(self, payload: dict, token: str) -> dict:
+        """
+        Verify and finalize a captured renewal checkout.
+
+        Monthly: a captured payment freezes the future period without
+        touching current dates/quota. Annual: delegates to the annual
+        wrapper preserving its lifecycle/credit baseline.
+        """
+        try:
+            decodedToken = jwt.decode(
+                token, os.environ["SECRET_KEY"], algorithms=["HS256"]
+            )
+            userId = decodedToken.get("userId")
+            subscription = self._getCanonicalSubscription(userId=userId, required=True)
+            billingMode = (subscription.get("billing_mode") or "").lower()
+            if billingMode != "monthly_prepaid":
+                return self.verifyAnnualRenewalPayment(payload=payload, token=token)
+
+            invoiceId = payload.get("invoiceId")
+            orderId = payload.get("razorpayOrderId")
+            paymentId = payload.get("razorpayPaymentId")
+            signature = payload.get("razorpaySignature")
+            if not all([invoiceId, orderId, paymentId, signature, userId]):
+                raise Exception("Missing required verification fields")
+            message = f"{orderId}|{paymentId}"
+            expectedSignature = hmac.new(
+                os.environ["RAZORPAY_KEY_SECRET"].encode(),
+                message.encode(),
+                hashlib.sha256,
+            ).hexdigest()
+            if not hmac.compare_digest(expectedSignature, signature):
+                raise Exception("Invalid Razorpay signature")
+
+            invoiceRows = (
+                self.client.table("Invoices")
+                .select(
+                    "id, userId, status, total_amount, amount, currency, "
+                    "razorpay_order_id, period_start, period_end, metadata_json"
+                )
+                .eq("id", invoiceId)
+                .limit(1)
+                .execute()
+                .data
+            )
+            if not invoiceRows:
+                raise Exception(f"Invoice {invoiceId} not found")
+            invoice = invoiceRows[0]
+            if invoice.get("userId") != userId:
+                raise Exception("Invoice ownership mismatch")
+            status = (invoice.get("status") or "").upper()
+            if status == "PAID":
+                return {
+                    "verified": True,
+                    "finalized": True,
+                    "alreadyFinalized": True,
+                    "state": "already_finalized",
+                    "creditsRefilled": False,
+                    "invoiceStatus": "PAID",
+                }
+            if status not in ("UPCOMING", "PAYMENT_PENDING"):
+                raise Exception(f"Invoice {invoiceId} is not payable (status={status})")
+
+            # Deadline: the current period end. A capture proven before the
+            # deadline is eligible even when its webhook arrives later.
+            currentEnd = parseUtc(subscription.get("current_period_end"))
+            now = utcNow()
+            if currentEnd is not None and now >= currentEnd:
+                raise CustomException(
+                    ValueError("Renewal verification window closed"),
+                    statusCode=409,
+                    uiMessage=(
+                        "Your subscription period has ended; this checkout can no "
+                        "longer be finalized. Contact support for any captured funds."
+                    ),
+                )
+
+            order = self.razorpayClient.order.fetch(orderId)
+            orderNotes = order.get("notes") or {}
+            if orderNotes.get("type") != "manual_renewal":
+                raise Exception(
+                    f"Order {orderId} is not a manual renewal order"
+                )
+            if orderNotes.get("userId") and orderNotes.get("userId") != userId:
+                raise Exception("Order/user mismatch")
+            invoiceOrderId = invoice.get("razorpay_order_id")
+            if invoiceOrderId and invoiceOrderId != orderId:
+                raise Exception("Invoice/order mismatch")
+
+            payment = self.razorpayClient.payment.fetch(paymentId)
+            if (payment.get("order_id") or orderId) != orderId:
+                raise Exception("Payment/order mismatch")
+            expectedAmount = invoice.get("total_amount") or invoice.get("amount")
+            if int(payment.get("amount") or 0) != int(expectedAmount or 0):
+                raise Exception("Amount mismatch")
+            if str(payment.get("currency") or "INR").upper() != str(invoice.get("currency") or "INR").upper():
+                raise Exception("Currency mismatch")
+            if (payment.get("status") or "").lower() != "captured":
+                return {
+                    "verified": True,
+                    "finalized": False,
+                    "state": "awaiting_capture",
+                    "creditsRefilled": False,
+                    "invoiceStatus": "PAYMENT_PENDING",
+                }
+
+            # Freeze the future period: paid_scheduled, no current changes.
+            existingMetadata = invoice.get("metadata_json")
+            metadata = dict(existingMetadata) if isinstance(existingMetadata, dict) else {}
+            manualBilling = dict(metadata.get("manualBilling") or {})
+            manualBilling.update({
+                "coverageState": "scheduled",
+                "paidAt": now.isoformat(),
+                "providerPaymentId": paymentId,
+            })
+            metadata["manualBilling"] = manualBilling
+            self.client.table("Invoices").update({
+                "status": "PAID",
+                "razorpayPaymentId": paymentId,
+                "paidAt": now.isoformat(),
+                "metadata_json": metadata,
+            }).eq("id", invoiceId).execute()
+            self._auditLog(
+                userId, "billing.manual_renewal_paid_scheduled",
+                paymentId=paymentId,
+                status="PAID_SCHEDULED",
+                metadata={
+                    "invoiceId": invoiceId,
+                    "orderId": orderId,
+                    "periodStart": invoice.get("period_start"),
+                    "periodEnd": invoice.get("period_end"),
+                },
+            )
+            return {
+                "verified": True,
+                "finalized": True,
+                "alreadyFinalized": False,
+                "state": "paid_scheduled",
+                "creditsRefilled": False,
+                "invoiceStatus": "PAID",
+                "currentPeriod": {
+                    "start": subscription.get("current_period_start"),
+                    "end": subscription.get("current_period_end"),
+                },
+                "nextPeriod": {
+                    "start": invoice.get("period_start"),
+                    "end": invoice.get("period_end"),
+                },
+            }
+        except CustomException:
+            raise
+        except Exception as e:
+            exception = CustomException(e)
+            logger.error(exception)
+            raise exception
+
 
 subscriptionService = SubscriptionService()

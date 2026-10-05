@@ -10,7 +10,7 @@ __all__ = ["router"]
 
 
 from utils.exceptionHandler import CustomException, raiseHttpException
-from api.models import VerifySubscriptionRequest, CreateSubscriptionRequest, AddDomainsRequest, VerifyDomainUpgradeRequest, RemoveDomainRequest, CancelPendingAdditionRequest, CancelSubscriptionRequest, RefundRequest, CreateAnnualRenewalSessionRequest, VerifyAnnualRenewalPaymentRequest
+from api.models import VerifySubscriptionRequest, CreateSubscriptionRequest, AddDomainsRequest, VerifyDomainUpgradeRequest, RemoveDomainRequest, CancelPendingAdditionRequest, CancelSubscriptionRequest, RefundRequest, CreateAnnualRenewalSessionRequest, VerifyAnnualRenewalPaymentRequest, PrepareRenewalInvoiceRequest, CreateRenewalSessionRequest, VerifyRenewalPaymentRequest
 from api.services.subscriptions.subscriptionService import subscriptionService
 from fastapi.responses import ORJSONResponse
 from fastapi import APIRouter, Depends
@@ -282,6 +282,91 @@ async def getInvoices(token=Depends(verifyToken)):
             content={
                 "status": "SUCCESS",
                 "invoices": result
+            }
+        )
+    except CustomException as e:
+        raiseHttpException(e)
+
+
+@router.post("/prepareRenewalInvoice")
+async def prepareRenewalInvoice(
+    _request: PrepareRenewalInvoiceRequest | None = None,
+    token=Depends(verifyToken),
+):
+    """
+    Prepare (or read) the next renewal invoice on explicit dashboard request.
+
+    Monthly: prepares the next calendar-month renewal invoice on demand,
+    including earlier than T-7, while access is valid and renewal is not
+    declined. Annual: existing preparation policy.
+    """
+    try:
+        result = subscriptionService.prepareRenewalInvoice(token=token)
+        return ORJSONResponse(
+            status_code=200,
+            content={
+                "status": "SUCCESS",
+                "message": "Renewal invoice prepared.",
+                "data": result,
+            }
+        )
+    except CustomException as e:
+        raiseHttpException(e)
+
+
+@router.post("/createRenewalPaymentSession")
+async def createRenewalPaymentSession(
+    request: CreateRenewalSessionRequest,
+    token=Depends(verifyToken),
+):
+    """
+    Create a customer-free Razorpay checkout session for an owned renewal
+    invoice. Monthly renewals pay before the current period end.
+    """
+    try:
+        result = subscriptionService.createRenewalPaymentSession(
+            invoiceId=request.invoiceId,
+            token=token,
+        )
+        return ORJSONResponse(
+            status_code=200,
+            content={
+                "status": "SUCCESS",
+                "message": "Renewal payment session created.",
+                "data": result,
+            }
+        )
+    except CustomException as e:
+        raiseHttpException(e)
+
+
+@router.post("/verifyRenewalPayment")
+async def verifyRenewalPayment(
+    payload: VerifyRenewalPaymentRequest,
+    token=Depends(verifyToken),
+):
+    """
+    Verify a renewal checkout signature and finalize the captured payment.
+
+    Monthly early payment schedules the frozen future month; credits refill
+    only at its start. Annual keeps its own lifecycle policy.
+    """
+    try:
+        result = subscriptionService.verifyRenewalPayment(
+            payload=payload.dict(),
+            token=token,
+        )
+        message = (
+            "Renewal payment verified and finalized."
+            if result.get("finalized")
+            else "Renewal payment verified. Awaiting capture/finalization."
+        )
+        return ORJSONResponse(
+            status_code=200,
+            content={
+                "status": "SUCCESS",
+                "message": message,
+                "data": result,
             }
         )
     except CustomException as e:
