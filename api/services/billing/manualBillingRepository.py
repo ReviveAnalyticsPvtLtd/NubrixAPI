@@ -107,7 +107,7 @@ class ManualBillingRepository:
         def operation(connection):
             with connection.cursor(cursor_factory=RealDictCursor) as cursor:
                 cursor.execute('''select * from public.billing_events where
-                    ((event_category='payment_attempt' and (metadata_json->'manualBilling'->>'billingMode'='monthly_prepaid' or user_id is null)
+                    ((event_category='payment_attempt'
                       and payment_status <> 'captured') or (event_type='refund.intent' and event_status <> 'processed'))
                     and coalesce((metadata_json->>'lastRecoveryAt')::timestamptz,created_at) < now()-interval '15 minutes'
                     order by coalesce((metadata_json->>'lastRecoveryAt')::timestamptz,created_at),id limit %s''',(limit,))
@@ -675,10 +675,23 @@ class ManualBillingRepository:
     def bindProviderOrder(self, attemptId: str, order: dict) -> CheckoutIntent:
         def operation(connection):
             with connection.cursor(cursor_factory=RealDictCursor) as cursor:
-                cursor.execute('select user_id,provider_order_id from public.billing_events where id=%s',(attemptId,))
+                cursor.execute("select user_id,invoice_id,provider_order_id from public.billing_events where id=%s and event_category='payment_attempt'",(attemptId,))
                 previous=cursor.fetchone()
                 if not previous: raise ValueError('ATTEMPT_MISSING')
                 self._lockUser(cursor,previous['user_id'])
+                subscription = self._canonical(cursor, previous['user_id']) if previous['user_id'] is not None else None
+                if subscription:
+                    cursor.execute('select id from public."Invoices" where id=%s and "userId"=%s for update',
+                        (previous['invoice_id'], previous['user_id']))
+                    if not cursor.fetchone():
+                        raise ValueError('OWNED_INVOICE_NOT_FOUND')
+                cursor.execute('select * from public.billing_events where id=%s for update', (attemptId,))
+                previous = cursor.fetchone()
+                if not order.get('id'):
+                    raise ValueError('PROVIDER_ORDER_ID_MISSING')
+                if ('amount' in order and int(order['amount']) != int(previous['amount'])) or (
+                        'currency' in order and order['currency'] != previous['currency']):
+                    raise ValueError('PROVIDER_ORDER_EVIDENCE_MISMATCH')
                 if previous.get('provider_order_id') and previous['provider_order_id'] != order.get('id'):
                     raise ValueError('PROVIDER_ORDER_ALREADY_BOUND')
                 cursor.execute(
@@ -703,7 +716,6 @@ class ManualBillingRepository:
                     return self._intentFromAttemptRow(row,self._json(row.get('metadata_json')),None,'erased_checkout')
                 cursor.execute('update public."Invoices" set razorpay_order_id=%s where id=%s and "userId"=%s',
                                (order.get('id'),row['invoice_id'],row['user_id']))
-                subscription=self._canonical(cursor,row['user_id'])
                 pending=subscription.get('pending_additions') or []
                 pending=json.loads(pending) if isinstance(pending,str) else list(pending)
                 changed=False
@@ -742,6 +754,30 @@ class ManualBillingRepository:
                 row=cursor.fetchone()
                 if not row: raise ValueError('PAYMENT_ATTEMPT_MISSING')
                 return row
+        return self._run(operation)
+
+    def attemptById(self, userId: str, attemptId: str) -> dict:
+        def operation(connection):
+            with connection.cursor(cursor_factory=RealDictCursor) as cursor:
+                cursor.execute("select * from public.billing_events where id=%s and user_id=%s and event_category='payment_attempt'",
+                    (attemptId, userId))
+                row = cursor.fetchone()
+                if not row:
+                    raise ValueError('OWNED_PAYMENT_ATTEMPT_MISSING')
+                return row
+        return self._run(operation)
+
+    def recordUnmappedPayment(self, payment: dict):
+        """Unknown historical money remains visible without guessing its owner or grant."""
+        def operation(connection):
+            with connection.cursor() as cursor:
+                cursor.execute('''insert into public.billing_events(id,event_category,event_type,event_status,
+                    provider,amount,currency,idempotency_key,metadata_json,occurred_at)
+                    values(%s,'reconciliation','payment.unmapped','REQUIRES_RECONCILIATION','razorpay',%s,%s,%s,%s,%s)
+                    on conflict(idempotency_key) do nothing''', (str(uuid.uuid4()),int(payment.get('amount') or 0),
+                    payment.get('currency') or 'INR','unmapped:'+str(payment.get('id'))+':'+str(payment.get('status')),
+                    Json({'paymentId':payment.get('id'),'orderId':payment.get('order_id'),
+                          'financialStatus':payment.get('status'),'reason':'PAYMENT_ATTEMPT_MISSING'}),_now()))
         return self._run(operation)
 
     # -- finalization ---------------------------------------------------------
@@ -830,10 +866,11 @@ class ManualBillingRepository:
                     return self._finalizeTopupCapture(cursor,invoice,subscription,attempt,evidence,captureId)
                 from dateutil.relativedelta import relativedelta
                 start = captureAt if evidence.purpose == 'initial_purchase' else _utc(invoice['period_start'])
-                end = start + relativedelta(months=1)
+                end = start + (relativedelta(years=1) if frozen['billingMode'] == 'annual_prepaid' else relativedelta(months=1))
                 if evidence.purpose == 'renewal' and _utc(invoice['period_end']) != end:
                     raise ValueError('INVALID_FROZEN_CALENDAR_PERIOD')
                 billing.update({'lifecycleId':frozen['lifecycleId'],'domains':frozen.get('domains',[]),
+                    'billingMode':frozen['billingMode'],'purpose':frozen['purpose'],
                     'creditPeriodId':str(uuid.uuid4()),'coverageState':'scheduled','providerPaymentId':evidence.providerPaymentId})
                 cursor.execute('''update public."Invoices" set status='PAID', "razorpayPaymentId"=%s,
                     "paidAt"=%s, period_start=%s, period_end=%s, metadata_json=%s where id=%s''',
@@ -847,6 +884,8 @@ class ManualBillingRepository:
                 state.setdefault('manualBilling',{}).update(lifecycleId=frozen['lifecycleId'],paidFutureEnd=end.isoformat())
                 cursor.execute('update public.subscriptions set billing_state=%s where id=%s', (Json(state),subscription['id']))
                 subscription['billing_state'] = state
+                if frozen['billingMode'] == 'annual_prepaid':
+                    return self._applyAnnualPayment(cursor, invoice, subscription, evidence.observedAt, evidence.attemptId)
                 return self._applyCoverage(cursor,invoice,subscription,evidence.observedAt,evidence.attemptId)
         return self._run(operation)
 
@@ -992,7 +1031,39 @@ class ManualBillingRepository:
         if not billing.get('creditPeriodId'): return None
         return CoveragePeriod(invoice['userId'],str(invoice['subscription_id']),billing['lifecycleId'],
             billing['creditPeriodId'],str(invoice['id']),_utc(invoice['period_start']),_utc(invoice['period_end']),
-            tuple(billing.get('domains',[])),'monthly_prepaid',_utc(billing.get('revokedAt')))
+            tuple(billing.get('domains',[])),billing.get('billingMode') or invoice.get('billing_mode') or 'monthly_prepaid',_utc(billing.get('revokedAt')))
+
+    def _applyAnnualPayment(self, cursor, invoice, subscription, now, attemptId):
+        """Annual service duration and monthly credit allocation have separate clocks."""
+        from api.services.credits.creditConfig import getTokenQuotaForPlan
+        from dateutil.relativedelta import relativedelta
+        metadata = self._json(invoice['metadata_json'])
+        billing = metadata['manualBilling']
+        period = self._coverage(invoice)
+        quota = getTokenQuotaForPlan('annual', len(period.domains))
+        cursor.execute('''insert into public.credit_balances (user_id,subscription_id,plan_tier,domain_count,
+            monthly_token_quota,used_tokens,remaining_tokens,period_start,period_end,lifecycle_id,
+            credit_period_id,balance_version,last_reset_at,updated_at)
+            values (%s,%s,'annual',%s,%s,0,%s,%s,%s,%s,%s,1,%s,%s)
+            on conflict(user_id) do update set subscription_id=excluded.subscription_id,plan_tier=excluded.plan_tier,
+            domain_count=excluded.domain_count,monthly_token_quota=excluded.monthly_token_quota,used_tokens=0,
+            remaining_tokens=excluded.remaining_tokens,period_start=excluded.period_start,period_end=excluded.period_end,
+            lifecycle_id=excluded.lifecycle_id,credit_period_id=excluded.credit_period_id,
+            balance_version=credit_balances.balance_version+1,last_reset_at=excluded.last_reset_at,updated_at=excluded.updated_at''',
+            (period.userId,period.subscriptionId,len(period.domains),quota,quota,now,now+relativedelta(months=1),
+             period.lifecycleId,period.creditPeriodId,now,now))
+        billing['coverageState'] = 'scheduled' if period.start > now else 'active'
+        billing['creditsAllocatedAt'] = now.isoformat()
+        cursor.execute('update public."Invoices" set metadata_json=%s where id=%s', (Json(metadata),invoice['id']))
+        cursor.execute('''update public.subscriptions set status='active',plan_type='annual',billing_mode='annual_prepaid',
+            current_period_start=%s,current_period_end=%s,renewal_due_at=%s,subscribed_experts=%s,
+            domain_count=%s,pending_removals=%s,auto_renew_enabled=false,version=version+1,updated_at=%s where id=%s''',
+            (period.start,period.end,period.end,Json(list(period.domains)),len(period.domains),Json([]),now,subscription['id']))
+        subscription.update(status='active',plan_type='annual',billing_mode='annual_prepaid',
+            current_period_start=period.start,current_period_end=period.end,renewal_due_at=period.end,
+            subscribed_experts=list(period.domains),domain_count=len(period.domains))
+        invoice['metadata_json'] = metadata
+        return self._result(invoice,subscription,'paid_scheduled' if period.start > now else 'activated',attemptId,refilled=True)
 
     def _result(self,invoice,subscription,state,attemptId,refilled=False,anomalyId=None):
         period = self._coverage(invoice)
@@ -1072,7 +1143,7 @@ class ManualBillingRepository:
         pending=json.loads(pending) if isinstance(pending,str) else list(pending)
         for item in pending:
             if item.get('orderId') == evidence.providerOrderId: item['state']='activated'
-        quota=getTokenQuotaForPlan('pro',len(combined))
+        quota=getTokenQuotaForPlan('annual' if subscription.get('billing_mode') == 'annual_prepaid' else 'pro',len(combined))
         remaining=max(0,int(credit['remaining_tokens'])+quota-int(credit['monthly_token_quota']))
         cursor.execute('''update public.credit_balances set monthly_token_quota=%s,remaining_tokens=%s,
             domain_count=%s,balance_version=balance_version+1,updated_at=%s where user_id=%s''',

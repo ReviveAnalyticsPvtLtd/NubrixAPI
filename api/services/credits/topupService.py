@@ -154,25 +154,6 @@ class TopupService:
 
     # ---- public API ----------------------------------------------------------
 
-    def _createManualTopupOrder(self,userId,subscription,invoice,snapshot,packId,tokens):
-        from datetime import datetime,timedelta,timezone
-        from api.services.billing.manualBillingRepository import getManualBillingRepository,_payloadHash
-        repository=getManualBillingRepository()
-        state=subscription.get('billing_state') or {}
-        lifecycle=state.get('manualBilling',{}).get('lifecycleId')
-        if not lifecycle: raise ValueError('MANUAL_LIFECYCLE_MISSING')
-        payload={'subscriptionId':subscription['id'],'invoiceId':invoice['id'],'lifecycleId':lifecycle,
-            'billingMode':'monthly_prepaid','amount':snapshot.total_amount,'currency':snapshot.currency,
-            'tokens':tokens,'expiresAt':(datetime.now(timezone.utc)+timedelta(seconds=int(os.environ.get("MANUAL_CHECKOUT_TTL_SECONDS","1800")))).isoformat()}
-        intent=repository.reserveCheckoutIntent(userId,'topup',invoice['id'],_payloadHash(payload),payload)
-        if intent.razorpayOrderId: return {'id':intent.razorpayOrderId,'expiresAt':intent.expiresAt.isoformat()}
-        if not repository.claimProviderOrderCreation(intent.attemptId):
-            raise ValueError('TOPUP_ORDER_REQUIRES_RECONCILIATION')
-        order=self.razorpayClient.order.create({'amount':intent.amount,'currency':intent.currency,'receipt':intent.attemptId,
-            'notes':{'userId':userId,'type':'credit_topup','billingMode':'monthly_prepaid','packId':packId,
-                'tokens':str(tokens),'invoiceId':invoice['id'],'attemptId':intent.attemptId}})
-        repository.bindProviderOrder(intent.attemptId,order)
-        return {**order,'expiresAt':intent.expiresAt.isoformat()}
 
     def listPacks(self, token: str) -> dict:
         """
@@ -233,82 +214,15 @@ class TopupService:
         return result
 
     def verifyTopupPayment(self, payload: dict, token: str) -> dict:
-        """
-        Verify the Razorpay checkout signature and grant the purchased tokens.
-
-        The grant is idempotent, so racing the payment.captured webhook is
-        expected and safe — whichever arrives first credits the tokens and the
-        other reports granted=False.
-
-        Ownership is established from the order's notes as fetched from
-        Razorpay, never from the client payload: a valid signature proves the
-        payment is genuine, not that it belongs to the caller.
-
-        Args:
-            payload (dict): Razorpay checkout response.
-            token (str): Authorization token.
-
-        Returns:
-            dict: {"granted": bool, "tokens": int, "credits": float}.
-        """
-        try:
-            from api.services.credits.creditService import creditService
-
-            userId, _ = self._decodeToken(token)
-            paymentId = payload.get("razorpayPaymentId")
-            orderId = payload.get("razorpayOrderId")
-            signature = payload.get("razorpaySignature")
-            if not all([paymentId, orderId, signature, userId]):
-                raise Exception("Missing Razorpay verification fields")
-
-            expectedSignature = hmac.new(
-                os.environ["RAZORPAY_KEY_SECRET"].encode(),
-                f"{orderId}|{paymentId}".encode(),
-                hashlib.sha256,
-            ).hexdigest()
-            if not hmac.compare_digest(expectedSignature, signature):
-                raise Exception("Invalid Razorpay signature")
-
-            order = self.razorpayClient.order.fetch(orderId)
-            notesRaw = order.get("notes") or {}
-            notes = notesRaw if isinstance(notesRaw, dict) else {}
-            if notes.get("type") != "credit_topup":
-                raise Exception(
-                    f"Order {orderId} is not a credit top-up order "
-                    f"(type={notes.get('type')})"
-                )
-            noteUserId = notes.get("userId")
-            if noteUserId and noteUserId != userId:
-                raise Exception(
-                    f"Order/user mismatch during top-up verification: "
-                    f"order.userId={noteUserId}, token.userId={userId}"
-                )
-
-            result = creditService.grantTopupTokens(userId, orderId, paymentId)
-            tokens = result["tokens"]
-
-            if result["granted"]:
-                self._audit(
-                    userId, "credit.topup_granted",
-                    paymentId=paymentId,
-                    status="GRANTED",
-                    metadata={
-                        "packId": notes.get("packId"),
-                        "tokens": tokens,
-                        "orderId": orderId,
-                        "flow": "verify",
-                    },
-                )
-
-            return {
-                "granted": result["granted"],
-                "tokens": tokens,
-                "credits": creditMath.tokensToCredits(tokens, TOKEN_TO_CREDIT_RATIO),
-            }
-        except Exception as e:
-            exception = CustomException(e)
-            logger.error(exception)
-            raise exception
+        from api.services.subscriptions.subscriptionService import SubscriptionService
+        from api.services.billing.manualBillingRepository import getManualBillingRepository
+        service = SubscriptionService.__new__(SubscriptionService)
+        service.client, service.razorpayClient = self.client, self.razorpayClient
+        result = service._verifyDurableCheckout(payload, token, 'topup')
+        attempt = getManualBillingRepository().attemptForOrder(payload['razorpayOrderId'])
+        tokens = int(getManualBillingRepository()._json(attempt['metadata_json'])['manualBilling']['tokens'])
+        return {**result, 'granted': result['finalized'] and not result['alreadyFinalized'],
+            'tokens': tokens, 'credits': creditMath.tokensToCredits(tokens, TOKEN_TO_CREDIT_RATIO)}
 
 
 topupService = TopupService()

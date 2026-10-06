@@ -47,6 +47,14 @@ class SqlRestQuery:
             connection.execute(f'INSERT INTO "{self.table}"({keys}) VALUES({",".join("?" for _ in values)})', values)
         return self
 
+    def upsert(self, payload, on_conflict):
+        with sqlTransaction(self.path) as connection:
+            keys = ','.join(f'"{key}"' for key in payload)
+            assignments = ','.join(f'"{key}"=excluded."{key}"' for key in payload if key != on_conflict)
+            connection.execute(f'INSERT INTO "{self.table}"({keys}) VALUES({",".join("?" for _ in payload)}) '
+                f'ON CONFLICT("{on_conflict}") DO UPDATE SET {assignments}', list(payload.values()))
+        return self
+
     def execute(self):
         import sqlite3
         with sqlTransaction(self.path) as connection:

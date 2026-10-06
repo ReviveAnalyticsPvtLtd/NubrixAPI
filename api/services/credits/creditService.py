@@ -883,70 +883,19 @@ class CreditService:
             logger.error(f"Token reset failed for userId={userId}: {e}")
 
     def grantTopupTokens(self, userId: str, orderId: str, paymentId: str) -> dict:
-        """
-        Credit a purchased token pack, exactly once.
-
-        The RPC flips the add_on invoice to PAID and increments topup_tokens in
-        a single transaction, so the verify endpoint and the payment.captured
-        webhook can both call this safely — whichever arrives first claims the
-        grant and the other returns granted=False. A failed Redis increment
-        drops the hash rather than retrying: Supabase already holds the grant,
-        so a rebuild is safer than serving a silently low balance.
-
-        Args:
-            userId (str): The purchasing user.
-            orderId (str): Razorpay order ID the invoice was created against.
-            paymentId (str): Razorpay payment ID that settled the order.
-
-        Returns:
-            dict: {"granted": bool, "tokens": int}.
-        """
-        attempts=self.supabase.table("billing_events").select("metadata_json").eq("provider_order_id",orderId).eq("event_category","payment_attempt").limit(1).execute().data
-        metadata=(attempts[0].get("metadata_json") or {}) if isinstance(attempts,list) and attempts else {}
-        manualTopup=isinstance(metadata,dict) and metadata.get("manualBilling",{}).get("purpose")=="topup"
-        if manualTopup:
-            from api.services.subscriptions.subscriptionService import subscriptionService
-            order=subscriptionService.razorpayClient.order.fetch(orderId)
-            if order.get('id') != orderId:
-                raise ValueError('TOPUP_PROVIDER_ORDER_MISMATCH')
-            from api.services.billing.manualBillingRepository import getManualBillingRepository
-            from api.services.billing.manualBillingContracts import VerifiedPaymentEvidence
-            repository=getManualBillingRepository()
-            attempt=repository.attemptForOrder(orderId)
-            if attempt['user_id'] != userId: raise ValueError('TOPUP_OWNER_MISMATCH')
-            payment=subscriptionService.razorpayClient.payment.fetch(paymentId)
-            if payment.get('order_id') != orderId or payment.get('id') != paymentId:
-                raise ValueError('TOPUP_PAYMENT_ORDER_MISMATCH')
-            frozen=repository._json(attempt['metadata_json'])['manualBilling']
-            result=repository.finalizeCapturedPayment(VerifiedPaymentEvidence(str(attempt['id']),str(attempt['invoice_id']),
-                userId,orderId,paymentId,'topup',payment['currency'],payment['status'],'server_observation',
-                int(payment['amount']),datetime.now(timezone.utc),None,None,False))
-            return {'granted':result.state=='topup_granted','tokens':int(frozen['tokens']) if result.state=='topup_granted' else 0,
-                'disposition':result.state,'anomalyId':result.anomalyId}
-        res = self.supabase.rpc("grant_topup_tokens", {
-            "p_order_id": orderId,
-            "p_payment_id": paymentId,
-        }).execute()
-
-        row = (res.data or [None])[0] or {}
-        if not row.get("granted"):
-            logger.info(f"Top-up grant already applied for order {orderId}, skipping")
-            return {"granted": False, "tokens": 0}
-
-        tokens = int(row.get("tokens", 0))
-        try:
-            self._redis().hincrby(self._redisKey(userId), "ttop", tokens)
-        except Exception as e:
-            logger.warning(f"Redis ttop increment failed for {userId}, dropping hash: {e}")
-            try:
-                self._redis().delete(self._redisKey(userId))
-            except Exception:
-                pass
-
-        logger.info(
-            f"Top-up granted — userId={userId}, tokens={tokens}, order={orderId}"
-        )
-        return {"granted": True, "tokens": tokens}
+        """Recovery alias; the owned durable attempt is the only grant authority."""
+        from api.services.billing.manualBillingRepository import getManualBillingRepository
+        from api.services.subscriptions.subscriptionService import subscriptionService
+        repository = getManualBillingRepository()
+        attempt = repository.attemptForOrder(orderId)
+        frozen = repository._json(attempt['metadata_json'])['manualBilling']
+        if attempt['user_id'] != userId or frozen['purpose'] != 'topup':
+            raise ValueError('TOPUP_OWNER_OR_PURPOSE_MISMATCH')
+        payment = subscriptionService.razorpayClient.payment.fetch(paymentId)
+        result = subscriptionService._finalizeManualCheckout(str(attempt['invoice_id']), orderId, paymentId, payment)
+        return {'granted': result['finalized'] and not result['alreadyFinalized'],
+            'tokens': int(frozen['tokens']) if result['finalized'] else 0,
+            'disposition': result['state'], 'anomalyId': result['anomalyId']}
 
     def clawbackTopupTokens(self, userId: str, refundId: str,
                             paymentId: str, refundAmount: int) -> dict:

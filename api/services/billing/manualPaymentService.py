@@ -20,6 +20,7 @@ from datetime import datetime, timedelta, timezone
 
 from api.services.billing.manualBillingContracts import (
     CheckoutIntent,
+    CheckoutRequest,
     FinalizationResult,
     VerifiedPaymentEvidence,
 )
@@ -76,10 +77,52 @@ class ManualPaymentService:
     ):
         self.razorpayClient = razorpayClient
         self.supabaseClient = supabaseClient
+        if repository is None and store is None:
+            from api.services.billing.manualBillingRepository import getManualBillingRepository
+            repository = getManualBillingRepository()
         self.repository = repository
-        self.store = store or _OperationStore()
+        self.store = store
         self.now = now or (lambda: datetime.now(timezone.utc))
         self._intents = {}
+
+    @classmethod
+    def forProduction(cls, provider=None, repository=None):
+        return cls(razorpayClient=provider, repository=repository)
+
+    def _createDurableCheckout(self, request):
+        self.repository.ensureCanonicalSubscription(request.userId)
+        intent = self.repository.reserveCheckout(request)
+        if intent.razorpayOrderId:
+            return intent
+        if self.razorpayClient is None:
+            raise RuntimeError('PAYMENT_PROVIDER_NOT_CONFIGURED')
+        if not self.repository.claimProviderOrderCreation(intent.attemptId):
+            from api.services.billing.manualBillingRecoveryService import ManualBillingRecoveryService
+            attempt = self.repository.attemptById(request.userId, intent.attemptId)
+            ManualBillingRecoveryService(self.repository, self.razorpayClient).recoverAttempt(attempt)
+            attempt = self.repository.attemptById(request.userId, intent.attemptId)
+            intent = self.repository._intentFromAttemptRow(attempt,
+                self.repository._json(attempt.get('metadata_json')), request.userId, request.purpose)
+            if not intent.razorpayOrderId:
+                raise RuntimeError('ORDER_ACK_UNKNOWN')
+            return intent
+        noteType = _PURPOSE_ORDER_NOTE_TYPES[request.purpose]
+        if request.purpose == 'renewal' and request.billingMode == 'annual_prepaid':
+            noteType = 'annual_renewal'
+        notes = {'userId': request.userId, 'invoiceId': intent.invoiceId,
+            'attemptId': intent.attemptId, 'type': noteType, 'purpose': request.purpose,
+            'billingMode': request.billingMode, 'domains': ', '.join(intent.snapshot.get('domains') or [])}
+        if request.purpose == 'topup':
+            notes.update(packId=intent.snapshot['packId'], tokens=str(intent.snapshot['tokens']))
+        try:
+            order = self.razorpayClient.order.create({'amount': intent.amount, 'currency': intent.currency,
+                'receipt': intent.attemptId, 'notes': notes})
+            if (not order.get('id') or int(order.get('amount', -1)) != intent.amount
+                    or order.get('currency') != intent.currency):
+                raise ValueError('PROVIDER_ORDER_EVIDENCE_MISMATCH')
+            return self.repository.bindProviderOrder(intent.attemptId, order)
+        except Exception as exc:
+            raise RuntimeError('ORDER_ACK_UNKNOWN') from exc
 
     # -- idempotency helpers --------------------------------------------------
 
@@ -95,10 +138,10 @@ class ManualPaymentService:
 
     def createCheckout(
         self,
-        userId: str,
-        purpose: str,
-        payload: dict,
-        requestKey: str,
+        userId: str | CheckoutRequest,
+        purpose: str = None,
+        payload: dict = None,
+        requestKey: str = None,
     ) -> CheckoutIntent:
         """Create (or idempotently return) a customer-free checkout intent.
 
@@ -106,6 +149,10 @@ class ManualPaymentService:
         acknowledgement is unknown the attempt stays pending_provider_ack for
         reconciliation instead of creating a second charge opportunity.
         """
+        if self.repository is not None:
+            if not isinstance(userId, CheckoutRequest):
+                raise TypeError('Production checkout requires CheckoutRequest')
+            return self._createDurableCheckout(userId)
         if not requestKey:
             raise ValueError("requestKey is required")
         payloadHash = self._payloadHash(payload)
@@ -233,6 +280,8 @@ class ManualPaymentService:
         - a capture against a closed attempt is a financial anomaly, never a
           grant.
         """
+        if self.repository is not None:
+            return self.repository.finalizeCapturedPayment(evidence)
         invoiceId = evidence.invoiceId
         operationKey = f"finalize:{invoiceId}"
 

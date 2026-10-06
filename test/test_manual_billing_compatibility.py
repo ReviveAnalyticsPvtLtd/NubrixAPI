@@ -185,4 +185,6 @@ def test_authentication_seeding_is_customer_free_and_canonical():
         assert dropped not in lowered, f"seeding writes contracted column {dropped}"
     # fresh shells are canonical rows
     assert "is_canonical" in lowered
-    assert "renewal_opt_out" in lowered
+    assert "ensurecanonicalsubscription" in lowered
+    repository = Path("api/services/billing/manualBillingRepository.py").read_text(encoding="utf-8")
+    assert "renewal_opt_out" in repository

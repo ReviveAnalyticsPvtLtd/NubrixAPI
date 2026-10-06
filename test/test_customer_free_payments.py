@@ -15,7 +15,7 @@ import pytest
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from api.services.billing.manualPaymentService import (  # noqa: E402
-    ManualPaymentService,
+    ManualPaymentService, _OperationStore,
 )
 
 
@@ -94,9 +94,17 @@ class StrictFakeRazorpayClient:
         self.token = _FakeTokenAPI(self)
 
     def forbiddenFieldCheck(self, payload, context):
-        lowered = str(payload).lower()
+        def field_names(value):
+            if isinstance(value, dict):
+                for key, item in value.items():
+                    yield str(key).lower()
+                    yield from field_names(item)
+            elif isinstance(value, list):
+                for item in value:
+                    yield from field_names(item)
+        fields = set(field_names(payload))
         for forbidden in ("customer_id", "token", "recurring"):
-            if forbidden in lowered:
+            if forbidden in fields:
                 self.forbiddenCalls.append((context, forbidden))
                 raise ForbiddenCallError(
                     f"{context} contains forbidden field '{forbidden}': {payload}"
@@ -172,6 +180,7 @@ def _service(provider=None, supabase=None):
         razorpayClient=provider or StrictFakeRazorpayClient(),
         supabaseClient=supabase or _FakeSupabaseClient(),
         now=lambda: _NOW,
+        store=_OperationStore(),
     )
     return service
 
