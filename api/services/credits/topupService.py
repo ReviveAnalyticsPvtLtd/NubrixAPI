@@ -142,7 +142,7 @@ class TopupService:
         Returns:
             bool: True when top-ups may be purchased.
         """
-        if not subscription:
+        if not subscription or subscription.get('status') == 'trial' or subscription.get('billing_mode') not in ('monthly_prepaid', 'annual_prepaid'):
             return False
         from api.services.subscriptions.subscriptionService import subscriptionService
         from api.services.subscriptions.paymentValidationService import isAccessActive
@@ -214,105 +214,23 @@ class TopupService:
             logger.error(exception)
             raise exception
 
-    def createTopupOrder(self, packId: str, token: str) -> dict:
-        """
-        Create a frozen invoice and a Razorpay Order for a top-up pack.
-
-        Tokens are granted only after payment, via verifyTopupPayment() or the
-        payment.captured webhook.
-
-        Args:
-            packId (str): Pack key from config, e.g. 'medium'.
-            token (str): Authorization token.
-
-        Returns:
-            dict: Checkout payload for Razorpay embedded checkout.
-        """
-        try:
-            userId, tokenEmail = self._decodeToken(token)
-            subscription = self._subscription(userId)
-            if not self._isTopupEligible(subscription):
-                raise Exception(
-                    "TOPUP_NOT_ELIGIBLE: credit top-ups require an active Pro or "
-                    f"Annual plan (status={(subscription or {}).get('status')}, "
-                    f"plan={(subscription or {}).get('plan_type')})"
-                )
-
-            pack = getTopupPack(packId)
-            if pack is None:
-                raise Exception(f"TOPUP_PACK_UNKNOWN: no active top-up pack '{packId}'")
-
-            billingMode = subscription.get("billing_mode") or "monthly_prepaid"
-            snapshot = computeTopupSnapshot(packId, billingMode)
-            tokens = pack["tokens"]
-
-            identity = self._identity(userId, tokenEmail)
-            invoice = self._createInvoice(
-                userId, subscription.get("id"), snapshot, packId, tokens
-            )
-
-            if billingMode == 'monthly_prepaid':
-                order=self._createManualTopupOrder(userId,subscription,invoice,snapshot,packId,tokens)
-            else:
-                order = self.razorpayClient.order.create({
-                "amount": snapshot.total_amount,
-                "currency": snapshot.currency,
-                "notes": {
-                    "userId": userId,
-                    "type": "credit_topup",
-                    "packId": packId,
-                    "tokens": str(tokens),
-                    "invoiceId": invoice["id"],
-                },
-            })
-            if billingMode != 'monthly_prepaid':
-                self._attachOrder(invoice["id"], order["id"])
-
-            self._audit(
-                userId, "credit.topup_requested",
-                amount=snapshot.total_amount,
-                status="AWAITING_PAYMENT",
-                metadata={
-                    "packId": packId,
-                    "tokens": tokens,
-                    "orderId": order["id"],
-                    "invoiceId": invoice["id"],
-                },
-            )
-            logger.info(
-                f"Top-up order created — userId={userId}, pack={packId}, "
-                f"tokens={tokens}, order={order['id']}"
-            )
-
-            return {
-                "razorpayKey": os.environ["RAZORPAY_KEY_ID"],
-                "orderId": order["id"],
-                "expiresAt":order.get('expiresAt'),
-                "currency": snapshot.currency,
-                "amount": snapshot.total_amount,
-                "packId": packId,
-                "tokens": tokens,
-                "credits": creditMath.tokensToCredits(tokens, TOKEN_TO_CREDIT_RATIO),
-                "invoiceId": invoice["id"],
-                "userEmail": identity["email"],
-                "userName": identity["name"],
-                "userContact": identity["contact"],
-                "pricingSnapshot": {
-                    "pricingVersion": snapshot.pricing_version,
-                    "priceSource": snapshot.pricing_reference_snapshot_json["source"],
-                },
-                "taxSnapshot": {
-                    "taxRuleVersion": snapshot.tax.tax_rule_version,
-                    "amountBeforeTax": snapshot.amount_before_tax,
-                    "taxAmount": snapshot.tax.tax_amount,
-                    "totalAmount": snapshot.total_amount,
-                    "currency": snapshot.currency,
-                },
-            }
-        except Exception as e:
-            exception = CustomException(e)
-            logger.error(exception)
-            raise exception
+    def createTopupOrder(self, packId: str, token: str, requestKey: str | None = None) -> dict:
+        from api.services.subscriptions.subscriptionService import SubscriptionService
+        userId, email = self._decodeToken(token)
+        service = SubscriptionService.__new__(SubscriptionService)
+        service.client = self.client
+        service.razorpayClient = self.razorpayClient
+        subscription = self._subscription(userId)
+        if not subscription or subscription.get('status') == 'trial' or subscription.get('billing_mode') not in ('monthly_prepaid', 'annual_prepaid'):
+            raise CustomException(ValueError('TOPUP_NOT_ELIGIBLE'), statusCode=403,
+                uiMessage='Credit top-ups require an active paid subscription.', errorCode='TOPUP_NOT_ELIGIBLE')
+        if getTopupPack(packId) is None:
+            raise CustomException(ValueError('TOPUP_PACK_UNKNOWN'), statusCode=422,
+                uiMessage='Unknown credit top-up pack.', errorCode='TOPUP_PACK_UNKNOWN')
+        result = service._reservedCheckout({'userId': userId, 'email': email}, 'topup',
+            subscription['billing_mode'], {'packId': packId}, requestKey)
+        result['credits'] = creditMath.tokensToCredits(result['tokens'], TOKEN_TO_CREDIT_RATIO)
+        return result
 
     def verifyTopupPayment(self, payload: dict, token: str) -> dict:
         """

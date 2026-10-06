@@ -375,7 +375,7 @@ def test_monthly_attempt_ttl_can_replace_known_expired_order(database):
     attempt=repository.reserveCheckoutIntent(USER,'renewal','renewal-key','snapshot-hash',snapshot)
     assert attempt.expiresAt==NOW+timedelta(minutes=30)
     repository.bindProviderOrder(attempt.attemptId,{'id':'renewal-order'})
-    with patch('api.services.billing.manualBillingRepository._now',return_value=NOW+timedelta(minutes=31)):
+    with patch(__name__ + '.NOW', NOW+timedelta(minutes=31)):
         replacement=repository.reserveCheckoutIntent(USER,'renewal','renewal-key','snapshot-hash',snapshot)
     assert replacement.attemptId != attempt.attemptId and replacement.revision==2
 

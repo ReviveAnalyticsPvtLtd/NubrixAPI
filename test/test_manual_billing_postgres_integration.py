@@ -20,7 +20,7 @@ pytestmark = pytest.mark.skipif(os.environ.get("RUN_MANUAL_BILLING_INTEGRATION")
 ROOT = Path(__file__).resolve().parents[1]
 NOW = datetime(2026,10,6,12,tzinfo=timezone.utc)
 BASELINE = '''
-CREATE TABLE public."Users" ("userId" text primary key);
+CREATE TABLE public."Users" ("userId" text primary key,"isBanned" boolean default false);
 CREATE TABLE public.subscriptions (
  id uuid primary key default gen_random_uuid(),user_id text not null references "Users"("userId"),
  billing_mode text not null default 'none' check(billing_mode in ('none','monthly_recurring','annual_prepaid')),
@@ -36,7 +36,10 @@ CREATE TABLE public."Invoices" (
  id uuid primary key default gen_random_uuid(),"userId" text references "Users"("userId"),
  subscription_id uuid references subscriptions(id),status text,billing_reason text,amount bigint,total_amount bigint,
  currency text,razorpay_order_id text,"razorpayPaymentId" text,"paidAt" timestamptz,
- period_start timestamptz,period_end timestamptz,metadata_json jsonb default '{}');
+ period_start timestamptz,period_end timestamptz,metadata_json jsonb default '{}',
+ payment_flow text,requires_customer_auth boolean,amount_before_tax bigint,tax_amount bigint,
+ tax_breakdown_json jsonb,tax_rule_version text,place_of_supply_snapshot text,
+ pricing_version text,pricing_reference_snapshot_json jsonb);
 CREATE TABLE public.billing_events (
  id uuid primary key default gen_random_uuid(),user_id text references "Users"("userId"),
  subscription_id uuid references subscriptions(id),invoice_id uuid references "Invoices"(id),
@@ -68,11 +71,36 @@ def postgres():
         with connection.cursor() as cursor:
             cursor.execute("drop schema public cascade; create schema public")
             cursor.execute(BASELINE)
-            for name in ("20261005195608_expand_manual_monthly_billing.sql","20261005195617_add_manual_billing_transactions.sql"):
+            for name in ("20261005195608_expand_manual_monthly_billing.sql","20261005195617_add_manual_billing_transactions.sql",
+                         "20261006131717_enforce_manual_checkout_order_identity.sql"):
                 cursor.execute((ROOT / "supabase/migrations" / name).read_text())
         connection.commit()
     finally: connection.close()
     return url
+
+
+@pytest.mark.parametrize('request_key', [None, 'browser-key'])
+def test_two_sessions_initial_reservation_creates_one_invoice_and_attempt(postgres, request_key):
+    from api.services.billing.manualBillingContracts import CheckoutRequest
+    user = 'checkout-race-' + str(uuid.uuid4())
+    with psycopg2.connect(postgres) as connection:
+        with connection.cursor() as cursor:
+            cursor.execute('insert into public."Users"("userId") values(%s)', (user,))
+    repository = ManualBillingRepository(lambda: psycopg2.connect(postgres))
+    repository.ensureCanonicalSubscription(user)
+    request = CheckoutRequest(user, 'initial_purchase', 'monthly_prepaid', {'domains': ['banking']}, request_key)
+    reference = {'amount': 10000, 'currency': 'INR', 'source': 'razorpay_plan_fetch'}
+    with patch('api.services.billing.billingEngine._getMonthlyBasePrice', return_value=reference):
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            results = list(pool.map(repository.reserveCheckout, [request, request]))
+    assert results[0].attemptId == results[1].attemptId
+    assert results[0].expiresAt == results[1].expiresAt
+    with psycopg2.connect(postgres) as connection:
+        with connection.cursor() as cursor:
+            cursor.execute('select count(*) from public."Invoices" where "userId"=%s', (user,))
+            assert cursor.fetchone()[0] == 1
+            cursor.execute("select count(*) from public.billing_events where user_id=%s and event_category='payment_attempt'", (user,))
+            assert cursor.fetchone()[0] == 1
 
 @pytest.fixture
 def payment(postgres):

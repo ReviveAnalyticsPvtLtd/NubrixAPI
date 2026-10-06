@@ -85,13 +85,21 @@ class TestTopupEligibilityAndOrder(unittest.TestCase):
         svc.razorpayClient = MagicMock()
         from api.services.billing.manualBillingContracts import CheckoutIntent
         from datetime import datetime,timezone,timedelta
-        def reserve(user,purpose,key,payloadHash,payload):
-            return CheckoutIntent('test-attempt',payload['invoiceId'],user,payload['lifecycleId'],purpose,
-                'monthly_prepaid',payloadHash,payload['currency'],'created',1,payload['amount'],
-                datetime.now(timezone.utc)+timedelta(minutes=30),None,payload)
+        def reserve(request):
+            from api.services.billing.billingEngine import computeTopupSnapshot
+            snap = computeTopupSnapshot(request.payload['packId'], request.billingMode)
+            payload = {'invoiceId': 'inv_1', 'lifecycleId': 'test-life',
+                'packId': request.payload['packId'], 'tokens': snap.pricing_reference_snapshot_json['tokens']}
+            repository.intent = CheckoutIntent('test-attempt', 'inv_1', request.userId, 'test-life', request.purpose,
+                request.billingMode, 'selection-hash', snap.currency, 'created', 1, snap.total_amount,
+                datetime.now(timezone.utc)+timedelta(minutes=30), None, payload)
+            return repository.intent
         repository=MagicMock()
-        repository.reserveCheckoutIntent.side_effect=reserve
+        repository.reserveCheckout.side_effect=reserve
         repository.claimProviderOrderCreation.return_value=True
+        from dataclasses import replace
+        repository.bindProviderOrder.side_effect = lambda attempt, order: replace(repository.intent, razorpayOrderId=order['id'])
+        svc.reservationRepository = repository
         patcher=patch('api.services.billing.manualBillingRepository.getManualBillingRepository',return_value=repository)
         patcher.start()
         self.addCleanup(patcher.stop)
@@ -168,7 +176,7 @@ class TestTopupEligibilityAndOrder(unittest.TestCase):
                                                                       planType="free")):
             with self.assertRaises(Exception) as ctx:
                 svc.createTopupOrder("medium", token="t")
-        self.assertIn("TOPUP_NOT_ELIGIBLE", str(ctx.exception))
+        self.assertEqual(ctx.exception.errorCode, "TOPUP_NOT_ELIGIBLE")
 
     def test_order_rejects_an_unknown_pack_before_calling_razorpay(self):
         svc = self._service()
@@ -176,7 +184,7 @@ class TestTopupEligibilityAndOrder(unittest.TestCase):
              patch.object(svc, "_subscription", return_value=self._sub()):
             with self.assertRaises(Exception) as ctx:
                 svc.createTopupOrder("enormous", token="t")
-        self.assertIn("TOPUP_PACK_UNKNOWN", str(ctx.exception))
+        self.assertEqual(ctx.exception.errorCode, "TOPUP_PACK_UNKNOWN")
         svc.razorpayClient.order.create.assert_not_called()
 
     def test_order_creates_a_frozen_invoice_and_razorpay_order(self):
@@ -197,7 +205,8 @@ class TestTopupEligibilityAndOrder(unittest.TestCase):
         self.assertEqual(result["tokens"], 5000000)
         self.assertEqual(result["credits"], 500.0)
         self.assertEqual(result["invoiceId"], "inv_1")
-        mkInv.assert_called_once()
+        mkInv.assert_not_called()
+        svc.reservationRepository.reserveCheckout.assert_called_once()
         attach.assert_not_called()
 
         notes = svc.razorpayClient.order.create.call_args[0][0]["notes"]

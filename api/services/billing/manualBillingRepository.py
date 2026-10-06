@@ -26,6 +26,7 @@ from psycopg2.extras import Json, RealDictCursor
 
 from api.services.billing.manualBillingContracts import (
     CheckoutIntent,
+    CheckoutRequest,
     CoveragePeriod,
     CoverageSnapshot,
     FinalizationResult,
@@ -199,6 +200,173 @@ class ManualBillingRepository:
 
     # -- checkout intents -----------------------------------------------------
 
+    def reserveCheckout(self, request: CheckoutRequest) -> CheckoutIntent:
+        """Freeze server pricing, invoice and attempt in one owner transaction.
+
+        Reference-plan transport runs outside locks. A replay lookup precedes
+        that fetch, so retries remain possible during a provider outage.
+        """
+        from api.services.billing import billingEngine
+        from dateutil.relativedelta import relativedelta
+        if request.purpose not in ('initial_purchase', 'renewal', 'expert_addition', 'topup'):
+            raise ValueError('INVALID_CHECKOUT_PURPOSE')
+        if request.billingMode not in ('monthly_prepaid', 'annual_prepaid'):
+            raise ValueError('INVALID_BILLING_MODE')
+        if request.requestKey is not None and (not request.requestKey.strip() or len(request.requestKey) > 128):
+            raise ValueError('INVALID_REQUEST_KEY')
+        if set(request.payload) - {'domains', 'packId', 'invoiceId', 'revision', 'contact'}:
+            raise ValueError('INVALID_CHECKOUT_PAYLOAD')
+        domains = tuple(sorted(set(str(value).strip().lower() for value in request.payload.get('domains', []))))
+        if request.purpose in ('initial_purchase', 'expert_addition') and (not domains or len(domains) > 4
+                or not set(domains) <= {'banking', 'manufacturing', 'supplychain', 'telecom'}):
+            raise ValueError('INVALID_EXPERT_SELECTION')
+        identity = {'billingMode': request.billingMode, 'purpose': request.purpose,
+            **{key: value for key, value in request.payload.items() if key in ('packId', 'invoiceId', 'revision')}}
+        if domains:
+            identity['domains'] = list(domains)
+        payload_hash = _payloadHash(identity)
+
+        def lookup(cursor, now):
+            cursor.execute('''select * from public.billing_events where user_id=%s
+                and event_category='payment_attempt' order by id''', (request.userId,))
+            for row in cursor.fetchall():
+                metadata = self._json(row.get('metadata_json'))
+                frozen = metadata.get('manualBilling', {})
+                if frozen.get('purpose') != request.purpose or frozen.get('billingMode') != request.billingMode:
+                    continue
+                exact = (request.requestKey is not None and row.get('idempotency_key') ==
+                    f'{request.purpose}:{request.userId}:{request.requestKey}')
+                expiry = _utc(frozen.get('expiresAt'))
+                live = (row.get('payment_status') in ('created', 'pending_provider_ack', 'authorized')
+                        and (expiry is not None and expiry > now or
+                             row.get('payment_status') == 'pending_provider_ack' and not row.get('provider_order_id')))
+                if exact:
+                    if frozen.get('payloadHash') != payload_hash:
+                        raise ValueError('IDEMPOTENCY_CONFLICT')
+                    return self._intentFromAttemptRow(row, metadata, request.userId, request.purpose)
+                if request.requestKey is None and live and frozen.get('payloadHash') == payload_hash:
+                    return self._intentFromAttemptRow(row, metadata, request.userId, request.purpose)
+                if request.purpose == 'initial_purchase' and live:
+                    raise ValueError('LIVE_INITIAL_CHECKOUT_CONFLICT')
+            return None
+
+        def transaction(connection, reference=None, replayOnly=False):
+            with connection.cursor(cursor_factory=RealDictCursor) as cursor:
+                self._lockUser(cursor, request.userId)
+                subscription = self._canonical(cursor, request.userId)
+                cursor.execute('select now() as current_time')
+                now = _utc(cursor.fetchone()['current_time'])
+                existing = lookup(cursor, now)
+                if existing is not None or replayOnly:
+                    return existing
+                coverage = self._coverageSnapshotLocked(cursor, subscription, now, materialize=True)
+                if subscription.get('erasure_pending') or coverage.denialReason == 'account_banned':
+                    raise ValueError('CHECKOUT_OWNER_NOT_ELIGIBLE')
+                if request.purpose == 'initial_purchase':
+                    if coverage.currentPeriod or coverage.nextPeriod or (
+                            subscription.get('billing_mode') == 'annual_prepaid'
+                            and _utc(subscription.get('current_period_end')) and _utc(subscription['current_period_end']) > now):
+                        raise ValueError('EXISTING_PAID_COVERAGE')
+                elif request.billingMode == 'monthly_prepaid':
+                    if not coverage.accessAllowed:
+                        raise ValueError('PAID_COVERAGE_REQUIRED')
+                elif request.purpose in ('expert_addition', 'topup'):
+                    from api.services.subscriptions.paymentValidationService import isAccessActive
+                    if not isAccessActive(subscription, now=now):
+                        raise ValueError('PAID_COVERAGE_REQUIRED')
+                if request.purpose != 'initial_purchase' and subscription.get('billing_mode') != request.billingMode:
+                    raise ValueError('CHECKOUT_MODE_CHANGED')
+                invoice = None
+                selected = list(domains)
+                end = _utc(subscription.get('current_period_end'))
+                start = now
+                lifecycle = str(uuid.uuid4()) if request.purpose == 'initial_purchase' else coverage.lifecycleId
+                revision = 1
+                if request.purpose == 'renewal':
+                    if subscription.get('renewal_opt_out') or not end or end <= now:
+                        raise ValueError('RENEWAL_NOT_ELIGIBLE')
+                    invoiceId = request.payload.get('invoiceId')
+                    cursor.execute('select * from public."Invoices" where id=%s and "userId"=%s for update', (invoiceId, request.userId))
+                    invoice = cursor.fetchone()
+                    if not invoice or str(invoice['subscription_id']) != str(subscription['id']):
+                        raise ValueError('OWNED_INVOICE_NOT_FOUND')
+                    frozen = self._json(invoice.get('metadata_json')).get('manualBilling', {})
+                    if invoice.get('billing_reason') != 'renewal' or invoice['status'] not in ('UPCOMING', 'PAYMENT_PENDING') or _utc(invoice.get('period_start')) != end:
+                        raise ValueError('RENEWAL_INVOICE_CLOSED')
+                    current = subscription.get('subscribed_experts') or []
+                    current = json.loads(current) if isinstance(current, str) else current
+                    removed = subscription.get('pending_removals') or []
+                    removed = json.loads(removed) if isinstance(removed, str) else removed
+                    selected = frozen.get('domains') or self._json(invoice.get('metadata_json')).get('renewalDomains') or [value for value in current if value not in removed]
+                    if (not selected or set(selected) != set(current) - set(removed)
+                            or not set(selected) <= {'banking', 'manufacturing', 'supplychain', 'telecom'}):
+                        raise ValueError('STALE_EXPERT_SELECTION')
+                    revision = int(frozen.get('revision') or 1)
+                    if request.payload.get('revision') is not None and int(request.payload['revision']) != revision:
+                        raise ValueError('INVOICE_REVISION_CONFLICT')
+                    start = end
+                elif request.purpose == 'expert_addition':
+                    current = subscription.get('subscribed_experts') or []
+                    current = json.loads(current) if isinstance(current, str) else current
+                    if set(selected) & set(current) or len(set(selected) | set(current)) > 4:
+                        raise ValueError('EXPERT_SELECTION_CONFLICT')
+                ttl = int(os.environ.get('MANUAL_CHECKOUT_TTL_SECONDS', '1800'))
+                if ttl <= 0:
+                    raise ValueError('INVALID_CHECKOUT_TTL')
+                deadline = now + timedelta(seconds=ttl)
+                if request.billingMode == 'annual_prepaid':
+                    # The existing annual adapter has no finite session TTL.
+                    # Keep it independent of the new monthly TTL policy.
+                    deadline = datetime.max.replace(tzinfo=timezone.utc)
+                    if request.purpose == 'expert_addition':
+                        deadline = end
+                if request.billingMode == 'monthly_prepaid' and request.purpose in ('renewal', 'expert_addition'):
+                    deadline = min(deadline, end)
+                if invoice is None:
+                    if request.purpose == 'topup':
+                        pricing = billingEngine.computeTopupSnapshot(request.payload.get('packId'), request.billingMode)
+                    else:
+                        reason = 'proration' if request.purpose == 'expert_addition' else request.purpose
+                        pricing = billingEngine.computeInvoiceSnapshot(request.billingMode, reason, len(selected),
+                            periodStart=start, priceReference=reference, evaluatedAt=now,
+                            prorationAnchorStart=_utc(subscription.get('current_period_start')), prorationAnchorEnd=end)
+                    billing = {'schemaVersion': 1, 'lifecycleId': lifecycle, 'purpose': request.purpose,
+                        'billingMode': request.billingMode, 'domains': selected, 'revision': revision,
+                        'coverageState': 'estimated', 'expiresAt': deadline.isoformat()}
+                    if request.purpose == 'topup':
+                        billing.update(tokens=pricing.pricing_reference_snapshot_json['tokens'], packId=request.payload['packId'])
+                    invoice = {'id': str(uuid.uuid4()), 'userId': request.userId, 'subscription_id': subscription['id'],
+                        'billing_reason': 'add_on' if request.purpose == 'topup' else pricing.billing_reason,
+                        'payment_flow': 'razorpay_order_checkout', 'requires_customer_auth': True,
+                        'status': 'PAYMENT_PENDING', 'amount': pricing.total_amount, 'total_amount': pricing.total_amount,
+                        'currency': pricing.currency, 'period_start': pricing.period_start, 'period_end': pricing.period_end,
+                        'amount_before_tax': pricing.amount_before_tax, 'tax_amount': pricing.tax.tax_amount,
+                        'tax_breakdown_json': pricing.tax.to_dict(), 'tax_rule_version': pricing.tax.tax_rule_version,
+                        'place_of_supply_snapshot': pricing.tax.place_of_supply_snapshot, 'pricing_version': pricing.pricing_version,
+                        'pricing_reference_snapshot_json': pricing.pricing_reference_snapshot_json,
+                        'metadata_json': {'manualBilling': billing, 'domains': selected, 'billingMode': request.billingMode}}
+                    if request.purpose == 'topup':
+                        invoice['metadata_json'].update(tokens=billing['tokens'], packId=billing['packId'])
+                    cursor.execute('insert into public."Invoices" (' + ','.join('"' + key + '"' for key in invoice) +
+                        ') values (' + ','.join('%s' for _ in invoice) + ')',
+                        [Json(value) if isinstance(value, (dict, list)) else value for value in invoice.values()])
+                frozen = self._json(invoice.get('metadata_json')).get('manualBilling', {})
+                snapshot = {'subscriptionId': str(subscription['id']), 'invoiceId': str(invoice['id']),
+                    'lifecycleId': lifecycle, 'cycleId': str(invoice.get('period_start')), 'revision': revision,
+                    'billingMode': request.billingMode, 'domains': selected, 'amount': int(invoice['total_amount']),
+                    'currency': invoice['currency'], 'periodStart': invoice.get('period_start'),
+                    'periodEnd': invoice.get('period_end'), 'expiresAt': deadline.isoformat(),
+                    'tokens': frozen.get('tokens'), 'packId': frozen.get('packId'), 'requestKey': request.requestKey or str(uuid.uuid4())}
+                return self._reserveCheckoutIntentLocked(cursor, subscription, request.userId, request.purpose,
+                    snapshot['requestKey'], payload_hash, snapshot, now)
+        existing = self._run(lambda connection: transaction(connection, replayOnly=True))
+        if existing is not None:
+            return existing
+        reference = None
+        if request.purpose in ('initial_purchase', 'expert_addition'):
+            reference = billingEngine._getMonthlyBasePrice() if request.billingMode == 'monthly_prepaid' else billingEngine._getAnnualBasePrice()
+        return self._run(lambda connection: transaction(connection, reference))
+
     def createFrozenRenewalInvoice(self, payload, expectedVersion):
         """Pricing is fetched outside locks; its selection version is checked here."""
         def operation(connection):
@@ -308,6 +476,17 @@ class ManualBillingRepository:
         payloadHash: str,
         snapshot: dict,
     ) -> CheckoutIntent:
+        def operation(connection):
+            with connection.cursor(cursor_factory=RealDictCursor) as cursor:
+                self._lockUser(cursor, userId)
+                subscription = self._canonical(cursor, userId)
+                cursor.execute('select now() as current_time')
+                return self._reserveCheckoutIntentLocked(cursor, subscription, userId, purpose,
+                    requestKey, payloadHash, snapshot, _utc(cursor.fetchone()['current_time']))
+        return self._run(operation)
+
+    def _reserveCheckoutIntentLocked(self, cursor, subscription, userId, purpose,
+                                    requestKey, payloadHash, snapshot, now):
         manualBilling = {
             "schemaVersion": 1,
             "lifecycleId": snapshot.get("lifecycleId"),
@@ -317,6 +496,10 @@ class ManualBillingRepository:
             "billingMode": snapshot.get("billingMode"),
             "domains": snapshot.get("domains", []),
             "tokens": snapshot.get("tokens"),
+            "packId": snapshot.get("packId"),
+            "requestKey": snapshot.get("requestKey", requestKey),
+            "periodStart": snapshot.get("periodStart"),
+            "periodEnd": snapshot.get("periodEnd"),
             "payloadHash": payloadHash,
             "frozenAmount": snapshot.get("amount"),
             "currency": snapshot.get("currency", "INR"),
@@ -325,151 +508,147 @@ class ManualBillingRepository:
             "closedReason": None,
         }
 
-        def operation(connection):
-            with connection.cursor(cursor_factory=RealDictCursor) as cursor:
-                self._lockUser(cursor, userId)
-                namespaceKey = f"{purpose}:{userId}:{requestKey}"
-                subscription = self._canonical(cursor,userId)
-                if str(subscription['id']) != str(snapshot.get('subscriptionId')) or subscription.get('erasure_pending'):
-                    raise ValueError('CHECKOUT_OWNER_NOT_ELIGIBLE')
-                cursor.execute('select * from public."Invoices" where id=%s for update',(snapshot.get('invoiceId'),))
-                invoice = cursor.fetchone()
-                if not invoice or invoice['userId'] != userId or int(invoice.get('total_amount') or invoice.get('amount') or 0) != int(snapshot.get('amount') or 0):
-                    raise ValueError('CHECKOUT_INVOICE_MISMATCH')
-                cursor.execute(
-                    """
-                    select id, user_id, subscription_id, invoice_id,
-                           payment_status, provider_order_id,
-                           metadata_json
-                    from public.billing_events
-                    where idempotency_key = %s
-                       or (idempotency_key like %s and invoice_id=%s and event_category='payment_attempt')
-                      and event_category = 'payment_attempt'
-                    order by attempted_at desc, idempotency_key desc
-                    limit 1
-                    """,
-                    (namespaceKey, namespaceKey+':revision:%', snapshot.get('invoiceId')),
+        namespaceKey = f"{purpose}:{userId}:{requestKey}"
+        if str(subscription['id']) != str(snapshot.get('subscriptionId')) or subscription.get('erasure_pending'):
+            raise ValueError('CHECKOUT_OWNER_NOT_ELIGIBLE')
+        cursor.execute('select * from public."Invoices" where id=%s for update',(snapshot.get('invoiceId'),))
+        invoice = cursor.fetchone()
+        if not invoice or invoice['userId'] != userId or int(invoice.get('total_amount') or invoice.get('amount') or 0) != int(snapshot.get('amount') or 0):
+            raise ValueError('CHECKOUT_INVOICE_MISMATCH')
+        cursor.execute(
+            """
+            select id, user_id, subscription_id, invoice_id,
+                   payment_status, provider_order_id,
+                   metadata_json
+            from public.billing_events
+            where idempotency_key = %s
+               or (idempotency_key like %s and invoice_id=%s and event_category='payment_attempt')
+              and event_category = 'payment_attempt'
+            order by attempted_at desc, idempotency_key desc
+            limit 1
+            """,
+            (namespaceKey, namespaceKey+':revision:%', snapshot.get('invoiceId')),
+        )
+        existing = cursor.fetchone()
+        if existing is not None:
+            storedMeta = existing.get("metadata_json") or {}
+            if isinstance(storedMeta, str):
+                try:
+                    storedMeta = json.loads(storedMeta)
+                except (ValueError, TypeError):
+                    storedMeta = {}
+            storedBilling = (
+                storedMeta.get("manualBilling") or {}
+                if isinstance(storedMeta, dict)
+                else {}
+            )
+            if storedBilling.get("payloadHash") != payloadHash:
+                raise ValueError(
+                    "IDEMPOTENCY_CONFLICT: same request key with a "
+                    "different payload"
                 )
-                existing = cursor.fetchone()
-                if existing is not None:
-                    storedMeta = existing.get("metadata_json") or {}
-                    if isinstance(storedMeta, str):
-                        try:
-                            storedMeta = json.loads(storedMeta)
-                        except (ValueError, TypeError):
-                            storedMeta = {}
-                    storedBilling = (
-                        storedMeta.get("manualBilling") or {}
-                        if isinstance(storedMeta, dict)
-                        else {}
-                    )
-                    if storedBilling.get("payloadHash") != payloadHash:
-                        raise ValueError(
-                            "IDEMPOTENCY_CONFLICT: same request key with a "
-                            "different payload"
-                        )
-                    intent=self._intentFromAttemptRow(existing,storedMeta,userId,purpose)
-                    if intent.expiresAt > _now() and intent.state in ('created','pending_provider_ack','authorized'):
-                        return intent
-                    if not intent.razorpayOrderId:
-                        # Unknown provider creation must be recovered before a new opportunity.
-                        return intent
-                    if invoice['status'] == 'PAID': return intent
-                    storedBilling.update(closedAt=_now().isoformat(),closedReason='CHECKOUT_EXPIRED')
-                    cursor.execute("update public.billing_events set payment_status='expired',event_status='expired',metadata_json=%s where id=%s",
-                        (Json(storedMeta),existing['id']))
-                    revision=int(storedBilling.get('revision') or 1)+1
-                    namespaceKey += ':revision:'+str(revision)
-                    manualBilling['revision']=revision
+            intent=self._intentFromAttemptRow(existing,storedMeta,userId,purpose)
+            if intent.expiresAt > now and intent.state in ('created','pending_provider_ack','authorized'):
+                return intent
+            if not intent.razorpayOrderId:
+                # Unknown provider creation must be recovered before a new opportunity.
+                return intent
+            if invoice['status'] == 'PAID': return intent
+            storedBilling.update(closedAt=now.isoformat(),closedReason='CHECKOUT_EXPIRED')
+            cursor.execute("update public.billing_events set payment_status='expired',event_status='expired',metadata_json=%s where id=%s",
+                (Json(storedMeta),existing['id']))
+            revision=int(storedBilling.get('revision') or 1)+1
+            namespaceKey += ':revision:'+str(revision)
+            manualBilling['revision']=revision
 
-                if invoice['status'] not in ('UPCOMING','PAYMENT_PENDING') or _utc(snapshot.get('expiresAt')) <= _now():
-                    raise ValueError('CHECKOUT_CLOSED')
-                if purpose == 'renewal' and (subscription.get('renewal_opt_out') or not _utc(subscription.get('current_period_end')) or _utc(subscription.get('current_period_end')) <= _now()):
-                    raise ValueError('RENEWAL_NOT_ELIGIBLE')
-                manualBilling['expiresAt']=min(_utc(snapshot['expiresAt']),_now()+timedelta(seconds=int(os.environ.get('MANUAL_CHECKOUT_TTL_SECONDS','1800')))).isoformat()
-                if purpose == 'initial_purchase' and subscription.get('billing_mode') in ('monthly_prepaid','annual_prepaid') and _utc(subscription.get('current_period_end')) and _utc(subscription['current_period_end']) > _now():
-                    raise ValueError('EXISTING_PAID_COVERAGE')
-                if purpose == 'topup' and (not _utc(subscription.get('current_period_end')) or _utc(subscription['current_period_end']) <= _now()):
-                    raise ValueError('TOPUP_NOT_ELIGIBLE')
-                expiredAttemptIds=set()
-                cursor.execute("select id,metadata_json from public.billing_events where user_id=%s and event_category='payment_attempt' and payment_status in ('created','pending_provider_ack','authorized') for update",(userId,))
-                for attempt in cursor.fetchall():
-                    metadata=self._json(attempt.get('metadata_json'))
-                    billing=metadata.get('manualBilling',{})
-                    expires=_utc(billing.get('expiresAt'))
-                    if expires and expires <= _now():
-                        expiredAttemptIds.add(str(attempt['id']))
-                        billing.update(closedAt=_now().isoformat(),closedReason='CHECKOUT_EXPIRED')
-                        cursor.execute("update public.billing_events set payment_status='expired',event_status='expired',metadata_json=%s where id=%s",(Json(metadata),attempt['id']))
+        if invoice['status'] not in ('UPCOMING','PAYMENT_PENDING') or _utc(snapshot.get('expiresAt')) <= now:
+            raise ValueError('CHECKOUT_CLOSED')
+        if purpose == 'renewal' and (subscription.get('renewal_opt_out') or not _utc(subscription.get('current_period_end')) or _utc(subscription.get('current_period_end')) <= now):
+            raise ValueError('RENEWAL_NOT_ELIGIBLE')
+        manualBilling['expiresAt']=(_utc(snapshot['expiresAt']) if snapshot.get('billingMode') == 'annual_prepaid'
+            else min(_utc(snapshot['expiresAt']),now+timedelta(seconds=int(os.environ.get('MANUAL_CHECKOUT_TTL_SECONDS','1800'))))).isoformat()
+        if purpose == 'initial_purchase' and subscription.get('billing_mode') in ('monthly_prepaid','annual_prepaid') and _utc(subscription.get('current_period_end')) and _utc(subscription['current_period_end']) > now:
+            raise ValueError('EXISTING_PAID_COVERAGE')
+        if purpose == 'topup' and (not _utc(subscription.get('current_period_end')) or _utc(subscription['current_period_end']) <= now):
+            raise ValueError('TOPUP_NOT_ELIGIBLE')
+        expiredAttemptIds=set()
+        cursor.execute("select id,metadata_json from public.billing_events where user_id=%s and event_category='payment_attempt' and payment_status in ('created','pending_provider_ack','authorized') order by id for update",(userId,))
+        for attempt in cursor.fetchall():
+            metadata=self._json(attempt.get('metadata_json'))
+            billing=metadata.get('manualBilling',{})
+            expires=_utc(billing.get('expiresAt'))
+            if expires and expires <= now:
+                expiredAttemptIds.add(str(attempt['id']))
+                billing.update(closedAt=now.isoformat(),closedReason='CHECKOUT_EXPIRED')
+                cursor.execute("update public.billing_events set payment_status='expired',event_status='expired',metadata_json=%s where id=%s",(Json(metadata),attempt['id']))
 
-                subscriptionId = snapshot.get("subscriptionId")
-                invoiceId = snapshot.get("invoiceId")
-                attemptId = snapshot.get("attemptId") or str(uuid.uuid4())
-                if purpose == 'expert_addition':
-                    domains=list(snapshot.get('domains') or [])
-                    current=subscription.get('subscribed_experts') or []
-                    current=json.loads(current) if isinstance(current,str) else list(current)
-                    pending=subscription.get('pending_additions') or []
-                    pending=json.loads(pending) if isinstance(pending,str) else list(pending)
-                    for item in pending:
-                        if item.get('attemptId') in expiredAttemptIds and item.get('state')=='awaiting_payment':
-                            item.update(state='expired',expiredAt=_now().isoformat())
-                    openDomains={item.get('domain') for item in pending if item.get('state')=='awaiting_payment'}
-                    if not domains or set(domains)&(set(current)|openDomains) or len(set(current)|openDomains|set(domains))>4:
-                        raise ValueError('EXPERT_SELECTION_CONFLICT')
-                    if not _utc(subscription.get('current_period_end')) or _utc(subscription['current_period_end']) <= _now():
-                        raise ValueError('EXPERT_PAID_PERIOD_ENDED')
-                    pending.extend({'domain':domain,'attemptId':attemptId,'state':'awaiting_payment'} for domain in domains)
-                    cursor.execute('update public.subscriptions set pending_additions=%s where id=%s',(Json(pending),subscription['id']))
-                cursor.execute(
-                    """
-                    insert into public.billing_events (
-                        id, user_id, subscription_id, invoice_id,
-                        event_category, event_type, event_status,
-                        payment_attempt_type, payment_status,
-                        provider, amount, currency,
-                        idempotency_key, metadata_json,
-                        period_start, period_end,
-                        attempted_at, occurred_at
-                    )
-                    values (
-                        %s, %s, %s, %s,
-                        'payment_attempt', 'payment.attempt', 'created',
-                        'authenticated_checkout', 'created',
-                        'razorpay', %s, %s,
-                        %s, %s,
-                        %s, %s,
-                        now(), now()
-                    )
-                    """,
-                    (
-                        attemptId,
-                        userId,
-                        subscriptionId,
-                        invoiceId,
-                        snapshot.get("amount"),
-                        snapshot.get("currency", "INR"),
-                        namespaceKey,
-                        Json({"manualBilling": manualBilling}),
-                        snapshot.get("periodStart"),
-                        snapshot.get("periodEnd"),
-                    ),
-                )
-                cursor.execute(
-                    """
-                    select id, user_id, subscription_id, invoice_id,
-                           payment_status, provider_order_id,
-                           metadata_json
-                    from public.billing_events
-                    where id = %s
-                    limit 1
-                    """,
-                    (attemptId,),
-                )
-                row = cursor.fetchone()
-                return self._intentFromAttemptRow(row, {"manualBilling": manualBilling}, userId, purpose)
+        subscriptionId = snapshot.get("subscriptionId")
+        invoiceId = snapshot.get("invoiceId")
+        attemptId = snapshot.get("attemptId") or str(uuid.uuid4())
+        if purpose == 'expert_addition':
+            domains=list(snapshot.get('domains') or [])
+            current=subscription.get('subscribed_experts') or []
+            current=json.loads(current) if isinstance(current,str) else list(current)
+            pending=subscription.get('pending_additions') or []
+            pending=json.loads(pending) if isinstance(pending,str) else list(pending)
+            for item in pending:
+                if item.get('attemptId') in expiredAttemptIds and item.get('state')=='awaiting_payment':
+                    item.update(state='expired',expiredAt=now.isoformat())
+            openDomains={item.get('domain') for item in pending if item.get('state')=='awaiting_payment'}
+            if not domains or set(domains)&(set(current)|openDomains) or len(set(current)|openDomains|set(domains))>4:
+                raise ValueError('EXPERT_SELECTION_CONFLICT')
+            if not _utc(subscription.get('current_period_end')) or _utc(subscription['current_period_end']) <= now:
+                raise ValueError('EXPERT_PAID_PERIOD_ENDED')
+            pending.extend({'domain':domain,'attemptId':attemptId,'state':'awaiting_payment'} for domain in domains)
+            cursor.execute('update public.subscriptions set pending_additions=%s where id=%s',(Json(pending),subscription['id']))
+        cursor.execute(
+            """
+            insert into public.billing_events (
+                id, user_id, subscription_id, invoice_id,
+                event_category, event_type, event_status,
+                payment_attempt_type, payment_status,
+                provider, amount, currency,
+                idempotency_key, metadata_json,
+                period_start, period_end,
+                attempted_at, occurred_at
+            )
+            values (
+                %s, %s, %s, %s,
+                'payment_attempt', 'payment.attempt', 'created',
+                'authenticated_checkout', 'created',
+                'razorpay', %s, %s,
+                %s, %s,
+                %s, %s,
+                now(), now()
+            )
+            """,
+            (
+                attemptId,
+                userId,
+                subscriptionId,
+                invoiceId,
+                snapshot.get("amount"),
+                snapshot.get("currency", "INR"),
+                namespaceKey,
+                Json({"manualBilling": manualBilling}),
+                snapshot.get("periodStart"),
+                snapshot.get("periodEnd"),
+            ),
+        )
+        cursor.execute(
+            """
+            select id, user_id, subscription_id, invoice_id,
+                   payment_status, provider_order_id,
+                   metadata_json
+            from public.billing_events
+            where id = %s
+            limit 1
+            """,
+            (attemptId,),
+        )
+        row = cursor.fetchone()
+        return self._intentFromAttemptRow(row, {"manualBilling": manualBilling}, userId, purpose)
 
-        return self._run(operation)
 
     def _intentFromAttemptRow(
         self, row: dict, metadata: dict, userId: str, purpose: str
@@ -853,7 +1032,10 @@ class ManualBillingRepository:
             current_period_start=%s,current_period_end=%s,renewal_due_at=%s,subscribed_experts=%s,
             domain_count=%s,pending_removals=%s,auto_renew_enabled=false,version=version+1,updated_at=%s where id=%s''',
             (period.start,period.end,period.end,Json(list(period.domains)),len(period.domains),Json([]),now,subscription['id']))
-        subscription.update(current_period_start=period.start,current_period_end=period.end,billing_mode='monthly_prepaid',status='active')
+        subscription.update(current_period_start=period.start,current_period_end=period.end,
+            renewal_due_at=period.end,billing_mode='monthly_prepaid',status='active',plan_type='pro',
+            subscribed_experts=list(period.domains),domain_count=len(period.domains),pending_removals=[],
+            auto_renew_enabled=False,version=int(subscription.get('version') or 0)+1)
         invoice['metadata_json']=metadata
         return self._result(invoice,subscription,'activated',attemptId,refilled=True)
 

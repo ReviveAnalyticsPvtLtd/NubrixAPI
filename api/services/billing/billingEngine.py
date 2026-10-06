@@ -194,7 +194,9 @@ def computeInvoiceSnapshot(billingMode: str, billingReason: str,
                            periodStart: datetime = None,
                            periodEnd: datetime = None,
                            prorationAnchorStart: datetime = None,
-                           prorationAnchorEnd: datetime = None) -> PricingSnapshot:
+                           prorationAnchorEnd: datetime = None,
+                           priceReference: dict = None,
+                           evaluatedAt: datetime = None) -> PricingSnapshot:
     """
     Compute an immutable invoice-ready pricing snapshot.
 
@@ -222,10 +224,10 @@ def computeInvoiceSnapshot(billingMode: str, billingReason: str,
         ValueError: If billing mode/reason combination is unsupported or
             required period arguments are missing.
     """
-    now = datetime.now(timezone.utc)
+    now = evaluatedAt or datetime.now(timezone.utc)
 
     if billingMode in ("monthly_prepaid", "monthly_recurring"):
-        priceRef = _getMonthlyBasePrice()
+        priceRef = priceReference or _getMonthlyBasePrice()
         basePrice = priceRef["amount"]
         planId = os.environ.get("RAZORPAY_PRO_PLAN_ID", "")
         if periodStart is None:
@@ -233,7 +235,7 @@ def computeInvoiceSnapshot(billingMode: str, billingReason: str,
         if periodEnd is None:
             periodEnd = periodStart + relativedelta(months=1)
     elif billingMode == "annual_prepaid":
-        priceRef = _getAnnualBasePrice()
+        priceRef = priceReference or _getAnnualBasePrice()
         basePrice = priceRef["amount"]
         planId = RAZORPAY_ANNUAL_PLAN_ID
         if periodStart is None:

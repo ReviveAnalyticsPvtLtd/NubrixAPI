@@ -10,6 +10,7 @@ __all__ = [
     "CoveragePeriod",
     "CoverageSnapshot",
     "CheckoutIntent",
+    "CheckoutRequest",
     "VerifiedPaymentEvidence",
     "FinalizationResult",
     "RefundQuote",
@@ -49,6 +50,15 @@ class CoverageSnapshot:
     renewalOptOut: bool
     accessAllowed: bool
     denialReason: str | None
+
+
+@dataclass(frozen=True)
+class CheckoutRequest:
+    userId: str
+    purpose: str
+    billingMode: str
+    payload: dict
+    requestKey: str | None = None
 
 
 @dataclass(frozen=True)
