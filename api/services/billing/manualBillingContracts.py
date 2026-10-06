@@ -16,11 +16,22 @@ __all__ = [
     "RefundQuote",
     "RefundIntent",
     "CreditOperationContext",
+    "BillingNotificationRevision",
 ]
 
 
 from dataclasses import dataclass
 from datetime import datetime
+
+
+@dataclass(frozen=True)
+class BillingNotificationRevision:
+    userId: str
+    subscriptionId: str | None
+    notificationType: str
+    dedupeKey: str
+    periodEnd: str
+    metadata: dict
 
 
 @dataclass(frozen=True)

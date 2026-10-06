@@ -18,6 +18,7 @@ def _delivery(deliveryId="11111111-1111-4111-8111-111111111111", **overrides):
         "subscription_id": "22222222-2222-4222-8222-222222222222",
         "period_end": "2026-09-19T01:00:00+00:00",
         "attempt_count": 1,
+        "payload_version": 1,
         "metadata_json": {"trialStartDate": "2026-09-07T01:00:00+00:00"},
     }
     row.update(overrides)
@@ -99,11 +100,14 @@ class FakeRepository:
         self.rows = self.rows[limit:]
         return claimed
 
-    def markAccepted(self, *args):
+    def authorizeBillingSubmission(self, *args):
+        return True
+
+    def markAccepted(self, *args, **kwargs):
         self.accepted.append(args)
         return True
 
-    def scheduleRetry(self, *args):
+    def scheduleRetry(self, *args, **kwargs):
         self.retries.append(args)
         return True
 

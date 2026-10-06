@@ -153,7 +153,7 @@ def test_ambiguousRowsRemainUnavailableForImmediateResend():
     query, params = connection.executed[0]
     assert "next_attempt_at = %s" in query
     assert "next_reconcile_at = %s" in query
-    assert params[1:3] == (
+    assert params[2:4] == (
         "2026-09-17T01:30:00+00:00",
         "2026-09-17T01:05:00+00:00",
     )

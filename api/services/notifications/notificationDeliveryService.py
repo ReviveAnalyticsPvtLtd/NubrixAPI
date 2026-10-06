@@ -148,6 +148,12 @@ class NotificationDeliveryService:
             )
             summary["failed"] += 1
             return
+        if (delivery.get('notification_type') != 'trial_expiry_warning'
+                and delivery.get('last_error_code') == 'AMBIGUOUS_SEND'):
+            self._scheduleRetry(delivery,workerId,'AMBIGUOUS_SEND',
+                now + datetime.timedelta(minutes=30),now + datetime.timedelta(minutes=5))
+            summary['ambiguous'] += 1
+            return
         subscription = self._findOne(
             "subscriptions",
             "id",
@@ -192,6 +198,10 @@ class NotificationDeliveryService:
             return
 
         if billingDelivery:
+            if not self.repository.authorizeBillingSubmission(str(delivery['id']),workerId,delivery['payload_version']):
+                self._cancel(delivery,workerId,'SUBSCRIPTION_NOT_ELIGIBLE',summary)
+                return
+            delivery['submission_started_at'] = now.isoformat()
             payload = {"mode":"send", "deliveryId":str(delivery["id"]),
                 "notificationType":delivery["notification_type"], "templateVersion":delivery["template_version"],
                 "email":email, "name":name, "periodEnd":str(delivery.get("period_end") or ""),
@@ -392,6 +402,7 @@ class NotificationDeliveryService:
                 workerId,
                 str(result.messageId),
                 now.isoformat(),
+                **self._versionArguments(delivery),
             ):
                 raise RuntimeError("DELIVERY_LEASE_LOST")
             summary["accepted"] += 1
@@ -447,6 +458,10 @@ class NotificationDeliveryService:
         summary["retryScheduled"] += 1
         self._audit(delivery, "RETRY_PENDING", result.errorCode)
 
+    @staticmethod
+    def _versionArguments(delivery):
+        return {'payloadVersion':delivery['payload_version']} if delivery.get('notification_type') != 'trial_expiry_warning' else {}
+
     def _scheduleUnexpectedFailure(
         self,
         delivery: dict,
@@ -460,7 +475,7 @@ class NotificationDeliveryService:
                     delivery,
                     workerId,
                     "FAILED",
-                    "INTERNAL_DISPATCH_ERROR",
+                    "AMBIGUOUS_SEND" if delivery.get("submission_started_at") else "INTERNAL_DISPATCH_ERROR",
                 )
                 summary["failed"] += 1
             except Exception:
@@ -476,9 +491,9 @@ class NotificationDeliveryService:
             self._scheduleRetry(
                 delivery,
                 workerId,
-                "INTERNAL_DISPATCH_ERROR",
+                "AMBIGUOUS_SEND" if delivery.get("submission_started_at") else "INTERNAL_DISPATCH_ERROR",
                 nextAttempt,
-                None,
+                self.now() + datetime.timedelta(minutes=5) if delivery.get("submission_started_at") else None,
             )
             summary["retryScheduled"] += 1
         except Exception:
@@ -501,6 +516,7 @@ class NotificationDeliveryService:
             errorCode,
             nextAttemptAt.isoformat(),
             nextReconcileAt.isoformat() if nextReconcileAt else None,
+            **self._versionArguments(delivery),
         )
         if not changed:
             raise RuntimeError("DELIVERY_LEASE_LOST")
@@ -527,6 +543,7 @@ class NotificationDeliveryService:
             status,
             errorCode=errorCode,
             leaseOwner=workerId,
+            **self._versionArguments(delivery),
         )
         if not changed:
             raise RuntimeError("DELIVERY_LEASE_LOST")

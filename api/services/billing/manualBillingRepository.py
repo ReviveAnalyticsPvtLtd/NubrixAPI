@@ -1224,15 +1224,22 @@ class ManualBillingRepository:
             values(%s,%s,%s,'notification','email.billing_intent.committed','COMMITTED',%s,%s,%s)
             on conflict(idempotency_key) do nothing''',
             (str(uuid.uuid4()),subscription['user_id'],subscription['id'],'notification:'+dedupeKey,Json(intent),_now()))
+        cursor.execute('select id,metadata_json from public.billing_events where idempotency_key=%s for update',('notification:'+dedupeKey,))
+        existing = cursor.fetchone()
+        old = self._json(existing['metadata_json'])
+        if {key:value for key,value in old.items() if key != 'payloadVersion'} != intent:
+            intent['payloadVersion'] = int(old.get('payloadVersion',1))+1
+            cursor.execute("update public.billing_events set metadata_json=%s,event_status='COMMITTED' where id=%s",(Json(intent),existing['id']))
 
     def _refreshCancellationFactsLocked(self, cursor, subscription, finalEnd):
-        cursor.execute("select id,metadata_json from public.billing_events where user_id=%s and event_type='email.billing_intent.committed' and event_status='COMMITTED' order by id for update",(subscription['user_id'],))
+        cursor.execute("select id,metadata_json from public.billing_events where user_id=%s and event_type='email.billing_intent.committed' and event_status in ('COMMITTED','BRIDGED') order by id for update",(subscription['user_id'],))
         for row in cursor.fetchall():
             intent = self._json(row['metadata_json'])
             if intent.get('notificationType') == 'monthly_cancellation_confirmation':
                 intent['periodEnd'] = finalEnd.isoformat()
                 intent['metadata'].update(finalPaidEnd=finalEnd.isoformat(), periodEnd=finalEnd.isoformat())
-                cursor.execute('update public.billing_events set metadata_json=%s where id=%s', (Json(intent),row['id']))
+                intent['payloadVersion'] = int(intent.get('payloadVersion',1))+1
+                cursor.execute("update public.billing_events set metadata_json=%s,event_status='COMMITTED' where id=%s", (Json(intent),row['id']))
 
     def bridgeNotificationIntents(self, limit=100):
         def load(connection):
@@ -1258,7 +1265,7 @@ class ManualBillingRepository:
             enqueueBillingIntent(intent)
             def mark(connection):
                 with connection.cursor() as cursor:
-                    cursor.execute("update public.billing_events set event_status='BRIDGED' where id=%s",(row['id'],))
+                    cursor.execute("update public.billing_events set event_status='BRIDGED' where id=%s and metadata_json=%s",(row['id'],Json(intent)))
             self._run(mark)
         return len(rows)
 
