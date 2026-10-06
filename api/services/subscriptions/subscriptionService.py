@@ -1040,11 +1040,10 @@ class SubscriptionService:
             if billingMode == "monthly_prepaid":
                 from api.services.billing.manualBillingRepository import getManualBillingRepository
                 row = getManualBillingRepository().setRenewalOptOut(userId, True, reason, "cancel:"+userId)
-                state = subscriptionBillingState(subscription).get("manualBilling", {})
-                end = max(filter(None, [parseUtc(row.get("current_period_end")), parseUtc(state.get("paidFutureEnd"))]))
-                return {"cancelled": True, "renewalOptOut": True, "effectiveAt": end.isoformat(),
-                        "cancellationReason": row.get("cancellation_reason"), "refundInitiated": False,
-                        "currentPeriod": {"start":subscription.get("current_period_start"),"end":subscription.get("current_period_end")}}
+                return {'cancelled':True,'renewalOptOut':True,'effectiveAt':row['finalPaidEnd'],
+                    'cancellationReason':row.get('cancellation_reason'),'refundInitiated':False,
+                    'currentPeriod':{'start':row.get('current_period_start'),'end':row.get('current_period_end'),
+                        'domains':row.get('subscribed_experts') or []}}
 
             # Annual: existing policy — mandatory reason, status cancelled.
             if not reason or not isinstance(reason, str) or not reason.strip():
@@ -1131,8 +1130,7 @@ class SubscriptionService:
             from api.services.billing.manualBillingRepository import getManualBillingRepository
             repeated = not bool(subscription.get("renewal_opt_out"))
             row = getManualBillingRepository().setRenewalOptOut(userId, False, None, "resume:"+userId)
-            state = subscriptionBillingState(subscription).get("manualBilling", {})
-            end = max(filter(None,[parseUtc(row.get("current_period_end")),parseUtc(state.get("paidFutureEnd"))]))
+            end = parseUtc(row['finalPaidEnd'])
             if not repeated and utcNow() >= parseUtc(row["current_period_end"]) - datetime.timedelta(days=7):
                 self.prepareRenewalInvoice(token)
             return {"renewalOptOut":False,"repeated":repeated,"effectiveAt":end.isoformat(),"creditsRefilled":False}
@@ -1252,15 +1250,9 @@ class SubscriptionService:
             identity = self._resolveCheckoutIdentity(userId, decoded.get('email'))
             if contact is not None:
                 identity['contact'] = self._normalizePhone(contact)
-            return {'userId': userId, 'userEmail': identity['email'], 'userName': identity['name'],
-                'userContact': identity['contact'], 'razorpayKey': os.environ['RAZORPAY_KEY_ID'],
-                'orderId': intent.razorpayOrderId, 'invoiceId': intent.invoiceId, 'attemptId': intent.attemptId,
-                'amount': intent.amount, 'currency': intent.currency, 'billingMode': mode,
-                'expiresAt': intent.expiresAt.isoformat(), 'state': 'payment_pending',
-                'domains': intent.snapshot.get('domains') or [], 'quantity': len(intent.snapshot.get('domains') or []),
-                'tokens': intent.snapshot.get('tokens'), 'packId': intent.snapshot.get('packId'),
-                'period': {'start': intent.snapshot.get('periodStart'), 'end': intent.snapshot.get('periodEnd'),
-                           'estimated': purpose == 'initial_purchase'}}
+            from api.services.billing.manualBillingPresentation import serializeCheckoutIntent
+            return serializeCheckoutIntent(intent,os.environ['RAZORPAY_KEY_ID'],
+                {'userEmail':identity['email'],'userName':identity['name'],'userContact':identity['contact']})
         except CustomException:
             raise
         except ValueError as exc:
@@ -1333,15 +1325,8 @@ class SubscriptionService:
             frozen["purpose"], str(paymentEntity.get("currency") or ""),
             str(paymentEntity.get("status") or "").lower(), "server_observation",
             int(paymentEntity.get("amount") or 0), now or utcNow(), None, None, False))
-        def period(value):
-            if value is None: return None
-            return {"start": value.start.isoformat(), "end": value.end.isoformat(),
-                    "domains": list(value.domains), "creditPeriodId": value.creditPeriodId}
-        return {"verified": True, "finalized": result.finalized, "state": result.state,
-                "alreadyFinalized": result.state == "already_finalized",
-                "creditsRefilled": result.creditsRefilled, "currentPeriod": period(result.currentPeriod),
-                "nextPeriod": period(result.nextPeriod), "anomalyId": result.anomalyId,
-                "invoiceStatus": "PAID" if result.finalized else "PAYMENT_PENDING"}
+        from api.services.billing.manualBillingPresentation import serializeFinalizationResult
+        return serializeFinalizationResult(result)
 
     def prepareRenewalInvoice(self, token: str) -> dict:
         """

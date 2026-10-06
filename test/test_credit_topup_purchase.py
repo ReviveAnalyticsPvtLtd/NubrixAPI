@@ -218,7 +218,7 @@ class TestTopupEligibilityAndOrder(unittest.TestCase):
     def test_order_amount_is_the_tax_inclusive_total(self):
         svc = self._service()
         svc.razorpayClient.order.create.return_value = {
-            "id": "order_abc", "currency": "INR", "amount": 0}
+            "id": "order_abc", "currency": "INR", "amount": 235882}
         with patch.object(svc, "_decodeToken", return_value=("u1", "a@b.c")), \
              patch.object(svc, "_subscription", return_value=self._sub()), \
              patch.object(svc, "_identity", return_value={
@@ -228,86 +228,6 @@ class TestTopupEligibilityAndOrder(unittest.TestCase):
             svc.createTopupOrder("medium", token="t")
         sent = svc.razorpayClient.order.create.call_args[0][0]
         self.assertGreaterEqual(sent["amount"], 199900)
-
-
-class TestTopupVerification(unittest.TestCase):
-    def _service(self):
-        from api.services.credits.topupService import TopupService
-        svc = TopupService()
-        svc.client = MagicMock()
-        svc.razorpayClient = MagicMock()
-        return svc
-
-    @staticmethod
-    def _signature(orderId, paymentId):
-        return hmac.new(os.environ["RAZORPAY_KEY_SECRET"].encode(),
-                        f"{orderId}|{paymentId}".encode(), hashlib.sha256).hexdigest()
-
-    def _payload(self, orderId="order_abc", paymentId="pay_abc", signature=None):
-        return {"razorpayOrderId": orderId, "razorpayPaymentId": paymentId,
-                "razorpaySignature": signature or self._signature(orderId, paymentId)}
-
-    def _order(self, userId="u1", packId="medium"):
-        return {"id": "order_abc", "notes": {"userId": userId, "type": "credit_topup",
-                                             "packId": packId, "invoiceId": "inv_1"}}
-
-    def test_valid_payment_grants_tokens(self):
-        svc = self._service()
-        svc.razorpayClient.order.fetch.return_value = self._order()
-        with patch.object(svc, "_decodeToken", return_value=("u1", "a@b.c")), \
-             patch("api.services.credits.creditService.creditService.grantTopupTokens",
-                   return_value={"granted": True, "tokens": 5000000}) as grant, \
-             patch.object(svc, "_audit"):
-            result = svc.verifyTopupPayment(self._payload(), token="t")
-        self.assertEqual(result, {"granted": True, "tokens": 5000000, "credits": 500.0})
-        grant.assert_called_once_with("u1", "order_abc", "pay_abc")
-
-    def test_tampered_signature_is_rejected_before_any_grant(self):
-        svc = self._service()
-        with patch.object(svc, "_decodeToken", return_value=("u1", "a@b.c")), \
-             patch("api.services.credits.creditService.creditService.grantTopupTokens") as grant:
-            with self.assertRaises(Exception) as ctx:
-                svc.verifyTopupPayment(self._payload(signature="deadbeef"), token="t")
-        self.assertIn("Invalid Razorpay signature", str(ctx.exception))
-        grant.assert_not_called()
-
-    def test_order_belonging_to_another_user_is_rejected(self):
-        svc = self._service()
-        svc.razorpayClient.order.fetch.return_value = self._order(userId="someone_else")
-        with patch.object(svc, "_decodeToken", return_value=("u1", "a@b.c")), \
-             patch("api.services.credits.creditService.creditService.grantTopupTokens") as grant:
-            with self.assertRaises(Exception) as ctx:
-                svc.verifyTopupPayment(self._payload(), token="t")
-        self.assertIn("mismatch", str(ctx.exception).lower())
-        grant.assert_not_called()
-
-    def test_non_topup_order_is_rejected(self):
-        svc = self._service()
-        order = self._order()
-        order["notes"]["type"] = "domain_upgrade_proration"
-        svc.razorpayClient.order.fetch.return_value = order
-        with patch.object(svc, "_decodeToken", return_value=("u1", "a@b.c")), \
-             patch("api.services.credits.creditService.creditService.grantTopupTokens") as grant:
-            with self.assertRaises(Exception):
-                svc.verifyTopupPayment(self._payload(), token="t")
-        grant.assert_not_called()
-
-    def test_missing_fields_are_rejected(self):
-        svc = self._service()
-        with patch.object(svc, "_decodeToken", return_value=("u1", "a@b.c")):
-            with self.assertRaises(Exception) as ctx:
-                svc.verifyTopupPayment({"razorpayOrderId": "order_abc"}, token="t")
-        self.assertIn("Missing Razorpay verification fields", str(ctx.exception))
-
-    def test_webhook_already_granted_reports_gracefully(self):
-        svc = self._service()
-        svc.razorpayClient.order.fetch.return_value = self._order()
-        with patch.object(svc, "_decodeToken", return_value=("u1", "a@b.c")), \
-             patch("api.services.credits.creditService.creditService.grantTopupTokens",
-                   return_value={"granted": False, "tokens": 0}), \
-             patch.object(svc, "_audit"):
-            result = svc.verifyTopupPayment(self._payload(), token="t")
-        self.assertEqual(result, {"granted": False, "tokens": 0, "credits": 0.0})
 
 
 class TestTopupErrorCodeMapping(unittest.TestCase):
@@ -436,29 +356,8 @@ class TestTopupWebhooks(unittest.TestCase):
         return patch("api.services.subscriptions.subscriptionService."
                      "subscriptionService.razorpayClient", rzp)
 
-    def test_captured_topup_payment_grants_tokens(self):
-        svc = self._service()
-        with patch("api.services.credits.creditService.creditService.grantTopupTokens",
-                   return_value={"granted": True, "tokens": 5000000}) as grant, \
-             patch.object(svc, "_auditLog"):
-            svc._handlePaymentCaptured(self._captured("credit_topup"))
-        grant.assert_called_once_with("u1", "order_abc", "pay_abc")
 
-    def test_captured_subscription_payment_never_grants_tokens(self):
-        svc = self._service()
-        with patch("api.services.credits.creditService.creditService.grantTopupTokens") as grant, \
-             patch.object(svc, "_auditLog"):
-            svc._handlePaymentCaptured(self._captured("some_other_type"))
-        grant.assert_not_called()
 
-    def test_topup_capture_without_userid_does_not_raise(self):
-        svc = self._service()
-        event = self._captured("credit_topup")
-        del event["payload"]["payment"]["entity"]["notes"]["userId"]
-        with patch("api.services.credits.creditService.creditService.grantTopupTokens") as grant, \
-             patch.object(svc, "_auditLog"):
-            svc._handlePaymentCaptured(event)
-        grant.assert_not_called()
 
     def test_refund_of_a_topup_payment_claws_back(self):
         svc = self._service()

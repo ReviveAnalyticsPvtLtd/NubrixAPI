@@ -828,7 +828,7 @@ class ManualBillingRepository:
                     str(attempt.get('currency')).upper() != evidence.currency.upper()):
                     raise ValueError('PAYMENT_EVIDENCE_MISMATCH')
                 if evidence.financialStatus != 'captured':
-                    return self._result(invoice, subscription, 'awaiting_capture', evidence.attemptId)
+                    return self._result(cursor,invoice, subscription, 'awaiting_capture', evidence.attemptId)
                 # A payment identity is global; a separate grant identity is per invoice.
                 cursor.execute('select * from public.billing_events where provider_payment_id = %s for update', (evidence.providerPaymentId,))
                 capture = cursor.fetchone()
@@ -836,7 +836,7 @@ class ManualBillingRepository:
                     if str(capture.get('invoice_id')) != evidence.invoiceId or capture['user_id'] != evidence.userId:
                         raise ValueError('PAYMENT_ALREADY_BOUND')
                     state = 'already_finalized' if invoice['status'] == 'PAID' and invoice.get('razorpayPaymentId') == evidence.providerPaymentId else 'requires_reconciliation'
-                    return self._result(invoice, subscription, state, evidence.attemptId, anomalyId=capture['id'] if state == 'requires_reconciliation' else None)
+                    return self._result(cursor,invoice, subscription, state, evidence.attemptId, anomalyId=capture['id'] if state == 'requires_reconciliation' else None)
                 captureId = str(uuid.uuid4())
                 cursor.execute('''insert into public.billing_events
                     (id,user_id,subscription_id,invoice_id,event_category,event_type,event_status,provider,
@@ -898,7 +898,7 @@ class ManualBillingRepository:
                     elif frozen.get('lifecycleId') != self._json(subscription.get('billing_state')).get('manualBilling',{}).get('lifecycleId'): reason = 'STALE_LIFECYCLE'
                 if reason:
                     cursor.execute('update public.billing_events set event_status = %s, failure_reason = %s where id = %s', ('REQUIRES_RECONCILIATION',reason,captureId))
-                    return self._result(invoice,subscription,'requires_reconciliation',evidence.attemptId,anomalyId=captureId)
+                    return self._result(cursor,invoice,subscription,'requires_reconciliation',evidence.attemptId,anomalyId=captureId)
                 if evidence.purpose == 'expert_addition':
                     return self._finalizeExpertCapture(cursor,invoice,subscription,attempt,evidence,captureId,metadata)
                 if evidence.purpose == 'topup':
@@ -967,7 +967,7 @@ class ManualBillingRepository:
 
     def _activateDueCoverageLocked(self, cursor, subscription, now, invoices=None):
         invoices = self._paidInvoicesLocked(cursor, subscription) if invoices is None else invoices
-        result = self._result({}, subscription, 'unchanged', None)
+        result = self._result(cursor,{}, subscription, 'unchanged', None)
         lifecycle = self._json(subscription.get('billing_state')).get('manualBilling', {}).get('lifecycleId')
         if subscription.get('erasure_pending'):
             return result
@@ -982,7 +982,7 @@ class ManualBillingRepository:
         end = _utc(subscription.get('current_period_end'))
         if subscription.get('billing_mode') == 'monthly_prepaid' and end and end <= now:
             if subscription.get('status') == 'expired':
-                return self._result({}, subscription, 'expired', None)
+                return self._result(cursor,{}, subscription, 'expired', None)
             cursor.execute("""update public.subscriptions set status='expired',plan_type='none',
                 subscribed_experts=%s,domain_count=0,pending_removals=%s,pending_additions=%s,
                 updated_at=%s where id=%s""", (Json([]), Json([]), Json([]), now, subscription['id']))
@@ -996,7 +996,7 @@ class ManualBillingRepository:
                      'cycleId': end.isoformat(), 'milestone': 'expired'})
             subscription.update(status='expired', plan_type='none', subscribed_experts=[], domain_count=0,
                                 pending_removals=[], pending_additions=[])
-            return self._result({}, subscription, 'expired', None)
+            return self._result(cursor,{}, subscription, 'expired', None)
         return result
 
     def getCoverageSnapshot(self, userId: str, now: datetime | None = None) -> CoverageSnapshot:
@@ -1104,27 +1104,31 @@ class ManualBillingRepository:
             current_period_start=period.start,current_period_end=period.end,renewal_due_at=period.end,
             subscribed_experts=list(period.domains),domain_count=len(period.domains))
         invoice['metadata_json'] = metadata
-        return self._result(invoice,subscription,'paid_scheduled' if period.start > now else 'activated',attemptId,refilled=True)
+        return self._result(cursor,invoice,subscription,'paid_scheduled' if period.start > now else 'activated',attemptId,refilled=True)
 
-    def _result(self,invoice,subscription,state,attemptId,refilled=False,anomalyId=None):
-        period = self._coverage(invoice)
-        future = state == 'paid_scheduled'
+    def _result(self,cursor,invoice,subscription,state,attemptId,refilled=False,anomalyId=None,now=None):
+        snapshot = self._coverageSnapshotLocked(cursor,subscription,now or _now(),materialize=False)
+        cursor.execute('select credit_period_id from public.credit_balances where user_id=%s',(subscription['user_id'],))
+        balance = cursor.fetchone()
+        ready = balance is not None and bool(balance.get('credit_period_id'))
         return FinalizationResult(str(invoice.get('id') or ''),attemptId,state,
-            'refilled' if refilled else 'unchanged',state in ('activated','paid_scheduled','already_finalized','elapsed','expert_activated','topup_granted'),
-            refilled,bool(subscription.get('renewal_opt_out')),None if future else period,period if future else None,anomalyId)
+            'ready' if ready else 'pending_materialization',
+            state in ('activated','paid_scheduled','already_finalized','elapsed','expert_activated','topup_granted'),
+            refilled,snapshot.renewalOptOut,snapshot.currentPeriod if snapshot.accessAllowed else None,
+            snapshot.nextPeriod,anomalyId)
 
     def _applyCoverage(self,cursor,invoice,subscription,now,attemptId):
         metadata = self._json(invoice.get('metadata_json'))
         billing = metadata['manualBilling']
         period = self._coverage(invoice)
-        if period.start > now: return self._result(invoice,subscription,'paid_scheduled',attemptId)
+        if period.start > now: return self._result(cursor,invoice,subscription,'paid_scheduled',attemptId,now=now)
         if period.end <= now:
             billing['coverageState']='elapsed'
             cursor.execute('update public."Invoices" set metadata_json=%s where id=%s',(Json(metadata),invoice['id']))
             cursor.execute('update public.subscriptions set current_period_start=%s,current_period_end=%s,renewal_due_at=%s where id=%s',
                 (period.start,period.end,period.end,subscription['id']))
             subscription.update(current_period_start=period.start,current_period_end=period.end)
-            return self._result(invoice,subscription,'elapsed',attemptId)
+            return self._result(cursor,invoice,subscription,'elapsed',attemptId,now=now)
         from api.services.credits.creditConfig import getTokenQuotaForPlan
         quota = getTokenQuotaForPlan('pro',len(period.domains))
         cursor.execute('''insert into public.credit_balances (user_id,subscription_id,plan_tier,domain_count,
@@ -1149,7 +1153,7 @@ class ManualBillingRepository:
             subscribed_experts=list(period.domains),domain_count=len(period.domains),pending_removals=[],
             auto_renew_enabled=False,version=int(subscription.get('version') or 0)+1)
         invoice['metadata_json']=metadata
-        return self._result(invoice,subscription,'activated',attemptId,refilled=True)
+        return self._result(cursor,invoice,subscription,'activated',attemptId,refilled=True,now=now)
 
     def _finalizeTopupCapture(self,cursor,invoice,subscription,attempt,evidence,captureId):
         tokens=int(self._json(attempt['metadata_json'])['manualBilling'].get('tokens') or 0)
@@ -1166,7 +1170,7 @@ class ManualBillingRepository:
             (evidence.observedAt,attempt['id']))
         cursor.execute("update public.billing_events set event_status='FINALIZED' where id=%s",(captureId,))
         invoice['status']='PAID'
-        return self._result(invoice,subscription,'topup_granted',evidence.attemptId)
+        return self._result(cursor,invoice,subscription,'topup_granted',evidence.attemptId)
 
     def _finalizeExpertCapture(self,cursor,invoice,subscription,attempt,evidence,captureId,metadata):
         from api.services.credits.creditConfig import getTokenQuotaForPlan
@@ -1176,7 +1180,7 @@ class ManualBillingRepository:
         combined=list(dict.fromkeys(current+added))
         if len(combined)>4 or len(combined)!=len(current)+len(added):
             cursor.execute("update public.billing_events set event_status='REQUIRES_RECONCILIATION',failure_reason='EXPERT_LIMIT_OR_ALREADY_PRESENT' where id=%s",(captureId,))
-            return self._result(invoice,subscription,'requires_reconciliation',evidence.attemptId,anomalyId=captureId)
+            return self._result(cursor,invoice,subscription,'requires_reconciliation',evidence.attemptId,anomalyId=captureId)
         cursor.execute('select * from public.credit_balances where user_id=%s for update',(evidence.userId,))
         credit=cursor.fetchone()
         if not credit or not credit.get('credit_period_id'): raise ValueError('CREDIT_PERIOD_MISSING')
@@ -1205,7 +1209,7 @@ class ManualBillingRepository:
         for unpaid in cursor.fetchall(): self._closeInvoice(cursor,unpaid,'EXPERT_SELECTION_CHANGED')
         self._recordNotification(cursor,subscription,'payment_receipt','receipt:'+evidence.providerPaymentId,
             {'paymentId':evidence.providerPaymentId,'invoiceId':invoice['id'],'amount':evidence.amount,'currency':evidence.currency})
-        return self._result(invoice,subscription,'expert_activated',evidence.attemptId)
+        return self._result(cursor,invoice,subscription,'expert_activated',evidence.attemptId)
 
     def _recordNotification(self, cursor, subscription, notificationType, dedupeKey, metadata):
         intent = {'userId':subscription['user_id'], 'subscriptionId':str(subscription['id']),
@@ -1263,6 +1267,10 @@ class ManualBillingRepository:
         reason: str | None,
         requestKey: str,
     ) -> dict:
+        if reason is not None:
+            if not isinstance(reason,str) or len(reason.strip()) > 1000:
+                raise ValueError('INVALID_CANCELLATION_REASON')
+            reason = reason.strip() or None
         def operation(connection):
             with connection.cursor(cursor_factory=RealDictCursor) as cursor:
                 self._lockUser(cursor, userId)
@@ -1270,7 +1278,9 @@ class ManualBillingRepository:
                 state = self._json(previous.get('billing_state')).get('manualBilling', {})
                 finalEnd = max(filter(None, [_utc(previous.get('current_period_end')), _utc(state.get('paidFutureEnd'))]), default=None)
                 if finalEnd is None or finalEnd <= _now(): raise ValueError('NO_PAID_ACCESS_TO_CANCEL_OR_RESUME')
-                if bool(previous.get('renewal_opt_out')) == optOut: return previous
+                if bool(previous.get('renewal_opt_out')) == optOut:
+                    previous['finalPaidEnd'] = finalEnd.isoformat()
+                    return previous
                 cursor.execute(
                     """
                     update public.subscriptions
@@ -1281,8 +1291,7 @@ class ManualBillingRepository:
                         end,
                         auto_renew_enabled = false, version = version + 1
                     where user_id = %s and is_canonical = true
-                    returning id, user_id, status, renewal_opt_out,
-                              cancellation_reason, current_period_end
+                    returning *
                     """,
                     (optOut, optOut, reason, userId),
                 )
@@ -1305,6 +1314,7 @@ class ManualBillingRepository:
                             cursor.execute("update public.billing_events set payment_status='cancelled',event_status='cancelled',metadata_json=%s where id=%s",(Json(attemptMetadata),attempt['id']))
                     self._recordNotification(cursor,row,'monthly_cancellation_confirmation','cancel:'+str(row['id'])+':'+str(previous.get('version',0)),
                         {'finalPaidEnd':finalEnd.isoformat(),'periodEnd':finalEnd.isoformat(),'holdForRenewalEvidence':True})
+                row['finalPaidEnd'] = finalEnd.isoformat()
                 return dict(row)
 
         return self._run(operation)

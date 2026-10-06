@@ -406,7 +406,13 @@ def test_production_checkout_and_browser_finalizer_use_same_repository(database)
     service.razorpayClient=Mock()
     service.razorpayClient.order.create.side_effect=lambda payload:{**payload,'id':'service-order','status':'created'}
     with patch('api.services.billing.manualBillingRepository.getManualBillingRepository',return_value=repository):
-        order=service._manualCheckoutOrder(invoice,subscription,['banking'],'initial_purchase',NOW+timedelta(minutes=30))
+        intent = repository.reserveCheckoutIntent(USER,'initial_purchase','service-invoice','service',{
+            'subscriptionId':SUB,'invoiceId':'service-invoice','lifecycleId':LIFE,'billingMode':'monthly_prepaid','domains':['banking'],
+            'amount':3000,'currency':'INR','expiresAt':(NOW+timedelta(minutes=30)).isoformat()})
+        repository.claimProviderOrderCreation(intent.attemptId)
+        order=service.razorpayClient.order.create({'amount':3000,'currency':'INR','receipt':intent.attemptId,
+            'notes':{'attemptId':intent.attemptId}})
+        repository.bindProviderOrder(intent.attemptId,order)
         payment={'id':'service-payment','order_id':order['id'],'amount':3000,'currency':'INR','status':'captured'}
         result=service._finalizeManualCheckout('service-invoice',order['id'],'service-payment',payment,now=NOW)
         replay=service._finalizeManualCheckout('service-invoice',order['id'],'service-payment',payment,now=NOW)
@@ -495,9 +501,11 @@ def test_manual_topup_cannot_fall_back_when_provider_notes_are_missing():
         {'metadata_json':{'manualBilling':{'purpose':'topup'}}}]
     repository=Mock()
     repository.attemptForOrder.return_value={'id':'attempt','invoice_id':'invoice','user_id':USER,
-        'metadata_json':{'manualBilling':{'tokens':500}}}
+        'metadata_json':{'manualBilling':{'tokens':500,'purpose':'topup'}}}
     repository._json.side_effect=lambda value:value
-    repository.finalizeCapturedPayment.return_value=SimpleNamespace(state='requires_reconciliation',anomalyId='late-capture')
+    repository.finalizeCapturedPayment.return_value=SimpleNamespace(state='requires_reconciliation',anomalyId='late-capture',
+        invoiceId='invoice',attemptId='attempt',finalized=False,creditState='pending_materialization',
+        creditsRefilled=False,renewalOptOut=False,currentPeriod=None,nextPeriod=None)
     provider=Mock()
     provider.order.fetch.return_value={'id':'topup-order','notes':{}}
     provider.payment.fetch.return_value={'id':'topup-payment','order_id':'topup-order',
