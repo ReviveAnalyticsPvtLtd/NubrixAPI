@@ -312,20 +312,10 @@ class CreditService:
 
     # ---- Redis hash lifecycle -------------------------------------------------
 
-    def _manualBalance(self, userId):
-        row = self._dbRow(userId)
-        if not row:
-            return None
-        subscriptions = self.supabase.table("subscriptions").select("billing_mode").eq("user_id", userId).eq("is_canonical", True).limit(1).execute().data
-        if not subscriptions:
-            raise RuntimeError("CANONICAL_CREDIT_OWNER_MISSING")
-        if subscriptions[0].get("billing_mode") != "monthly_prepaid":
-            return None
-        if not row.get('credit_period_id') or not row.get('lifecycle_id'):
-            raise RuntimeError('MANUAL_CREDIT_IDENTITY_MISSING')
-        from api.services.billing.manualBillingRepository import getManualBillingRepository
-        getManualBillingRepository().activateDueCoverage(userId, datetime.now(timezone.utc))
-        return self._dbRow(userId)
+    def _manualBalance(self,userId):
+        # One PostgreSQL authority for all modes; Redis never owns shared top-ups.
+        from api.services.credits.manualCreditRepository import ManualCreditRepository
+        return ManualCreditRepository().balanceSnapshot(userId)
 
     def _ensureHash(self, userId: str) -> dict | None:
         """
@@ -554,66 +544,13 @@ class CreditService:
             logger.warning(f"Admin trial credit cache refresh failed for {userId}: {e}")
             return "FAILED"
 
-    def initializeCreditBalance(self, userId, planTier, subscriptionId=None,
-                                domainCount=1) -> dict:
-        """
-        Create or reset a user's balance on activation / trial start / renewal.
-
-        The purchased bucket survives: the upsert payload omits topup_tokens so
-        PostgREST leaves the column untouched on conflict, and the Redis mapping
-        reseeds it from the existing row.
-
-        The allowance scales with domainCount for paid tiers; free and none
-        ignore it.
-        """
-        quota = getTokenQuotaForPlan(planTier, domainCount)
-        now = datetime.now(timezone.utc)
-        periodEnd = now + relativedelta(months=1)
-
-        existingRow = self._dbRow(userId)
-        topup = (existingRow or {}).get("topup_tokens", 0) or 0
-
-        payload = {
-            "user_id": userId,
-            "subscription_id": str(subscriptionId) if subscriptionId else None,
-            "plan_tier": planTier,
-            "domain_count": domainCount,
-            "monthly_token_quota": quota,
-            "used_tokens": 0,
-            "remaining_tokens": quota,
-            "period_start": now.isoformat(),
-            "period_end": periodEnd.isoformat(),
-            "last_reset_at": now.isoformat(),
-            "updated_at": now.isoformat(),
-        }
-        result = (
-            self.supabase.table("credit_balances")
-            .upsert(payload, on_conflict="user_id")
-            .execute()
-        )
-        try:
-            r = self._redis()
-            r.hset(self._redisKey(userId), mapping={
-                "trem": quota,
-                "ttop": topup,
-                "tquota": quota,
-                "pend": int(periodEnd.timestamp()),
-                "pnext": int(creditMath.nextPeriodEnd(periodEnd).timestamp()),
-            })
-            logger.info(
-                f"Credit balance initialized — userId={userId}, plan={planTier}, "
-                f"monthlyTokens={quota}, topupTokens={topup}"
-            )
-        except Exception as e:
-            logger.warning(
-                f"Redis credit init failed for {userId}, dropping hash so the "
-                f"next read rebuilds from Supabase: {e}"
-            )
-            try:
-                self._redis().delete(self._redisKey(userId))
-            except Exception:
-                pass
-        return result.data[0] if result.data else payload
+    def initializeCreditBalance(self,userId,planTier,subscriptionId=None,domainCount=1):
+        from api.services.credits.manualCreditRepository import ManualCreditRepository
+        balance=ManualCreditRepository().balanceSnapshot(userId)
+        if balance.get('plan_tier')!=planTier or (subscriptionId and str(balance.get('subscription_id'))!=str(subscriptionId)):
+            raise ValueError('CREDIT_INITIALIZER_MODE_OR_OWNER_MISMATCH')
+        # Reading a committed allocation never resets usage or purchased credits.
+        return balance
 
     def applyDomainCountChange(self, userId: str, domainCount: int,
                                grantImmediately: bool) -> dict:
@@ -897,47 +834,9 @@ class CreditService:
             'tokens': int(frozen['tokens']) if result['finalized'] else 0,
             'disposition': result['state'], 'anomalyId': result['anomalyId']}
 
-    def clawbackTopupTokens(self, userId: str, refundId: str,
-                            paymentId: str, refundAmount: int) -> dict:
-        """
-        Remove purchased tokens in proportion to a refund, exactly once.
-
-        The RPC is guarded twice: the invoice must be billing_reason='add_on',
-        and the billing_events insert must actually happen (idempotency_key is
-        UNIQUE, so a redelivered refund.processed no-ops). A subscription
-        refund matches neither and moves nothing. The Redis hash is dropped
-        rather than decremented, since Supabase is authoritative.
-
-        Args:
-            userId (str): The refunded user.
-            refundId (str): Razorpay refund ID, the idempotency key.
-            paymentId (str): Razorpay payment ID being refunded.
-            refundAmount (int): Refunded amount in paise.
-
-        Returns:
-            dict: {"clawed": bool, "tokens": int}.
-        """
-        res = self.supabase.rpc("clawback_topup_tokens", {
-            "p_refund_id": refundId,
-            "p_payment_id": paymentId,
-            "p_refund_amount": refundAmount,
-        }).execute()
-
-        row = (res.data or [None])[0] or {}
-        if not row.get("clawed"):
-            return {"clawed": False, "tokens": 0}
-
-        tokens = int(row.get("tokens", 0))
-        try:
-            self._redis().delete(self._redisKey(userId))
-        except Exception as e:
-            logger.warning(f"Redis hash drop after clawback failed for {userId}: {e}")
-
-        logger.info(
-            f"Top-up clawed back — userId={userId}, tokens={tokens}, "
-            f"refund={refundId}, amount={refundAmount}"
-        )
-        return {"clawed": True, "tokens": tokens}
+    def clawbackTopupTokens(self,userId,refundId,paymentId,refundAmount):
+        from api.services.credits.manualCreditRepository import ManualCreditRepository
+        return ManualCreditRepository().clawbackTopup(userId,refundId,paymentId,int(refundAmount))
 
     def reconcile(self, userId: str) -> None:
         """

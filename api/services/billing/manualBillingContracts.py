@@ -147,3 +147,6 @@ class CreditOperationContext:
     operationType: str
     accountingReference: str
     admittedAt: datetime
+    subscriptionId: str | None = None
+    billingMode: str | None = None
+    quotaWatermark: int | None = None

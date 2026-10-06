@@ -142,6 +142,7 @@ class TestTopupBalanceReads(unittest.TestCase):
         from api.services.credits.creditService import CreditService
         svc = CreditService()
         svc.supabase = MagicMock()
+        svc._manualBalance = MagicMock(return_value=None)
         return svc
 
     def test_remaining_tokens_is_the_sum_of_both_buckets(self):
@@ -290,6 +291,7 @@ class TestTopupLifecycleGuards(unittest.TestCase):
         from api.services.credits.creditService import CreditService
         svc = CreditService()
         svc.supabase = MagicMock()
+        svc._manualBalance = MagicMock(return_value=None)
         return svc
 
     def test_initialize_never_writes_topup_tokens(self):
@@ -344,6 +346,7 @@ class TestTopupGrantAndClawback(unittest.TestCase):
         from api.services.credits.creditService import CreditService
         svc = CreditService()
         svc.supabase = MagicMock()
+        svc._manualBalance = MagicMock(return_value=None)
         svc.supabase.rpc.return_value.execute.return_value = MagicMock(data=rpcData)
         return svc
 

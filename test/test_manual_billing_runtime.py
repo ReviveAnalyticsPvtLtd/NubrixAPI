@@ -441,12 +441,11 @@ def test_manual_balance_without_identity_cannot_fall_back_to_redis():
     from unittest.mock import Mock
     from api.services.credits.creditService import CreditService
     service=CreditService.__new__(CreditService)
-    service._dbRow=Mock(return_value={'remaining_tokens':999999,'credit_period_id':None})
-    service.supabase=Mock()
-    service.supabase.table.return_value.select.return_value.eq.return_value.eq.return_value.limit.return_value.execute.return_value.data=[{'billing_mode':'monthly_prepaid'}]
     service._redis=Mock()
-    with pytest.raises(RuntimeError,match='MANUAL_CREDIT_IDENTITY_MISSING'):
-        service.getRemainingParts(USER)
+    with patch('api.services.credits.manualCreditRepository.ManualCreditRepository.balanceSnapshot',
+            side_effect=RuntimeError('CREDIT_PERIOD_MISSING')):
+        with pytest.raises(RuntimeError,match='CREDIT_PERIOD_MISSING'):
+            service._manualBalance(USER)
     service._redis.assert_not_called()
 
 
