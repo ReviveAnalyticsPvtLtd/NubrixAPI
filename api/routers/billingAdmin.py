@@ -19,7 +19,8 @@ from api.models import (
 )
 from api.services.billing.billingMetricsService import BillingMetricsService
 from api.services.billing.reconciliationService import ReconciliationService
-from api.services.billing.subscriptionRefundService import SubscriptionRefundService
+from api.services.billing.subscriptionRefundService import SubscriptionRefundService, RefundConflictError
+from api.services.billing.manualBillingContracts import RefundQuoteConflict
 from utils.exceptionHandler import CustomException, raiseHttpException
 from fastapi.responses import ORJSONResponse
 from fastapi import APIRouter, Depends, Header, HTTPException, status
@@ -190,7 +191,7 @@ async def quoteSubscriptionRefund(
 async def initiateSubscriptionRefund(
     payload: SubscriptionRefundInitiateRequest,
     adminUserId=Depends(verifyBillingAdmin),
-    idempotencyKey: str | None = Header(default=None, alias="Idempotency-Key"),
+    idempotencyKey: str | None = Header(default=None, alias="Idempotency-Key", min_length=1, max_length=128),
 ):
     """
     Execute an approved unused-time refund: fresh cutoff recomputation under
@@ -204,9 +205,6 @@ async def initiateSubscriptionRefund(
                 statusCode=422,
                 uiMessage="Idempotency-Key header is required.",
             )
-        paidIntervals = _loadPaidIntervalsForInvoices(
-            payload.userId, payload.invoiceIds
-        )
         service = SubscriptionRefundService.forProduction()
         intent = service.initiateUnusedTimeRefund(
             staffId=adminUserId,
@@ -235,6 +233,15 @@ async def initiateSubscriptionRefund(
                 },
             },
         )
+    except RefundQuoteConflict as conflict:
+        from fastapi.encoders import jsonable_encoder
+        return ORJSONResponse(status_code=409,content={
+            'status':409,'message':'Refund quote changed. Review and approve the refreshed quote.',
+            'errorCode':conflict.code,'quote':jsonable_encoder(conflict.quote)})
+    except (RefundConflictError,ValueError) as error:
+        code = str(error)
+        statusCode = 422 if code == 'REFUND_APPROVAL_REQUIRED' else 404 if code == 'REFUND_QUOTE_MISSING' else 403 if code == 'REFUND_QUOTE_OWNERSHIP_MISMATCH' else 409
+        return ORJSONResponse(status_code=statusCode,content={'status':statusCode,'message':code,'errorCode':code})
     except CustomException as e:
         raiseHttpException(e)
     except Exception as e:

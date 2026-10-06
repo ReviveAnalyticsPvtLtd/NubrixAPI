@@ -1355,7 +1355,15 @@ class ManualBillingRepository:
 
     # -- staff refunds --------------------------------------------------------
 
-    def findRefundReservation(self,userId,requestKey,quoteId,expectedAmount):
+    def findRefundQuote(self, quoteId):
+        def operation(connection):
+            with connection.cursor(cursor_factory=RealDictCursor) as cursor:
+                cursor.execute('select metadata_json from public.billing_events where idempotency_key=%s',('refund-quote:'+quoteId,))
+                row = cursor.fetchone()
+                return self._json(row['metadata_json']) if row else None
+        return self._run(operation)
+
+    def findRefundReservation(self,userId,requestKey,quoteId,expectedAmount,caseReference=None,reason=None):
         def operation(connection):
             with connection.cursor(cursor_factory=RealDictCursor) as cursor:
                 cursor.execute('select metadata_json from public.billing_events where idempotency_key=%s',
@@ -1363,7 +1371,9 @@ class ManualBillingRepository:
                 row=cursor.fetchone()
                 if not row: return None
                 metadata=self._json(row['metadata_json'])
-                if metadata['quoteId'] != quoteId or int(metadata['amount']) != int(expectedAmount):
+                if (metadata['quoteId'] != quoteId or int(metadata['amount']) != int(expectedAmount)
+                        or (caseReference is not None and metadata.get('caseReference') != caseReference)
+                        or (reason is not None and metadata.get('reason') != reason)):
                     raise ValueError('REFUND_IDEMPOTENCY_CONFLICT')
                 return self._refundIntent(metadata)
         return self._run(operation)
@@ -1420,7 +1430,9 @@ class ManualBillingRepository:
         expectedAmount: int,
         requestKey: str,
     ) -> RefundIntent:
-        if not all((quoteId,staffId,caseReference,reason,requestKey)):
+        if (not all((quoteId,staffId,caseReference.strip(),reason.strip(),requestKey.strip()))
+                or len(caseReference.strip()) > 200 or len(reason.strip()) > 2000 or len(requestKey.strip()) > 128
+                or isinstance(expectedAmount,bool) or int(expectedAmount) < 0):
             raise ValueError('REFUND_APPROVAL_REQUIRED')
         def operation(connection):
             with connection.cursor(cursor_factory=RealDictCursor) as cursor:
@@ -1437,11 +1449,12 @@ class ManualBillingRepository:
                 existing=cursor.fetchone()
                 if existing:
                     metadata=self._json(existing['metadata_json'])
-                    if metadata.get('quoteId') != quoteId: raise ValueError('REFUND_IDEMPOTENCY_CONFLICT')
+                    if (metadata.get('quoteId') != quoteId or metadata.get('caseReference') != caseReference
+                            or metadata.get('reason') != reason): raise ValueError('REFUND_IDEMPOTENCY_CONFLICT')
                     if int(metadata['amount']) != int(expectedAmount): raise ValueError('REFUND_IDEMPOTENCY_CONFLICT')
                     return self._refundIntent(metadata)
                 now=_now()
-                if _utc(quote['expiresAt']) <= now: raise ValueError('REFUND_QUOTE_EXPIRED')
+                expired = _utc(quote['expiresAt']) <= now
                 if quote.get('caseReference') != caseReference: raise ValueError('REFUND_CASE_MISMATCH')
                 cursor.execute('''select * from public."Invoices" where "userId"=%s and subscription_id=%s
                     and status='PAID' order by id for update''',(userId,subscription['id']))
@@ -1485,7 +1498,11 @@ class ManualBillingRepository:
                         self._json(row.get('metadata_json')).get('manualBilling',{}).get('coverageState') in ('scheduled','active') and str(row['id']) not in selected]
                     if unpaidSelection: raise ValueError('CURRENT_TERMINATION_REQUIRES_FUTURE_SETTLEMENT')
                 amount=sum(item['amount'] for item in items)
-                if amount != int(expectedAmount): raise ValueError('REFUND_AMOUNT_CHANGED')
+                if expired or amount != int(expectedAmount):
+                    from api.services.billing.manualBillingContracts import RefundQuoteConflict
+                    refreshed = RefundQuote('rq_'+str(uuid.uuid4()),userId,caseReference,items[0]['currency'],
+                        now,now+timedelta(minutes=5),amount,tuple(items),closesCurrent,not closesCurrent)
+                    raise RefundQuoteConflict('REFUND_QUOTE_EXPIRED' if expired else 'REFUND_AMOUNT_CHANGED',refreshed)
                 intentId=str(uuid.uuid4())
                 metadata={'refundIntentId':intentId,'userId':userId,'quoteId':quoteId,'staffId':staffId,
                     'caseReference':caseReference,'reason':reason,'cutoff':now.isoformat(),'amount':amount,

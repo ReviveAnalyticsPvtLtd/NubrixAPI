@@ -105,18 +105,8 @@ class _ProductionRefundStore:
             tuple(quote["items"]),quote["accessExpired"],quote["currentAccessPreserved"]),quote["reason"])
 
     def findQuote(self, quoteId):
-        rows = (
-            self.client.table("billing_events")
-            .select("id, metadata_json")
-            .eq("idempotency_key", f"refund-quote:{quoteId}")
-            .limit(1)
-            .execute()
-            .data
-        )
-        if not rows:
-            return None
-        metadata = rows[0].get("metadata_json") or {}
-        return dict(metadata) if isinstance(metadata, dict) else {}
+        from api.services.billing.manualBillingRepository import getManualBillingRepository
+        return getManualBillingRepository().findRefundQuote(quoteId)
 
     def findClosingIntentForInterval(self, userId, invoiceId, intervalStart):
         rows = (
@@ -326,11 +316,12 @@ class SubscriptionRefundService:
         from api.services.billing.manualBillingRepository import getManualBillingRepository
         repository = getManualBillingRepository()
         quote = self.store.findQuote(payload.get("quoteId"))
-        if not quote or quote.get("userId") != payload.get("userId"):
+        if not quote: raise RefundConflictError("REFUND_QUOTE_MISSING")
+        if quote.get("userId") != payload.get("userId"):
             raise RefundConflictError("REFUND_QUOTE_OWNERSHIP_MISMATCH")
         if set(payload.get("invoiceIds") or []) != {item["invoiceId"] for item in quote["items"]}:
             raise RefundConflictError("REFUND_QUOTE_SELECTION_MISMATCH")
-        replay=repository.findRefundReservation(payload['userId'],requestKey,payload['quoteId'],int(payload['expectedTotalAmount']))
+        replay=repository.findRefundReservation(payload['userId'],requestKey,payload['quoteId'],int(payload['expectedTotalAmount']),payload['caseReference'],payload['reason'])
         if replay is not None:
             return replay
         # Provider reads occur before acquiring database locks. An external
@@ -338,8 +329,15 @@ class SubscriptionRefundService:
         # the approved amount or closing access against already-returned money.
         for item in quote['items']:
             self.provider.verifyUnreturnedCapture(item)
-        intent = repository.reserveUnusedTimeRefund(payload["quoteId"],staffId,
-            payload["caseReference"],payload["reason"],int(payload["expectedTotalAmount"]),requestKey)
+        from api.services.billing.manualBillingContracts import RefundQuoteConflict
+        try:
+            intent = repository.reserveUnusedTimeRefund(payload["quoteId"],staffId,
+                payload["caseReference"],payload["reason"],int(payload["expectedTotalAmount"]),requestKey)
+        except RefundQuoteConflict as conflict:
+            # Reservation rolled back completely. A separate safe quote write
+            # retains the refreshed approval without reserving money or access.
+            repository.saveRefundQuote(staffId,conflict.quote,payload['reason'])
+            raise
         state = intent.refundState
         for item in intent.items:
             if not repository.claimRefundSubmission(intent.refundIntentId,item["paymentId"]):

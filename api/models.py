@@ -210,18 +210,14 @@ class PrepareRenewalInvoiceRequest(BaseModel):
     pass
 
 class SubscriptionRefundQuoteRequest(BaseModel):
-    userId: str
-    invoiceIds: list[str]
-    caseReference: str
-    reason: str
+    userId: str = Field(min_length=1)
+    invoiceIds: list[str] = Field(min_length=1)
+    caseReference: str = Field(min_length=1, max_length=200)
+    reason: str = Field(min_length=1, max_length=2000)
 
-class SubscriptionRefundInitiateRequest(BaseModel):
-    userId: str
-    invoiceIds: list[str]
-    caseReference: str
-    reason: str
-    quoteId: str
-    expectedTotalAmount: int
+class SubscriptionRefundInitiateRequest(SubscriptionRefundQuoteRequest):
+    quoteId: str = Field(min_length=1)
+    expectedTotalAmount: int = Field(ge=0)
 
 class CreateRenewalSessionRequest(BaseModel):
     invoiceId: str

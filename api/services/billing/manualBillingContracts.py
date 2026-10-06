@@ -17,6 +17,7 @@ __all__ = [
     "RefundIntent",
     "CreditOperationContext",
     "BillingNotificationRevision",
+    "RefundQuoteConflict",
 ]
 
 
@@ -32,6 +33,14 @@ class BillingNotificationRevision:
     dedupeKey: str
     periodEnd: str
     metadata: dict
+
+
+class RefundQuoteConflict(ValueError):
+    """Rejected approval; refreshed quote requires explicit staff reapproval."""
+    def __init__(self, code, quote):
+        super().__init__(code)
+        self.code = code
+        self.quote = quote
 
 
 @dataclass(frozen=True)
