@@ -54,6 +54,10 @@ class ManualBillingRecoveryService:
                 None,None,False)
             result = self.repository.finalizeCapturedPayment(evidence)
             resolved += int(result.state != 'awaiting_capture')
+        if frozen.get('closedAt'):
+            # A successful complete provider listing settles cancellation wording;
+            # a later capture is still audited against the original cutoff.
+            self.repository.markClosedAttemptReconciled(str(attempt['id']))
         return resolved
 
     def recoverRefund(self, intent):

@@ -121,6 +121,24 @@ class ManualBillingRepository:
                     (Json({'lastRecoveryAt':_now().isoformat()}),eventId))
         return self._run(operation)
 
+    def markClosedAttemptReconciled(self, attemptId):
+        def operation(connection):
+            with connection.cursor(cursor_factory=RealDictCursor) as cursor:
+                cursor.execute('select user_id from public.billing_events where id=%s',(attemptId,))
+                owner = cursor.fetchone()
+                if not owner:
+                    raise ValueError('ATTEMPT_MISSING')
+                self._lockUser(cursor,owner['user_id'])
+                if owner['user_id'] is not None:
+                    self._canonical(cursor,owner['user_id'])
+                cursor.execute('select metadata_json from public.billing_events where id=%s for update',(attemptId,))
+                row = cursor.fetchone()
+                metadata = self._json(row['metadata_json'])
+                if metadata.get('manualBilling',{}).get('closedAt'):
+                    metadata['manualBilling']['closureReconciledAt'] = _now().isoformat()
+                    cursor.execute('update public.billing_events set metadata_json=%s where id=%s',(Json(metadata),attemptId))
+        return self._run(operation)
+
     def ensureCanonicalSubscription(self, userId: str) -> dict:
         def operation(connection):
             with connection.cursor(cursor_factory=RealDictCursor) as cursor:
@@ -794,6 +812,7 @@ class ManualBillingRepository:
                     if erasedAttempt and erasedAttempt['user_id'] is None:
                         return self._recordErasedCapture(cursor,erasedAttempt,evidence)
                 subscription = self._canonical(cursor, evidence.userId)
+                existingCoverage = self._paidInvoicesLocked(cursor, subscription) if evidence.purpose == 'initial_purchase' else []
                 cursor.execute('select * from public."Invoices" where id = %s for update', (evidence.invoiceId,))
                 invoice = cursor.fetchone()
                 cursor.execute('select * from public.billing_events where id = %s for update', (evidence.attemptId,))
@@ -842,12 +861,32 @@ class ManualBillingRepository:
                     reason='INVALID_FROZEN_EXPERT_SELECTION'
                 metadata = self._json(invoice.get('metadata_json'))
                 billing = metadata.setdefault('manualBilling', {})
+                closed = self._json(attempt.get('metadata_json')).get('manualBilling', {})
+                closedAt = _utc(closed.get('closedAt') or billing.get('closedAt'))
+                closedReason = closed.get('closedReason') or billing.get('closedReason')
+                if (reason in ('CLOSED_INVOICE', 'CLOSED_ATTEMPT') and evidence.purpose == 'renewal'
+                        and frozen.get('billingMode') == 'monthly_prepaid'
+                        and closedReason == 'RENEWAL_DECLINED' and closedAt
+                        and evidence.timingVerified and evidence.provenCaptureAt
+                        and evidence.provenCaptureAt < closedAt and cutoff and evidence.provenCaptureAt < cutoff
+                        and not subscription.get('erasure_pending') and not billing.get('revokedAt')):
+                    reason = None
                 if evidence.purpose == 'renewal':
                     lifecycle = self._json(subscription.get('billing_state')).get('manualBilling', {}).get('lifecycleId')
                     if frozen.get('lifecycleId') != lifecycle: reason = 'STALE_LIFECYCLE'
                     if _utc(invoice.get('period_start')) != _utc(subscription.get('current_period_end')): reason = 'STALE_CYCLE'
                 elif evidence.purpose == 'initial_purchase' and subscription.get('billing_mode') in ('monthly_prepaid','annual_prepaid') and (_utc(subscription.get('current_period_end')) or captureAt) > captureAt:
                     reason = 'EXISTING_PAID_COVERAGE'
+                if evidence.purpose == 'initial_purchase':
+                    from dateutil.relativedelta import relativedelta
+                    newEnd = captureAt + (relativedelta(years=1) if frozen['billingMode'] == 'annual_prepaid' else relativedelta(months=1))
+                    for paid in existingCoverage:
+                        paidBilling = self._json(paid.get('metadata_json')).get('manualBilling', {})
+                        paidStart, paidEnd = _utc(paid.get('period_start')), _utc(paid.get('period_end'))
+                        if (paidBilling.get('purpose') in ('initial_purchase','renewal')
+                                and not paidBilling.get('revokedAt') and paidStart and paidEnd
+                                and paidStart < newEnd and captureAt < paidEnd):
+                            reason = 'EXISTING_PAID_COVERAGE'
                 if evidence.purpose == 'expert_addition':
                     pending = subscription.get('pending_additions') or []
                     pending = json.loads(pending) if isinstance(pending,str) else list(pending)
@@ -886,6 +925,8 @@ class ManualBillingRepository:
                 subscription['billing_state'] = state
                 if frozen['billingMode'] == 'annual_prepaid':
                     return self._applyAnnualPayment(cursor, invoice, subscription, evidence.observedAt, evidence.attemptId)
+                if subscription.get('renewal_opt_out'):
+                    self._refreshCancellationFactsLocked(cursor, subscription, end)
                 return self._applyCoverage(cursor,invoice,subscription,evidence.observedAt,evidence.attemptId)
         return self._run(operation)
 
@@ -1176,6 +1217,15 @@ class ManualBillingRepository:
             on conflict(idempotency_key) do nothing''',
             (str(uuid.uuid4()),subscription['user_id'],subscription['id'],'notification:'+dedupeKey,Json(intent),_now()))
 
+    def _refreshCancellationFactsLocked(self, cursor, subscription, finalEnd):
+        cursor.execute("select id,metadata_json from public.billing_events where user_id=%s and event_type='email.billing_intent.committed' and event_status='COMMITTED' order by id for update",(subscription['user_id'],))
+        for row in cursor.fetchall():
+            intent = self._json(row['metadata_json'])
+            if intent.get('notificationType') == 'monthly_cancellation_confirmation':
+                intent['periodEnd'] = finalEnd.isoformat()
+                intent['metadata'].update(finalPaidEnd=finalEnd.isoformat(), periodEnd=finalEnd.isoformat())
+                cursor.execute('update public.billing_events set metadata_json=%s where id=%s', (Json(intent),row['id']))
+
     def bridgeNotificationIntents(self, limit=100):
         def load(connection):
             with connection.cursor(cursor_factory=RealDictCursor) as cursor:
@@ -1184,7 +1234,20 @@ class ManualBillingRepository:
         rows = self._run(load)
         from api.services.notifications.billingNotificationService import enqueueBillingIntent
         for row in rows:
-            enqueueBillingIntent(self._json(row['metadata_json']))
+            intent = self._json(row['metadata_json'])
+            if intent.get('metadata',{}).get('holdForRenewalEvidence'):
+                def unresolved(connection):
+                    with connection.cursor(cursor_factory=RealDictCursor) as cursor:
+                        cursor.execute("select payment_status,metadata_json from public.billing_events where user_id=%s and event_category='payment_attempt'",(intent['userId'],))
+                        for attempt in cursor.fetchall():
+                            frozen = self._json(attempt['metadata_json']).get('manualBilling',{})
+                            if (frozen.get('closedReason') == 'RENEWAL_DECLINED' and attempt['payment_status'] != 'captured'
+                                    and not frozen.get('closureReconciledAt')):
+                                return True
+                        return False
+                if self._run(unresolved):
+                    continue
+            enqueueBillingIntent(intent)
             def mark(connection):
                 with connection.cursor() as cursor:
                     cursor.execute("update public.billing_events set event_status='BRIDGED' where id=%s",(row['id'],))
@@ -1230,13 +1293,18 @@ class ManualBillingRepository:
                     )
                 if optOut:
                     cursor.execute('''select id,metadata_json from public."Invoices" where "userId"=%s
-                        and subscription_id=%s and billing_reason='renewal' and status in ('UPCOMING','PAYMENT_PENDING') for update''',(userId,row['id']))
+                        and subscription_id=%s and billing_reason='renewal' and status in ('UPCOMING','PAYMENT_PENDING') order by id for update''',(userId,row['id']))
                     for invoice in cursor.fetchall():
                         metadata = self._json(invoice.get('metadata_json'))
                         metadata.setdefault('manualBilling',{}).update(closedAt=_now().isoformat(),closedReason='RENEWAL_DECLINED')
                         cursor.execute('update public."Invoices" set status=\'VOID\',metadata_json=%s where id=%s',(Json(metadata),invoice['id']))
-                        cursor.execute("update public.billing_events set payment_status='cancelled',event_status='cancelled' where invoice_id=%s and event_category='payment_attempt' and payment_status in ('created','pending_provider_ack','authorized')",(invoice['id'],))
-                    self._recordNotification(cursor,row,'monthly_cancellation_confirmation','cancel:'+str(row['id'])+':'+str(previous.get('version',0)),{'reason':reason})
+                        cursor.execute("select id,metadata_json from public.billing_events where invoice_id=%s and event_category='payment_attempt' and payment_status in ('created','pending_provider_ack','authorized') order by id for update",(invoice['id'],))
+                        for attempt in cursor.fetchall():
+                            attemptMetadata = self._json(attempt['metadata_json'])
+                            attemptMetadata.setdefault('manualBilling',{}).update(closedAt=_now().isoformat(),closedReason='RENEWAL_DECLINED')
+                            cursor.execute("update public.billing_events set payment_status='cancelled',event_status='cancelled',metadata_json=%s where id=%s",(Json(attemptMetadata),attempt['id']))
+                    self._recordNotification(cursor,row,'monthly_cancellation_confirmation','cancel:'+str(row['id'])+':'+str(previous.get('version',0)),
+                        {'finalPaidEnd':finalEnd.isoformat(),'periodEnd':finalEnd.isoformat(),'holdForRenewalEvidence':True})
                 return dict(row)
 
         return self._run(operation)

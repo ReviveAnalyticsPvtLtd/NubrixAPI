@@ -5,6 +5,36 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 import pytest
+from dataclasses import replace
+from datetime import timedelta
+from unittest.mock import patch
+from test.test_manual_billing_runtime import database, NOW, USER, read_row
+from test.test_manual_checkout_http import checkout_database
+from test.test_manual_payment_entrypoints import paid_then_request, evidence
+
+
+def test_proven_capture_before_optout_preserves_future_coverage(checkout_database):
+    repository, path = checkout_database
+    service, checkout = paid_then_request(checkout_database, 'monthly_prepaid', 'renewal')
+    intent = service.createCheckout(checkout)
+    with patch('api.services.billing.manualBillingRepository._now', return_value=NOW + timedelta(minutes=1)):
+        repository.setRenewalOptOut(USER, True, 'finished', 'cancel')
+    result = repository.finalizeCapturedPayment(replace(evidence(intent), observedAt=NOW+timedelta(minutes=2)))
+    assert result.finalized
+    assert result.nextPeriod.start.isoformat() == intent.snapshot['periodStart']
+    assert result.renewalOptOut and not result.creditsRefilled
+
+
+@pytest.mark.parametrize('offset,verified', [(60,True), (61,True), (0,False)])
+def test_optout_at_or_after_cutoff_and_unproven_capture_is_audited(checkout_database, offset, verified):
+    repository, path = checkout_database
+    service, checkout = paid_then_request(checkout_database, 'monthly_prepaid', 'renewal')
+    intent = service.createCheckout(checkout)
+    with patch('api.services.billing.manualBillingRepository._now', return_value=NOW+timedelta(seconds=60)):
+        repository.setRenewalOptOut(USER, True, None, 'cancel')
+    result = repository.finalizeCapturedPayment(replace(evidence(intent), provenCaptureAt=NOW+timedelta(seconds=offset),
+        timingVerified=verified, observedAt=NOW+timedelta(minutes=2)))
+    assert result.state == 'requires_reconciliation' and result.anomalyId
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
