@@ -751,8 +751,8 @@ class CreditService:
         roll in Python. That fallback includes the purchased balance, so a Redis
         outage cannot lock out the users who paid not to be locked out.
 
-        `monthly` is -1 when the balance is unreadable (Redis and Supabase both
-        unavailable), which callers treat as "allow".
+        `monthly` is -1 when the balance is unreadable. Protected work treats
+        that state as a retryable failure and cannot use the cache to authorize it.
         """
         manual = self._manualBalance(userId)
         if manual is not None:
@@ -795,10 +795,14 @@ class CreditService:
         """
         Total spendable tokens: monthly remainder plus purchased balance.
 
-        Returns -1 when the balance is unreadable, which requireCredits treats
-        as "allow" rather than blocking users on an infrastructure fault.
+        Returns -1 when the authoritative balance is unreadable, which
+        requireCredits translates to a retryable HTTP 503.
         """
-        parts = self.getRemainingParts(userId)
+        try:
+            parts = self.getRemainingParts(userId)
+        except Exception:
+            logger.warning('Authoritative credit balance unavailable')
+            return -1
         if parts["monthly"] == -1:
             return -1
         return parts["monthly"] + parts["topup"]

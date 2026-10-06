@@ -63,3 +63,34 @@ def test_credit_ready_cannot_use_another_mode_allocation(checkout_database):
         db.execute("UPDATE credit_balances SET plan_tier='annual',lifecycle_id='other-life'")
     result=manual.finalizeCapturedPayment(evidence(intent))
     assert result.creditState=='pending_materialization'
+
+
+def test_actual_staff_bulk_reset_updates_durable_balance(checkout_database,monkeypatch):
+    repo,path=checkout_database
+    paid_then_request(checkout_database,'monthly_prepaid','topup')
+    with sqlTransaction(path) as db:
+        db.execute('UPDATE credit_balances SET used_tokens=100,remaining_tokens=remaining_tokens-100,topup_tokens=123')
+    before=read_row(path,'credit_balances')
+    monkeypatch.setattr('api.services.billing.manualBillingRepository.getManualBillingRepository',lambda:repo)
+    from api.services.credits.creditService import CreditService
+    from test.test_manual_auth_coverage import SqlRestClient
+    service=CreditService()
+    service.supabase=SqlRestClient(path)
+    service._redis=lambda: (_ for _ in ()).throw(RuntimeError('test cache unavailable'))
+    with patch('api.services.credits.manualCreditRepository.datetime',wraps=datetime) as clock:
+        clock.now.return_value=NOW
+        result=service.forceResetAllQuotas(resetUsage=True)
+    after=read_row(path,'credit_balances')
+    assert result['updatedCount']==1
+    assert after['credit_period_id']!=before['credit_period_id'] and after['used_tokens']==0
+    assert after['topup_tokens']==123
+
+
+def test_durable_credit_database_failure_is_unreadable_never_cache_fallback(monkeypatch):
+    from api.services.credits.creditService import CreditService
+    class BrokenRepository:
+        def activateDueCoverage(self,*args): raise RuntimeError('test database unavailable')
+    monkeypatch.setattr('api.services.billing.manualBillingRepository.getManualBillingRepository',lambda:BrokenRepository())
+    service=CreditService()
+    service._redis=lambda:pytest.fail('Redis cannot authorize a SQL failure')
+    assert service.getRemainingTokens(USER)==-1
