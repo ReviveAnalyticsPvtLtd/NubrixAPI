@@ -148,9 +148,18 @@ def main(argv: list[str] | None = None) -> int:
     try:
         connection.set_session(readonly=True, autocommit=True)
         with connection.cursor(cursor_factory=RealDictCursor) as cursor:
+            cursor.execute("""select column_name from information_schema.columns
+                where table_schema='public' and table_name='subscriptions'""")
+            subscriptionColumns={row['column_name'] for row in cursor.fetchall()}
             for name, query in queries.items():
+                if name=='token_mandate_remnants' and 'razorpay_token_id' not in subscriptionColumns:
+                    report[name]={'localTokenColumnAbsent':True,'providerRetirementVerified':False}
+                    continue
                 cursor.execute(query)
                 rows = [dict(row) for row in cursor.fetchall()]
+                for row in rows:
+                    for key in ('user_id','userId','email','phoneNumber'):
+                        if key in row: row[key]=redactValue(row[key])
                 report[name] = rows
     finally:
         connection.close()

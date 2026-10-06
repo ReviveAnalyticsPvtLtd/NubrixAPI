@@ -57,6 +57,7 @@ CREATE TABLE public.credit_balances (
  plan_tier text default 'none',domain_count integer default 0,monthly_token_quota bigint default 0,
  used_tokens bigint default 0,remaining_tokens bigint default 0,topup_tokens bigint default 0,
  period_start timestamptz,period_end timestamptz,last_reset_at timestamptz,updated_at timestamptz default now());
+CREATE TABLE public."WebhookEvents" (id uuid primary key default gen_random_uuid(),status text);
 '''
 
 @pytest.fixture(scope="module")
@@ -166,6 +167,26 @@ def test_failure_before_commit_rolls_back_paid_invoice_and_quota(payment):
             assert cursor.fetchone()[0]==0
     finally: connection.close()
     assert repository.finalizeCapturedPayment(evidence).creditsRefilled
+
+@pytest.mark.parametrize('blocker',['token','recurring_mode','credit_identity'])
+def test_contract_refuses_unretired_or_unmapped_state(postgres,blocker):
+    connection=psycopg2.connect(postgres)
+    try:
+        with connection.cursor() as cursor:
+            user='contract-blocker-'+str(uuid.uuid4())
+            cursor.execute('insert into public."Users"("userId") values(%s)',(user,))
+            cursor.execute('''insert into public.subscriptions(user_id,is_canonical,billing_mode,status,current_period_start,current_period_end,razorpay_token_id)
+                values(%s,true,%s,'active',now(),now()+interval '1 month',%s)''',
+                (user,'monthly_recurring' if blocker=='recurring_mode' else 'monthly_prepaid' if blocker=='credit_identity' else 'none',
+                 'test-only-mandate' if blocker=='token' else None))
+            with pytest.raises(psycopg2.Error,match='CONTRACT_PRECONDITION_FAILED'):
+                cursor.execute((ROOT/'supabase/migrations/20261005195626_contract_recurring_billing_fields.sql').read_text())
+        connection.rollback()
+        with connection.cursor() as cursor:
+            cursor.execute("select count(*) from information_schema.columns where table_schema='public' and table_name='subscriptions' and column_name='razorpay_token_id'")
+            assert cursor.fetchone()[0]==1
+    finally: connection.rollback(); connection.close()
+
 
 def test_contract_migration_executes_after_retirement_preconditions(postgres):
     connection=psycopg2.connect(postgres)
@@ -450,3 +471,178 @@ def test_expired_dispatch_lease_cannot_start_provider_submission(payment):
         with connection.cursor() as cursor:
             cursor.execute("update public.notification_deliveries set status='SENDING',lease_owner='old-worker',claimed_payload_version=payload_version,lease_expires_at=now()-interval '1 second' where id=%s",(row['id'],))
     assert not deliveries.authorizeBillingSubmission(str(row['id']),'old-worker',1)
+
+
+def _pendingRenewal(payment):
+    from dateutil.relativedelta import relativedelta
+    repository,evidence,url=payment
+    period=repository.finalizeCapturedPayment(evidence).currentPeriod
+    invoice=str(uuid.uuid4())
+    with psycopg2.connect(url) as connection:
+        with connection.cursor() as cursor:
+            cursor.execute('''insert into public."Invoices"(id,"userId",subscription_id,status,billing_reason,total_amount,currency,period_start,period_end,metadata_json)
+                values(%s,%s,%s,'PAYMENT_PENDING','renewal',3000,'INR',%s,%s,%s)''',
+                (invoice,evidence.userId,period.subscriptionId,period.end,period.end+relativedelta(months=1),
+                 Json({'manualBilling':{'lifecycleId':period.lifecycleId,'billingMode':'monthly_prepaid'}})))
+    attempt=repository.reserveCheckoutIntent(evidence.userId,'renewal',invoice,invoice,{
+        'subscriptionId':period.subscriptionId,'invoiceId':invoice,'lifecycleId':period.lifecycleId,
+        'billingMode':'monthly_prepaid','amount':3000,'currency':'INR','domains':['banking'],
+        'expiresAt':(NOW+timedelta(minutes=30)).isoformat()})
+    order='order-'+str(uuid.uuid4())
+    repository.bindProviderOrder(attempt.attemptId,{'id':order})
+    capture=VerifiedPaymentEvidence(attempt.attemptId,invoice,evidence.userId,order,'pay-'+str(uuid.uuid4()),
+        'renewal','INR','captured','attested_capture',3000,NOW+timedelta(minutes=2),NOW+timedelta(minutes=1),None,True)
+    return period,capture
+
+
+def test_optout_races_proven_earlier_capture_and_preserves_both_paid_months(payment):
+    repository,evidence,url=payment
+    period,capture=_pendingRenewal(payment)
+    with patch('api.services.billing.manualBillingRepository._now',return_value=NOW+timedelta(minutes=2)):
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            paid=pool.submit(repository.finalizeCapturedPayment,capture)
+            cancelled=pool.submit(repository.setRenewalOptOut,evidence.userId,True,'Finished project','race-optout')
+            assert paid.result().state=='paid_scheduled'
+            cancelled.result()
+    snapshot=repository.getCoverageSnapshot(evidence.userId,NOW+timedelta(minutes=3))
+    assert snapshot.currentPeriod.end==period.end and snapshot.nextPeriod.start==period.end
+    assert snapshot.finalPaidEnd==snapshot.nextPeriod.end
+    with psycopg2.connect(url) as connection:
+        with connection.cursor() as cursor:
+            cursor.execute('select renewal_opt_out from public.subscriptions where user_id=%s',(evidence.userId,))
+            assert cursor.fetchone()[0]
+
+
+def test_refund_races_future_capture_without_reopening_closed_coverage(payment):
+    repository,evidence,url=payment
+    period,capture=_pendingRenewal(payment)
+    cutoff=NOW+timedelta(days=10)
+    amount=3000*((period.end-cutoff)//timedelta(microseconds=1))//((period.end-period.start)//timedelta(microseconds=1))
+    quote=RefundQuote('quote-'+str(uuid.uuid4()),evidence.userId,'email-case','INR',cutoff,
+        cutoff+timedelta(minutes=5),amount,({'invoiceId':evidence.invoiceId},),True,False)
+    repository.saveRefundQuote('staff',quote,'Unused service')
+    from dataclasses import replace
+    capture=replace(capture,observedAt=cutoff)
+    def reserve():
+        try: return repository.reserveUnusedTimeRefund(quote.quoteId,'staff','email-case','Unused service',amount,'refund-capture-race')
+        except ValueError as error:
+            assert str(error)=='CURRENT_TERMINATION_REQUIRES_FUTURE_SETTLEMENT'
+            return None
+    with patch('api.services.billing.manualBillingRepository._now',return_value=cutoff):
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            refund=pool.submit(reserve); paid=pool.submit(repository.finalizeCapturedPayment,capture)
+            reserved=refund.result(); result=paid.result()
+    snapshot=repository.getCoverageSnapshot(evidence.userId,cutoff)
+    if reserved:
+        assert not snapshot.accessAllowed and snapshot.nextPeriod is None
+        assert result.state=='requires_reconciliation'
+    else:
+        assert snapshot.accessAllowed and snapshot.nextPeriod is not None
+        assert result.state=='paid_scheduled'
+
+
+def test_settlement_races_staff_reset_without_debiting_the_new_allocation(payment):
+    from api.services.credits.manualCreditRepository import ManualCreditRepository
+    repository,evidence,url=payment
+    repository.finalizeCapturedPayment(evidence)
+    credits=ManualCreditRepository(repository)
+    context=credits.admit(evidence.userId,'reporting_query','reset-race')
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        old=pool.submit(credits.settle,context,100,'old-run')
+        reset=pool.submit(credits.resizeQuota,evidence.userId,1,False,True)
+        old.result(); assert reset.result()['applied']
+    balance=credits.balanceSnapshot(evidence.userId)
+    assert balance['credit_period_id']!=context.creditPeriodId
+    assert balance['used_tokens']==0 and balance['remaining_tokens']==balance['monthly_token_quota']
+
+
+def test_topup_clawback_races_usage_without_losing_the_unfunded_obligation(payment):
+    from api.services.credits.manualCreditRepository import ManualCreditRepository
+    repository,evidence,url=payment
+    period=repository.finalizeCapturedPayment(evidence).currentPeriod
+    credits=ManualCreditRepository(repository)
+    context=credits.admit(evidence.userId,'reporting_query','clawback-race')
+    paymentId='topup-pay-'+str(uuid.uuid4())
+    with psycopg2.connect(url) as connection:
+        with connection.cursor() as cursor:
+            cursor.execute('''insert into public."Invoices"(id,"userId",subscription_id,status,billing_reason,total_amount,currency,"razorpayPaymentId",metadata_json)
+                values(%s,%s,%s,'PAID','add_on',150,'INR',%s,%s)''',
+                (str(uuid.uuid4()),evidence.userId,period.subscriptionId,paymentId,Json({'tokens':500})))
+            cursor.execute('update public.credit_balances set remaining_tokens=0,used_tokens=monthly_token_quota,topup_tokens=500 where user_id=%s',(evidence.userId,))
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        usage=pool.submit(credits.settle,context,100,'usage-run')
+        refund=pool.submit(credits.clawbackTopup,evidence.userId,'refund-'+paymentId,paymentId,150)
+        usage.result(); refund.result()
+    assert credits.balanceSnapshot(evidence.userId)['topup_tokens']==0
+    with psycopg2.connect(url) as connection:
+        with connection.cursor() as cursor:
+            cursor.execute("select sum((metadata_json->>'unfundedTokens')::bigint) from public.billing_events where user_id=%s and event_type in ('credit.operation_settled','credit.topup_refunded')",(evidence.userId,))
+            assert cursor.fetchone()[0]==100
+
+
+def test_distinct_expert_captures_respect_the_catalogue_limit(payment):
+    from api.services.billing.manualBillingContracts import CheckoutRequest
+    repository,evidence,url=payment
+    repository.finalizeCapturedPayment(evidence)
+    reference={'amount':10000,'currency':'INR','source':'razorpay_plan_fetch'}
+    def reserve(domain):
+        return repository.reserveCheckout(CheckoutRequest(evidence.userId,'expert_addition','monthly_prepaid',{'domains':[domain]},'add-'+domain))
+    with patch('api.services.billing.billingEngine._getMonthlyBasePrice',return_value=reference):
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            attempts=list(pool.map(reserve,['telecom','manufacturing','supplychain']))
+    captures=[]
+    for attempt in attempts:
+        order='expert-order-'+str(uuid.uuid4())
+        repository.bindProviderOrder(attempt.attemptId,{'id':order})
+        captures.append(VerifiedPaymentEvidence(attempt.attemptId,attempt.invoiceId,evidence.userId,
+            order,'expert-pay-'+str(uuid.uuid4()),'expert_addition','INR','captured',
+            'server_observation',attempt.amount,NOW+timedelta(minutes=1),None,None,False))
+    with ThreadPoolExecutor(max_workers=3) as pool:
+        results=list(pool.map(repository.finalizeCapturedPayment,captures))
+    assert all(result.finalized for result in results)
+    assert set(repository.getCoverageSnapshot(evidence.userId).currentPeriod.domains)=={'banking','telecom','manufacturing','supplychain'}
+    with pytest.raises(ValueError,match='EXPERT_SELECTION_CONFLICT'):
+        with patch('api.services.billing.billingEngine._getMonthlyBasePrice',return_value=reference):
+            repository.reserveCheckout(CheckoutRequest(evidence.userId,'expert_addition','monthly_prepaid',{'domains':['telecom']},'duplicate-new-key'))
+
+
+def test_erasure_races_capture_and_dispatch_without_new_access_or_repeat_send(payment):
+    from api.services.notifications.notificationDeliveryRepository import NotificationDeliveryRepository
+    repository,evidence,url=payment
+    period=repository.finalizeCapturedPayment(evidence).currentPeriod
+    deliveries=NotificationDeliveryRepository(lambda:psycopg2.connect(url))
+    row,_=deliveries.enqueueBillingNotification(evidence.userId,period.subscriptionId,'payment_receipt',
+        'erasure-race:'+evidence.providerPaymentId,period.end.isoformat(),{'invoiceId':evidence.invoiceId})
+    with psycopg2.connect(url) as connection:
+        with connection.cursor() as cursor:
+            cursor.execute("update public.notification_deliveries set status='SENDING',lease_owner='race-worker',claimed_payload_version=payload_version,lease_expires_at=now()+interval '5 minutes' where id=%s",(row['id'],))
+    def erase():
+        def operation(connection):
+            with connection.cursor() as cursor:
+                repository._lockUser(cursor,evidence.userId)
+                cursor.execute('update public.subscriptions set erasure_pending=true where user_id=%s and is_canonical=true',(evidence.userId,))
+        repository._run(operation)
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        sent=pool.submit(deliveries.authorizeBillingSubmission,str(row['id']),'race-worker',1)
+        erased=pool.submit(erase)
+        sent.result(); erased.result()
+    assert not repository.getCoverageSnapshot(evidence.userId).accessAllowed
+    assert not deliveries.authorizeBillingSubmission(str(row['id']),'race-worker',1)
+    assert repository.finalizeCapturedPayment(evidence).state=='already_finalized'
+
+
+def test_inventory_cli_is_read_only_and_redacted_after_contraction(postgres,monkeypatch,capsys):
+    from scripts.manual_billing_inventory import main
+    owner='sensitive-inventory-owner-'+str(uuid.uuid4())
+    with psycopg2.connect(postgres) as connection:
+        with connection.cursor() as cursor:
+            cursor.execute('insert into public."Users"("userId") values(%s)',(owner,))
+            cursor.execute("insert into public.subscriptions(user_id,is_canonical) values(%s,true),(%s,false)",(owner,owner))
+    monkeypatch.setenv('DATABASE_URL',postgres)
+    assert main(['--json'])==0
+    output=capsys.readouterr().out
+    assert owner not in output
+    with psycopg2.connect(postgres) as connection:
+        with connection.cursor() as cursor:
+            cursor.execute('select count(*) from public.subscriptions where user_id=%s',(owner,))
+            assert cursor.fetchone()[0]==2
