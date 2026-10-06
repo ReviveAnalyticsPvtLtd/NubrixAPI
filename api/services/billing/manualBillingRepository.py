@@ -1170,6 +1170,10 @@ class ManualBillingRepository:
             (evidence.observedAt,attempt['id']))
         cursor.execute("update public.billing_events set event_status='FINALIZED' where id=%s",(captureId,))
         invoice['status']='PAID'
+        self._recordNotification(cursor,subscription,'payment_receipt','receipt:'+evidence.providerPaymentId,
+            {'paymentId':evidence.providerPaymentId,'invoiceId':invoice['id'],
+                'amount':evidence.amount,'currency':evidence.currency,'purpose':'topup','tokens':tokens,
+                'paidAccessGranted':False})
         return self._result(cursor,invoice,subscription,'topup_granted',evidence.attemptId)
 
     def _finalizeExpertCapture(self,cursor,invoice,subscription,attempt,evidence,captureId,metadata):

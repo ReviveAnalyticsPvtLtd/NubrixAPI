@@ -5,6 +5,26 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 import pytest
+from test.test_manual_billing_runtime import database, sqlTransaction
+from test.test_manual_checkout_http import checkout_database
+from test.test_manual_payment_entrypoints import paid_then_request, evidence
+
+
+@pytest.mark.parametrize('mode',['monthly_prepaid','annual_prepaid'])
+@pytest.mark.parametrize('purpose',['initial_purchase','renewal','expert_addition','topup'])
+def test_all_eligible_captures_commit_one_payment_receipt(checkout_database,mode,purpose):
+    manual,request=paid_then_request(checkout_database,mode,purpose)
+    intent=manual.createCheckout(request)
+    manual.finalizeCapturedPayment(evidence(intent,'receipt-payment'))
+    manual.finalizeCapturedPayment(evidence(intent,'receipt-payment'))
+    with sqlTransaction(checkout_database[1]) as connection:
+        rows=connection.execute("SELECT metadata_json FROM billing_events WHERE idempotency_key='notification:receipt:receipt-payment'").fetchall()
+    assert len(rows)==1
+    import json
+    receipt=json.loads(rows[0][0])
+    assert receipt['dedupeKey']=='receipt:receipt-payment'
+    assert receipt['metadata']['invoiceId']==intent.invoiceId
+    assert receipt['metadata']['amount']==intent.amount
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
