@@ -37,8 +37,16 @@ class ReconciliationService:
     and executing safe remediation actions with full audit trails.
     """
 
-    def __init__(self):
+    def __init__(self,repository=None):
         self.client = client
+        if repository is None:
+            from api.services.billing.manualBillingRepository import getManualBillingRepository
+            repository=getManualBillingRepository()
+        self.repository=repository
+
+    def listManualObligations(self,limit=100,cursor=None):
+        from api.services.billing.manualObligationReport import listObligations
+        return listObligations(self.repository,limit,cursor)
 
     def generateReport(self) -> dict:
         """
@@ -55,6 +63,7 @@ class ReconciliationService:
             "staleAttempts": self._findStaleAttempts(now),
             "providerMismatches": self._findProviderMismatches(now),
             "webhookAnomalies": self._findWebhookAnomalies(now),
+            "manualObligations": self.listManualObligations(),
         }
         report["summary"] = {
             "staleAttemptCount": len(report["staleAttempts"]),

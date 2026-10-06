@@ -62,7 +62,7 @@ class BillingMetricsService:
     alert thresholds.
     """
 
-    def __init__(self, client=None, notificationRepository=None, now=None):
+    def __init__(self, client=None, notificationRepository=None, now=None,manualRepository=None):
         self.client = client if client is not None else globals()["client"]
         if notificationRepository is None:
             from api.services.notifications.notificationDeliveryRepository import (
@@ -71,6 +71,10 @@ class BillingMetricsService:
 
             notificationRepository = getNotificationDeliveryRepository()
         self.notificationRepository = notificationRepository
+        if manualRepository is None:
+            from api.services.billing.manualBillingRepository import getManualBillingRepository
+            manualRepository=getManualBillingRepository()
+        self.manualRepository=manualRepository
         self._now = now or (
             lambda: datetime.datetime.now(datetime.timezone.utc)
         )
@@ -100,6 +104,7 @@ class BillingMetricsService:
                 self.notificationRepository.collectHealth(now.isoformat())
             ),
             "expirySweep": self._collectExpirySweepHeartbeat(),
+            "manualObligations": self.collectManualObligations(),
         }
 
         logger.info(
@@ -110,6 +115,11 @@ class BillingMetricsService:
             f"backlog={metrics['webhookBacklog']['count']}"
         )
         return metrics
+
+    def collectManualObligations(self):
+        from api.services.billing.manualObligationReport import listObligations
+        report=listObligations(self.manualRepository,limit=1)
+        return {key:report[key] for key in ('available','total','totals','errors')}
 
     def evaluateAlerts(self) -> list[dict]:
         """

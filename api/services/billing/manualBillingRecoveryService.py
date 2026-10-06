@@ -76,14 +76,22 @@ class ManualBillingRecoveryService:
         return resolved
 
     def execute(self):
-        summary = {'resolved':0,'errors':0}
+        summary = {'resolved':0,'errors':0,'checked':0,'noProgress':0}
         for row in self.repository.pendingRecoveryRows():
+            outcome='failed'
             try:
-                summary['resolved'] += (self.recoverAttempt(row) if row['event_category'] == 'payment_attempt'
+                resolved = (self.recoverAttempt(row) if row['event_category'] == 'payment_attempt'
                     else self.recoverRefund(row))
+                summary['resolved'] += resolved
+                summary['noProgress'] += int(resolved==0)
+                outcome='resolved' if resolved else 'no_progress'
             except Exception:
                 # Keep the original identity and reserve; no blind recreation.
                 summary['errors'] += 1
             finally:
-                self.repository.recordRecoveryCheck(str(row['id']))
+                summary['checked'] += 1
+                try:
+                    self.repository.recordRecoveryCheck(str(row['id']),outcome)
+                except Exception:
+                    summary['errors'] += 1
         return summary

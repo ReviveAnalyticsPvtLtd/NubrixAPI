@@ -114,11 +114,11 @@ class ManualBillingRepository:
                 return list(cursor.fetchall())
         return self._run(operation)
 
-    def recordRecoveryCheck(self, eventId):
+    def recordRecoveryCheck(self, eventId, outcome=None):
         def operation(connection):
             with connection.cursor() as cursor:
                 cursor.execute("update public.billing_events set metadata_json=coalesce(metadata_json,'{}'::jsonb) || %s where id=%s",
-                    (Json({'lastRecoveryAt':_now().isoformat()}),eventId))
+                    (Json({'lastRecoveryAt':_now().isoformat(),'lastRecoveryOutcome':outcome or 'checked'}),eventId))
         return self._run(operation)
 
     def markClosedAttemptReconciled(self, attemptId):

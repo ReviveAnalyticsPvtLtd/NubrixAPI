@@ -23,7 +23,7 @@ from api.services.billing.subscriptionRefundService import SubscriptionRefundSer
 from api.services.billing.manualBillingContracts import RefundQuoteConflict
 from utils.exceptionHandler import CustomException, raiseHttpException
 from fastapi.responses import ORJSONResponse
-from fastapi import APIRouter, Depends, Header, HTTPException, status
+from fastapi import APIRouter, Depends, Header, HTTPException, Query, status
 from api.commons import verifyToken
 from utils.logger import logger
 from jose import jwt
@@ -286,6 +286,15 @@ async def getBillingMetrics(_adminUserId=Depends(verifyBillingAdmin)):
         raiseHttpException(e)
     except Exception as e:
         raiseHttpException(CustomException(e))
+
+
+@router.get('/reconciliation/obligations')
+async def getManualObligations(limit:int=Query(100,ge=1,le=500),cursor:str|None=None,
+                               _adminUserId=Depends(verifyBillingAdmin)):
+    try:
+        return ORJSONResponse(content={'status':'SUCCESS','data':ReconciliationService().listManualObligations(limit,cursor)})
+    except ValueError as error:
+        raiseHttpException(CustomException(error,statusCode=422,uiMessage=str(error)))
 
 
 @router.post("/reconciliation/webhooks/replay")
