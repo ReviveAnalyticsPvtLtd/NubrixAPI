@@ -18,7 +18,7 @@ from api.services.billing.manualBillingRepository import ManualBillingRepository
 
 pytestmark = pytest.mark.skipif(os.environ.get("RUN_MANUAL_BILLING_INTEGRATION") != "1", reason="Disposable PostgreSQL opt-in required; skipped is UNVERIFIED")
 ROOT = Path(__file__).resolve().parents[1]
-NOW = datetime(2026,10,6,12,tzinfo=timezone.utc)
+NOW = datetime.now(timezone.utc)
 BASELINE = '''
 CREATE TABLE public."Users" ("userId" text primary key,"isBanned" boolean default false);
 CREATE TABLE public.subscriptions (
@@ -36,7 +36,7 @@ CREATE TABLE public."Invoices" (
  id uuid primary key default gen_random_uuid(),"userId" text references "Users"("userId"),
  subscription_id uuid references subscriptions(id),status text,billing_reason text,amount bigint,total_amount bigint,
  currency text,razorpay_order_id text,"razorpayPaymentId" text,"paidAt" timestamptz,
- period_start timestamptz,period_end timestamptz,metadata_json jsonb default '{}',
+ period_start timestamptz,period_end timestamptz,due_date timestamptz,metadata_json jsonb default '{}',
  payment_flow text,requires_customer_auth boolean,amount_before_tax bigint,tax_amount bigint,
  tax_breakdown_json jsonb,tax_rule_version text,place_of_supply_snapshot text,
  pricing_version text,pricing_reference_snapshot_json jsonb);
@@ -71,9 +71,17 @@ def postgres():
         with connection.cursor() as cursor:
             cursor.execute("drop schema public cascade; create schema public")
             cursor.execute(BASELINE)
-            for name in ("20261005195608_expand_manual_monthly_billing.sql","20261005195617_add_manual_billing_transactions.sql",
-                         "20261006131717_enforce_manual_checkout_order_identity.sql"):
-                cursor.execute((ROOT / "supabase/migrations" / name).read_text())
+            cursor.execute("""DO $$ BEGIN CREATE ROLE anon; EXCEPTION WHEN duplicate_object THEN NULL; END $$;
+                DO $$ BEGIN CREATE ROLE authenticated; EXCEPTION WHEN duplicate_object THEN NULL; END $$;
+                DO $$ BEGIN CREATE ROLE service_role; EXCEPTION WHEN duplicate_object THEN NULL; END $$;""")
+            for name in ('20260813112853_create_admin_auth.sql',
+                         '20260823220448_create_admin_free_trial_extensions.sql',
+                         '20260901194813_simplify_admin_trial_extensions.sql',
+                         '20260911120000_create_admin_free_trial_reductions.sql'):
+                cursor.execute((ROOT/'supabase/migrations'/name).read_text())
+            from scripts.manual_billing_migration_plan import buildMigrationPlan
+            for migration in buildMigrationPlan(set(),'expand'):
+                cursor.execute(migration.read_text())
         connection.commit()
     finally: connection.close()
     return url
@@ -190,7 +198,7 @@ def test_topup_race_after_expiry_stores_tokens_without_refill(payment):
     late=period.end+timedelta(minutes=10)
     repository.activateDueCoverage(evidence.userId,late)
     capture=VerifiedPaymentEvidence(attempt.attemptId,invoice,evidence.userId,order,paymentId,'topup','INR','captured',
-        'server_observation',150,late,None,None,False)
+        'attested_capture',150,late,NOW+timedelta(minutes=1),None,True)
     with ThreadPoolExecutor(max_workers=2) as pool:
         results=list(pool.map(repository.finalizeCapturedPayment,[capture,capture]))
     assert sorted(result.state for result in results)==['already_finalized','topup_granted']
@@ -298,17 +306,6 @@ def test_refund_race_reserves_once_expires_access_and_preserves_topups(payment):
 def test_sql_notification_bridge_recovers_commit_without_duplicate_delivery(payment):
     from api.services.notifications.notificationDeliveryRepository import NotificationDeliveryRepository
     repository,evidence,url=payment
-    connection=psycopg2.connect(url)
-    try:
-        with connection.cursor() as cursor:
-            cursor.execute("""DO $$ BEGIN CREATE ROLE anon; EXCEPTION WHEN duplicate_object THEN NULL; END $$;
-                DO $$ BEGIN CREATE ROLE authenticated; EXCEPTION WHEN duplicate_object THEN NULL; END $$;
-                DO $$ BEGIN CREATE ROLE service_role; EXCEPTION WHEN duplicate_object THEN NULL; END $$;""")
-            cursor.execute((ROOT/'supabase/migrations/20260917170828_create_notification_deliveries.sql').read_text())
-            cursor.execute((ROOT/'supabase/migrations/20260918100000_harden_notification_claims.sql').read_text())
-            cursor.execute((ROOT/'supabase/migrations/20261005195635_extend_monthly_notifications.sql').read_text())
-        connection.commit()
-    finally: connection.close()
     repository.finalizeCapturedPayment(evidence)
     deliveries=NotificationDeliveryRepository(lambda:psycopg2.connect(url))
     with patch('api.services.notifications.notificationDeliveryRepository.getNotificationDeliveryRepository',return_value=deliveries):
@@ -351,3 +348,105 @@ def test_reviewed_backfill_preserves_consumption_and_maps_current_identity(payme
             assert used==200 and remaining==quota-200 and topups==1234
             assert str(actualLife)==lifecycle and str(actualPeriod)==period
     finally: connection.close()
+
+
+@pytest.mark.parametrize('existing_balance',[False,True])
+def test_trial_staff_refill_uses_canonical_lifecycle_and_fences_old_usage(postgres,existing_balance):
+    from api.services.adminTrialExtensionRepository import AdminTrialExtensionRepository
+    from api.services.credits.manualCreditRepository import ManualCreditRepository
+    user='trial-staff-'+str(uuid.uuid4())
+    admin=str(uuid.uuid4())
+    repository=ManualBillingRepository(lambda:psycopg2.connect(postgres))
+    with psycopg2.connect(postgres) as connection:
+        with connection.cursor() as cursor:
+            cursor.execute('insert into public."Users"("userId") values(%s)',(user,))
+            cursor.execute('insert into public.admin_users(id,email,name,password_hash) values(%s,%s,\'Staff\',\'test-hash\')',(admin,admin+'@example.test'))
+    repository.ensureCanonicalSubscription(user)
+    trial=repository.activateTrial(user,('banking',))
+    credits=ManualCreditRepository(repository)
+    old=None
+    if existing_balance:
+        old=credits.admit(user,'reporting_query','before-staff-refill')
+        with psycopg2.connect(postgres) as connection:
+            with connection.cursor() as cursor:
+                cursor.execute('update public.credit_balances set topup_tokens=123 where user_id=%s',(user,))
+    extensions=AdminTrialExtensionRepository(lambda:psycopg2.connect(postgres),freeQuotaProvider=lambda:12345)
+    operation=extensions.createOrGetExtension(str(uuid.uuid4()),'a'*64,user,3,'Approved trial extension',admin)
+    result=extensions.extendUser(str(operation['id']),user,3,NOW+timedelta(minutes=1))
+    assert result['outcome']=='EXTENDED'
+    fresh=credits.balanceSnapshot(user)
+    assert fresh['remaining_tokens']==12345 and fresh['topup_tokens']==(123 if existing_balance else 0)
+    again=extensions.extendUser(str(operation['id']),user,3,NOW+timedelta(minutes=1))
+    assert again['outcome']=='EXTENDED'
+    assert credits.balanceSnapshot(user)['credit_period_id']==fresh['credit_period_id']
+    if old:
+        assert fresh['credit_period_id']!=old.creditPeriodId
+        assert credits.settle(old,100,'old-run')['historicalPeriod']
+        assert credits.balanceSnapshot(user)['remaining_tokens']==12345
+
+
+def test_bridge_replay_keeps_claimed_payload_version_unchanged(payment):
+    from api.services.notifications.notificationDeliveryRepository import NotificationDeliveryRepository
+    repository,evidence,url=payment
+    period=repository.finalizeCapturedPayment(evidence).currentPeriod
+    deliveries=NotificationDeliveryRepository(lambda:psycopg2.connect(url))
+    args=(evidence.userId,period.subscriptionId,'payment_receipt','revision-test:'+evidence.providerPaymentId,
+          period.end.isoformat(),{'invoiceId':evidence.invoiceId,'amount':3000})
+    first,_=deliveries.enqueueBillingNotification(*args)
+    deliveries.claimDue('worker-repeat',limit=500)
+    repeated,_=deliveries.enqueueBillingNotification(*args)
+    assert repeated['payload_version']==first['payload_version'] and repeated['status']=='SENDING'
+
+
+def test_concurrent_extra_money_is_applied_or_audited_once(payment):
+    from dataclasses import replace
+    repository,evidence,url=payment
+    second=replace(evidence,providerPaymentId='extra-'+str(uuid.uuid4()))
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        results=list(pool.map(repository.finalizeCapturedPayment,[evidence,second]))
+    assert sum(result.finalized for result in results)==1
+    assert sum(result.state=='requires_reconciliation' for result in results)==1
+    with psycopg2.connect(url) as connection:
+        with connection.cursor() as cursor:
+            cursor.execute("select event_status,sum(amount) from public.billing_events where invoice_id=%s and event_type='payment.capture' group by event_status",(evidence.invoiceId,))
+            totals=dict(cursor.fetchall())
+            assert totals=={'FINALIZED':3000,'REQUIRES_RECONCILIATION':3000}
+            cursor.execute('select balance_version from public.credit_balances where user_id=%s',(evidence.userId,))
+            assert cursor.fetchone()[0]==1
+
+
+def test_concurrent_revision_and_submission_keep_one_provider_identity(payment):
+    from api.services.notifications.notificationDeliveryRepository import NotificationDeliveryRepository
+    repository,evidence,url=payment
+    period=repository.finalizeCapturedPayment(evidence).currentPeriod
+    deliveries=NotificationDeliveryRepository(lambda:psycopg2.connect(url))
+    args=(evidence.userId,period.subscriptionId,'payment_receipt','race-revision:'+evidence.providerPaymentId,
+          period.end.isoformat())
+    row,_=deliveries.enqueueBillingNotification(*args,{'invoiceId':evidence.invoiceId,'amount':3000})
+    with psycopg2.connect(url) as connection:
+        with connection.cursor() as cursor:
+            cursor.execute("update public.notification_deliveries set status='SENDING',lease_owner='worker-race',claimed_payload_version=payload_version where id=%s",(row['id'],))
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        send=pool.submit(deliveries.authorizeBillingSubmission,str(row['id']),'worker-race',1)
+        revise=pool.submit(deliveries.enqueueBillingNotification,*args,{'invoiceId':evidence.invoiceId,'amount':3000,'finalPaidEnd':period.end.isoformat()})
+        submitted=send.result(); revised=revise.result()[0]
+    if submitted:
+        assert revised['payload_version']==1
+        assert deliveries.markAccepted(str(row['id']),'worker-race','provider-message',NOW.isoformat(),payloadVersion=1)
+    else:
+        assert revised['payload_version']==2
+        assert not deliveries.markAccepted(str(row['id']),'worker-race','provider-message',NOW.isoformat(),payloadVersion=1)
+    assert not deliveries.authorizeBillingSubmission(str(row['id']),'worker-race',1)
+
+
+def test_expired_dispatch_lease_cannot_start_provider_submission(payment):
+    from api.services.notifications.notificationDeliveryRepository import NotificationDeliveryRepository
+    repository,evidence,url=payment
+    period=repository.finalizeCapturedPayment(evidence).currentPeriod
+    deliveries=NotificationDeliveryRepository(lambda:psycopg2.connect(url))
+    row,_=deliveries.enqueueBillingNotification(evidence.userId,period.subscriptionId,'payment_receipt',
+        'expired-lease:'+evidence.providerPaymentId,period.end.isoformat(),{'invoiceId':evidence.invoiceId})
+    with psycopg2.connect(url) as connection:
+        with connection.cursor() as cursor:
+            cursor.execute("update public.notification_deliveries set status='SENDING',lease_owner='old-worker',claimed_payload_version=payload_version,lease_expires_at=now()-interval '1 second' where id=%s",(row['id'],))
+    assert not deliveries.authorizeBillingSubmission(str(row['id']),'old-worker',1)

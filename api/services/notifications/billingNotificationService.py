@@ -268,6 +268,8 @@ def isBillingNotificationEligible(
     if notificationType in ("monthly_renewal_ready", "monthly_renewal_reminder"):
         if current >= periodEnd:
             return False
+        if not _withinWindow(current,periodEnd,7 if notificationType=='monthly_renewal_ready' else 1):
+            return False
         if notificationType == "monthly_renewal_ready" and _withinWindow(current, periodEnd, 1):
             return False
         return _invoiceUnpaid(snapshot or {})

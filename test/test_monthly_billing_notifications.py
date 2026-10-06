@@ -39,6 +39,13 @@ _NOW = datetime(2026, 10, 10, 10, tzinfo=timezone.utc)
 _END = datetime(2026, 10, 20, 10, tzinfo=timezone.utc)
 
 
+@pytest.mark.parametrize('kind',['monthly_renewal_ready','monthly_renewal_reminder'])
+def test_dispatch_cannot_send_before_approved_milestone_window(kind):
+    snapshot={'subscription':_subscription(),'invoice':{'status':'UPCOMING'}}
+    delivery={'notification_type':kind,'period_end':_END.isoformat(),'metadata_json':{}}
+    assert not isBillingNotificationEligible(delivery,snapshot,_NOW)
+
+
 def _subscription(optOut=False, status="active", end=_END):
     return {
         "id": "sub-1",

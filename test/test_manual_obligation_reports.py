@@ -62,3 +62,15 @@ def test_database_failure_is_unavailable_not_zero():
     assert not report['available'] and report['total'] is None
     assert report['errors']==['billing_database_unavailable']
     assert 'private credentials' not in json.dumps(report)
+
+
+@pytest.mark.parametrize('status',['FAILED','CANCELLED'])
+def test_terminal_ambiguous_delivery_remains_an_operator_obligation(obligations,status):
+    service,path=obligations
+    with sqlTransaction(path) as db:
+        db.execute("UPDATE notification_deliveries SET status=?,last_error_code='AMBIGUOUS_SEND_UNRESOLVED',user_id=null",(status,))
+    report=service.listManualObligations()
+    delivery=next(row for row in report['items'] if row['source']=='delivery')
+    assert delivery['category']=='delivery_ambiguous'
+    assert delivery['safeAction']=='reconcile_original_tracking_tag'
+    assert delivery['userId'] is None

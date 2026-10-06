@@ -8,6 +8,7 @@ __all__ = [
 
 import os
 import json
+from api.services.subscriptions.paymentValidationService import parseUtc
 
 import psycopg2
 from psycopg2.extras import Json, RealDictCursor
@@ -158,7 +159,7 @@ class NotificationDeliveryRepository:
                             and (row.get('status') in ('PENDING', 'RETRY_PENDING', 'SENDING')
                                  or (row.get('status') == 'CANCELLED' and row.get('last_error_code')
                                      in ('SUBSCRIPTION_NOT_ELIGIBLE', 'OBSOLETE_INVOICE', 'RENEWAL_DECLINED'))))
-                        if mutable and (old != metadata or str(row.get('period_end')) != periodEnd
+                        if mutable and (old != metadata or parseUtc(row.get('period_end')) != parseUtc(periodEnd)
                                         or row.get('status') == 'CANCELLED'):
                             cursor.execute('''update public.notification_deliveries
                                 set metadata_json=%s, period_end=%s, payload_version=payload_version+1,
@@ -351,6 +352,7 @@ class NotificationDeliveryRepository:
                 cursor.execute('select now() as observed_at')
                 from api.services.subscriptions.paymentValidationService import parseUtc
                 observedAt = parseUtc(cursor.fetchone()['observed_at'])
+                if row.get('lease_expires_at') and parseUtc(row['lease_expires_at']) <= observedAt: return False
                 subscription['billing_state'] = repository._json(subscription.get('billing_state'))
                 if not isBillingNotificationEligible(row,{'subscription':subscription,'invoice':invoice},observedAt): return False
                 cursor.execute('update public.notification_deliveries set submission_started_at=now() where id=%s',(deliveryId,))

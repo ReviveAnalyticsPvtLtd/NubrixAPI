@@ -58,7 +58,9 @@ def listObligations(repository, limit=100, cursor=None):
                     and b.event_type='credit.usage_reported'
                     and b.metadata_json->>'operationId'=a.metadata_json->>'operationId'))''')
             events = sql.fetchall()
-            sql.execute("select * from public.notification_deliveries where status in ('PENDING','RETRY_PENDING','SENDING','ACCEPTED')")
+            sql.execute("""select * from public.notification_deliveries where
+                status in ('PENDING','RETRY_PENDING','SENDING','ACCEPTED')
+                or last_error_code in ('AMBIGUOUS_SEND','AMBIGUOUS_SEND_UNRESOLVED')""")
             return events,sql.fetchall()
     try:
         events,deliveries = repository._run(load)
@@ -89,7 +91,7 @@ def listObligations(repository, limit=100, cursor=None):
                 else 'bridge_original_intent' if category.startswith('notification') else 'support_review')
             project('billing_event',row,category,action)
     for row in deliveries:
-        category = 'delivery_ambiguous' if row.get('last_error_code')=='AMBIGUOUS_SEND' or (row['status']=='SENDING' and row.get('submission_started_at')) else 'delivery_unresolved'
+        category = 'delivery_ambiguous' if row.get('last_error_code') in ('AMBIGUOUS_SEND','AMBIGUOUS_SEND_UNRESOLVED') or (row['status']=='SENDING' and row.get('submission_started_at')) else 'delivery_unresolved'
         project('delivery',row,category,'reconcile_original_tracking_tag' if category=='delivery_ambiguous' else 'dispatch_or_reconcile_original_delivery')
     from api.services.credits.creditUsageSpool import spoolDirectory
     for path in sorted(spoolDirectory().glob('*.json')):
