@@ -360,6 +360,7 @@ class RenewalEmailFlowTests(unittest.TestCase):
         subscription = {
             "id": "sub_1",
             "user_id": "u1",
+            "is_canonical": True,
             "billing_mode": "annual_prepaid",
             "subscribed_experts": ["banking"],
         }

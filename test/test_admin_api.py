@@ -102,6 +102,8 @@ USER_ACCESS_VIEW = {
 }
 
 SUBSCRIPTION_VIEW = {
+    "is_canonical":False,
+    "renewal_opt_out":False,
     "id": "subscription-1",
     "user_id": "user-1",
     "billing_mode": "subscription",

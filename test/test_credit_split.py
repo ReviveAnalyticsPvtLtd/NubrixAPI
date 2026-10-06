@@ -1,23 +1,5 @@
-import sys
-import types
 import unittest
-
-
-class _NoopLogger:
-    def __getattr__(self, _name):
-        return lambda *args, **kwargs: None
-
-
-# Logging is an external integration and is irrelevant to quota/presentation
-# behavior. Replacing it keeps these tests focused on the real credit modules.
-logger_module = types.ModuleType("utils.logger")
-logger_module.logger = _NoopLogger()
-sys.modules.setdefault("utils.logger", logger_module)
-
-redis_module = types.ModuleType("redis")
-redis_module.ConnectionPool = type("ConnectionPool", (), {})
-redis_module.Redis = type("Redis", (), {})
-sys.modules.setdefault("redis", redis_module)
+import types
 
 
 from api.services.credits.creditConfig import getTokenQuotaForPlan
@@ -170,6 +152,7 @@ class CreditQuotaResizeTests(unittest.TestCase):
         redis_client = EvalOnlyRedis()
         supabase = FakeSupabase()
         service = CreditService()
+        service._manualBalance = lambda _: None
         service.supabase = supabase
         service._dbRow = lambda _user_id: {
             "plan_tier": "pro",
@@ -220,6 +203,7 @@ class CreditQuotaResizeTests(unittest.TestCase):
 
         supabase = FakeSupabase()
         service = CreditService()
+        service._manualBalance = lambda _: None
         service.supabase = supabase
         service._ensureHash = lambda _user_id: None
         service._deduct = lambda *_args: {

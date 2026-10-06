@@ -4,54 +4,6 @@ import types
 import unittest
 from unittest.mock import patch
 
-# --- import-time stubs (match existing test suite pattern) ---
-os.environ.setdefault("SUPABASE_URL", "http://localhost")
-os.environ.setdefault("SUPABASE_KEY", "test-key")
-os.environ.setdefault("SECRET_KEY", "test-secret")
-os.environ.setdefault("REDIS_HOST", "localhost")
-os.environ.setdefault("REDIS_PORT", "6379")
-os.environ.setdefault("REDIS_PASSWORD", "")
-
-for name in ("logtail", "loguru", "redis"):
-    if name not in sys.modules:
-        sys.modules[name] = types.ModuleType(name)
-if not hasattr(sys.modules["logtail"], "LogtailHandler"):
-    sys.modules["logtail"].LogtailHandler = lambda *a, **k: None
-if not hasattr(sys.modules["loguru"], "logger"):
-    class _L:
-        def __getattr__(self, _):
-            return lambda *a, **k: None
-    sys.modules["loguru"].logger = _L()
-if not hasattr(sys.modules["redis"], "Redis"):
-    sys.modules["redis"].Redis = lambda *a, **k: None
-if not hasattr(sys.modules["redis"], "ConnectionPool"):
-    sys.modules["redis"].ConnectionPool = type("ConnectionPool", (), {})
-# Ensure complete stubs even if a sibling test already installed a partial one.
-supabaseStub = sys.modules.setdefault("supabase", types.ModuleType("supabase"))
-if not hasattr(supabaseStub, "create_client"):
-    supabaseStub.create_client = lambda *a, **k: None
-sys.modules.setdefault("supabase.lib", types.ModuleType("supabase.lib"))
-optsMod = sys.modules.setdefault("supabase.lib.client_options", types.ModuleType("supabase.lib.client_options"))
-if not hasattr(optsMod, "ClientOptions"):
-    optsMod.ClientOptions = lambda *a, **k: None
-joseStub = sys.modules.setdefault("jose", types.ModuleType("jose"))
-if not hasattr(joseStub, "jwt"):
-    joseStub.jwt = types.SimpleNamespace(decode=lambda *a, **k: {})
-if not hasattr(joseStub, "JWTError"):
-    joseStub.JWTError = type("JWTError", (Exception,), {})
-
-# Sibling tests (collected in the same process) may leave contaminated modules
-# in sys.modules: a broken partial api.commons, or stub replacements of real
-# installed packages (e.g. fastapi). Purge both so our import below re-runs
-# cleanly with the genuine dependencies, regardless of collection order.
-for _pkg in ("fastapi", "starlette"):
-    _stub = sys.modules.get(_pkg)
-    if _stub is not None and not hasattr(_stub, "__path__"):
-        for _m in [m for m in sys.modules if m == _pkg or m.startswith(_pkg + ".")]:
-            del sys.modules[_m]
-for _m in [m for m in sys.modules if m == "api.commons" or m.startswith("api.commons.")]:
-    del sys.modules[_m]
-
 from fastapi import HTTPException
 from api.commons import requireCredits
 from api.services.subscriptions.entitlementService import (
