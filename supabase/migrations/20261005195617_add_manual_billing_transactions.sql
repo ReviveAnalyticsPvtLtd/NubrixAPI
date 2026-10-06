@@ -55,6 +55,8 @@ DROP INDEX IF EXISTS idx_billing_events_live_attempt_revision;
 CREATE UNIQUE INDEX idx_billing_events_live_attempt_revision
     ON public.billing_events (
         user_id,
+        invoice_id,
+        (COALESCE(metadata_json -> 'manualBilling' ->> 'purpose', '')),
         (COALESCE(metadata_json -> 'manualBilling' ->> 'lifecycleId', '')),
         (COALESCE(metadata_json -> 'manualBilling' ->> 'cycleId', '')),
         (COALESCE(metadata_json -> 'manualBilling' ->> 'revision', '0'))

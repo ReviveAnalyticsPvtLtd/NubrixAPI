@@ -239,20 +239,6 @@ def validateOrderPaymentAgainstInvoice(
         if paymentStatus != "captured":
             _raise(f"Payment {payment.get('id')} is not captured (status={paymentStatus})")
 
-    orderCustomerId = order.get("customer_id")
-    if expectedCustomerId and orderCustomerId and orderCustomerId != expectedCustomerId:
-        _raise(
-            f"Order/customer mismatch: order.customer_id={orderCustomerId}, "
-            f"expected={expectedCustomerId}"
-        )
-
-    paymentCustomerId = payment.get("customer_id")
-    if expectedCustomerId and paymentCustomerId and paymentCustomerId != expectedCustomerId:
-        _raise(
-            f"Payment/customer mismatch: payment.customer_id={paymentCustomerId}, "
-            f"expected={expectedCustomerId}"
-        )
-
     expectedAmount = invoice.get("total_amount")
     if expectedAmount is None:
         expectedAmount = invoice.get("amount")
@@ -285,7 +271,7 @@ def normalizeChurnedSubscription(
     Apply a partial churn reset to a terminal subscription row.
 
     Clears period dates, entitlements, pending changes, and stale payment
-    tokens while preserving ``billing_mode`` and ``razorpay_customer_id``.
+    provider handles while preserving ``billing_mode`` and historical evidence.
     Archives previous values in ``billing_state.churn_snapshot``.
 
     Returns ``True`` if the DB was updated, ``False`` if already reset (no-op).

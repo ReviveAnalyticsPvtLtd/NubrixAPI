@@ -21,7 +21,8 @@
 --     in add_manual_billing_transactions.sql with a guard that tolerates
 --     conflicts during rollout by raising an actionable error.
 --   * credit identity columns are added NULLable; NOT NULL is enforced only
---     in the contract phase after auditable backfill for all modes.
+--     only for manual monthly paid balances after operator-reviewed backfill.
+--     Annual/free rows retain their existing credit adapter until a separate change.
 
 -- =============================================================================
 -- 1. subscriptions: monthly_prepaid billing mode
@@ -90,6 +91,9 @@ ALTER TABLE public.billing_events
     DROP CONSTRAINT IF EXISTS billing_events_payment_attempt_type_chk;
 
 ALTER TABLE public.billing_events
+    DROP CONSTRAINT IF EXISTS billing_events_payment_attempt_type_check;
+
+ALTER TABLE public.billing_events
     ADD CONSTRAINT billing_events_payment_attempt_type_chk
     CHECK (
         payment_attempt_type IS NULL OR payment_attempt_type IN (
@@ -106,9 +110,8 @@ ALTER TABLE public.billing_events
 -- Existing code writes PAYMENT_PENDING (uppercase) at creation while some
 -- scheduler paths wrote lowercase. Storage normalizes to the uppercase
 -- contract: UPCOMING, PAYMENT_PENDING, PAID, VOID, EXPIRED, plus the
--- historically separate FAILED rows which are mapped to EXPIRED (failed
--- manual checkout is not a distinct financial state; retry uses a new
--- order/attempt). Update every exact-match consumer together (done in code
+-- historically separate FAILED rows, whose annual meaning is preserved.
+-- Update every exact-match consumer together (done in code
 -- tasks); this migration fixes stored rows.
 
 UPDATE public."Invoices"
@@ -116,9 +119,6 @@ UPDATE public."Invoices"
  WHERE status IS NOT NULL
    AND status <> UPPER(status);
 
-UPDATE public."Invoices"
-   SET status = 'EXPIRED'
- WHERE status IN ('FAILED');
 
 -- =============================================================================
 -- 6. Invoices: renewal uniqueness supports replacement after revoked coverage

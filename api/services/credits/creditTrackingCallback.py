@@ -51,31 +51,13 @@ class CreditTrackingCallback(BaseCallbackHandler):
         self._admit()
 
     def _admit(self) -> None:
-        """Persist the admission context before counted work starts.
-
-        Admission failures are logged, not raised: the LLM call itself is
-        already authorized by the request-time gate, and a missing context
-        falls back to the legacy immediate-deduct path below.
-        """
-        try:
-            from api.services.credits.creditOperationSettlement import (
-                CreditOperationSettlement,
-            )
-
-            settlement = CreditOperationSettlement()
-            self._context = settlement.admitCreditOperation(
-                userId=self.userId,
-                operationType=self.operationType,
-                operationId=self.operationId,
-                lifecycleId=self.lifecycleId or "unknown",
-                creditPeriodId=self.creditPeriodId,
-            )
-        except Exception as admitError:
-            logger.warning(
-                f"Credit operation admission failed — userId={self.userId}, "
-                f"op={self.operationType}: {admitError}"
-            )
-            self._context = None
+        """Manual usage needs a durable admission before counted work begins."""
+        from api.services.credits.creditService import creditService
+        if creditService._manualBalance(self.userId) is not None:
+            from api.services.credits.manualCreditRepository import ManualCreditRepository
+            self._settlement = ManualCreditRepository()
+            self._context = self._settlement.admit(self.userId, self.operationType, self.operationId)
+            self.raise_error = True
 
     def on_llm_end(self, response: LLMResult, **kwargs: Any) -> None:
         """
@@ -101,17 +83,13 @@ class CreditTrackingCallback(BaseCallbackHandler):
                             totalTokens += tokenUsage.get("total_tokens", 0)
 
             if totalTokens > 0 and self._context is not None:
-                from api.services.credits.creditOperationSettlement import (
-                    CreditOperationSettlement,
-                )
-
-                settlement = CreditOperationSettlement()
-                settlement.settleCreditOperation(
-                    context=self._context,
-                    tokensUsed=totalTokens,
-                )
+                runId = kwargs.get("run_id")
+                if runId is None:
+                    raise ValueError("LLM_RUN_ID_REQUIRED_FOR_DURABLE_USAGE")
+                self._settlement.reportUsage(self._context,totalTokens,str(runId))
+                self._settlement.settle(self._context, totalTokens, str(runId))
             elif totalTokens > 0:
-                # No admission context (legacy callers): immediate deduct.
+                # Free and annual compatibility path; manual admission never falls back.
                 from api.services.credits.creditService import creditService
                 creditService.deductTokens(
                     userId=self.userId,
@@ -123,3 +101,5 @@ class CreditTrackingCallback(BaseCallbackHandler):
                 f"CreditTrackingCallback.on_llm_end failed — "
                 f"userId={self.userId}, op={self.operationType}: {e}"
             )
+            if self._context is not None:
+                raise

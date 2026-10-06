@@ -143,12 +143,13 @@ async def verifyDomainUpgrade(
         ORJSONResponse: Verification result.
     """
     try:
-        subscriptionService.verifyDomainUpgrade(payload=payload.dict(), token=token)
+        result = subscriptionService.verifyDomainUpgrade(payload=payload.dict(), token=token)
         return ORJSONResponse(
             status_code=200,
             content={
                 "status": "SUCCESS",
-                "message": "Domain upgrade verified and activated."
+                "message": "Domain upgrade payment checked.",
+                "data": result,
             }
         )
     except CustomException as e:

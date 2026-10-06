@@ -154,6 +154,26 @@ class TopupService:
 
     # ---- public API ----------------------------------------------------------
 
+    def _createManualTopupOrder(self,userId,subscription,invoice,snapshot,packId,tokens):
+        from datetime import datetime,timedelta,timezone
+        from api.services.billing.manualBillingRepository import getManualBillingRepository,_payloadHash
+        repository=getManualBillingRepository()
+        state=subscription.get('billing_state') or {}
+        lifecycle=state.get('manualBilling',{}).get('lifecycleId')
+        if not lifecycle: raise ValueError('MANUAL_LIFECYCLE_MISSING')
+        payload={'subscriptionId':subscription['id'],'invoiceId':invoice['id'],'lifecycleId':lifecycle,
+            'billingMode':'monthly_prepaid','amount':snapshot.total_amount,'currency':snapshot.currency,
+            'tokens':tokens,'expiresAt':(datetime.now(timezone.utc)+timedelta(seconds=int(os.environ.get("MANUAL_CHECKOUT_TTL_SECONDS","1800")))).isoformat()}
+        intent=repository.reserveCheckoutIntent(userId,'topup',invoice['id'],_payloadHash(payload),payload)
+        if intent.razorpayOrderId: return {'id':intent.razorpayOrderId,'expiresAt':intent.expiresAt.isoformat()}
+        if not repository.claimProviderOrderCreation(intent.attemptId):
+            raise ValueError('TOPUP_ORDER_REQUIRES_RECONCILIATION')
+        order=self.razorpayClient.order.create({'amount':intent.amount,'currency':intent.currency,'receipt':intent.attemptId,
+            'notes':{'userId':userId,'type':'credit_topup','billingMode':'monthly_prepaid','packId':packId,
+                'tokens':str(tokens),'invoiceId':invoice['id'],'attemptId':intent.attemptId}})
+        repository.bindProviderOrder(intent.attemptId,order)
+        return {**order,'expiresAt':intent.expiresAt.isoformat()}
+
     def listPacks(self, token: str) -> dict:
         """
         Return the purchasable packs with tax-inclusive totals.
@@ -231,7 +251,10 @@ class TopupService:
                 userId, subscription.get("id"), snapshot, packId, tokens
             )
 
-            order = self.razorpayClient.order.create({
+            if billingMode == 'monthly_prepaid':
+                order=self._createManualTopupOrder(userId,subscription,invoice,snapshot,packId,tokens)
+            else:
+                order = self.razorpayClient.order.create({
                 "amount": snapshot.total_amount,
                 "currency": snapshot.currency,
                 "notes": {
@@ -242,7 +265,8 @@ class TopupService:
                     "invoiceId": invoice["id"],
                 },
             })
-            self._attachOrder(invoice["id"], order["id"])
+            if billingMode != 'monthly_prepaid':
+                self._attachOrder(invoice["id"], order["id"])
 
             self._audit(
                 userId, "credit.topup_requested",
@@ -263,6 +287,7 @@ class TopupService:
             return {
                 "razorpayKey": os.environ["RAZORPAY_KEY_ID"],
                 "orderId": order["id"],
+                "expiresAt":order.get('expiresAt'),
                 "currency": snapshot.currency,
                 "amount": snapshot.total_amount,
                 "packId": packId,

@@ -193,7 +193,7 @@ def test_payment_suppresses_reminder_but_receipt_is_deliverable():
 def test_dispatch_suppresses_reminder_after_opt_out():
     now = datetime(2026, 10, 19, 10, tzinfo=timezone.utc)
     eligible = isBillingNotificationEligible(
-        delivery={"notification_type": "monthly_renewal_reminder", "status": "PENDING"},
+        delivery={"notification_type": "monthly_renewal_reminder", "status": "PENDING", "period_end":"2026-10-20T10:00:00+00:00"},
         snapshot={
             "subscription": _subscription(),
             "invoice": _invoice(),
@@ -203,7 +203,7 @@ def test_dispatch_suppresses_reminder_after_opt_out():
     )
     assert eligible is True
     suppressed = isBillingNotificationEligible(
-        delivery={"notification_type": "monthly_renewal_reminder", "status": "PENDING"},
+        delivery={"notification_type": "monthly_renewal_reminder", "status": "PENDING", "period_end":"2026-10-20T10:00:00+00:00"},
         snapshot={
             "subscription": _subscription(optOut=True),
             "invoice": _invoice(),
@@ -217,7 +217,7 @@ def test_dispatch_suppresses_reminder_after_opt_out():
 def test_dispatch_suppresses_reminder_after_payment():
     now = datetime(2026, 10, 19, 10, tzinfo=timezone.utc)
     eligible = isBillingNotificationEligible(
-        delivery={"notification_type": "monthly_renewal_reminder", "status": "PENDING"},
+        delivery={"notification_type": "monthly_renewal_reminder", "status": "PENDING", "period_end":"2026-10-20T10:00:00+00:00"},
         snapshot={
             "subscription": _subscription(),
             "invoice": _invoice(status="PAID"),

@@ -141,7 +141,7 @@ class TestEntitlementBoundaryLowersQuota(unittest.TestCase):
     def _task(self, subscriptionRow):
         from nubrix.triggers.tasks.entitlementBoundaryTask import EntitlementBoundaryTask
         client = MagicMock()
-        client.table.return_value.select.return_value.in_.return_value \
+        client.table.return_value.select.return_value.eq.return_value.in_.return_value \
             .execute.return_value.data = [subscriptionRow]
         client.table.return_value.select.return_value.eq.return_value.eq \
             .return_value.order.return_value.limit.return_value \
@@ -152,6 +152,7 @@ class TestEntitlementBoundaryLowersQuota(unittest.TestCase):
         subscription = {
             "id": "sub1",
             "user_id": "u1",
+                "is_canonical": True,
             "subscribed_experts": ["banking", "telecom", "manufacturing"],
             "domain_count": 3,
             "pending_removals": ["telecom"],
@@ -175,6 +176,7 @@ class TestEntitlementBoundaryLowersQuota(unittest.TestCase):
         subscription = {
             "id": "sub1",
             "user_id": "u1",
+                "is_canonical": True,
             "subscribed_experts": ["banking", "telecom"],
             "domain_count": 2,
             "pending_removals": ["telecom"],
@@ -257,8 +259,11 @@ class TestActivatePaidDomainsGrantsCreditsImmediately(unittest.TestCase):
         subscription = {
             "id": "sub1",
             "user_id": "u1",
+                "is_canonical": True,
             "subscribed_experts": ["banking"],
             "domain_count": 1,
+            "status": "active",
+            "current_period_end": "2099-01-01T00:00:00+00:00",
             "pending_additions": [
                 {"orderId": "order1", "domain": "telecom", "state": "awaiting_payment"},
             ],

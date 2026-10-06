@@ -5,6 +5,7 @@ from dataclasses import dataclass
 from api.services.subscriptions.paymentValidationService import (
     isAccessActive,
     isPeriodExpired,
+    utcNow,
     parseUtc,
 )
 from api.services.subscriptions.subscriptionFieldUtils import (
@@ -16,7 +17,7 @@ from utils.logger import logger
 
 _PAID_PLAN_TYPES = {"pro", "annual"}
 _VALID_PLAN_TYPES = {"none", "free", "pro", "annual"}
-_TOPUP_ELIGIBLE_STATUSES = {"active", "renewal_upcoming", "payment_pending"}
+_TOPUP_ELIGIBLE_STATUSES = {"active", "renewal_upcoming", "payment_pending", "cancelled"}
 
 
 class EntitlementUnavailableError(RuntimeError):
@@ -61,6 +62,9 @@ def evaluateSubscriptionEntitlement(
         activeSubscription = isAccessActive(row) and periodEndValid
     else:
         activeSubscription = False
+    if billingMode == "monthly_prepaid":
+        start = parseUtc(row.get("current_period_start"))
+        activeSubscription = activeSubscription and start is not None and start <= utcNow()
     trialPeriodValid = (
         status == "trial"
         and periodEndValid
@@ -91,6 +95,13 @@ class SubscriptionEntitlementService:
 
     def get(self, userId: str) -> SubscriptionEntitlement:
         row = self._resolveCanonicalRow(userId)
+        if row and row.get("billing_mode") == "monthly_prepaid":
+            from api.services.billing.manualBillingRepository import getManualBillingRepository
+            try:
+                getManualBillingRepository().activateDueCoverage(userId, utcNow())
+                row = self._resolveCanonicalRow(userId)
+            except Exception as exc:
+                raise EntitlementUnavailableError("Paid coverage activation unavailable") from exc
         return evaluateSubscriptionEntitlement(userId, row)
 
     def _resolveCanonicalRow(self, userId: str) -> dict | None:
@@ -115,17 +126,10 @@ class SubscriptionEntitlementService:
             )
             if canonicalRows:
                 return canonicalRows[0]
-            legacyRows = (
-                self.client.table("subscriptions")
-                .select(CANONICAL_SUBSCRIPTION_SELECT)
-                .eq("user_id", userId)
-                .order("updated_at", desc=True)
-                .order("id", desc=True)
-                .limit(1)
-                .execute()
-                .data
-            )
-            return legacyRows[0] if legacyRows else None
+            legacyRows = self.client.table("subscriptions").select(CANONICAL_SUBSCRIPTION_SELECT).eq("user_id", userId).limit(1).execute().data
+            if legacyRows:
+                raise EntitlementUnavailableError("Canonical subscription backfill required")
+            return None
         except Exception as exc:
             logger.error(
                 "Entitlement lookup failed for userId={}: {}",

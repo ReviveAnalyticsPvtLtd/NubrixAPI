@@ -272,7 +272,8 @@ class CreditService:
             self.supabase.table("credit_balances")
             .select(
                 "plan_tier, monthly_token_quota, used_tokens, remaining_tokens, "
-                "topup_tokens, domain_count, period_start, period_end, last_reset_at"
+                "topup_tokens, domain_count, period_start, period_end, last_reset_at, "
+                "subscription_id, lifecycle_id, credit_period_id, balance_version"
             )
             .eq("user_id", userId)
             .limit(1)
@@ -310,6 +311,21 @@ class CreditService:
             return []
 
     # ---- Redis hash lifecycle -------------------------------------------------
+
+    def _manualBalance(self, userId):
+        row = self._dbRow(userId)
+        if not row:
+            return None
+        subscriptions = self.supabase.table("subscriptions").select("billing_mode").eq("user_id", userId).eq("is_canonical", True).limit(1).execute().data
+        if not subscriptions:
+            raise RuntimeError("CANONICAL_CREDIT_OWNER_MISSING")
+        if subscriptions[0].get("billing_mode") != "monthly_prepaid":
+            return None
+        if not row.get('credit_period_id') or not row.get('lifecycle_id'):
+            raise RuntimeError('MANUAL_CREDIT_IDENTITY_MISSING')
+        from api.services.billing.manualBillingRepository import getManualBillingRepository
+        getManualBillingRepository().activateDueCoverage(userId, datetime.now(timezone.utc))
+        return self._dbRow(userId)
 
     def _ensureHash(self, userId: str) -> dict | None:
         """
@@ -638,6 +654,8 @@ class CreditService:
         Returns:
             dict: {"applied": bool, "quota": int, "delta": int, "remaining": int}.
         """
+        if self._manualBalance(userId) is not None:
+            raise ValueError('MANUAL_QUOTA_REQUIRES_PAID_TRANSACTION')
         try:
             domainCount = max(1, int(domainCount))
         except (TypeError, ValueError):
@@ -719,6 +737,15 @@ class CreditService:
         if tokensUsed <= 0:
             return self.getRemainingTokens(userId)
 
+        if self._manualBalance(userId) is not None:
+            import uuid
+            from api.services.credits.manualCreditRepository import ManualCreditRepository
+            repository = ManualCreditRepository()
+            operationId = "direct:" + str(uuid.uuid4())
+            context = repository.admit(userId, operationType, operationId)
+            repository.settle(context, tokensUsed, operationId)
+            return self.getRemainingTokens(userId)
+
         self._ensureHash(userId)
         state = self._deduct(userId, tokensUsed)
         if state is None:
@@ -775,6 +802,10 @@ class CreditService:
         `monthly` is -1 when the balance is unreadable (Redis and Supabase both
         unavailable), which callers treat as "allow".
         """
+        manual = self._manualBalance(userId)
+        if manual is not None:
+            return {"monthly": int(manual.get("remaining_tokens") or 0),
+                    "topup": int(manual.get("topup_tokens") or 0), "rolled": False}
         self._ensureHash(userId)
         state = self._peek(userId)
         if state is not None:
@@ -822,6 +853,8 @@ class CreditService:
 
     def resetMonthlyTokens(self, userId: str) -> None:
         """Event-driven monthly reset (e.g. annual renewal). Restores the full quota."""
+        if self._manualBalance(userId) is not None:
+            return
         try:
             row = self._dbRow(userId)
             if not row:
@@ -868,6 +901,28 @@ class CreditService:
         Returns:
             dict: {"granted": bool, "tokens": int}.
         """
+        attempts=self.supabase.table("billing_events").select("metadata_json").eq("provider_order_id",orderId).eq("event_category","payment_attempt").limit(1).execute().data
+        metadata=(attempts[0].get("metadata_json") or {}) if isinstance(attempts,list) and attempts else {}
+        manualTopup=isinstance(metadata,dict) and metadata.get("manualBilling",{}).get("purpose")=="topup"
+        if manualTopup:
+            from api.services.subscriptions.subscriptionService import subscriptionService
+            order=subscriptionService.razorpayClient.order.fetch(orderId)
+            if order.get('id') != orderId:
+                raise ValueError('TOPUP_PROVIDER_ORDER_MISMATCH')
+            from api.services.billing.manualBillingRepository import getManualBillingRepository
+            from api.services.billing.manualBillingContracts import VerifiedPaymentEvidence
+            repository=getManualBillingRepository()
+            attempt=repository.attemptForOrder(orderId)
+            if attempt['user_id'] != userId: raise ValueError('TOPUP_OWNER_MISMATCH')
+            payment=subscriptionService.razorpayClient.payment.fetch(paymentId)
+            if payment.get('order_id') != orderId or payment.get('id') != paymentId:
+                raise ValueError('TOPUP_PAYMENT_ORDER_MISMATCH')
+            frozen=repository._json(attempt['metadata_json'])['manualBilling']
+            result=repository.finalizeCapturedPayment(VerifiedPaymentEvidence(str(attempt['id']),str(attempt['invoice_id']),
+                userId,orderId,paymentId,'topup',payment['currency'],payment['status'],'server_observation',
+                int(payment['amount']),datetime.now(timezone.utc),None,None,False))
+            return {'granted':result.state=='topup_granted','tokens':int(frozen['tokens']) if result.state=='topup_granted' else 0,
+                'disposition':result.state,'anomalyId':result.anomalyId}
         res = self.supabase.rpc("grant_topup_tokens", {
             "p_order_id": orderId,
             "p_payment_id": paymentId,
@@ -943,6 +998,8 @@ class CreditService:
         writes on both sides, so an absolute sync here would race with an
         in-flight grant and lose a purchase.
         """
+        if self._manualBalance(userId) is not None:
+            return
         try:
             self.syncQuotaFromConfig(userId)
 
@@ -1096,6 +1153,8 @@ class CreditService:
             updatedCount = 0
             for row in rows.data:
                 userId = row["user_id"]
+                if self._manualBalance(userId) is not None:
+                    continue
                 planTier = row.get("plan_tier", "none")
                 domainCount = row.get("domain_count", 1) or 1
                 newQuota = getTokenQuotaForPlan(planTier, domainCount)
@@ -1165,6 +1224,8 @@ class CreditService:
 
         Called during reconcile to prevent long-term drift.
         """
+        if self._manualBalance(userId) is not None:
+            return
         try:
             row = self._dbRow(userId)
             if not row:

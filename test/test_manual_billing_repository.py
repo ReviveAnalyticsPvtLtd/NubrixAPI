@@ -192,22 +192,13 @@ def test_ensure_canonical_uses_per_user_advisory_lock():
     assert "pg_advisory_xact_lock" in connection.sql
 
 
-def test_historical_row_can_be_promoted_when_no_canonical_exists():
+def test_historical_row_requires_reviewed_backfill():
     connection = _ScriptedConnection()
-    historical = {
-        "id": "hist-1",
-        "user_id": "u-hist",
-        "billing_mode": "monthly_recurring",
-        "status": "expired",
-        "is_canonical": False,
-    }
     connection.on("is_canonical = true", results=[])
-    connection.on("order by updated_at desc", results=[historical])
-    connection.on("update public.subscriptions", results=[])
-    row = _repository(connection).ensureCanonicalSubscription("u-hist")
-    assert row["id"] == "hist-1"
-    assert row["is_canonical"] is True
-    assert connection.committed == 1
+    connection.on("select id from public.subscriptions", results=[{"id":"history"}])
+    with pytest.raises(ValueError, match="CANONICAL_BACKFILL_REQUIRED"):
+        _repository(connection).ensureCanonicalSubscription("u-hist")
+    assert connection.rolledBack == 1
 
 
 def test_existing_canonical_row_is_returned_without_rewrites():
@@ -227,197 +218,42 @@ def test_existing_canonical_row_is_returned_without_rewrites():
     assert "update" not in connection.sql
 
 
-def test_reserve_checkout_intent_persists_attempt_row():
-    connection = _ScriptedConnection()
-    connection.on("idempotency_key = %s", results=[])  # no existing intent
-    connection.on(
-        "where id = %s",
-        results=[
-            {
-                "id": "attempt-1",
-                "user_id": "u1",
-                "invoice_id": "inv-1",
-                "payment_status": "created",
-                "provider_order_id": None,
-                "metadata_json": {
-                    "manualBilling": {
-                        "lifecycleId": "lc1",
-                        "payloadHash": "hash-1",
-                        "frozenAmount": 100000,
-                        "currency": "INR",
-                        "expiresAt": "2026-10-05T12:30:00+00:00",
-                        "revision": 1,
-                        "billingMode": "monthly_prepaid",
-                        "purpose": "initial_purchase",
-                    }
-                },
-            }
-        ],
-    )
-    intent = _repository(connection).reserveCheckoutIntent(
-        userId="u1",
-        purpose="initial_purchase",
-        requestKey="req-1",
-        payloadHash="hash-1",
-        snapshot={
-            "lifecycleId": "lc1",
-            "invoiceId": "inv-1",
-            "subscriptionId": "sub-1",
-            "billingMode": "monthly_prepaid",
-            "domains": ["banking"],
-            "amount": 100000,
-            "currency": "INR",
-            "expiresAt": "2026-10-05T12:30:00+00:00",
-            "periodStart": "2026-10-05T12:00:00+00:00",
-            "periodEnd": "2026-11-05T12:00:00+00:00",
-        },
-    )
-    assert isinstance(intent, CheckoutIntent)
-    assert intent.payloadHash == "hash-1"
-    assert intent.amount == 100000
-    assert intent.razorpayOrderId is None
-    assert "billing_events" in connection.sql
-    assert "authenticated_checkout" in connection.sql
-    assert "pg_advisory_xact_lock" in connection.sql
-    assert connection.committed == 1
-    assert connection.rolledBack == 0
+from test.test_manual_billing_runtime import database, seed_payment, read_row, sqlTransaction, USER
 
 
-def test_same_key_changed_payload_conflicts():
-    connection = _ScriptedConnection()
-    connection.on(
-        "idempotency_key = %s",
-        results=[
-            {
-                "id": "attempt-1",
-                "user_id": "u1",
-                "invoice_id": "inv-1",
-                "payment_status": "created",
-                "provider_order_id": None,
-                "metadata_json": {
-                    "manualBilling": {
-                        "payloadHash": "different-hash",
-                        "purpose": "initial_purchase",
-                    }
-                },
-            }
-        ],
-    )
-    with pytest.raises(ValueError):
-        _repository(connection).reserveCheckoutIntent(
-            userId="u1",
-            purpose="initial_purchase",
-            requestKey="req-1",
-            payloadHash="hash-1",
-            snapshot={"lifecycleId": "lc1", "amount": 100000, "currency": "INR"},
-        )
-    assert connection.rolledBack == 1
-    assert connection.committed == 0
+def test_same_key_payload_conflict_is_rejected(database):
+    repository,path=database
+    evidence=seed_payment(database)
+    with pytest.raises(ValueError,match="IDEMPOTENCY_CONFLICT"):
+        repository.reserveCheckoutIntent(USER,"initial_purchase","invoice-one","different-payload",{
+            "subscriptionId":read_row(path,"subscriptions")["id"],"invoiceId":"invoice-one","amount":3000})
+    assert read_row(path,"Invoices")["status"]=="PAYMENT_PENDING"
 
 
-def test_same_key_same_payload_returns_original_intent():
-    connection = _ScriptedConnection()
-    connection.on(
-        "idempotency_key = %s",
-        results=[
-            {
-                "id": "attempt-1",
-                "user_id": "u1",
-                "invoice_id": "inv-1",
-                "payment_status": "created",
-                "provider_order_id": None,
-                "metadata_json": {
-                    "manualBilling": {
-                        "payloadHash": "hash-1",
-                        "purpose": "initial_purchase",
-                        "frozenAmount": 100000,
-                        "currency": "INR",
-                        "expiresAt": "2026-10-05T12:30:00+00:00",
-                    }
-                },
-            }
-        ],
-    )
-    intent = _repository(connection).reserveCheckoutIntent(
-        userId="u1",
-        purpose="initial_purchase",
-        requestKey="req-1",
-        payloadHash="hash-1",
-        snapshot={"lifecycleId": "lc1", "amount": 100000, "currency": "INR"},
-    )
-    assert intent.attemptId == "attempt-1"
-    # no second insert for an idempotent replay
-    assert "insert into public.billing_events" not in connection.sql
+def test_bound_order_cannot_be_replaced(database):
+    repository,path=database
+    evidence=seed_payment(database)
+    with pytest.raises(ValueError,match="PROVIDER_ORDER_ALREADY_BOUND"):
+        repository.bindProviderOrder(evidence.attemptId,{"id":"different-order"})
+    assert read_row(path,"Invoices")["razorpay_order_id"]=="order-one"
 
 
-def test_bind_provider_order_updates_attempt_mapping():
-    connection = _ScriptedConnection()
-    connection.on(
-        "update public.billing_events",
-        results=[
-            {
-                "id": "attempt-1",
-                "user_id": "u1",
-                "invoice_id": "inv-1",
-                "payment_status": "pending_provider_ack",
-                "provider_order_id": "order_new",
-                "metadata_json": {
-                    "manualBilling": {
-                        "purpose": "initial_purchase",
-                        "frozenAmount": 100000,
-                        "currency": "INR",
-                        "expiresAt": "2026-10-05T12:30:00+00:00",
-                    }
-                },
-            }
-        ],
-    )
-    intent = _repository(connection).bindProviderOrder(
-        "attempt-1",
-        {"id": "order_new", "status": "created", "amount": 100000},
-    )
-    assert intent.razorpayOrderId == "order_new"
-    assert intent.state == "pending_provider_ack"
-    assert "provider_order_id" in connection.sql
-    assert connection.committed == 1
+def test_unknown_provider_ack_is_not_submitted_again(database):
+    repository,path=database
+    evidence=seed_payment(database)
+    with sqlTransaction(path) as connection:
+        connection.execute("UPDATE billing_events SET payment_status='created' WHERE id=?",(evidence.attemptId,))
+    assert repository.claimProviderOrderCreation(evidence.attemptId)
+    assert not repository.claimProviderOrderCreation(evidence.attemptId)
 
 
-def test_transaction_failure_rolls_back_all_writes():
-    connection = _ScriptedConnection()
-    connection.on("idempotency_key = %s", results=[])
-    connection.on("insert into public.billing_events", error=RuntimeError)
-    with pytest.raises(RuntimeError):
-        _repository(connection).reserveCheckoutIntent(
-            userId="u1",
-            purpose="initial_purchase",
-            requestKey="req-2",
-            payloadHash="hash-2",
-            snapshot={"lifecycleId": "lc1", "amount": 100000, "currency": "INR"},
-        )
-    assert connection.rolledBack == 1
-    assert connection.committed == 0
-    assert connection.closed >= 1
-
-
-def test_set_renewal_opt_out_writes_flag_and_reason():
-    connection = _ScriptedConnection()
-    connection.on(
-        "renewal_opt_out = %s",
-        results=[
-            {
-                "id": "sub-1",
-                "user_id": "u1",
-                "status": "active",
-                "renewal_opt_out": True,
-                "cancellation_reason": "not needed",
-                "current_period_end": "2026-10-20T10:00:00+00:00",
-            }
-        ],
-    )
-    row = _repository(connection).setRenewalOptOut(
-        "u1", True, "not needed", requestKey="cancel-1"
-    )
-    assert row["renewal_opt_out"] is True
-    assert "renewal_opt_out" in connection.sql
-    assert "auto_renew_enabled = false" in connection.sql
-    assert connection.committed == 1
+def test_cancellation_is_durable_and_idempotent_without_access_loss(database):
+    repository,path=database
+    repository.finalizeCapturedPayment(seed_payment(database))
+    end=read_row(path,"subscriptions")["current_period_end"]
+    repository.setRenewalOptOut(USER,True,"No longer needed","request-one")
+    repository.setRenewalOptOut(USER,True,"Repeated","request-one")
+    subscription=read_row(path,"subscriptions")
+    assert subscription["renewal_opt_out"] and subscription["status"]=="active"
+    assert subscription["current_period_end"]==end
+    assert subscription["cancellation_reason"]=="No longer needed"

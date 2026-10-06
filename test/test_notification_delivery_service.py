@@ -149,6 +149,9 @@ class FakeEdgeClient:
             raise result
         return result
 
+    def sendBilling(self, payload):
+        return self.sendTrialExpiry(payload)
+
 
 class FakeLedger:
     def __init__(self):
@@ -213,6 +216,17 @@ def test_globalValidationOccursBeforeClaimingRows():
         assert str(error) == "EDGE_VALIDATION_FAILED"
 
     assert repository.claimCalls == 0
+
+
+def test_committedBillingReceiptDispatchesEvenAfterSubscriptionExpires():
+    delivery = _delivery(notification_type="payment_receipt", metadata_json={"paymentId":"pay_123","amount":3000,"currency":"INR"})
+    repository = FakeRepository([delivery])
+    edge = FakeEdgeClient([EdgeSendResult(outcome="ACCEPTED", messageId="receipt-message")])
+    service = _service(repository, edge, subscriptions=[_subscription(status="expired",billing_mode="monthly_prepaid")])
+    result = service.dispatchBatch("worker-a")
+    assert result["accepted"] == 1 and result["cancelled"] == 0
+    assert edge.payloads[0]["notificationType"] == "payment_receipt"
+    assert edge.payloads[0]["metadata"]["paymentId"] == "pay_123"
 
 
 def test_acceptedResponsePersistsMessageIdAndSafeAudit():

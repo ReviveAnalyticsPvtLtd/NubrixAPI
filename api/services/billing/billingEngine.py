@@ -224,7 +224,7 @@ def computeInvoiceSnapshot(billingMode: str, billingReason: str,
     """
     now = datetime.now(timezone.utc)
 
-    if billingMode == "monthly_recurring":
+    if billingMode in ("monthly_prepaid", "monthly_recurring"):
         priceRef = _getMonthlyBasePrice()
         basePrice = priceRef["amount"]
         planId = os.environ.get("RAZORPAY_PRO_PLAN_ID", "")

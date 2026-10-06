@@ -21,9 +21,12 @@ DECLARE
     active_tokens INTEGER;
     unmigrated_monthly INTEGER;
 BEGIN
-    SELECT count(*) INTO active_tokens
-    FROM public.subscriptions
-    WHERE razorpay_token_id IS NOT NULL;
+    active_tokens := 0;
+    IF EXISTS (SELECT 1 FROM information_schema.columns WHERE table_schema='public'
+               AND table_name='subscriptions' AND column_name='razorpay_token_id') THEN
+        EXECUTE 'SELECT count(*) FROM public.subscriptions WHERE razorpay_token_id IS NOT NULL'
+        INTO active_tokens;
+    END IF;
 
     IF active_tokens > 0 THEN
         RAISE EXCEPTION
@@ -40,6 +43,18 @@ BEGIN
             'CONTRACT_PRECONDITION_FAILED: % subscription row(s) still use billing_mode=monthly_recurring. Run the reviewed backfill mapping to monthly_prepaid first.',
             unmigrated_monthly;
     END IF;
+    IF EXISTS (
+        SELECT 1 FROM public.subscriptions s
+        LEFT JOIN public.credit_balances c ON c.user_id=s.user_id
+        WHERE s.is_canonical AND s.billing_mode='monthly_prepaid'
+          AND s.current_period_end > now()
+          AND (c.lifecycle_id IS NULL OR c.credit_period_id IS NULL
+               OR c.subscription_id IS DISTINCT FROM s.id
+               OR c.period_start IS DISTINCT FROM s.current_period_start
+               OR c.period_end IS DISTINCT FROM s.current_period_end)
+    ) THEN
+        RAISE EXCEPTION 'CONTRACT_PRECONDITION_FAILED: paid monthly credit identities and dates require reviewed backfill';
+    END IF;
 END
 $$;
 
@@ -55,10 +70,10 @@ DROP INDEX IF EXISTS idx_subscriptions_razorpay_customer;
 DROP INDEX IF EXISTS idx_subscriptions_razorpay_token;
 
 ALTER TABLE public.subscriptions
-    DROP COLUMN IF EXISTS subscriptions.razorpay_customer_id,
-    DROP COLUMN IF EXISTS subscriptions.razorpay_token_id,
-    DROP COLUMN IF EXISTS subscriptions.subscription_anchor_day,
-    DROP COLUMN IF EXISTS subscriptions.recurring_failures;
+    DROP COLUMN IF EXISTS razorpay_customer_id,
+    DROP COLUMN IF EXISTS razorpay_token_id,
+    DROP COLUMN IF EXISTS subscription_anchor_day,
+    DROP COLUMN IF EXISTS recurring_failures;
 
 -- The billing-mode check contracts monthly_recurring out of the allowed set
 -- for NEW/UPDATED rows; historical rows were migrated by precondition 2.

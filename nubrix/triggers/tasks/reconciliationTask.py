@@ -53,6 +53,11 @@ class ReconciliationTask:
             dict: Counts of resolved attempts, errors, and anomaly summary.
         """
         logger.info("Reconciliation task started")
+        from api.services.billing.manualBillingRepository import getManualBillingRepository
+        from api.services.billing.manualBillingRecoveryService import ManualBillingRecoveryService
+        manualResults = ManualBillingRecoveryService(getManualBillingRepository(), self.razorpayClient).execute()
+        from api.services.credits.manualCreditRepository import ManualCreditRepository
+        usageResults = ManualCreditRepository().recoverUsage()
         results = self._reconcileStaleAttempts()
         anomalySummary = self._generateAnomalyReport()
         logger.info(
@@ -60,7 +65,7 @@ class ReconciliationTask:
             f"{results['errors']} errors, "
             f"{anomalySummary['totalAnomalies']} anomalies detected"
         )
-        return {**results, "anomalySummary": anomalySummary}
+        return {**results, "manualResults":manualResults, "usageResults":usageResults, "anomalySummary": anomalySummary}
 
     def _reconcileStaleAttempts(self) -> dict:
         """
@@ -75,7 +80,7 @@ class ReconciliationTask:
 
         staleAttempts = (
             self.client.table("billing_events")
-            .select("id, provider_payment_id, provider_order_id, user_id, payment_status")
+            .select("id, provider_payment_id, provider_order_id, user_id, payment_status, metadata_json")
             .eq("event_category", "payment_attempt")
             .in_("payment_status", ["created", "pending_provider_ack", "authorized"])
             .lte("attempted_at", cutoff)
@@ -92,6 +97,8 @@ class ReconciliationTask:
         errors = 0
 
         for attempt in staleAttempts:
+            if (attempt.get('metadata_json') or {}).get('manualBilling',{}).get('billingMode') == 'monthly_prepaid':
+                continue
             attemptId = attempt["id"]
             try:
                 finalStatus = self._resolveAttempt(attempt)

@@ -37,8 +37,8 @@ def test_contract_drops_exactly_the_four_columns():
         "subscription_anchor_day",
         "recurring_failures",
     ):
-        assert f"drop column subscriptions.{column}" in sql or (
-            f"drop column if exists subscriptions.{column}" in sql
+        assert f"drop column {column}" in sql or (
+            f"drop column if exists {column}" in sql
         ), f"contract migration must drop {column}"
 
 

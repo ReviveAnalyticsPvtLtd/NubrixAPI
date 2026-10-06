@@ -467,6 +467,12 @@ class UserErasureRepository:
                     "select pg_advisory_xact_lock(hashtextextended(%s, 0))",
                     (userId,),
                 )
+                from api.services.billing.manualBillingRepository import _advisoryKey
+                cursor.execute('select pg_advisory_xact_lock(%s)',(_advisoryKey(userId),))
+                if self._tableExists(cursor,'billing_events'):
+                    cursor.execute("select id from public.billing_events where user_id=%s and event_type='refund.intent' and event_status <> 'processed' limit 1",(userId,))
+                    if cursor.fetchone() is not None:
+                        raise AdminApiError(409,'Approved refund must be reconciled before financial records are anonymised')
                 self._scrubNotificationDeliveries(cursor, userId)
                 if self._tableExists(cursor, "Invoices"):
                     cursor.execute(

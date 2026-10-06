@@ -83,6 +83,18 @@ class TestTopupEligibilityAndOrder(unittest.TestCase):
         svc = TopupService()
         svc.client = MagicMock()
         svc.razorpayClient = MagicMock()
+        from api.services.billing.manualBillingContracts import CheckoutIntent
+        from datetime import datetime,timezone,timedelta
+        def reserve(user,purpose,key,payloadHash,payload):
+            return CheckoutIntent('test-attempt',payload['invoiceId'],user,payload['lifecycleId'],purpose,
+                'monthly_prepaid',payloadHash,payload['currency'],'created',1,payload['amount'],
+                datetime.now(timezone.utc)+timedelta(minutes=30),None,payload)
+        repository=MagicMock()
+        repository.reserveCheckoutIntent.side_effect=reserve
+        repository.claimProviderOrderCreation.return_value=True
+        patcher=patch('api.services.billing.manualBillingRepository.getManualBillingRepository',return_value=repository)
+        patcher.start()
+        self.addCleanup(patcher.stop)
         return svc
 
     def _sub(self, status="active", planType="pro"):
@@ -90,6 +102,7 @@ class TestTopupEligibilityAndOrder(unittest.TestCase):
         start = (datetime.now(timezone.utc) - timedelta(days=10)).isoformat()
         end = (datetime.now(timezone.utc) + timedelta(days=20)).isoformat()
         return {"id": "sub_1", "status": status, "plan_type": planType,
+                "user_id":"u1","billing_state":{"manualBilling":{"lifecycleId":"test-life"}},
                 "billing_mode": "monthly_prepaid",
                 "current_period_start": start, "current_period_end": end}
 
@@ -185,7 +198,7 @@ class TestTopupEligibilityAndOrder(unittest.TestCase):
         self.assertEqual(result["credits"], 500.0)
         self.assertEqual(result["invoiceId"], "inv_1")
         mkInv.assert_called_once()
-        attach.assert_called_once_with("inv_1", "order_abc")
+        attach.assert_not_called()
 
         notes = svc.razorpayClient.order.create.call_args[0][0]["notes"]
         self.assertEqual(notes["type"], "credit_topup")

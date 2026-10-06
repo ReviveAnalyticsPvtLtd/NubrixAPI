@@ -76,7 +76,7 @@ def test_expansionNormalizesInvoiceStatusStorage():
     assert "set status = upper(status)" in normalized
     assert "paying_pending_placeholder_not_expected" not in normalized
     assert "'payment_pending'" in normalized or "'PAYMENT_PENDING'" in sql
-    assert "'EXPIRED'" in sql
+    assert "set status = 'expired' where status in ('failed')" not in normalized
 
 
 def test_expansionIsAdditiveOnlyForContractedColumns():

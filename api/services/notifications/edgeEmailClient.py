@@ -57,7 +57,7 @@ class EdgeEmailClient:
         }:
             raise RuntimeError("EDGE_VALIDATION_FAILED")
 
-    def sendTrialExpiry(self, payload: dict) -> EdgeSendResult:
+    def sendTrialExpiry(self, payload: dict, *, billing=False) -> EdgeSendResult:
         self._requireConfiguration()
         try:
             response = self.requestPost(
@@ -82,8 +82,8 @@ class EdgeEmailClient:
         if 200 <= status < 300:
             if responsePayload is None:
                 return EdgeSendResult(
-                    outcome="RETRYABLE",
-                    errorCode="EDGE_RESPONSE_INVALID",
+                    outcome="AMBIGUOUS" if billing else "RETRYABLE",
+                    errorCode="AMBIGUOUS_SEND" if billing else "EDGE_RESPONSE_INVALID",
                 )
             messageId = str(responsePayload.get("messageId") or "").strip()
             if (
@@ -92,8 +92,8 @@ class EdgeEmailClient:
                 or not messageId
             ):
                 return EdgeSendResult(
-                    outcome="RETRYABLE",
-                    errorCode="PROVIDER_MESSAGE_ID_MISSING",
+                    outcome="AMBIGUOUS" if billing else "RETRYABLE",
+                    errorCode="AMBIGUOUS_SEND" if billing else "PROVIDER_MESSAGE_ID_MISSING",
                 )
             return EdgeSendResult(
                 outcome="ACCEPTED",
@@ -101,6 +101,8 @@ class EdgeEmailClient:
             )
 
         errorCode = self._safeErrorCode(responsePayload, f"EDGE_HTTP_{status}")
+        if billing and errorCode == 'AMBIGUOUS_SEND':
+            return EdgeSendResult(outcome='AMBIGUOUS',errorCode='AMBIGUOUS_SEND')
         if status in {408, 429} or status >= 500:
             return EdgeSendResult(
                 outcome="RETRYABLE",
@@ -110,6 +112,13 @@ class EdgeEmailClient:
             outcome="PERMANENT",
             errorCode=errorCode,
         )
+
+    def sendBilling(self, payload: dict) -> EdgeSendResult:
+        edgeUrl = os.environ.get("BILLING_NOTIFICATION_EMAIL_URL", "")
+        if not edgeUrl:
+            raise RuntimeError("BILLING_EDGE_CONFIGURATION_MISSING")
+        return EdgeEmailClient(edgeUrl=edgeUrl,apiKey=self.apiKey,
+            requestPost=self.requestPost,timeoutSeconds=self.timeoutSeconds).sendTrialExpiry(payload,billing=True)
 
     def _requireConfiguration(self) -> None:
         if not self.edgeUrl or not self.apiKey:

@@ -134,6 +134,7 @@ class EntitlementBoundaryTaskTests(unittest.TestCase):
             "subscriptions": [{
                 "id": "sub_1",
                 "user_id": "u1",
+                "is_canonical": True,
                 "billing_mode": "annual_prepaid",
                 "status": "active",
                 "current_period_start": "2025-05-26T11:22:10+00:00",
@@ -184,6 +185,7 @@ class EntitlementBoundaryTaskTests(unittest.TestCase):
             "subscriptions": [{
                 "id": "sub_1",
                 "user_id": "u1",
+                "is_canonical": True,
                 "status": "active",
                 "current_period_end": future.isoformat(),
                 "subscribed_experts": ["banking", "manufacturing"],

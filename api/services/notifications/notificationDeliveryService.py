@@ -154,19 +154,27 @@ class NotificationDeliveryService:
             delivery.get("subscription_id"),
             (
                 "id, user_id, current_period_start, current_period_end, "
-                "status, billing_mode, erasure_pending"
+                "status, billing_mode, erasure_pending, renewal_opt_out, billing_state, is_canonical"
             ),
         )
         if subscription is None:
             self._cancel(delivery, workerId, "SUBSCRIPTION_NOT_FOUND", summary)
             return
 
-        intent = buildTrialExpiryIntent(subscription, now)
-        if intent is None or not self._samePeriod(
-            intent["periodEnd"], delivery.get("period_end")
-        ):
-            self._cancel(delivery, workerId, "SUBSCRIPTION_NOT_ELIGIBLE", summary)
-            return
+        billingDelivery = delivery.get("notification_type") != "trial_expiry_warning"
+        if billingDelivery:
+            from api.services.notifications.billingNotificationService import isBillingNotificationEligible
+            metadata = delivery.get("metadata_json") or {}
+            invoice = self._findOne("Invoices", "id", metadata.get("invoiceId"), "id, status, period_start, period_end, metadata_json") if metadata.get("invoiceId") else None
+            snapshot = {"subscription":subscription, "invoice":invoice}
+            if not isBillingNotificationEligible(delivery, snapshot, now):
+                self._cancel(delivery, workerId, "SUBSCRIPTION_NOT_ELIGIBLE", summary)
+                return
+        else:
+            intent = buildTrialExpiryIntent(subscription, now)
+            if intent is None or not self._samePeriod(intent["periodEnd"], delivery.get("period_end")):
+                self._cancel(delivery, workerId, "SUBSCRIPTION_NOT_ELIGIBLE", summary)
+                return
 
         user = self._findOne(
             "Users",
@@ -181,6 +189,15 @@ class NotificationDeliveryService:
         name = str(user.get("fullName") or "").strip()
         if not email or not name:
             self._cancel(delivery, workerId, "USER_PROFILE_INCOMPLETE", summary)
+            return
+
+        if billingDelivery:
+            payload = {"mode":"send", "deliveryId":str(delivery["id"]),
+                "notificationType":delivery["notification_type"], "templateVersion":delivery["template_version"],
+                "email":email, "name":name, "periodEnd":str(delivery.get("period_end") or ""),
+                "metadata":delivery.get("metadata_json") or {}, "trackingTag":f"nubrix_delivery:{delivery['id']}"}
+            result = self.edgeClient.sendBilling(payload)
+            self._applySendResult(delivery,workerId,result,now,summary)
             return
 
         payload = {

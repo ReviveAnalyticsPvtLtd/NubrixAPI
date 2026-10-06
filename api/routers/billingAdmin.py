@@ -87,7 +87,8 @@ def _loadPaidIntervalsForInvoices(userId: str, invoiceIds: list[str]) -> list[di
         client.table("Invoices")
         .select(
             "id, userId, billing_reason, period_start, period_end, "
-            "total_amount, amount, currency, status, metadata_json"
+            "total_amount, amount, currency, status, metadata_json, "
+            "razorpayPaymentId"
         )
         .eq("userId", userId)
         .in_("id", invoiceIds)
@@ -150,7 +151,7 @@ async def quoteSubscriptionRefund(
         paidIntervals = _loadPaidIntervalsForInvoices(
             payload.userId, payload.invoiceIds
         )
-        service = SubscriptionRefundService()
+        service = SubscriptionRefundService.forProduction()
         quote = service.quoteUnusedTimeRefund(
             staffId=adminUserId,
             payload=payload.dict(),
@@ -206,7 +207,7 @@ async def initiateSubscriptionRefund(
         paidIntervals = _loadPaidIntervalsForInvoices(
             payload.userId, payload.invoiceIds
         )
-        service = SubscriptionRefundService()
+        service = SubscriptionRefundService.forProduction()
         intent = service.initiateUnusedTimeRefund(
             staffId=adminUserId,
             payload=payload.dict(),

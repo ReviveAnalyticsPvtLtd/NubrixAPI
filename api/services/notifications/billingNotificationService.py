@@ -257,15 +257,25 @@ def isBillingNotificationEligible(
 
     if bool(subscription.get("renewal_opt_out")):
         return False
+    current = _utc(now)
+    periodEnd = _periodEnd(snapshot or {})
+    deliveryEnd = parseUtc(delivery.get("period_end"))
+    if periodEnd is None or deliveryEnd != periodEnd:
+        return False
+    metadata = delivery.get("metadata_json") or {}
+    if metadata.get("lifecycleId") and metadata["lifecycleId"] != _lifecycleId(snapshot):
+        return False
     if notificationType in ("monthly_renewal_ready", "monthly_renewal_reminder"):
+        if current >= periodEnd:
+            return False
+        if notificationType == "monthly_renewal_ready" and _withinWindow(current, periodEnd, 1):
+            return False
         return _invoiceUnpaid(snapshot or {})
 
     # Expiry notice: only unpaid, uncancelled, no valid paid continuation.
-    current = _utc(now)
     invoice = (snapshot or {}).get("invoice")
     if invoice is not None and (invoice.get("status") or "").upper() == "PAID":
         return False
-    periodEnd = _periodEnd(snapshot or {})
     return periodEnd is not None and current >= periodEnd
 
 

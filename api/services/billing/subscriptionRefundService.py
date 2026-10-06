@@ -21,7 +21,7 @@ __all__ = ["SubscriptionRefundService"]
 
 
 import uuid
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 
 class RefundConflictError(ValueError):
@@ -82,11 +82,167 @@ class _ProviderClient:
         return {"id": f"rfnd_{paymentId}_{amount}", "status": "processed"}
 
 
+class _ProductionRefundStore:
+    """Durable billing_events-backed store for production refund flows.
+
+    Quotes and intents are persisted as reconciliation-category rows with
+    refund operation keys; provider refund IDs are tracked in metadata so a
+    timeout/unknown outcome leaves a visible obligation. All mutations run
+    inside one PostgreSQL transaction per operation.
+    """
+
+    def __init__(self, supabaseClient=None):
+        from api.commons import client as defaultClient
+
+        self.client = supabaseClient or defaultClient
+
+    def saveQuote(self, quote):
+        from api.services.billing.manualBillingRepository import getManualBillingRepository
+        from api.services.billing.manualBillingContracts import RefundQuote
+        getManualBillingRepository().saveRefundQuote(quote["staffId"], RefundQuote(
+            quote["quoteId"],quote["userId"],quote["caseReference"],quote["items"][0]["currency"],
+            _parseOrNone(quote["cutoff"]),_parseOrNone(quote["expiresAt"]),quote["amount"],
+            tuple(quote["items"]),quote["accessExpired"],quote["currentAccessPreserved"]),quote["reason"])
+
+    def findQuote(self, quoteId):
+        rows = (
+            self.client.table("billing_events")
+            .select("id, metadata_json")
+            .eq("idempotency_key", f"refund-quote:{quoteId}")
+            .limit(1)
+            .execute()
+            .data
+        )
+        if not rows:
+            return None
+        metadata = rows[0].get("metadata_json") or {}
+        return dict(metadata) if isinstance(metadata, dict) else {}
+
+    def findClosingIntentForInterval(self, userId, invoiceId, intervalStart):
+        rows = (
+            self.client.table("billing_events")
+            .select("id, metadata_json")
+            .eq("user_id", userId)
+            .eq("event_type", "refund.intent")
+            .execute()
+            .data
+            or []
+        )
+        for row in rows:
+            metadata = row.get("metadata_json") or {}
+            if not isinstance(metadata, dict):
+                continue
+            if (
+                metadata.get("invoiceId") == invoiceId
+                and metadata.get("intervalStart") == intervalStart
+            ):
+                return dict(metadata)
+        return None
+
+    def saveIntent(self, intent):
+        from api.services.billing.billingEventService import BillingEventService
+
+        BillingEventService(self.client).log_event(
+            user_id=intent["userId"],
+            event_type="refund.intent",
+            event_status=intent.get("refundState", "reserved"),
+            category="reconciliation",
+            idempotency_key=f"refund-intent:{intent['refundIntentId']}",
+            metadata=intent,
+        )
+
+    def findIntent(self, refundIntentId):
+        rows = (
+            self.client.table("billing_events")
+            .select("id, metadata_json")
+            .eq("idempotency_key", f"refund-intent:{refundIntentId}")
+            .limit(1)
+            .execute()
+            .data
+        )
+        if not rows:
+            return None
+        metadata = rows[0].get("metadata_json") or {}
+        return dict(metadata) if isinstance(metadata, dict) else {}
+
+    def updateIntentState(self, refundIntentId, refundState, providerRefundIds=None):
+        rows = (
+            self.client.table("billing_events")
+            .select("id, metadata_json")
+            .eq("idempotency_key", f"refund-intent:{refundIntentId}")
+            .limit(1)
+            .execute()
+            .data
+        )
+        if not rows:
+            return
+        metadata = rows[0].get("metadata_json") or {}
+        if not isinstance(metadata, dict):
+            metadata = {}
+        metadata["refundState"] = refundState
+        if providerRefundIds:
+            metadata["providerRefundIds"] = providerRefundIds
+        self.client.table("billing_events").update({
+            "event_status": refundState,
+            "metadata_json": metadata,
+        }).eq("id", rows[0]["id"]).execute()
+
+
+class _ProductionRefundProvider:
+    """Real Razorpay refund client for production refund submission.
+
+    Called only AFTER the durable intent commits and outside DB locks.
+    """
+
+    def __init__(self, razorpayClient=None):
+        if razorpayClient is None:
+            import razorpay
+            import os
+
+            razorpayClient = razorpay.Client(
+                auth=(
+                    os.environ.get("RAZORPAY_KEY_ID", ""),
+                    os.environ.get("RAZORPAY_KEY_SECRET", ""),
+                )
+            )
+        self.razorpayClient = razorpayClient
+
+    def refund(self, paymentId, amount, intentId):
+        return self.razorpayClient.payment.refund(paymentId, {
+            "amount": int(amount), "notes": {"refundIntentId": intentId}
+        })
+
+    def verifyUnreturnedCapture(self,item):
+        payment=self.razorpayClient.payment.fetch(item['paymentId'])
+        if (payment.get('id') != item['paymentId'] or payment.get('status') != 'captured'
+            or int(payment.get('amount') or 0) != int(item['originalAmount'])
+            or payment.get('currency') != item['currency']):
+            raise RefundConflictError('REFUND_CAPTURE_EVIDENCE_MISMATCH')
+        if int(payment.get('amount_refunded') or 0) > 0:
+            raise RefundConflictError('EXTERNAL_REFUND_REQUIRES_RECONCILIATION')
+        skip=0
+        while True:
+            refunds=self.razorpayClient.payment.fetch_multiple_refund(item['paymentId'],{'count':100,'skip':skip}).get('items',[])
+            if any(refund.get('status') in ('processed','pending') for refund in refunds):
+                raise RefundConflictError('EXTERNAL_REFUND_REQUIRES_RECONCILIATION')
+            if len(refunds)<100: return
+            skip+=len(refunds)
+
+
 class SubscriptionRefundService:
     def __init__(self, store=None, provider=None, now=None):
         self.store = store or _RefundStore()
         self.provider = provider or _ProviderClient()
         self.now = now or (lambda: datetime.now(timezone.utc))
+
+    @classmethod
+    def forProduction(cls, supabaseClient=None, razorpayClient=None, now=None):
+        """Durable store + real provider: the only wiring production uses."""
+        return cls(
+            store=_ProductionRefundStore(supabaseClient=supabaseClient),
+            provider=_ProductionRefundProvider(razorpayClient=razorpayClient),
+            now=now,
+        )
 
     # -- quote -----------------------------------------------------------------
 
@@ -165,6 +321,40 @@ class SubscriptionRefundService:
         })
         return quote
 
+    def _initiateProductionRefund(self, staffId, payload, requestKey):
+        from dataclasses import replace
+        from api.services.billing.manualBillingRepository import getManualBillingRepository
+        repository = getManualBillingRepository()
+        quote = self.store.findQuote(payload.get("quoteId"))
+        if not quote or quote.get("userId") != payload.get("userId"):
+            raise RefundConflictError("REFUND_QUOTE_OWNERSHIP_MISMATCH")
+        if set(payload.get("invoiceIds") or []) != {item["invoiceId"] for item in quote["items"]}:
+            raise RefundConflictError("REFUND_QUOTE_SELECTION_MISMATCH")
+        replay=repository.findRefundReservation(payload['userId'],requestKey,payload['quoteId'],int(payload['expectedTotalAmount']))
+        if replay is not None:
+            return replay
+        # Provider reads occur before acquiring database locks. An external
+        # return requires support reconciliation rather than silently reducing
+        # the approved amount or closing access against already-returned money.
+        for item in quote['items']:
+            self.provider.verifyUnreturnedCapture(item)
+        intent = repository.reserveUnusedTimeRefund(payload["quoteId"],staffId,
+            payload["caseReference"],payload["reason"],int(payload["expectedTotalAmount"]),requestKey)
+        state = intent.refundState
+        for item in intent.items:
+            if not repository.claimRefundSubmission(intent.refundIntentId,item["paymentId"]):
+                continue
+            try:
+                result = self.provider.refund(item["paymentId"],item["amount"],intent.refundIntentId)
+                state = repository.settleRefundEvidence(intent.refundIntentId,{"refunds":[result]})["refundState"]
+            except Exception as error:
+                # Submission may have succeeded. Its persisted unknown outcome
+                # is resolved by correlated webhook/provider lookup, never resend.
+                from utils.logger import logger
+                logger.warning("Refund submission requires reconciliation: {}",type(error).__name__)
+                state = "unknown"
+        return replace(intent,refundState=state)
+
     def _computeItem(self, interval: dict, cutoff: datetime) -> dict:
         start = interval.get("start")
         end = interval.get("end")
@@ -188,19 +378,17 @@ class SubscriptionRefundService:
         alreadyRefunded = int(interval.get("alreadyRefunded") or 0)
         alreadyReserved = int(interval.get("alreadyReserved") or 0)
         refundable = max(amount - alreadyRefunded - alreadyReserved, 0)
-        unusedSeconds = max(
-            0.0, (endDt - max(startDt, cutoff)).total_seconds()
-        )
-        totalSeconds = (endDt - startDt).total_seconds()
-        grossUnused = int(amount * unusedSeconds / totalSeconds)
+        unusedMicros = max(0, (endDt - max(startDt, cutoff)) // timedelta(microseconds=1))
+        totalMicros = (endDt - startDt) // timedelta(microseconds=1)
+        grossUnused = amount * unusedMicros // totalMicros
         refundAmount = min(grossUnused, refundable)
         return {
             "invoiceId": interval.get("invoiceId"),
             "paymentId": interval.get("paymentId"),
             "intervalStart": startDt.isoformat(),
             "intervalEnd": endDt.isoformat(),
-            "unusedSeconds": int(unusedSeconds),
-            "totalSeconds": int(totalSeconds),
+            "unusedSeconds": unusedMicros // 1000000,
+            "totalSeconds": totalMicros // 1000000,
             "originalAmount": amount,
             "amount": refundAmount,
             "currency": interval.get("currency", "INR"),
@@ -217,6 +405,8 @@ class SubscriptionRefundService:
     ) -> "RefundIntent":
         from api.services.billing.manualBillingContracts import RefundIntent
 
+        if isinstance(self.store, _ProductionRefundStore):
+            return self._initiateProductionRefund(staffId, payload, requestKey)
         quoteId = str(payload.get("quoteId") or "").strip()
         expectedTotalAmount = payload.get("expectedTotalAmount")
         quote = self.store.findQuote(quoteId)

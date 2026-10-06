@@ -239,6 +239,7 @@ def _subscription(status="active", billingMode="monthly_recurring", periodEnd=No
     return {
         "id": "sub_1",
         "user_id": "u1",
+                "is_canonical": True,
         "billing_mode": billingMode,
         "status": status,
         "current_period_start": (now - timedelta(days=10)).isoformat(),
@@ -480,6 +481,7 @@ class SubscriptionHardeningTests(unittest.TestCase):
         service._attachOrderToInvoice = lambda **_kwargs: None
         service._auditLog = lambda *_args, **_kwargs: None
         service.razorpayClient = _FakeRazorpayClient()
+        service._createManualInitialCheckout = unittest.mock.Mock(return_value={"orderId":"order_new"})
 
         result = service.createSubscription(
             domains=["banking"],
@@ -489,6 +491,7 @@ class SubscriptionHardeningTests(unittest.TestCase):
         )
 
         self.assertEqual(result["orderId"], "order_new")
+        service._createManualInitialCheckout.assert_called_once()
 
     def test_payment_validation_rejects_currency_order_and_uncaptured_status(self):
         invoice = {
@@ -868,7 +871,7 @@ class SubscriptionHardeningTests(unittest.TestCase):
             for update in service.client.state["updates"]
             if update["table"] == "Invoices"
         )
-        self.assertEqual(invoiceUpdate["status"], "expired")
+        self.assertEqual(invoiceUpdate["status"], "EXPIRED")
         self.assertNotIn("razorpay" + "InvoiceId", invoiceUpdate)
         self.assertNotIn("razorpay_" + "payment_" + "link_id", invoiceUpdate)
         self.assertNotIn("short" + "Url", invoiceUpdate)

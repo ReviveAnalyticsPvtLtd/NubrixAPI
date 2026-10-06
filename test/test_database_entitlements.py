@@ -169,13 +169,13 @@ def test_active_status_with_expired_period_fails_closed_before_cron_runs():
     assert result.paidPlan is False
 
 
-def test_unexpired_cancelled_paid_plan_has_access_but_no_topup():
+def test_unexpired_cancelled_paid_plan_has_access_and_topup():
     result = evaluateSubscriptionEntitlement(
         "u1", _subscription("cancelled", period_end=_period_end(10))
     )
     assert result.activeSubscription is True
     assert result.paidPlan is True
-    assert result.topupEligible is False
+    assert result.topupEligible is True
 
 
 def test_expired_cancelled_paid_plan_has_no_access():
@@ -299,7 +299,7 @@ def test_service_reads_and_evaluates_latest_canonical_row():
     assert result.activeSubscription is True
 
 
-def test_service_falls_back_to_latest_row_when_no_canonical_flag_exists():
+def test_service_requires_reviewed_canonical_flag_for_legacy_rows():
     # Legacy rows created before the expansion have is_canonical = false. The
     # service still resolves the deterministic latest row as a compatibility
     # fallback until operator-reviewed backfill promotes canonical rows.
@@ -326,9 +326,8 @@ def test_service_falls_back_to_latest_row_when_no_canonical_flag_exists():
 
             return _PhaseQuery([row])
 
-    result = SubscriptionEntitlementService(_TwoPhaseClient()).get("u1")
-    assert result.status == "active"
-    assert result.activeSubscription is True
+    with pytest.raises(EntitlementUnavailableError):
+        SubscriptionEntitlementService(_TwoPhaseClient()).get("u1")
 
 
 def test_service_treats_missing_row_as_no_entitlement():

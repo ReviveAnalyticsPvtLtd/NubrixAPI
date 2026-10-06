@@ -156,8 +156,6 @@ def dryRunReport(
                 "resolution": "operator_review_required",
             })
         promotedId = mapping.get(userId)
-        if promotedId is None:
-            promotedId = rows[0].get("id")
         promotedRow = next(
             (row for row in rows if row.get("id") == promotedId), rows[0]
         )
@@ -165,7 +163,7 @@ def dryRunReport(
         candidates.append({
             "user_id": userId,
             "promote_id": promotedId,
-            "reason": _canonicalReason(promotedRow, linkages) or "terminal_fallback",
+            "reason": (_canonicalReason(promotedRow, linkages) or "terminal_fallback") if promotedId else "operator_review_required",
             "old_fields": {
                 "billing_mode": promotedRow.get("billing_mode"),
                 "status": promotedRow.get("status"),
@@ -173,11 +171,12 @@ def dryRunReport(
                 "current_period_end": promotedRow.get("current_period_end"),
             },
             "new_fields": newFields,
+            "requires_paid_identity_mapping": _paidWindow(promotedRow) and (promotedRow.get('billing_mode') or '').lower() in ('monthly_recurring','monthly_prepaid'),
         })
 
     return {
         "dry_run": True,
-        "would_promote": len(candidates),
+        "would_promote": sum(item["promote_id"] is not None for item in candidates),
         "conflicts": conflicts,
         "candidates": candidates,
     }
@@ -202,25 +201,89 @@ def applyMapping(mappingFilePath: str) -> dict:
     )
     promoted = 0
     try:
-        with connection.cursor() as cursor:
+        from psycopg2.extras import RealDictCursor, Json
+        from api.services.billing.manualBillingRepository import _advisoryKey, _utc
+        import uuid
+        with connection.cursor(cursor_factory=RealDictCursor) as cursor:
             for entry in reviewed.get("mappings") or []:
+                cursor.execute('select pg_advisory_xact_lock(%s)',(_advisoryKey(entry['user_id']),))
+                cursor.execute('select * from public.subscriptions where user_id=%s order by id for update',(entry['user_id'],))
+                owned=cursor.fetchall()
+                canonical=next((row for row in owned if str(row['id'])==entry['promote_id']),None)
+                if canonical is None: raise ValueError('BACKFILL_CANONICAL_OWNERSHIP_MISMATCH')
+                if int(entry['expected_version']) != int(canonical['version']): raise ValueError('BACKFILL_STALE_VERSION')
+                mode=(canonical.get('billing_mode') or 'none').lower()
+                paidMonthly=mode in ('monthly_recurring','monthly_prepaid') and _paidWindow(canonical)
+                if paidMonthly:
+                    lifecycle=str(uuid.UUID(entry['lifecycle_id']))
+                    period=str(uuid.UUID(entry['credit_period_id']))
+                    cursor.execute('select * from public."Invoices" where id=%s for update',(entry['current_invoice_id'],))
+                    invoice=cursor.fetchone()
+                    if (not invoice or invoice['userId']!=entry['user_id'] or str(invoice['subscription_id'])!=entry['promote_id']
+                        or invoice['status'].upper()!='PAID' or not invoice.get('razorpayPaymentId')
+                        or _utc(invoice['period_start'])!=_utc(canonical['current_period_start'])
+                        or _utc(invoice['period_end'])!=_utc(canonical['current_period_end'])):
+                        raise ValueError('BACKFILL_PAID_INTERVAL_EVIDENCE_REQUIRED')
+                    metadata=invoice.get('metadata_json') or {}
+                    metadata=json.loads(metadata) if isinstance(metadata,str) else dict(metadata)
+                    metadata.setdefault('manualBilling',{}).update(lifecycleId=lifecycle,creditPeriodId=period,
+                        billingMode='monthly_prepaid',domains=canonical['subscribed_experts'],coverageState='active',
+                        backfillApprovedBy=reviewed['approved_by'])
+                    cursor.execute('update public."Invoices" set metadata_json=%s where id=%s',(Json(metadata),invoice['id']))
+                    state=canonical.get('billing_state') or {}
+                    state=json.loads(state) if isinstance(state,str) else dict(state)
+                    existingLifecycle=state.get('manualBilling',{}).get('lifecycleId')
+                    if existingLifecycle and existingLifecycle != lifecycle:
+                        raise ValueError('BACKFILL_LIFECYCLE_REPLACEMENT_FORBIDDEN')
+                    state.setdefault('manualBilling',{}).update(lifecycleId=lifecycle,paidFutureEnd=_utc(canonical['current_period_end']).isoformat())
+                    cursor.execute('''select * from public."Invoices" where "userId"=%s and subscription_id=%s
+                        and status='PAID' and billing_reason='renewal' and period_start >= %s order by period_start,id for update''',
+                        (entry['user_id'],canonical['id'],canonical['current_period_end']))
+                    future=[row for row in cursor.fetchall() if (row.get('metadata_json') or {}).get('manualBilling',{}).get('coverageState')!='revoked']
+                    reviewedFuture=entry.get('future_coverage') or []
+                    if len(future)>1 or {str(row['id']) for row in future} != {item['invoice_id'] for item in reviewedFuture}:
+                        raise ValueError('BACKFILL_FUTURE_COVERAGE_REVIEW_REQUIRED')
+                    from dateutil.relativedelta import relativedelta
+                    for paid in future:
+                        mapping=next(item for item in reviewedFuture if item['invoice_id']==str(paid['id']))
+                        experts=mapping['experts']
+                        if (not paid.get('razorpayPaymentId') or _utc(paid['period_start'])!=_utc(canonical['current_period_end'])
+                            or _utc(paid['period_end'])!=_utc(paid['period_start'])+relativedelta(months=1)
+                            or not 1<=len(experts)<=4 or len(set(experts))!=len(experts)):
+                            raise ValueError('BACKFILL_FUTURE_INTERVAL_EVIDENCE_REQUIRED')
+                        frozen=dict(paid.get('metadata_json') or {})
+                        frozen.setdefault('manualBilling',{}).update(lifecycleId=lifecycle,
+                            creditPeriodId=str(uuid.UUID(mapping['credit_period_id'])),billingMode='monthly_prepaid',
+                            domains=experts,coverageState='scheduled',backfillApprovedBy=reviewed['approved_by'])
+                        cursor.execute('update public."Invoices" set metadata_json=%s where id=%s',(Json(frozen),paid['id']))
+                        state['manualBilling']['paidFutureEnd']=_utc(paid['period_end']).isoformat()
+                    cursor.execute('update public.subscriptions set billing_state=%s where id=%s',(Json(state),canonical['id']))
+                    cursor.execute('''update public.credit_balances set lifecycle_id=%s,credit_period_id=%s,
+                        subscription_id=%s,period_start=%s,period_end=%s,balance_version=balance_version+1
+                        where user_id=%s returning user_id''',
+                        (lifecycle,period,canonical['id'],canonical['current_period_start'],canonical['current_period_end'],entry['user_id']))
+                    if cursor.fetchone() is None: raise ValueError('BACKFILL_CREDIT_BALANCE_REQUIRED')
+                # Demote first, avoiding partial-index collisions while swapping
+                # authoritative rows. All history remains owned and readable.
+                cursor.execute('update public.subscriptions set is_canonical=false where user_id=%s',(entry['user_id'],))
                 cursor.execute(
                     """
                     update public.subscriptions
                     set is_canonical = (id = %s),
                         billing_mode = case
-                            when id = %s and billing_mode = 'monthly_recurring'
+                            when billing_mode = 'monthly_recurring'
                                 then 'monthly_prepaid'
                             else billing_mode
                         end,
                         renewal_opt_out = case
-                            when id = %s and status = 'cancelled' then true
+                            when id = %s and status = 'cancelled' and billing_mode in ('monthly_recurring','monthly_prepaid') then true
                             else renewal_opt_out
-                        end
+                        end,
+                        auto_renew_enabled=false,
+                        version=version+1
                     where user_id = %s
                     """,
                     (
-                        entry["promote_id"],
                         entry["promote_id"],
                         entry["promote_id"],
                         entry["user_id"],

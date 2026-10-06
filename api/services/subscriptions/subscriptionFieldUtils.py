@@ -211,7 +211,7 @@ def buildChurnResetPayload(
     """
     Build a partial-reset payload for a churned subscription.
 
-    Preserves ``billing_mode``, ``razorpay_customer_id``, ``subscribed_experts``,
+    Preserves ``billing_mode``, ``subscribed_experts``,
     ``domain_count``, and identity fields while clearing period dates, pending
     changes, and stale payment tokens.  Domain fields are intentionally kept so
     expired users retain access to their project data in the frontend.

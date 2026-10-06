@@ -34,6 +34,7 @@ from api.services.subscriptions.subscriptionFieldUtils import (
     subscriptionErasurePending,
 )
 from utils.logger import logger
+from dateutil.relativedelta import relativedelta
 
 
 _T7_DAYS = 7
@@ -44,7 +45,17 @@ class MonthlyRenewalTask:
     def __init__(self, supabaseClient=None, now=None):
         self.client = supabaseClient or client
         self.now = now or utcNow
-        self._coverageService = MonthlyCoverageService(now=self.now)
+        self._coverageService = None
+
+    @property
+    def coverageService(self):
+        if self._coverageService is None:
+            from api.services.billing.monthlyCoverageService import (
+                MonthlyCoverageService,
+            )
+
+            self._coverageService = MonthlyCoverageService(now=self.now)
+        return self._coverageService
 
     def execute(self, now=None) -> dict:
         current = now or self.now()
@@ -63,10 +74,14 @@ class MonthlyRenewalTask:
                 "id, user_id, status, billing_mode, current_period_start, "
                 "current_period_end, renewal_opt_out, erasure_pending, "
                 "subscribed_experts, pending_removals, pending_additions, "
-                "billing_state"
+                "billing_state, version"
             )
             .eq("billing_mode", "monthly_prepaid")
-            .in_("status", ["active", "renewal_upcoming", "payment_pending"])
+            .eq("is_canonical", True)
+            .in_(
+                "status",
+                ["active", "renewal_upcoming", "payment_pending", "expired"],
+            )
             .execute()
             .data
         )
@@ -107,19 +122,34 @@ class MonthlyRenewalTask:
             outcome["skipped"] = 1
             return outcome
 
+        from api.services.billing.manualBillingRepository import getManualBillingRepository
+        repository = getManualBillingRepository()
+        activated = repository.activateDueCoverage(userId, now)
+        if activated.state == "activated":
+            outcome["skipped"] = 1
+            return outcome
         if now < periodEnd:
             invoice = self._loadPayableRenewal(userId, periodEnd)
             if invoice is None and self._withinT7(now, periodEnd):
                 try:
-                    self._coverageService.prepareRenewalInvoice(
-                        userId=userId,
-                        subscription=subscription,
-                        now=now,
+                    # Persist the prepared revision through the same path
+                    # the on-demand dashboard preparation uses.
+                    from api.services.subscriptions.subscriptionService import (
+                        subscriptionService,
+                    )
+
+                    subscriptionService._persistMonthlyRenewalInvoice(
+                        userId, subscription, {
+                            "nextPeriod": {
+                                "start": periodEnd.isoformat(),
+                                "end": (periodEnd + relativedelta(months=1)).isoformat(),
+                            },
+                        },
                     )
                     outcome["prepared"] = 1
                 except Exception:
-                    # Not eligible yet (e.g. paid future cycle already exists
-                    # or the removal-empty guard): not an error.
+                    # Not eligible (paid future cycle exists, empty selection
+                    # guard): not an error.
                     outcome["skipped"] = 1
                 invoice = self._loadPayableRenewal(userId, periodEnd)
             if invoice is not None:
@@ -129,6 +159,8 @@ class MonthlyRenewalTask:
                     "invoice": invoice,
                     "cycleId": cycleId,
                 }
+                if invoice.get("status") == "PAID":
+                    return outcome
                 if self._withinT7(now, periodEnd) and not self._withinT1(now, periodEnd):
                     intent = buildBillingNotificationIntent(
                         {"type": "monthly_renewal_ready"}, snapshot, now
@@ -147,7 +179,15 @@ class MonthlyRenewalTask:
 
         # At/after end: the unpaid expiry notice (opted-out users suppressed
         # upstream). State transitions themselves belong to the expiry/
-        # boundary tasks; this scheduler only queues the notification.
+        # boundary tasks; this scheduler only queues the notification. Only
+        # recently-ended cycles are noticed: the sweep is a catch-up for rows
+        # the daily expiry sweep may already have flipped to expired, not a
+        # win-back channel for old history.
+        from datetime import timedelta
+
+        if now - periodEnd > timedelta(hours=25):
+            outcome["skipped"] = 1
+            return outcome
         expiryIntent = buildBillingNotificationIntent(
             {"type": "monthly_subscription_expired"},
             {
@@ -171,7 +211,7 @@ class MonthlyRenewalTask:
             .eq("userId", userId)
             .eq("billing_reason", "renewal")
             .eq("period_start", periodEnd.isoformat())
-            .in_("status", ["UPCOMING", "PAYMENT_PENDING"])
+            .in_("status", ["UPCOMING", "PAYMENT_PENDING", "PAID"])
             .limit(1)
             .execute()
             .data
@@ -191,26 +231,13 @@ class MonthlyRenewalTask:
         return now >= periodEnd - timedelta(days=_T1_DAYS)
 
     def _enqueue(self, intent: dict) -> None:
-        try:
-            from api.services.notifications.billingNotificationService import (
-                enqueueBillingIntent,
-            )
-
-            enqueueBillingIntent(intent)
-            BillingEventService(self.client).log_event(
-                user_id=intent.get("userId"),
-                event_type="email.billing_intent.committed",
-                event_status="QUEUED",
-                category="notification",
-                metadata={
-                    "notificationType": intent.get("notificationType"),
-                    "dedupeKey": intent.get("dedupeKey"),
-                },
-            )
-        except Exception as enqueueError:
-            # The committed intent is recoverable from the ledger; never
-            # create a duplicate logical email from an enqueue failure.
-            logger.warning(
-                f"Billing notification bridge failed for dedupeKey="
-                f"{intent.get('dedupeKey')}: {enqueueError}"
-            )
+        from api.services.billing.manualBillingRepository import getManualBillingRepository
+        from psycopg2.extras import RealDictCursor
+        repository = getManualBillingRepository()
+        def operation(connection):
+            with connection.cursor(cursor_factory=RealDictCursor) as cursor:
+                repository._lockUser(cursor,intent["userId"])
+                subscription=repository._canonical(cursor,intent["userId"])
+                repository._recordNotification(cursor,subscription,intent["notificationType"],intent["dedupeKey"],intent.get("metadata") or {})
+        repository._run(operation)
+        repository.bridgeNotificationIntents()

@@ -46,6 +46,8 @@ EVENT_HANDLERS = {
     "order.paid": "_handleOrderPaid",
     "payment.failed": "_handlePaymentFailed",
     "refund.processed": "_handleRefundProcessed",
+    "refund.created": "_handleRefundProcessed",
+    "refund.failed": "_handleRefundProcessed",
     "token.confirmed": "_handleTokenConfirmed",
     "token.cancelled": "_handleTokenCancelled",
 }
@@ -499,6 +501,9 @@ class WebhookService:
                 self._validateFrozenInvoicePaymentMatch(frozenInvoice, paymentEntity)
             from api.services.subscriptions.subscriptionService import subscriptionService
             orderId = paymentEntity.get("order_id")
+            if notes.get("billingMode") == "monthly_prepaid":
+                subscriptionService._finalizeManualCheckout(invoiceId,orderId,paymentId,paymentEntity)
+                return
             if orderId:
                 subscriptionService._activatePaidDomains(
                     userId=userId,
@@ -614,6 +619,81 @@ class WebhookService:
                 f"Credit top-up webhook processed — payment={paymentId}, "
                 f"granted={result['granted']}, tokens={result['tokens']}"
             )
+        elif paymentType in ("manual_renewal", "initial_subscription"):
+            # Webhook backup for the browser verification paths: the same
+            # shared finalization rules apply (idempotent by invoice; the
+            # invoice's PAID state is the replay guard). A captured payment
+            # recovers the purchase even when the browser never verifies.
+            userId = notes.get("userId")
+            if not userId:
+                logger.error(
+                    f"{paymentType} payment {paymentId} missing userId in notes"
+                )
+                return
+            if not invoiceId:
+                logger.error(
+                    f"{paymentType} payment {paymentId} missing invoiceId in notes"
+                )
+                return
+            from api.services.subscriptions.subscriptionService import (
+                subscriptionService,
+            )
+
+            try:
+                if paymentType == "manual_renewal":
+                    # Freeze the future period; no current changes/refill.
+                    subscriptionService._finalizeCapturedManualRenewal(
+                        invoiceId=invoiceId,
+                        orderId=paymentEntity.get("order_id"),
+                        paymentId=paymentId,
+                        paymentEntity=paymentEntity,
+                    )
+                else:
+                    # Captured initial purchase the browser never verified:
+                    # activate the paid period once through the same path
+                    # verifySubscription uses (idempotent by invoice state).
+                    subscriptionService._finalizeCapturedInitialPurchase(
+                        invoiceId=invoiceId,
+                        orderId=paymentEntity.get("order_id"),
+                        paymentId=paymentId,
+                        paymentEntity=paymentEntity,
+                        userId=userId,
+                    )
+                self._auditLog(
+                    userId, "payment.captured",
+                    paymentId=paymentId,
+                    amount=paymentEntity.get("amount"),
+                    currency=paymentEntity.get("currency", "INR"),
+                    status="FINALIZED",
+                    metadata={
+                        "type": paymentType,
+                        "orderId": paymentEntity.get("order_id"),
+                        "invoiceId": invoiceId,
+                        "flow": "webhook_backup",
+                    },
+                )
+            except Exception as finalizeError:
+                # Unknown order/ownership/amount mismatch or closed attempt:
+                # keep the money visible as a reconciliation case, never
+                # invent success.
+                self._auditLog(
+                    userId, "payment.captured",
+                    paymentId=paymentId,
+                    amount=paymentEntity.get("amount"),
+                    currency=paymentEntity.get("currency", "INR"),
+                    status="REQUIRES_RECONCILIATION",
+                    metadata={
+                        "type": paymentType,
+                        "orderId": paymentEntity.get("order_id"),
+                        "invoiceId": invoiceId,
+                        "flow": "webhook_backup",
+                        "error": str(finalizeError)[:500],
+                    },
+                )
+                logger.error(
+                    f"{paymentType} webhook finalization failed for payment "
+                    f"{paymentId}, invoice {invoiceId}: {finalizeError}"
+                )
         else:
             self._auditLog(
                 notes.get("userId", "unknown"), "payment.captured",
@@ -834,6 +914,11 @@ class WebhookService:
             event (dict): The Razorpay webhook event.
         """
         refundEntity = event.get("payload", {}).get("refund", {}).get("entity", {})
+        intentId = (refundEntity.get("notes") or {}).get("refundIntentId")
+        if intentId:
+            from api.services.billing.manualBillingRepository import getManualBillingRepository
+            getManualBillingRepository().settleRefundEvidence(intentId, {"refunds": [refundEntity]})
+            return
         paymentId = refundEntity.get("payment_id", "")
         refundId = refundEntity.get("id", "")
         refundAmount = refundEntity.get("amount") or 0

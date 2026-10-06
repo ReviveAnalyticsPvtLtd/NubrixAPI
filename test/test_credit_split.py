@@ -148,11 +148,17 @@ class CreditQuotaResizeTests(unittest.TestCase):
                 self.payload = payload
                 return self
 
+            def select(self, *_args):
+                return self
+
+            def limit(self, *_args):
+                return self
+
             def eq(self, *_args):
                 return self
 
             def execute(self):
-                return types.SimpleNamespace(data=[])
+                return types.SimpleNamespace(data=[{'billing_mode':'annual_prepaid'}])
 
         class FakeSupabase:
             def __init__(self):
@@ -196,8 +202,14 @@ class CreditQuotaResizeTests(unittest.TestCase):
             def eq(self, *_args):
                 return self
 
+            def select(self, *_args):
+                return self
+
+            def limit(self, *_args):
+                return self
+
             def execute(self):
-                return types.SimpleNamespace(data=[])
+                return types.SimpleNamespace(data=[{'billing_mode':'annual_prepaid'}])
 
         class FakeSupabase:
             def __init__(self):
