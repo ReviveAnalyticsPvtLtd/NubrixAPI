@@ -791,21 +791,15 @@ class SubscriptionService:
             trialDurationDays = 12
             trialExpiry = currentTime + datetime.timedelta(days=trialDurationDays)
             experts = ["banking", "manufacturing", "supplychain", "telecom"]
-            self._upsertCanonicalSubscription(
-                userId=userId,
-                billingMode="none",
-                status="trial",
-                currentPeriodStart=currentTime.isoformat(),
-                currentPeriodEnd=trialExpiry.isoformat(),
-                renewalDueAt=trialExpiry.isoformat(),
-                autoRenewEnabled=False,
-                paymentCollectionMode="authenticated_checkout",
-                subscribedExperts=experts,
-                domainCount=4,
-                pendingRemovals=[],
-                pendingAdditions=[],
-                planType="free",
-            )
+            from api.services.billing.manualBillingRepository import getManualBillingRepository
+            repository = getManualBillingRepository()
+            repository.ensureCanonicalSubscription(userId)
+            try:
+                activated = repository.activateTrial(userId, tuple(experts))
+            except ValueError as exc:
+                raise CustomException(exc, statusCode=409,
+                    uiMessage="A free trial is not available for this account.") from exc
+            trialExpiry = activated['current_period_end']
             records = self.client.table("Users").select("fullName").eq("userId", userId).limit(1).execute()
             name = records.data[0]["fullName"] if records.data else userEmail
             self._sendFreeTrialEmail(email=userEmail, name=name)

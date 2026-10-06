@@ -98,10 +98,23 @@ class SubscriptionEntitlementService:
         if row and row.get("billing_mode") == "monthly_prepaid":
             from api.services.billing.manualBillingRepository import getManualBillingRepository
             try:
-                getManualBillingRepository().activateDueCoverage(userId, utcNow())
+                coverage = getManualBillingRepository().getCoverageSnapshot(userId)
                 row = self._resolveCanonicalRow(userId)
             except Exception as exc:
                 raise EntitlementUnavailableError("Paid coverage activation unavailable") from exc
+            if not row or str(row.get('id')) != coverage.subscriptionId:
+                raise EntitlementUnavailableError("Canonical subscription changed during lookup")
+            return SubscriptionEntitlement(
+                userId=userId,
+                status=str(row.get('status') or 'none').lower(),
+                planType='pro' if coverage.accessAllowed else 'none',
+                currentPeriodEnd=(coverage.currentPeriod.end.isoformat() if coverage.currentPeriod
+                                  else row.get('current_period_end')),
+                activeSubscription=coverage.accessAllowed,
+                trialOrAbove=coverage.accessAllowed,
+                paidPlan=coverage.accessAllowed,
+                topupEligible=coverage.accessAllowed,
+            )
         return evaluateSubscriptionEntitlement(userId, row)
 
     def _resolveCanonicalRow(self, userId: str) -> dict | None:
@@ -110,9 +123,8 @@ class SubscriptionEntitlementService:
 
         Selection is by the persisted ``is_canonical`` flag, never by
         ``updated_at`` ordering (a historical row updated later must not
-        become canonical). Until operator-reviewed backfill has promoted
-        canonical rows, a deterministic latest-row fallback keeps legacy
-        accounts readable; the canonical flag wins whenever it exists.
+        become canonical). Historical-only accounts require operator-reviewed
+        backfill; guessing their current subscription would grant wrong access.
         """
         try:
             canonicalRows = (

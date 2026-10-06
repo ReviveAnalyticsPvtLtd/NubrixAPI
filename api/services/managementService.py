@@ -1174,7 +1174,7 @@ class ManagementService:
         subscription = self.client.table("subscriptions") \
             .select(CANONICAL_SUBSCRIPTION_SELECT) \
             .eq("user_id", userId) \
-            .order("updated_at", desc=True) \
+            .eq("is_canonical", True) \
             .limit(1) \
             .execute().data
         if not subscription:
@@ -1186,12 +1186,24 @@ class ManagementService:
         return subscription[0]
 
     def _refreshLifecycleSnapshot(self, userId: str, subscription: dict) -> int:
+        if subscription.get("billing_mode") == "monthly_prepaid":
+            from api.services.billing.manualBillingRepository import getManualBillingRepository
+            from api.services.subscriptions.entitlementService import EntitlementUnavailableError
+            try:
+                getManualBillingRepository().getCoverageSnapshot(userId)
+                refreshed = self._getCanonicalSubscription(userId)
+                subscription.clear()
+                subscription.update(refreshed)
+            except Exception as exc:
+                raise EntitlementUnavailableError("Paid coverage refresh unavailable") from exc
+            return calculateSubscriptionDaysLeft(subscription.get("current_period_end"))
         expiryStr = subscription.get("current_period_end")
         daysLeft = calculateSubscriptionDaysLeft(expiryStr)
         currentStatus = (subscription.get("status") or "").lower()
 
         effectiveStatus = currentStatus
-        if daysLeft <= 0 and expiryStr is not None and currentStatus in ("trial", "active"):
+        from api.services.subscriptions.paymentValidationService import isPeriodExpired
+        if isPeriodExpired(subscription) and expiryStr is not None and currentStatus in ("trial", "active"):
             effectiveStatus = "expired"
 
         billingState = mergeSubscriptionLifecycleSnapshot(
@@ -1207,7 +1219,7 @@ class ManagementService:
             )
 
         try:
-            self.client.table("subscriptions").update(updatePayload).eq("user_id", userId).execute()
+            self.client.table("subscriptions").update(updatePayload).eq("id", subscription["id"]).eq("is_canonical", True).execute()
             subscription["billing_state"] = billingState
             if effectiveStatus != currentStatus:
                 subscription["status"] = effectiveStatus

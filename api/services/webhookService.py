@@ -314,7 +314,7 @@ class WebhookService:
         result = self.client.table("subscriptions") \
             .select(CANONICAL_SUBSCRIPTION_SELECT) \
             .eq("user_id", userId) \
-            .order("updated_at", desc=True) \
+            .eq("is_canonical", True) \
             .limit(1) \
             .execute()
         return result.data[0] if result.data else None

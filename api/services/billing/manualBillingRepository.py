@@ -27,6 +27,7 @@ from psycopg2.extras import Json, RealDictCursor
 from api.services.billing.manualBillingContracts import (
     CheckoutIntent,
     CoveragePeriod,
+    CoverageSnapshot,
     FinalizationResult,
     RefundIntent,
     RefundQuote,
@@ -145,11 +146,11 @@ class ManualBillingRepository:
                 cursor.execute(
                     """
                     insert into public.subscriptions (
-                        user_id, billing_mode, status, plan_type,
+                        id, user_id, billing_mode, status, plan_type,
                         auto_renew_enabled, payment_collection_mode,
                         default_currency, is_canonical
                     )
-                    values (%s, 'none', 'none', 'none', false,
+                    values (%s, %s, 'none', 'none', 'none', false,
                             'authenticated_checkout', 'INR', true)
                     returning id, user_id, billing_mode, status, plan_type,
                                current_period_start, current_period_end,
@@ -157,11 +158,43 @@ class ManualBillingRepository:
                                payment_collection_mode, default_currency,
                                version, erasure_pending, is_canonical
                     """,
-                    (userId,),
+                    (str(uuid.uuid4()), userId),
                 )
                 created = cursor.fetchone()
                 return dict(created)
 
+        return self._run(operation)
+
+    def activateTrial(self, userId: str, domains: tuple[str, ...]) -> dict:
+        """Consume the existing twelve-day trial once, under the owner lock."""
+        def operation(connection):
+            with connection.cursor(cursor_factory=RealDictCursor) as cursor:
+                self._lockUser(cursor, userId)
+                subscription = self._canonical(cursor, userId)
+                cursor.execute('select now() as current_time')
+                now = _utc(cursor.fetchone()['current_time'])
+                state = self._json(subscription.get('billing_state'))
+                cursor.execute('select "isBanned" from public."Users" where "userId"=%s', (userId,))
+                owner = cursor.fetchone()
+                # Existing trial/paid/churned rows never become first-time users.
+                if (not owner or owner.get('isBanned') or subscription.get('erasure_pending')
+                        or state.get('trialConsumed') or state.get('churn_snapshot')
+                        or subscription.get('status') != 'none'
+                        or subscription.get('current_period_start') or subscription.get('current_period_end')):
+                    raise ValueError('TRIAL_NOT_ELIGIBLE')
+                cursor.execute('select id from public.subscriptions where user_id=%s and is_canonical=false', (userId,))
+                if cursor.fetchone():
+                    raise ValueError('TRIAL_NOT_ELIGIBLE')
+                state.update(trialConsumed=True, trialConsumedAt=now.isoformat())
+                end = now + timedelta(days=12)
+                cursor.execute('''update public.subscriptions set billing_mode='none',status='trial',plan_type='free',
+                    current_period_start=%s,current_period_end=%s,renewal_due_at=%s,
+                    subscribed_experts=%s,domain_count=%s,billing_state=%s,version=version+1,updated_at=%s
+                    where id=%s and is_canonical=true''',
+                    (now,end,end,Json(list(domains)),len(domains),Json(state),now,subscription['id']))
+                subscription.update(status='trial',plan_type='free',current_period_start=now,
+                    current_period_end=end,billing_state=state,subscribed_experts=list(domains),domain_count=len(domains))
+                return subscription
         return self._run(operation)
 
     # -- checkout intents -----------------------------------------------------
@@ -665,28 +698,103 @@ class ManualBillingRepository:
             with connection.cursor(cursor_factory=RealDictCursor) as cursor:
                 self._lockUser(cursor,userId)
                 subscription = self._canonical(cursor,userId)
-                cursor.execute('''select * from public."Invoices" where "userId"=%s and subscription_id=%s
-                    and status='PAID' order by period_start, id for update''',(userId,subscription['id']))
-                result = self._result({},subscription,'unchanged',None)
-                lifecycle = self._json(subscription.get('billing_state')).get('manualBilling',{}).get('lifecycleId')
-                for invoice in cursor.fetchall():
-                    billing = self._json(invoice.get('metadata_json')).get('manualBilling',{})
-                    if billing.get('lifecycleId') == lifecycle and billing.get('coverageState') == 'scheduled' and _utc(invoice.get('period_start')) <= now:
-                        result = self._applyCoverage(cursor,invoice,subscription,now,None)
-                if subscription.get('billing_mode') == 'monthly_prepaid' and _utc(subscription.get('current_period_end')) and _utc(subscription['current_period_end']) <= now:
-                    if subscription.get('status') == 'expired':
-                        return self._result({},subscription,'expired',None)
-                    cursor.execute("update public.subscriptions set status='expired',plan_type='none',subscribed_experts=%s,domain_count=0,updated_at=%s where id=%s",(Json([]),now,subscription['id']))
-                    cursor.execute('''update public.credit_balances set monthly_token_quota=0,remaining_tokens=0,
-                        balance_version=balance_version+1,updated_at=%s where user_id=%s''',(now,userId))
-                    if not subscription.get('renewal_opt_out'):
-                        end=_utc(subscription['current_period_end']).isoformat()
-                        self._recordNotification(cursor,subscription,'monthly_subscription_expired',
-                            'monthly:'+str(lifecycle)+':'+end+':expired',
-                            {'periodEnd':end,'lifecycleId':lifecycle,'cycleId':end,'milestone':'expired'})
-                    return self._result({},subscription,'expired',None)
-                return result
+                return self._activateDueCoverageLocked(cursor, subscription, _utc(now))
         return self._run(operation)
+
+    def _paidInvoicesLocked(self, cursor, subscription):
+        cursor.execute('''select * from public."Invoices" where "userId"=%s and subscription_id=%s
+            and status='PAID' order by id for update''', (subscription['user_id'], subscription['id']))
+        return list(cursor.fetchall())
+
+    def _activateDueCoverageLocked(self, cursor, subscription, now, invoices=None):
+        invoices = self._paidInvoicesLocked(cursor, subscription) if invoices is None else invoices
+        result = self._result({}, subscription, 'unchanged', None)
+        lifecycle = self._json(subscription.get('billing_state')).get('manualBilling', {}).get('lifecycleId')
+        if subscription.get('erasure_pending'):
+            return result
+        for invoice in sorted(invoices, key=lambda row: (_utc(row.get('period_start')) or now, str(row['id']))):
+            billing = self._json(invoice.get('metadata_json')).get('manualBilling', {})
+            start = _utc(invoice.get('period_start'))
+            if (billing.get('lifecycleId') == lifecycle and lifecycle
+                    and billing.get('coverageState') == 'scheduled' and not billing.get('revokedAt')
+                    and start is not None and start <= now
+                    and start == _utc(subscription.get('current_period_end'))):
+                result = self._applyCoverage(cursor, invoice, subscription, now, None)
+        end = _utc(subscription.get('current_period_end'))
+        if subscription.get('billing_mode') == 'monthly_prepaid' and end and end <= now:
+            if subscription.get('status') == 'expired':
+                return self._result({}, subscription, 'expired', None)
+            cursor.execute("""update public.subscriptions set status='expired',plan_type='none',
+                subscribed_experts=%s,domain_count=0,pending_removals=%s,pending_additions=%s,
+                updated_at=%s where id=%s""", (Json([]), Json([]), Json([]), now, subscription['id']))
+            cursor.execute('''update public.credit_balances set plan_tier='none',domain_count=0,
+                monthly_token_quota=0,remaining_tokens=0,balance_version=balance_version+1,
+                updated_at=%s where user_id=%s''', (now, subscription['user_id']))
+            if not subscription.get('renewal_opt_out'):
+                self._recordNotification(cursor, subscription, 'monthly_subscription_expired',
+                    'monthly:' + str(lifecycle) + ':' + end.isoformat() + ':expired',
+                    {'periodEnd': end.isoformat(), 'lifecycleId': lifecycle,
+                     'cycleId': end.isoformat(), 'milestone': 'expired'})
+            subscription.update(status='expired', plan_type='none', subscribed_experts=[], domain_count=0,
+                                pending_removals=[], pending_additions=[])
+            return self._result({}, subscription, 'expired', None)
+        return result
+
+    def getCoverageSnapshot(self, userId: str, now: datetime | None = None) -> CoverageSnapshot:
+        def operation(connection):
+            with connection.cursor(cursor_factory=RealDictCursor) as cursor:
+                self._lockUser(cursor, userId)
+                subscription = self._canonical(cursor, userId)
+                if now is None:
+                    cursor.execute('select now() as current_time')
+                    evaluated = _utc(cursor.fetchone()['current_time'])
+                else:
+                    evaluated = _utc(now)
+                return self._coverageSnapshotLocked(cursor, subscription, evaluated, materialize=True)
+        return self._run(operation)
+
+    def _coverageSnapshotLocked(self, cursor, subscription: dict, now: datetime,
+                               materialize: bool) -> CoverageSnapshot:
+        cursor.execute('select "isBanned" from public."Users" where "userId"=%s', (subscription['user_id'],))
+        owner = cursor.fetchone()
+        if not owner:
+            raise ValueError('OWNERSHIP_OR_USER_MISSING')
+        invoices = self._paidInvoicesLocked(cursor, subscription)
+        if materialize and subscription.get('billing_mode') == 'monthly_prepaid':
+            self._activateDueCoverageLocked(cursor, subscription, now, invoices)
+        mode = subscription.get('billing_mode') or 'none'
+        billing_state = self._json(subscription.get('billing_state')).get('manualBilling', {})
+        lifecycle = str(billing_state.get('lifecycleId') or subscription['id'])
+        periods = []
+        for invoice in invoices:
+            billing = self._json(invoice.get('metadata_json')).get('manualBilling', {})
+            start, end = _utc(invoice.get('period_start')), _utc(invoice.get('period_end'))
+            if not start or not end or end <= start or billing.get('revokedAt') or billing.get('coverageState') == 'revoked':
+                continue
+            if mode == 'monthly_prepaid' and (billing.get('lifecycleId') != lifecycle
+                    or billing.get('purpose') not in ('initial_purchase', 'renewal')
+                    or billing.get('coverageState') not in ('active', 'scheduled', 'elapsed')):
+                continue
+            if mode == 'annual_prepaid' and billing.get('purpose') not in ('initial_purchase', 'renewal'):
+                continue
+            domains = billing.get('domains') or subscription.get('subscribed_experts') or []
+            if isinstance(domains, str):
+                domains = json.loads(domains)
+            periods.append(CoveragePeriod(subscription['user_id'], str(subscription['id']), lifecycle,
+                str(billing.get('creditPeriodId') or ''), str(invoice['id']), start, end,
+                tuple(domains), mode, None))
+        current = next((period for period in periods if period.start <= now < period.end), None)
+        future = sorted((period for period in periods if period.start > now), key=lambda period: period.start)
+        next_period = next((period for period in future if current and period.start == current.end), None)
+        final_end = next_period.end if next_period else current.end if current else None
+        status = str(subscription.get('status') or 'none').lower()
+        denied = 'erasure_pending' if subscription.get('erasure_pending') else 'account_banned' if owner.get('isBanned') else None
+        if denied is None and status in ('suspended', 'paused'):
+            denied = 'restricted_subscription'
+        if denied is None and (current is None or mode not in ('monthly_prepaid', 'annual_prepaid')):
+            denied = 'no_paid_coverage'
+        return CoverageSnapshot(subscription['user_id'], str(subscription['id']), lifecycle, mode, now,
+            current, next_period, final_end, bool(subscription.get('renewal_opt_out')), denied is None, denied)
 
     @staticmethod
     def _json(value):
@@ -696,6 +804,7 @@ class ManualBillingRepository:
         cursor.execute('select * from public.subscriptions where user_id=%s and is_canonical=true for update',(userId,))
         row = cursor.fetchone()
         if not row: raise ValueError('OWNERSHIP_OR_CANONICAL_SUBSCRIPTION_MISSING')
+        if cursor.fetchone(): raise ValueError('AMBIGUOUS_CANONICAL_SUBSCRIPTION')
         return row
 
     def _coverage(self,invoice):

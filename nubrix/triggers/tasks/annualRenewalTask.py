@@ -101,6 +101,7 @@ class AnnualRenewalTask:
             self.client.table("subscriptions")
             .select(CANONICAL_SUBSCRIPTION_SELECT)
             .eq("billing_mode", "annual_prepaid")
+            .eq("is_canonical", True)
             .in_("status", ["active", "renewal_upcoming"])
             .gte("current_period_end", now.isoformat())
             .lte("current_period_end", windowEnd)
@@ -202,6 +203,7 @@ class AnnualRenewalTask:
                     self.client.table("subscriptions")
                     .select(CANONICAL_SUBSCRIPTION_SELECT)
                     .eq("id", invoice.get("subscription_id"))
+                    .eq("is_canonical", True)
                     .limit(1)
                     .execute()
                     .data

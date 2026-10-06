@@ -198,7 +198,7 @@ class AdminManagementService:
                 raise AdminApiError(
                     500, "Failed to verify user erasure state"
                 ) from exc
-        if rows and rows[0].get("erasure_pending"):
+        if any(row.get("erasure_pending") for row in rows):
             return True
         try:
             requests = (

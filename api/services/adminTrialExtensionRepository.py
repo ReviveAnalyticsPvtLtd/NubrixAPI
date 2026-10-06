@@ -169,7 +169,7 @@ class AdminTrialExtensionRepository:
                            current_period_start, current_period_end,
                            erasure_pending
                     from public.subscriptions
-                    where user_id = %s
+                    where user_id = %s and is_canonical = true
                     limit 1
                     for update
                     """,

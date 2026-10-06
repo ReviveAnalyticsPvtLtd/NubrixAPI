@@ -140,7 +140,7 @@ def test_create_reduction_persists_one_idempotent_operation():
     assert any('from public."users"' in query for query in statementList)
     assert any(
         "from public.subscriptions" in query
-        and "order by updated_at desc, id desc" in query
+        and "is_canonical = true" in query
         for query in statementList
     )
     assert result == stored

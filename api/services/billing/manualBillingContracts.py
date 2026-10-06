@@ -8,6 +8,7 @@ Datetimes are timezone-aware UTC; monetary values are integer minor units.
 
 __all__ = [
     "CoveragePeriod",
+    "CoverageSnapshot",
     "CheckoutIntent",
     "VerifiedPaymentEvidence",
     "FinalizationResult",
@@ -33,6 +34,21 @@ class CoveragePeriod:
     domains: tuple[str, ...]
     billingMode: str
     revokedAt: datetime | None
+
+
+@dataclass(frozen=True)
+class CoverageSnapshot:
+    userId: str
+    subscriptionId: str
+    lifecycleId: str
+    billingMode: str
+    evaluatedAt: datetime
+    currentPeriod: CoveragePeriod | None
+    nextPeriod: CoveragePeriod | None
+    finalPaidEnd: datetime | None
+    renewalOptOut: bool
+    accessAllowed: bool
+    denialReason: str | None
 
 
 @dataclass(frozen=True)

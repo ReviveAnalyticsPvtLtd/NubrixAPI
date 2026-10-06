@@ -17,7 +17,7 @@ __all__ = ["authenticationService"]
 from utils.exceptionHandler import CustomException, accountAccessRevokedException
 from utils.logger import logger
 from api.commons import client
-from api.services.subscriptions.subscriptionFieldUtils import mapBillingModeToPlanType
+from api.services.subscriptions.subscriptionFieldUtils import mapBillingModeToPlanType, CANONICAL_SUBSCRIPTION_SELECT
 from api.services.subscriptions.paymentValidationService import (
     calculateSubscriptionDaysLeft,
     mergeSubscriptionLifecycleSnapshot,
@@ -103,9 +103,9 @@ class AuthenticationService:
 
     def _getSubscriptionSnapshot(self, userId: str) -> dict | None:
         response = self.client.table("subscriptions") \
-            .select("id, user_id, billing_mode, status, current_period_start, current_period_end, billing_state, subscribed_experts, renewal_due_at") \
+            .select(CANONICAL_SUBSCRIPTION_SELECT) \
             .eq("user_id", userId) \
-            .order("updated_at", desc=True) \
+            .eq("is_canonical", True) \
             .limit(1) \
             .execute().data
         return response[0] if response else None
@@ -113,12 +113,26 @@ class AuthenticationService:
     def _refreshLifecycleSnapshot(self, userId: str, subscription: dict | None) -> int:
         if not subscription:
             return 0
+        if subscription.get("billing_mode") == "monthly_prepaid":
+            from api.services.billing.manualBillingRepository import getManualBillingRepository
+            from api.services.subscriptions.entitlementService import EntitlementUnavailableError
+            try:
+                getManualBillingRepository().getCoverageSnapshot(userId)
+                refreshed = self._getSubscriptionSnapshot(userId)
+                if not refreshed:
+                    raise EntitlementUnavailableError("Canonical subscription missing")
+                subscription.clear()
+                subscription.update(refreshed)
+            except Exception as exc:
+                raise EntitlementUnavailableError("Paid coverage refresh unavailable") from exc
+            return calculateSubscriptionDaysLeft(subscription.get("current_period_end"))
         expiryStr = subscription.get("current_period_end")
         daysLeft = calculateSubscriptionDaysLeft(expiryStr)
         currentStatus = (subscription.get("status") or "").lower()
 
         effectiveStatus = currentStatus
-        if daysLeft <= 0 and expiryStr is not None and currentStatus in ("trial", "active"):
+        from api.services.subscriptions.paymentValidationService import isPeriodExpired
+        if isPeriodExpired(subscription) and expiryStr is not None and currentStatus in ("trial", "active"):
             effectiveStatus = "expired"
 
         billingState = mergeSubscriptionLifecycleSnapshot(
@@ -134,7 +148,7 @@ class AuthenticationService:
             )
 
         try:
-            self.client.table("subscriptions").update(updatePayload).eq("user_id", userId).execute()
+            self.client.table("subscriptions").update(updatePayload).eq("id", subscription["id"]).eq("is_canonical", True).execute()
             subscription["billing_state"] = billingState
             if effectiveStatus != currentStatus:
                 subscription["status"] = effectiveStatus
@@ -153,26 +167,8 @@ class AuthenticationService:
         This enforces the hard-cutover rule: subscription lifecycle fields must be
         sourced from the subscriptions table only (never from Users columns).
         """
-        self.client.table("subscriptions").insert({
-            "user_id": userId,
-            "billing_mode": "none",
-            "status": "none",
-            "plan_type": "none",
-            "auto_renew_enabled": False,
-            "payment_collection_mode": "authenticated_checkout",
-            "default_currency": "INR",
-            "current_period_start": None,
-            "current_period_end": None,
-            "renewal_due_at": None,
-            "subscribed_experts": [],
-            "domain_count": 0,
-            "pending_removals": [],
-            "pending_additions": [],
-            "billing_state": {},
-            "is_canonical": True,
-            "renewal_opt_out": False,
-            "cancellation_reason": None,
-        }).execute()
+        from api.services.billing.manualBillingRepository import getManualBillingRepository
+        getManualBillingRepository().ensureCanonicalSubscription(userId)
 
     @staticmethod
     def _getCreditSnapshot(userId: str) -> dict:

@@ -98,6 +98,10 @@ def database(tmp_path):
     path = tmp_path / "runtime.db"
     connection = sqlite3.connect(path)
     connection.executescript('''
+      CREATE TABLE "Users" (
+        "userId" TEXT PRIMARY KEY, email TEXT, password TEXT, onboarded BOOLEAN,
+        "currentWorkspaceId" TEXT, "profileImage" TEXT, "isBanned" BOOLEAN DEFAULT 0
+      );
       CREATE TABLE subscriptions (
         id TEXT PRIMARY KEY, user_id TEXT, is_canonical BOOLEAN,
         billing_mode TEXT, status TEXT, plan_type TEXT,
@@ -135,6 +139,7 @@ def database(tmp_path):
         balance_version INTEGER DEFAULT 0, last_reset_at TEXT, updated_at TEXT
       );
     ''')
+    connection.execute('INSERT INTO "Users"("userId") VALUES(?)', (USER,))
     connection.execute(
         "INSERT INTO subscriptions(id,user_id,is_canonical,billing_mode,status,plan_type,billing_state) VALUES(?,?,1,'none','none','none',?)",
         (SUB, USER, json.dumps({"manualBilling": {"lifecycleId": LIFE}})),

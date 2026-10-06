@@ -218,8 +218,8 @@ class TestSyncQuotaFromConfig(unittest.TestCase):
         supabase = MagicMock()
         supabase.table.side_effect = tableSideEffect
         subTable = tableSideEffect("subscriptions")
-        subTable.select.return_value.eq.return_value.in_.return_value \
-            .order.return_value.limit.return_value.execute.return_value.data = subscriptionRows
+        subTable.select.return_value.eq.return_value.eq.return_value.in_.return_value \
+            .limit.return_value.execute.return_value.data = subscriptionRows
         tableSideEffect("credit_balances")  # pre-create so "not called" assertions work
         svc.supabase = supabase
         svc._tables = tables
