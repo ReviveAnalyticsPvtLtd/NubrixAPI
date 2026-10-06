@@ -1036,7 +1036,8 @@ class ManualBillingRepository:
                 continue
             if mode == 'annual_prepaid' and billing.get('purpose') not in ('initial_purchase', 'renewal'):
                 continue
-            domains = billing.get('domains') or subscription.get('subscribed_experts') or []
+            domains = (subscription.get('subscribed_experts') if start <= now < end
+                       else billing.get('domains')) or billing.get('domains') or []
             if isinstance(domains, str):
                 domains = json.loads(domains)
             periods.append(CoveragePeriod(subscription['user_id'], str(subscription['id']), lifecycle,
@@ -1107,10 +1108,19 @@ class ManualBillingRepository:
         return self._result(cursor,invoice,subscription,'paid_scheduled' if period.start > now else 'activated',attemptId,refilled=True)
 
     def _result(self,cursor,invoice,subscription,state,attemptId,refilled=False,anomalyId=None,now=None):
-        snapshot = self._coverageSnapshotLocked(cursor,subscription,now or _now(),materialize=False)
-        cursor.execute('select credit_period_id from public.credit_balances where user_id=%s',(subscription['user_id'],))
+        subscription=self._canonical(cursor,subscription['user_id'])
+        evaluated=now or _now()
+        snapshot = self._coverageSnapshotLocked(cursor,subscription,evaluated,materialize=False)
+        cursor.execute('select * from public.credit_balances where user_id=%s',(subscription['user_id'],))
         balance = cursor.fetchone()
-        ready = balance is not None and bool(balance.get('credit_period_id'))
+        ready = (balance is not None and bool(balance.get('credit_period_id'))
+            and str(balance.get('subscription_id'))==str(subscription['id'])
+            and str(balance.get('lifecycle_id'))==snapshot.lifecycleId
+            and balance.get('plan_tier')==('annual' if snapshot.billingMode=='annual_prepaid' else 'pro')
+            and snapshot.accessAllowed and _utc(balance.get('period_start')) is not None
+            and _utc(balance['period_start'])<=evaluated<_utc(balance['period_end']))
+        if invoice.get('billing_reason')=='add_on' and balance is not None:
+            ready=True  # Stored purchased credits do not imply subscription access.
         return FinalizationResult(str(invoice.get('id') or ''),attemptId,state,
             'ready' if ready else 'pending_materialization',
             state in ('activated','paid_scheduled','already_finalized','elapsed','expert_activated','topup_granted'),
@@ -1197,6 +1207,10 @@ class ManualBillingRepository:
         cursor.execute('''update public.credit_balances set monthly_token_quota=%s,remaining_tokens=%s,
             domain_count=%s,balance_version=balance_version+1,updated_at=%s where user_id=%s''',
             (quota,remaining,len(combined),evidence.observedAt,evidence.userId))
+        from api.services.credits.manualCreditRepository import ManualCreditRepository
+        credits=ManualCreditRepository(self)
+        credits.reviseAllocation(cursor,evidence.userId,str(credit['credit_period_id']),
+            remaining+credits._monthlySettled(cursor,evidence.userId,str(credit['credit_period_id'])))
         cursor.execute('update public.subscriptions set subscribed_experts=%s,domain_count=%s,pending_additions=%s,version=version+1 where id=%s',
             (Json(combined),len(combined),Json(pending),subscription['id']))
         billing=metadata.setdefault('manualBilling',{})

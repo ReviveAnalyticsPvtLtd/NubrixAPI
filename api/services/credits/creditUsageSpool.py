@@ -29,7 +29,15 @@ def retainUsage(context,tokensUsed,runId):
             json.dump(data,stream,sort_keys=True)
             stream.flush()
             os.fsync(stream.fileno())
-        os.replace(temporary,target)
+        try:
+            # Publish without replacing another worker's measured obligation.
+            if os.name == 'nt':
+                os.rename(temporary,target)  # Windows rename never replaces an existing target.
+            else:
+                os.link(temporary,target)
+        except FileExistsError:
+            if json.loads(target.read_text(encoding='utf-8')) != data:
+                raise ValueError('CREDIT_USAGE_IDENTITY_CONFLICT')
     finally:
         Path(temporary).unlink(missing_ok=True)
     return target

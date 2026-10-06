@@ -609,7 +609,8 @@ class CreditService:
             dict: {"applied": bool, "quota": int, "delta": int, "remaining": int}.
         """
         if self._manualBalance(userId) is not None:
-            raise ValueError('MANUAL_QUOTA_REQUIRES_PAID_TRANSACTION')
+            from api.services.credits.manualCreditRepository import ManualCreditRepository
+            return ManualCreditRepository().resizeQuota(userId,domainCount,grantImmediately)
         try:
             domainCount = max(1, int(domainCount))
         except (TypeError, ValueError):
@@ -805,6 +806,13 @@ class CreditService:
     def resetMonthlyTokens(self, userId: str) -> None:
         """Event-driven monthly reset (e.g. annual renewal). Restores the full quota."""
         if self._manualBalance(userId) is not None:
+            from api.services.credits.manualCreditRepository import ManualCreditRepository
+            from api.services.billing.manualBillingRepository import getManualBillingRepository
+            repository=getManualBillingRepository()
+            snapshot=repository.getCoverageSnapshot(userId)
+            if snapshot.accessAllowed or snapshot.billingMode=='none':
+                row=repository.selectCanonicalSubscription(userId)
+                ManualCreditRepository(repository).resizeQuota(userId,row.get('domain_count') or 1,False)
             return
         try:
             row = self._dbRow(userId)
@@ -1016,6 +1024,9 @@ class CreditService:
             for row in rows.data:
                 userId = row["user_id"]
                 if self._manualBalance(userId) is not None:
+                    from api.services.credits.manualCreditRepository import ManualCreditRepository
+                    result=ManualCreditRepository().resizeQuota(userId,row.get('domain_count') or 1,False,resetUsage)
+                    updatedCount += int(result['applied'])
                     continue
                 planTier = row.get("plan_tier", "none")
                 domainCount = row.get("domain_count", 1) or 1
@@ -1087,6 +1098,8 @@ class CreditService:
         Called during reconcile to prevent long-term drift.
         """
         if self._manualBalance(userId) is not None:
+            from api.services.credits.manualCreditRepository import ManualCreditRepository
+            ManualCreditRepository().resizeQuota(userId,None,False)
             return
         try:
             row = self._dbRow(userId)

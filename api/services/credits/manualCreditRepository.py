@@ -12,9 +12,45 @@ class ManualCreditRepository:
         self.repository = repository or getManualBillingRepository()
 
     def _monthlySettled(self, cursor, userId, periodId):
-        cursor.execute("select metadata_json from public.billing_events where user_id=%s and event_type='credit.operation_settled'", (userId,))
+        cursor.execute("select metadata_json from public.billing_events where user_id=%s and event_type='credit.operation_settled' and metadata_json->>'creditPeriodId'=%s", (userId,periodId))
         records = [self.repository._json(row['metadata_json']) for row in cursor.fetchall()]
         return sum(int(row.get('monthlyCharged', 0)) for row in records if row.get('creditPeriodId') == periodId)
+
+    def resizeQuota(self,userId,domainCount,grantImmediately=False,resetUsage=False):
+        """Preserve staff quota policy under the same lock as usage/top-ups."""
+        from api.services.credits.creditConfig import getTokenQuotaForPlan
+        now=datetime.now(timezone.utc)
+        self.repository.activateDueCoverage(userId,now)
+        def operation(connection):
+            with connection.cursor(cursor_factory=RealDictCursor) as cursor:
+                self.repository._lockUser(cursor,userId)
+                subscription=self.repository._canonical(cursor,userId)
+                if not self._eligibleLocked(cursor,subscription,now):
+                    return {'applied':False,'reason':'inactive_coverage'}
+                balance=self._balanceLocked(cursor,subscription,now)
+                count=max(1,min(4,int(subscription.get('domain_count') or 1) if domainCount is None else int(domainCount)))
+                quota=getTokenQuotaForPlan(balance['plan_tier'],count)
+                used=0 if resetUsage else int(balance['used_tokens'])
+                remaining=(quota if resetUsage else max(0,quota-used) if grantImmediately
+                    else min(int(balance['remaining_tokens']),max(0,quota-used)))
+                periodId=str(uuid.uuid4()) if resetUsage else str(balance['credit_period_id'])
+                cursor.execute('''update public.credit_balances set domain_count=%s,monthly_token_quota=%s,
+                    used_tokens=%s,remaining_tokens=%s,credit_period_id=%s,balance_version=balance_version+1,
+                    updated_at=%s where user_id=%s''',(count,quota,used,remaining,periodId,now,userId))
+                if not resetUsage:
+                    self.reviseAllocation(cursor,userId,periodId,remaining+self._monthlySettled(cursor,userId,periodId))
+                return {'applied':True,'monthly_token_quota':quota,'remaining_tokens':remaining,
+                    'used_tokens':used,'domain_count':count,'credit_period_id':periodId}
+        return self.repository._run(operation)
+
+    def reviseAllocation(self,cursor,userId,periodId,watermark):
+        cursor.execute('select id,metadata_json from public.billing_events where idempotency_key=%s for update',
+            ('credit-allocation:'+userId+':'+periodId,))
+        allocation=cursor.fetchone()
+        if allocation:
+            data=self.repository._json(allocation['metadata_json'])
+            data['quotaWatermark']=int(watermark)
+            cursor.execute('update public.billing_events set metadata_json=%s where id=%s',(Json(data),allocation['id']))
 
     @staticmethod
     def _context(data):
@@ -171,7 +207,11 @@ class ManualCreditRepository:
                     and subscription.get('billing_mode')==context.billingMode
                     and str(subscription['id'])==context.subscriptionId
                     and _utc(balance['period_end'])>now and int(balance['monthly_token_quota'])>0)
-                available = int(balance['remaining_tokens']) if current else max(0, int(snapshot['quotaWatermark']) - self._monthlySettled(cursor, context.userId, context.creditPeriodId))
+                cursor.execute('select metadata_json from public.billing_events where idempotency_key=%s',
+                    ('credit-allocation:'+context.userId+':'+context.creditPeriodId,))
+                allocation=cursor.fetchone()
+                watermark=self.repository._json(allocation['metadata_json'])['quotaWatermark'] if allocation else snapshot['quotaWatermark']
+                available = int(balance['remaining_tokens']) if current else max(0, int(watermark) - self._monthlySettled(cursor, context.userId, context.creditPeriodId))
                 monthly = min(available, int(tokensUsed))
                 topup = min(int(balance.get('topup_tokens') or 0), int(tokensUsed) - monthly)
                 metadata = {'subscriptionId':context.subscriptionId,'billingMode':context.billingMode,'quotaWatermark':context.quotaWatermark, 'creditPeriodId': context.creditPeriodId, 'lifecycleId': context.lifecycleId,
