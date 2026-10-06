@@ -170,8 +170,10 @@ class NotificationDeliveryService:
         billingDelivery = delivery.get("notification_type") != "trial_expiry_warning"
         if billingDelivery:
             from api.services.notifications.billingNotificationService import isBillingNotificationEligible
-            metadata = delivery.get("metadata_json") or {}
+            metadata = dict(delivery.get("metadata_json") or {})
             invoice = self._findOne("Invoices", "id", metadata.get("invoiceId"), "id, status, period_start, period_end, metadata_json") if metadata.get("invoiceId") else None
+            if invoice and delivery.get('notification_type') == 'payment_receipt':
+                metadata['serviceRevoked'] = bool((invoice.get('metadata_json') or {}).get('manualBilling',{}).get('revokedAt'))
             snapshot = {"subscription":subscription, "invoice":invoice}
             if not isBillingNotificationEligible(delivery, snapshot, now):
                 self._cancel(delivery, workerId, "SUBSCRIPTION_NOT_ELIGIBLE", summary)
@@ -205,7 +207,7 @@ class NotificationDeliveryService:
             payload = {"mode":"send", "deliveryId":str(delivery["id"]),
                 "notificationType":delivery["notification_type"], "templateVersion":delivery["template_version"],
                 "email":email, "name":name, "periodEnd":str(delivery.get("period_end") or ""),
-                "metadata":delivery.get("metadata_json") or {}, "trackingTag":f"nubrix_delivery:{delivery['id']}"}
+                "metadata":metadata, "trackingTag":f"nubrix_delivery:{delivery['id']}"}
             result = self.edgeClient.sendBilling(payload)
             self._applySendResult(delivery,workerId,result,now,summary)
             return

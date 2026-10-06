@@ -1216,6 +1216,29 @@ class ManualBillingRepository:
         return self._result(cursor,invoice,subscription,'expert_activated',evidence.attemptId)
 
     def _recordNotification(self, cursor, subscription, notificationType, dedupeKey, metadata):
+        metadata = dict(metadata)
+        invoiceId = metadata.get('invoiceId')
+        if invoiceId:
+            cursor.execute('select * from public."Invoices" where id=%s and "userId"=%s',(invoiceId,subscription['user_id']))
+            invoice = cursor.fetchone()
+            if invoice:
+                billing = self._json(invoice.get('metadata_json')).get('manualBilling',{})
+                metadata.update(amount=int(invoice.get('total_amount') or invoice.get('amount') or 0),
+                    currency=invoice.get('currency'), domains=billing.get('domains',[]),
+                    purpose=billing.get('purpose') or invoice.get('billing_reason'),
+                    periodStart=str(invoice.get('period_start') or ''),serviceEnd=str(invoice.get('period_end') or ''),
+                    serviceRevoked=bool(billing.get('revokedAt')))
+                if notificationType in ('monthly_renewal_ready','monthly_renewal_reminder'):
+                    metadata.update(nextStart=str(invoice.get('period_start') or ''),nextEnd=str(invoice.get('period_end') or ''),
+                        renewalDeadline=str(subscription.get('current_period_end') or ''))
+        current = self._canonical(cursor,subscription['user_id'])
+        snapshot = self._coverageSnapshotLocked(cursor,current,_now(),materialize=False)
+        if snapshot.currentPeriod:
+            metadata.update(currentStart=snapshot.currentPeriod.start.isoformat(),currentEnd=snapshot.currentPeriod.end.isoformat())
+        if snapshot.nextPeriod:
+            metadata.update(nextStart=snapshot.nextPeriod.start.isoformat(),nextEnd=snapshot.nextPeriod.end.isoformat())
+        if snapshot.finalPaidEnd:
+            metadata.setdefault('finalPaidEnd',snapshot.finalPaidEnd.isoformat())
         intent = {'userId':subscription['user_id'], 'subscriptionId':str(subscription['id']),
             'notificationType':notificationType, 'dedupeKey':dedupeKey,
             'periodEnd':str(metadata.get('periodEnd') or subscription.get('current_period_end') or ''), 'metadata':metadata}
@@ -1489,7 +1512,7 @@ class ManualBillingRepository:
                 if closesCurrent:
                     cursor.execute("update public.subscriptions set status='expired',plan_type='none',current_period_end=%s,subscribed_experts=%s,domain_count=0 where id=%s",(now,Json([]),subscription['id']))
                     cursor.execute('update public.credit_balances set remaining_tokens=0,monthly_token_quota=0,balance_version=balance_version+1,updated_at=%s where user_id=%s',(now,userId))
-                self._recordNotification(cursor,subscription,'subscription_refund_initiated','refund:'+intentId+':initiated',{'refundIntentId':intentId,'amount':amount,'currency':items[0]['currency'],'accessExpired':closesCurrent,'currentAccessPreserved':not closesCurrent})
+                self._recordNotification(cursor,subscription,'subscription_refund_initiated','refund:'+intentId+':initiated',{'refundIntentId':intentId,'amount':amount,'currency':items[0]['currency'],'accessExpired':closesCurrent,'currentAccessPreserved':not closesCurrent,'cutoff':now.isoformat(),'finalPaidEnd':finalEnd.isoformat()})
                 return self._refundIntent(metadata)
         return self._run(operation)
 
@@ -1540,7 +1563,7 @@ class ManualBillingRepository:
                 cursor.execute('update public.billing_events set metadata_json=%s,event_status=%s where id=%s',(Json(metadata),state,refundIntentId))
                 if state == 'processed':
                     subscription=self._canonical(cursor,row['user_id'])
-                    self._recordNotification(cursor,subscription,'subscription_refund_processed','refund:'+refundIntentId+':processed',{'refundIntentId':refundIntentId,'amount':metadata['amount']})
+                    self._recordNotification(cursor,subscription,'subscription_refund_processed','refund:'+refundIntentId+':processed',{'refundIntentId':refundIntentId,'amount':metadata['amount'],'currency':metadata['items'][0]['currency'],'accessExpired':metadata['accessExpired'],'currentAccessPreserved':metadata['currentAccessPreserved'],'cutoff':metadata['cutoff']})
                 return {'refundIntentId':refundIntentId,'refundState':state,'accessRestored':False}
         return self._run(operation)
 
