@@ -518,6 +518,23 @@ class CreditService:
 
     # ---- public API -----------------------------------------------------------
 
+    def admitCreditOperation(self,userId,operationType,operationId):
+        from api.services.credits.manualCreditRepository import ManualCreditRepository
+        return ManualCreditRepository().admit(userId,operationType,operationId)
+
+    def settleCreditOperation(self,context,tokensUsed,runId):
+        from api.services.credits.manualCreditRepository import ManualCreditRepository
+        repository=ManualCreditRepository()
+        try:
+            repository.reportUsage(context,tokensUsed,str(runId))
+        except ValueError:
+            raise
+        except Exception:
+            from api.services.credits.creditUsageSpool import retainUsage
+            retainUsage(context,tokensUsed,str(runId))
+            raise
+        return repository.settle(context,tokensUsed,str(runId))
+
     def refreshTrialCreditsCache(
         self, userId: str, quota: int, topupTokens: int, periodEnd,
         generation: int,
@@ -655,7 +672,7 @@ class CreditService:
         return {"applied": True, "quota": newQuota, "delta": delta,
                 "remaining": newRemaining}
 
-    def deductTokens(self, userId, tokensUsed, operationType) -> int:
+    def deductTokens(self, userId, tokensUsed, operationType, context=None, runId=None) -> int:
         """
         Subtract the exact token count from the user's balance.
 
@@ -675,12 +692,9 @@ class CreditService:
             return self.getRemainingTokens(userId)
 
         if self._manualBalance(userId) is not None:
-            import uuid
-            from api.services.credits.manualCreditRepository import ManualCreditRepository
-            repository = ManualCreditRepository()
-            operationId = "direct:" + str(uuid.uuid4())
-            context = repository.admit(userId, operationType, operationId)
-            repository.settle(context, tokensUsed, operationId)
+            if context is None or runId is None or context.userId!=userId or context.operationType!=operationType:
+                raise ValueError('CREDIT_PREWORK_ADMISSION_REQUIRED')
+            self.settleCreditOperation(context,tokensUsed,runId)
             return self.getRemainingTokens(userId)
 
         self._ensureHash(userId)

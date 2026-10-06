@@ -8,6 +8,7 @@ from api.services.billing.manualBillingRepository import getManualBillingReposit
 
 class ManualCreditRepository:
     def __init__(self, repository=None):
+        from api.services.billing.manualBillingRepository import getManualBillingRepository
         self.repository = repository or getManualBillingRepository()
 
     def _monthlySettled(self, cursor, userId, periodId):
@@ -263,15 +264,16 @@ class ManualCreditRepository:
         return self.repository._run(operation)
 
     def recoverUsage(self,limit=100):
+        from api.services.credits.creditUsageSpool import recoverSpooledUsage
         def load(connection):
             with connection.cursor(cursor_factory=RealDictCursor) as cursor:
                 cursor.execute("select id,metadata_json from public.billing_events where event_type='credit.usage_reported' and event_status='PENDING' and user_id is not null order by coalesce((metadata_json->>'lastRecoveryAt')::timestamptz,updated_at),id limit %s",(limit,))
                 return list(cursor.fetchall())
-        summary={'settled':0,'errors':0}
+        summary=recoverSpooledUsage(self,limit)
         for row in self.repository._run(load):
             data=self.repository._json(row['metadata_json'])
-            context=self._context(data)
             try:
+                context=self._context(data)
                 self.settle(context,data['tokensUsed'],data['runId'])
                 summary['settled']+=1
             except Exception:

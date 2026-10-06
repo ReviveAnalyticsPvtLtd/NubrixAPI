@@ -51,13 +51,21 @@ class CreditTrackingCallback(BaseCallbackHandler):
         self._admit()
 
     def _admit(self) -> None:
-        """Manual usage needs a durable admission before counted work begins."""
+        """Every eligible mode needs durable admission before counted work."""
         from api.services.credits.creditService import creditService
-        if creditService._manualBalance(self.userId) is not None:
-            from api.services.credits.manualCreditRepository import ManualCreditRepository
-            self._settlement = ManualCreditRepository()
-            self._context = self._settlement.admit(self.userId, self.operationType, self.operationId)
-            self.raise_error = True
+        self._context = creditService.admitCreditOperation(self.userId,self.operationType,self.operationId)
+        if ((self.creditPeriodId and self.creditPeriodId!=self._context.creditPeriodId)
+                or (self.lifecycleId and self.lifecycleId!=self._context.lifecycleId)):
+            raise ValueError('CREDIT_CONTEXT_MISMATCH')
+        self.raise_error = True
+
+    def on_llm_start(self, serialized, prompts, **kwargs):
+        if kwargs.get('run_id') is None:
+            raise ValueError('LLM_RUN_ID_REQUIRED_FOR_DURABLE_USAGE')
+        self._admit()
+
+    def on_chat_model_start(self, serialized, messages, **kwargs):
+        self.on_llm_start(serialized,messages,**kwargs)
 
     def on_llm_end(self, response: LLMResult, **kwargs: Any) -> None:
         """
@@ -86,16 +94,8 @@ class CreditTrackingCallback(BaseCallbackHandler):
                 runId = kwargs.get("run_id")
                 if runId is None:
                     raise ValueError("LLM_RUN_ID_REQUIRED_FOR_DURABLE_USAGE")
-                self._settlement.reportUsage(self._context,totalTokens,str(runId))
-                self._settlement.settle(self._context, totalTokens, str(runId))
-            elif totalTokens > 0:
-                # Free and annual compatibility path; manual admission never falls back.
                 from api.services.credits.creditService import creditService
-                creditService.deductTokens(
-                    userId=self.userId,
-                    tokensUsed=totalTokens,
-                    operationType=self.operationType,
-                )
+                creditService.settleCreditOperation(self._context,totalTokens,str(runId))
         except Exception as e:
             logger.warning(
                 f"CreditTrackingCallback.on_llm_end failed — "
