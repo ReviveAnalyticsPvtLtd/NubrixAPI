@@ -8,6 +8,7 @@ import json
 import uuid
 from dataclasses import replace
 from datetime import timedelta
+from unittest.mock import patch
 
 import pytest
 
@@ -59,20 +60,26 @@ def reports(deliveries):
         connection.execute("ALTER TABLE notification_deliveries ADD COLUMN created_at TEXT")
 
 
-def service(cases, entity=None):
+CLOCK = NOW + timedelta(hours=2)
+
+
+def service(cases, entity=None, clock=CLOCK):
     from api.services.adminPaymentCaseService import AdminPaymentCaseService
     repository, _, _, _, default = cases
-    return AdminPaymentCaseService(repository=repository, provider=FakeProvider(default if entity is None else entity))
+    return AdminPaymentCaseService(repository=repository, provider=FakeProvider(default if entity is None else entity),
+                                   now=lambda: clock)
 
 
 def body(action="recheck", **overrides):
     return {"action": action, "caseReference": CASE_REF, "reason": REASON, **overrides}
 
 
-def act(cases, action="recheck", key="case-key-1", admin=ADMIN, entity=None, svc=None):
+def act(cases, action="recheck", key="case-key-1", admin=ADMIN, entity=None, svc=None, clock=CLOCK):
+    """Service and database clocks are pinned so outcomes never depend on the run date."""
     from api.adminModels import AdminPaymentCaseActionRequest
-    svc = svc or service(cases, entity)
-    return svc.act(cases[2], AdminPaymentCaseActionRequest(**body(action)), key, admin)
+    svc = svc or service(cases, entity, clock)
+    with patch("api.services.billing.manualBillingRepository._now", return_value=clock):
+        return svc.act(cases[2], AdminPaymentCaseActionRequest(**body(action)), key, admin)
 
 
 def capture(cases):
@@ -122,6 +129,21 @@ def test_recheck_with_attested_capture_time_finalizes_the_original_purchase(case
     [audit] = audits(path)
     assert audit["action"] == "billing.payment_case.recheck" and audit["outcome"] == "FINALIZED_ORIGINAL"
     assert "event_status" in json.loads(audit["changed_fields"])
+
+
+def test_recheck_never_finalizes_an_original_interval_that_has_already_elapsed(cases):
+    _, path, _, _, _ = cases
+    before = read_row(path, "subscriptions")
+    result = act(cases, clock=NOW + timedelta(days=40))
+    assert (result["financialStatus"], result["actionOutcome"], result["reasonCode"]) == (
+        "OPEN", "STILL_UNRESOLVED", "ORIGINAL_INTERVAL_ELAPSED")
+    assert read_row(path, "Invoices")["status"] == "PAYMENT_PENDING"
+    assert capture(cases)["event_status"] == "REQUIRES_RECONCILIATION"
+    after = read_row(path, "subscriptions")
+    assert (after["current_period_start"], after["current_period_end"], after["billing_state"]) == (
+        before["current_period_start"], before["current_period_end"], before["billing_state"])
+    receipts = rows(path, "SELECT id FROM billing_events WHERE event_type='email.billing_intent.committed'")
+    assert receipts == []
 
 
 def test_finalized_case_leaves_reports_and_later_channels_stay_idempotent(cases, reports):
@@ -298,9 +320,12 @@ def api(cases, authFixture):
     productionApp.dependency_overrides[getAdminPaymentCaseService] = lambda: svc
     login = authFixture.service.login("admin@example.com", VALID_PASSWORD, "203.0.113.10")
     client = TestClient(productionApp, raise_server_exceptions=False)
+    clock = patch("api.services.billing.manualBillingRepository._now", return_value=CLOCK)
+    clock.start()
     try:
         yield {"client": client, "token": login["token"], "adminId": login["admin"]["id"], "service": svc}
     finally:
+        clock.stop()
         client.close()
         productionApp.dependency_overrides.clear()
 

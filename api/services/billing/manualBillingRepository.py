@@ -1103,6 +1103,16 @@ class ManualBillingRepository:
                 or str(attempt.get('currency')).upper() != evidence.currency.upper()
                 or evidence.financialStatus != 'captured'):
             return None, 'PROVIDER_EVIDENCE_MISMATCH'
+        # A historical interval never becomes a closed case: money for service the
+        # customer can no longer receive stays open for the deferred refund policy.
+        if evidence.purpose == 'initial_purchase':
+            from dateutil.relativedelta import relativedelta
+            intervalEnd = evidence.provenCaptureAt + (relativedelta(years=1) if frozen.get('billingMode') == 'annual_prepaid' else relativedelta(months=1))
+        else:
+            intervalEnd = _utc(invoice.get('period_end'))
+        cursor.execute('select clock_timestamp() as current_time')
+        if intervalEnd is not None and intervalEnd <= _utc(cursor.fetchone()['current_time']):
+            return None, 'ORIGINAL_INTERVAL_ELAPSED'
         stored.update(timingKind=evidence.timingKind, provenCaptureAt=evidence.provenCaptureAt.isoformat(),
                       reconsideredAt=evidence.observedAt.isoformat())
         cursor.execute('update public.billing_events set metadata_json=%s where id=%s', (Json(stored), str(capture['id'])))

@@ -158,10 +158,11 @@ class AdminPaymentCaseRepository:
 
 
 class AdminPaymentCaseService:
-    def __init__(self, repository=None, provider=None):
+    def __init__(self, repository=None, provider=None, now=None):
         self._repository = repository
         self._provider = provider
         self._cases = None
+        self.now = now or (lambda: datetime.now(timezone.utc))
 
     @property
     def cases(self) -> AdminPaymentCaseRepository:
@@ -248,7 +249,7 @@ class AdminPaymentCaseService:
         # The recheck's own observation time proves nothing about the original deadline.
         evidence = ManualPaymentService.buildPaymentEvidence(
             payment, attemptId=str(attempt["id"]), invoiceId=str(case["invoice_id"]), userId=case["user_id"],
-            purpose=frozen.get("purpose") or "", observedAt=datetime.now(timezone.utc), serverObservedCapture=False)
+            purpose=frozen.get("purpose") or "", observedAt=self.now(), serverObservedCapture=False)
         return evidence, None
 
 
