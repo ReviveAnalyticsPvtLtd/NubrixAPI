@@ -1092,14 +1092,21 @@ class ManualBillingRepository:
         return self._run(operation)
 
     def _unresolvedCycleCaptureLocked(self, cursor, subscription, cycleEnd):
-        """One owned-cycle predicate shared by commit, sweep and dispatch."""
+        """One owned-cycle predicate shared by commit, enqueue, sweep and dispatch.
+
+        Invoices frozen to another lifecycle do not hold this one; invoices
+        without a frozen lifecycle are treated as owned (conservative).
+        """
+        lifecycle = self._json(subscription.get('billing_state')).get('manualBilling', {}).get('lifecycleId')
+        lifecycleClause = " and coalesce(i.metadata_json->'manualBilling'->>'lifecycleId', %s)=%s" if lifecycle else ''
         cursor.execute('''select e.id from public.billing_events e
             join public."Invoices" i on i.id=e.invoice_id
             where e.user_id=%s and i."userId"=%s and i.subscription_id=%s
-            and i.billing_reason='renewal' and i.period_start=%s
+            and i.billing_reason='renewal' and i.period_start=%s''' + lifecycleClause + '''
             and ((e.event_type='payment.capture' and e.event_status in ('OBSERVED','REQUIRES_RECONCILIATION'))
               or (e.event_category='payment_attempt' and e.payment_status in ('authorized','captured') and upper(i.status)<>'PAID'))
-            limit 1''', (subscription['user_id'], subscription['user_id'], subscription['id'], cycleEnd))
+            limit 1''', (subscription['user_id'], subscription['user_id'], subscription['id'], cycleEnd)
+                + ((str(lifecycle), str(lifecycle)) if lifecycle else ()))
         return cursor.fetchone() is not None
 
     def hasUnresolvedCycleCapture(self, userId, cycleEnd):

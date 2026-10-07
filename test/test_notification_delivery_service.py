@@ -100,8 +100,10 @@ class FakeRepository:
         self.rows = self.rows[limit:]
         return claimed
 
-    def authorizeBillingSubmission(self, *args):
-        return True
+    authorization = "AUTHORIZED"
+
+    def authorizeBillingSubmissionResult(self, *args):
+        return self.authorization
 
     def markAccepted(self, *args, **kwargs):
         self.accepted.append(args)
@@ -220,6 +222,20 @@ def test_globalValidationOccursBeforeClaimingRows():
         assert str(error) == "EDGE_VALIDATION_FAILED"
 
     assert repository.claimCalls == 0
+
+
+def test_heldBillingSolicitationIsRescheduledNotCancelled():
+    delivery = _delivery(notification_type="monthly_subscription_expired",
+        period_end="2026-09-16T01:00:00+00:00", metadata_json={})
+    repository = FakeRepository([delivery])
+    repository.authorization = "HELD"
+    edge = FakeEdgeClient([])
+    service = _service(repository, edge, subscriptions=[_subscription(status="expired",
+        billing_mode="monthly_prepaid", current_period_end="2026-09-16T01:00:00+00:00")])
+    result = service.dispatchBatch("worker-a")
+    assert result["cancelled"] == 0 and repository.terminals == []
+    assert edge.payloads == []
+    assert len(repository.retries) == 1 and repository.retries[0][2] == "PAYMENT_HOLD"
 
 
 def test_committedBillingReceiptDispatchesEvenAfterSubscriptionExpires():

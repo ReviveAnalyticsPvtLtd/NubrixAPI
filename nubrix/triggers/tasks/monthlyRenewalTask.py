@@ -166,15 +166,19 @@ class MonthlyRenewalTask:
                         {"type": "monthly_renewal_ready"}, snapshot, now
                     )
                     if intent:
-                        self._enqueue(intent)
-                        outcome["readyQueued"] = 1
+                        if self._enqueue(intent):
+                            outcome["readyQueued"] = 1
+                        else:
+                            outcome["skipped"] = 1
                 elif self._withinT1(now, periodEnd):
                     intent = buildBillingNotificationIntent(
                         {"type": "monthly_renewal_reminder"}, snapshot, now
                     )
                     if intent:
-                        self._enqueue(intent)
-                        outcome["remindersQueued"] = 1
+                        if self._enqueue(intent):
+                            outcome["remindersQueued"] = 1
+                        else:
+                            outcome["skipped"] = 1
             return outcome
 
         # At/after end: the unpaid expiry notice (opted-out users suppressed
@@ -188,9 +192,6 @@ class MonthlyRenewalTask:
         if now - periodEnd > timedelta(hours=25):
             outcome["skipped"] = 1
             return outcome
-        if repository.hasUnresolvedCycleCapture(userId, periodEnd):
-            outcome['skipped'] = 1
-            return outcome
         expiryIntent = buildBillingNotificationIntent(
             {"type": "monthly_subscription_expired"},
             {
@@ -200,8 +201,10 @@ class MonthlyRenewalTask:
             now,
         )
         if expiryIntent:
-            self._enqueue(expiryIntent)
-            outcome["expiryQueued"] = 1
+            if self._enqueue(expiryIntent):
+                outcome["expiryQueued"] = 1
+            else:
+                outcome["skipped"] = 1
         return outcome
 
     def _loadPayableRenewal(self, userId, periodEnd) -> dict | None:
@@ -233,7 +236,8 @@ class MonthlyRenewalTask:
 
         return now >= periodEnd - timedelta(days=_T1_DAYS)
 
-    def _enqueue(self, intent: dict) -> None:
+    def _enqueue(self, intent: dict) -> bool:
+        """Commit the intent under the owner lock; False while the cycle is held."""
         from api.services.billing.manualBillingRepository import getManualBillingRepository
         from psycopg2.extras import RealDictCursor
         repository = getManualBillingRepository()
@@ -241,6 +245,11 @@ class MonthlyRenewalTask:
             with connection.cursor(cursor_factory=RealDictCursor) as cursor:
                 repository._lockUser(cursor,intent["userId"])
                 subscription=repository._canonical(cursor,intent["userId"])
+                if repository._unresolvedCycleCaptureLocked(cursor,subscription,parseUtc(subscription.get("current_period_end"))):
+                    return False
                 repository._recordNotification(cursor,subscription,intent["notificationType"],intent["dedupeKey"],intent.get("metadata") or {})
-        repository._run(operation)
+                return True
+        if not repository._run(operation):
+            return False
         repository.bridgeNotificationIntents()
+        return True

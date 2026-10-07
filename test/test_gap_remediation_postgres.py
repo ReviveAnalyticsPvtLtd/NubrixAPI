@@ -183,3 +183,148 @@ def test_two_sessions_refund_replay_after_reserve_submits_once(payment,monkeypat
     assert len(calls)==1
     assert all(row.refundIntentId==reserved.refundIntentId for row in results)
     assert service.initiateUnusedTimeRefund('staff',payload,'approval').refundState=='processed'
+
+
+# -- renewal solicitation hold vs dispatch (owner-locked authorization) --------
+
+def _heldReady(payment):
+    """Paid cycle ending in five real days with an unpaid renewal and a claimed T-7 delivery.
+
+    Authorization reads clock_timestamp(), so the cycle is moved onto the real clock.
+    """
+    from api.services.notifications.notificationDeliveryRepository import NotificationDeliveryRepository
+    repo, money, url = payment
+    period = repo.finalizeCapturedPayment(money).currentPeriod
+    invoice = str(uuid.uuid4())
+    with psycopg2.connect(url) as db:
+        with db.cursor() as sql:
+            sql.execute("update public.subscriptions set current_period_end=date_trunc('second',now())+interval '5 days' where id=%s returning current_period_end",
+                        (period.subscriptionId,))
+            end = sql.fetchone()[0]
+            sql.execute('''insert into public."Invoices"(id,"userId",subscription_id,status,billing_reason,total_amount,currency,period_start,period_end,metadata_json)
+                values(%s,%s,%s,'UPCOMING','renewal',3000,'INR',%s,%s + interval '1 month',%s)''',
+                (invoice, money.userId, period.subscriptionId, end, end,
+                 Json({'manualBilling': {'lifecycleId': period.lifecycleId, 'billingMode': 'monthly_prepaid'}})))
+    deliveries = NotificationDeliveryRepository(lambda: psycopg2.connect(url))
+    row, _ = deliveries.enqueueBillingNotification(money.userId, period.subscriptionId, 'monthly_renewal_ready',
+        'ready-hold:' + invoice, end.isoformat(), {'invoiceId': invoice})
+    with psycopg2.connect(url) as db:
+        with db.cursor() as sql:
+            sql.execute("update public.notification_deliveries set status='SENDING',lease_owner='hold-worker',claimed_payload_version=payload_version,lease_expires_at=now()+interval '5 minutes' where id=%s",
+                        (row['id'],))
+    return SimpleNamespace(repo=repo, url=url, user=money.userId, sub=period.subscriptionId, invoice=invoice,
+                           end=end, deliveries=deliveries, delivery=str(row['id']))
+
+
+def _recordCapture(sql, case, invoice=None, status='REQUIRES_RECONCILIATION'):
+    key = 'held-' + str(uuid.uuid4())
+    sql.execute('''insert into public.billing_events(user_id,subscription_id,invoice_id,event_category,event_type,event_status,
+        provider,provider_payment_id,amount,currency,idempotency_key,occurred_at,created_at)
+        values(%s,%s,%s,'reconciliation','payment.capture',%s,'razorpay',%s,3000,'INR',%s,clock_timestamp(),clock_timestamp())
+        returning created_at''', (case.user, case.sub, invoice or case.invoice, status, 'pay-' + key, key))
+    return sql.fetchone()[0]
+
+
+def _submissionStarted(case):
+    with psycopg2.connect(case.url) as db:
+        with db.cursor() as sql:
+            sql.execute('select submission_started_at from public.notification_deliveries where id=%s', (case.delivery,))
+            return sql.fetchone()[0]
+
+
+def test_capture_committed_under_owner_lock_holds_waiting_dispatch(payment):
+    import time
+    case = _heldReady(payment)
+    holder = psycopg2.connect(case.url)
+    try:
+        with holder.cursor() as sql:
+            case.repo._lockUser(sql, case.user)
+            _recordCapture(sql, case)
+            with ThreadPoolExecutor(max_workers=1) as pool:
+                waiting = pool.submit(case.deliveries.authorizeBillingSubmissionResult, case.delivery, 'hold-worker', 1)
+                time.sleep(0.5)
+                assert not waiting.done(), 'authorization must wait for the financial owner lock'
+                holder.commit()
+                assert waiting.result() == 'HELD'
+    finally:
+        holder.close()
+    assert _submissionStarted(case) is None
+
+
+def test_two_sessions_capture_vs_dispatch_never_authorize_after_hold(payment):
+    case = _heldReady(payment)
+    def capture():
+        with psycopg2.connect(case.url) as db:
+            with db.cursor() as sql:
+                case.repo._lockUser(sql, case.user)
+                return _recordCapture(sql, case)
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        sent = pool.submit(case.deliveries.authorizeBillingSubmissionResult, case.delivery, 'hold-worker', 1)
+        held = pool.submit(capture)
+        outcome, capturedAt = sent.result(), held.result()
+    assert outcome in ('AUTHORIZED', 'HELD')
+    started = _submissionStarted(case)
+    if outcome == 'AUTHORIZED':
+        assert started < capturedAt
+    else:
+        assert started is None
+
+
+def test_two_sessions_resolution_vs_dispatch_never_send_held_money(payment):
+    case = _heldReady(payment)
+    with psycopg2.connect(case.url) as db:
+        with db.cursor() as sql:
+            _recordCapture(sql, case)
+    def resolve():
+        with psycopg2.connect(case.url) as db:
+            with db.cursor() as sql:
+                case.repo._lockUser(sql, case.user)
+                sql.execute("update public.billing_events set event_status='FINALIZED' where invoice_id=%s and event_type='payment.capture'", (case.invoice,))
+                sql.execute('update public."Invoices" set status=%s where id=%s', ('PAID', case.invoice))
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        sent = pool.submit(case.deliveries.authorizeBillingSubmissionResult, case.delivery, 'hold-worker', 1)
+        done = pool.submit(resolve)
+        outcome = sent.result(); done.result()
+    assert outcome in ('HELD', 'REJECTED')
+    assert _submissionStarted(case) is None
+
+
+def test_two_sessions_cancellation_vs_held_dispatch_never_authorize(payment):
+    case = _heldReady(payment)
+    with psycopg2.connect(case.url) as db:
+        with db.cursor() as sql:
+            _recordCapture(sql, case)
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        sent = pool.submit(case.deliveries.authorizeBillingSubmissionResult, case.delivery, 'hold-worker', 1)
+        cancelled = pool.submit(case.repo.setRenewalOptOut, case.user, True, 'Finished project', 'hold-optout')
+        outcome = sent.result(); cancelled.result()
+    assert outcome in ('HELD', 'REJECTED')
+    assert case.deliveries.authorizeBillingSubmissionResult(case.delivery, 'hold-worker', 1) == 'REJECTED'
+
+
+def test_two_sessions_repricing_vs_held_dispatch_never_authorize(payment):
+    case = _heldReady(payment)
+    with psycopg2.connect(case.url) as db:
+        with db.cursor() as sql:
+            _recordCapture(sql, case)
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        sent = pool.submit(case.deliveries.authorizeBillingSubmissionResult, case.delivery, 'hold-worker', 1)
+        revised = pool.submit(case.deliveries.enqueueBillingNotification, case.user, case.sub, 'monthly_renewal_ready',
+            'ready-hold:' + case.invoice, case.end.isoformat(), {'invoiceId': case.invoice, 'repriced': True})
+        outcome = sent.result(); revised.result()
+    assert outcome in ('HELD', 'REJECTED')
+    assert _submissionStarted(case) is None
+
+
+@pytest.mark.parametrize('boundary', ['future_paid_cycle', 'previous_cycle'])
+def test_capture_on_another_cycle_boundary_does_not_hold_this_renewal(payment, boundary):
+    case = _heldReady(payment)
+    other = str(uuid.uuid4())
+    shift = timedelta(days=31) if boundary == 'future_paid_cycle' else -timedelta(days=31)
+    with psycopg2.connect(case.url) as db:
+        with db.cursor() as sql:
+            sql.execute('''insert into public."Invoices"(id,"userId",subscription_id,status,billing_reason,total_amount,currency,period_start,period_end,metadata_json)
+                values(%s,%s,%s,'UPCOMING','renewal',3000,'INR',%s,%s,'{}')''',
+                (other, case.user, case.sub, case.end + shift, case.end + shift + timedelta(days=30)))
+            _recordCapture(sql, case, invoice=other)
+    assert case.deliveries.authorizeBillingSubmissionResult(case.delivery, 'hold-worker', 1) == 'AUTHORIZED'

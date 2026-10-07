@@ -200,7 +200,15 @@ class NotificationDeliveryService:
             return
 
         if billingDelivery:
-            if not self.repository.authorizeBillingSubmission(str(delivery['id']),workerId,delivery['payload_version']):
+            authorization = self.repository.authorizeBillingSubmissionResult(
+                str(delivery['id']),workerId,delivery['payload_version'])
+            if authorization == 'HELD':
+                # Unresolved received money for this cycle: keep the original
+                # milestone and re-check after the hold, never discard it.
+                self._scheduleRetry(delivery,workerId,'PAYMENT_HOLD',now + datetime.timedelta(hours=1),None)
+                summary['retryScheduled'] += 1
+                return
+            if authorization != 'AUTHORIZED':
                 self._cancel(delivery,workerId,'SUBSCRIPTION_NOT_ELIGIBLE',summary)
                 return
             delivery['submission_started_at'] = now.isoformat()

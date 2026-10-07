@@ -265,6 +265,10 @@ def isBillingNotificationEligible(
     metadata = delivery.get("metadata_json") or {}
     if metadata.get("lifecycleId") and metadata["lifecycleId"] != _lifecycleId(snapshot):
         return False
+    # Received but unresolved money for this owned cycle holds every
+    # solicitation; the caller decides whether a hold reschedules.
+    if (snapshot or {}).get('unresolvedOwnedCapture'):
+        return False
     if notificationType in ("monthly_renewal_ready", "monthly_renewal_reminder"):
         if current >= periodEnd:
             return False
@@ -275,8 +279,6 @@ def isBillingNotificationEligible(
         return _invoiceUnpaid(snapshot or {})
 
     # Expiry notice: only unpaid, uncancelled, no valid paid continuation.
-    if (snapshot or {}).get('unresolvedOwnedCapture'):
-        return False
     invoice = (snapshot or {}).get("invoice")
     if invoice is not None and (invoice.get("status") or "").upper() == "PAID":
         return False

@@ -245,6 +245,9 @@ class NotificationDeliveryRepository:
                 submission_started_at = case when %s = 'AMBIGUOUS_SEND'
                     then submission_started_at else null end,
                 last_error_code = %s,
+                -- A payment hold is not a delivery attempt: return the claim's count.
+                attempt_count = case when %s = 'PAYMENT_HOLD' and attempt_count > 0
+                    then attempt_count - 1 else attempt_count end,
                 next_attempt_at = %s,
                 next_reconcile_at = %s,
                 lease_owner = null,
@@ -253,6 +256,7 @@ class NotificationDeliveryRepository:
             where id = %s and status = 'SENDING' and lease_owner = %s
             """ + self._versionPredicate(payloadVersion),
             (
+                errorCode,
                 errorCode,
                 errorCode,
                 nextAttemptAt,
@@ -320,19 +324,25 @@ class NotificationDeliveryRepository:
         return str(row['id'])
 
     def authorizeBillingSubmission(self, deliveryId, leaseOwner, payloadVersion) -> bool:
+        return self.authorizeBillingSubmissionResult(deliveryId, leaseOwner, payloadVersion) == 'AUTHORIZED'
+
+    def authorizeBillingSubmissionResult(self, deliveryId, leaseOwner, payloadVersion) -> str:
         """Fence the immutable provider submission under the financial owner lock.
 
-        Once committed, possibly submitted payloads cannot be revised. No network
+        Returns AUTHORIZED, HELD (otherwise eligible solicitation for a cycle
+        with unresolved received money; retry later) or REJECTED. Once
+        committed, possibly submitted payloads cannot be revised. No network
         IO occurs inside this transaction; crashed submissions reconcile by tag.
         """
         from api.services.billing.manualBillingRepository import ManualBillingRepository
-        from api.services.notifications.billingNotificationService import isBillingNotificationEligible
+        from api.services.notifications.billingNotificationService import (
+            _SOLICITATION_TYPES, isBillingNotificationEligible)
         repository = ManualBillingRepository(self.connectionFactory)
         def operation(connection):
             with connection.cursor(cursor_factory=RealDictCursor) as cursor:
                 cursor.execute('select user_id from public.notification_deliveries where id=%s',(deliveryId,))
                 identity = cursor.fetchone()
-                if not identity or not identity['user_id']: return False
+                if not identity or not identity['user_id']: return 'REJECTED'
                 repository._lockUser(cursor,identity['user_id'])
                 subscription = repository._canonical(cursor,identity['user_id'])
                 cursor.execute('select * from public.notification_deliveries where id=%s for update',(deliveryId,))
@@ -341,7 +351,7 @@ class NotificationDeliveryRepository:
                         or row['payload_version'] != payloadVersion
                         or row['claimed_payload_version'] != payloadVersion
                         or row.get('submission_started_at') or row.get('last_error_code') == 'AMBIGUOUS_SEND'
-                        or str(row.get('subscription_id')) != str(subscription['id'])): return False
+                        or str(row.get('subscription_id')) != str(subscription['id'])): return 'REJECTED'
                 row['metadata_json'] = repository._json(row.get('metadata_json'))
                 invoiceId = row['metadata_json'].get('invoiceId')
                 invoice = None
@@ -352,14 +362,18 @@ class NotificationDeliveryRepository:
                 cursor.execute('select clock_timestamp() as observed_at')
                 from api.services.subscriptions.paymentValidationService import parseUtc
                 observedAt = parseUtc(cursor.fetchone()['observed_at'])
-                if row.get('lease_expires_at') and parseUtc(row['lease_expires_at']) <= observedAt: return False
+                if row.get('lease_expires_at') and parseUtc(row['lease_expires_at']) <= observedAt: return 'REJECTED'
                 subscription['billing_state'] = repository._json(subscription.get('billing_state'))
-                held = (row['notification_type'] == 'monthly_subscription_expired'
+                held = (row['notification_type'] in _SOLICITATION_TYPES
                     and repository._unresolvedCycleCaptureLocked(cursor, subscription, parseUtc(row.get('period_end'))))
-                if not isBillingNotificationEligible(row,{'subscription':subscription,'invoice':invoice,
-                        'unresolvedOwnedCapture':held},observedAt): return False
+                snapshot = {'subscription':subscription,'invoice':invoice,'unresolvedOwnedCapture':held}
+                if not isBillingNotificationEligible(row,snapshot,observedAt):
+                    # A hold never revives a message whose own window or facts have lapsed.
+                    if held and isBillingNotificationEligible(row,{**snapshot,'unresolvedOwnedCapture':False},observedAt):
+                        return 'HELD'
+                    return 'REJECTED'
                 cursor.execute('update public.notification_deliveries set submission_started_at=clock_timestamp() where id=%s',(deliveryId,))
-                return True
+                return 'AUTHORIZED'
         return repository._run(operation)
 
     def listForReconciliation(self, limit: int = 100) -> list[dict]:

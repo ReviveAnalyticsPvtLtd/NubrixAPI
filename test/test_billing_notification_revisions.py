@@ -17,7 +17,8 @@ def deliveries(database):
           claimed_payload_version INTEGER, submission_started_at TEXT,
           provider_message_id TEXT, provider TEXT, provider_status TEXT, accepted_at TEXT, last_error_code TEXT,
           next_attempt_at TEXT, next_reconcile_at TEXT, lease_owner TEXT,
-          lease_expires_at TEXT, terminal_at TEXT, updated_at TEXT
+          lease_expires_at TEXT, terminal_at TEXT, updated_at TEXT,
+          attempt_count INTEGER DEFAULT 0
         );''')
     return NotificationDeliveryRepository(lambda: SqlConnection(path)), path
 
