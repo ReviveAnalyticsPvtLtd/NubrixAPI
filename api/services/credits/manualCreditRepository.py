@@ -63,8 +63,13 @@ class ManualCreditRepository:
 
     _RESET_DENIALS = {'erasure_pending':'ERASURE_PENDING','account_banned':'ACCOUNT_BANNED',
         'restricted_subscription':'RESTRICTED_SUBSCRIPTION'}
-    RESET_CHANGED_FIELDS = ('domain_count','monthly_token_quota','used_tokens','remaining_tokens',
-        'credit_period_id','balance_version','last_reset_at','updated_at')
+    # Columns the live-trial initialization inserts; topup_tokens keeps its default and is never reset.
+    RESET_INSERTED_FIELDS = ('user_id','subscription_id','plan_tier','domain_count','monthly_token_quota',
+        'used_tokens','remaining_tokens','period_start','period_end','lifecycle_id','credit_period_id',
+        'balance_version','last_reset_at','updated_at')
+    _RESET_VALUE_FIELDS = (('domain_count','domainCount'),('monthly_token_quota','monthlyTokenQuota'),
+        ('used_tokens','usedTokens'),('remaining_tokens','remainingTokens'))
+    _RESET_ROTATED_FIELDS = ('credit_period_id','balance_version','last_reset_at','updated_at')
 
     @staticmethod
     def creditSnapshot(balance):
@@ -135,7 +140,13 @@ class ManualCreditRepository:
         cursor.execute('''insert into public.billing_events(id,user_id,subscription_id,event_category,event_type,event_status,idempotency_key,metadata_json,occurred_at)
             values(%s,%s,%s,'audit','credit.allocation_started','ACTIVE',%s,%s,%s)''',
             (str(uuid.uuid4()),userId,subscription['id'],'credit-allocation:'+userId+':'+periodId,Json(allocation),now))
-        return {'before':before,'after':self.creditSnapshot(after),'changedFields':list(self.RESET_CHANGED_FIELDS)}
+        afterSnapshot=self.creditSnapshot(after)
+        if before is None:
+            changed=list(self.RESET_INSERTED_FIELDS)
+        else:
+            changed=[column for column,key in self._RESET_VALUE_FIELDS if before[key]!=afterSnapshot[key]]
+            changed+=list(self._RESET_ROTATED_FIELDS)
+        return {'before':before,'after':afterSnapshot,'changedFields':changed}
 
     @staticmethod
     def _context(data):

@@ -790,3 +790,111 @@ def test_future_only_paid_coverage_is_not_reset(resets):
     _, target = reset(resets)
     assert (target["outcome"], target["reason_code"]) == ("SKIPPED", "NO_ACTIVE_COVERAGE")
     assert read_row(path, "credit_balances")["credit_period_id"] == before["credit_period_id"]
+
+
+# ---- Pre-merge: fair bulk progress, UTC output and accurate audit fields -------
+
+def advancingClock(start=NOW):
+    ticks = {"count": 0}
+
+    def now():
+        ticks["count"] += 1
+        return start + timedelta(microseconds=ticks["count"])
+
+    return now
+
+
+def recordAttempts(api, failing):
+    repository = api["service"].repository
+    original = repository.resetTarget
+    attempts = []
+
+    def attempt(operationId, userId):
+        attempts.append(userId)
+        if userId in failing:
+            raise RuntimeError("persistent per-user failure")
+        return original(operationId, userId)
+
+    repository.resetTarget = attempt
+    return attempts
+
+
+def test_persistently_failing_targets_do_not_starve_untouched_targets(api, resets):
+    activateMonthly(resets)
+    users = addUsers(api["path"], 205)
+    failing = set(sorted(users + [USER])[:100])
+    attempts = recordAttempts(api, failing)
+    with patch("api.services.billing.manualBillingRepository._now", side_effect=advancingClock()):
+        for _ in range(4):
+            before = len(attempts)
+            response = resetAll(api)
+            batch = attempts[before:]
+            assert len(batch) <= 100 and len(set(batch)) == len(batch)
+    outcomes = {row["user_id"]: row["outcome"] for row in targetRows(api["path"])}
+    untouched = set(users + [USER]) - failing
+    assert all(outcomes[userId] in ("RESET", "SKIPPED") for userId in untouched)
+    assert all(outcomes[userId] == "RETRYABLE_FAILED" for userId in failing)
+    assert response.status_code == 202 and response.json()["retryableFailureCount"] == 100
+    assert read_row(api["path"], "credit_balances")["remaining_tokens"] == 10000
+    assert len(audits(api["path"])) == 106
+
+
+def test_failed_targets_are_retried_oldest_attempt_first(api):
+    users = addUsers(api["path"], 150)
+    attempts = recordAttempts(api, set(users) | {USER})
+    with patch("api.services.billing.manualBillingRepository._now", side_effect=advancingClock()):
+        for _ in range(3):
+            resetAll(api)
+    counts = {userId: attempts.count(userId) for userId in users + [USER]}
+    assert len(attempts) == 300 and len(counts) == 151
+    assert min(counts.values()) >= 1 and max(counts.values()) - min(counts.values()) <= 1
+
+
+def test_operation_timestamps_serialize_as_utc():
+    from datetime import datetime, timezone as tz
+    from api.services.adminCreditResetService import AdminCreditResetService
+    india = tz(timedelta(hours=5, minutes=30))
+    created = datetime(2026, 10, 7, 17, 30, tzinfo=india)
+    view = AdminCreditResetService._publicView({
+        "operation": {"id": "op", "scope": "individual", "admin_id": ADMIN.adminId, "reason": REASON,
+                      "created_at": created},
+        "counts": {"RESET": 1}, "cachePendingCount": 0, "nextAfterUserId": None,
+        "targets": [{"user_id": USER, "outcome": "RESET", "reason_code": None, "audit_id": "a",
+                     "reset_at": created, "before_snapshot": None, "after_snapshot": None,
+                     "cache_state": "INVALIDATED"}],
+    })
+    assert view["createdAt"] == "2026-10-07T12:00:00+00:00"
+    assert view["targets"][0]["resetAt"] == "2026-10-07T12:00:00+00:00"
+
+
+def test_audit_changed_fields_list_only_values_the_reset_changed(resets):
+    _, _, path = resets
+    activateMonthly(resets)
+    reset(resets)
+    changed = set(json.loads(audits(path)[0]["changed_fields"]))
+    assert changed == {"used_tokens", "remaining_tokens", "credit_period_id", "balance_version",
+                       "last_reset_at", "updated_at"}
+
+
+def test_trial_initialization_audits_inserted_fields_without_topups(resets):
+    _, _, path = resets
+    with sqlTransaction(path) as connection:
+        connection.execute("UPDATE subscriptions SET billing_mode='none',status='trial',plan_type='free',"
+            "current_period_start=?,current_period_end=?,domain_count=4",
+            ((NOW - timedelta(days=1)).isoformat(), (NOW + timedelta(days=11)).isoformat()))
+    _, target = reset(resets)
+    changed = set(json.loads(audits(path)[0]["changed_fields"]))
+    assert target["before_snapshot"] is None
+    assert {"plan_tier", "monthly_token_quota", "remaining_tokens", "credit_period_id"} <= changed
+    assert "topup_tokens" not in changed
+
+
+def test_stored_operation_keeps_provenance_after_audit_retention(api, resets):
+    activateMonthly(resets)
+    operationId = resetUser(api).json()["operationId"]
+    with sqlTransaction(api["path"]) as connection:
+        connection.execute("DELETE FROM admin_audit_log")
+    body = getOperation(api, operationId).json()
+    assert body["requestedByAdminId"] == api["adminId"] and body["reason"] == REASON
+    assert body["targets"][0]["before"]["usedTokens"] == 7000
+    assert body["targets"][0]["after"]["remainingTokens"] == 10000

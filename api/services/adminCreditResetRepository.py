@@ -152,12 +152,18 @@ class AdminCreditResetRepository:
         return self._run(operation)
 
     def unfinishedTargets(self, operationId, limit=100) -> list[str]:
+        """Untouched targets first, then retries by oldest failed attempt.
+
+        A persisted failure refreshes updated_at, so repeated requests rotate
+        through failing targets instead of retrying the same leading users.
+        """
         def operation(connection):
             with connection.cursor(cursor_factory=RealDictCursor) as cursor:
                 cursor.execute(
                     """select user_id from public.admin_credit_reset_targets
                     where operation_id = %s and outcome in ('PENDING', 'RETRYABLE_FAILED')
-                    order by user_id limit %s""",
+                    order by (outcome = 'RETRYABLE_FAILED'), updated_at, user_id
+                    limit %s""",
                     (operationId, int(limit)),
                 )
                 return [row["user_id"] for row in cursor.fetchall()]
@@ -277,7 +283,7 @@ class AdminCreditResetRepository:
             with connection.cursor(cursor_factory=RealDictCursor) as cursor:
                 cursor.execute(
                     """update public.admin_credit_reset_targets
-                    set outcome = 'RETRYABLE_FAILED', reason_code = %s, updated_at = now()
+                    set outcome = 'RETRYABLE_FAILED', reason_code = %s, updated_at = clock_timestamp()
                     where operation_id = %s and user_id = %s
                       and outcome in ('PENDING', 'RETRYABLE_FAILED')
                     returning user_id""",

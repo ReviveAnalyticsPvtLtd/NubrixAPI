@@ -22,9 +22,10 @@ _UNAVAILABLE = "Credit reset is temporarily unavailable"
 
 
 def _iso(value) -> str | None:
-    if value is None:
-        return None
-    return value.isoformat() if hasattr(value, "isoformat") else str(value)
+    """UTC ISO-8601 regardless of the database session time zone."""
+    from api.services.billing.manualBillingRepository import _utc
+    instant = _utc(value)
+    return instant.isoformat() if instant is not None else None
 
 
 def _validIdempotencyKey(value) -> str:

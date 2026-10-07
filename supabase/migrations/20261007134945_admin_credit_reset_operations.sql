@@ -67,8 +67,10 @@ create table if not exists public.admin_credit_reset_targets (
         check (cache_state = 'NOT_APPLICABLE' or outcome = 'RESET')
 );
 
+-- Matches unfinishedTargets: untouched first, then oldest failed attempt.
 create index if not exists admin_credit_reset_targets_unfinished_idx
-    on public.admin_credit_reset_targets (operation_id, user_id)
+    on public.admin_credit_reset_targets
+        (operation_id, (outcome = 'RETRYABLE_FAILED'), updated_at, user_id)
     where outcome in ('PENDING', 'RETRYABLE_FAILED');
 
 create index if not exists admin_credit_reset_targets_cache_pending_idx
