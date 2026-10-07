@@ -960,106 +960,157 @@ class ManualBillingRepository:
                     (captureId,evidence.userId,subscription['id'],evidence.invoiceId,evidence.providerOrderId,
                      evidence.providerPaymentId,evidence.amount,evidence.currency,'capture:'+evidence.providerPaymentId,
                      Json({'timingKind':evidence.timingKind,'provenCaptureAt':evidence.provenCaptureAt.isoformat() if evidence.provenCaptureAt else None}), evidence.observedAt))
-                cutoff = _utc(frozen.get('expiresAt'))
-                captureAt = evidence.provenCaptureAt if evidence.timingVerified else None
-                # A server observation before the deadline proves captured funds existed then.
-                captureAt = captureAt or evidence.observedAt
-                reason = None
-                if invoice['status'] == 'PAID': reason = 'EXCESS_CAPTURE'
-                elif str(invoice['status']).upper() not in ('UPCOMING','PAYMENT_PENDING'): reason = 'CLOSED_INVOICE'
-                elif frozen.get('closedAt'): reason = 'CLOSED_ATTEMPT'
-                elif cutoff is None or captureAt >= cutoff: reason = 'CAPTURE_OUTSIDE_WINDOW'
-                elif subscription.get('erasure_pending'): reason = 'ERASURE_PENDING'
-                elif evidence.purpose not in ('initial_purchase','renewal','expert_addition','topup'): reason = 'UNSUPPORTED_PURPOSE'
-                domains=frozen.get('domains') or []
-                if evidence.purpose != 'topup' and (not 1 <= len(domains) <= 4 or len(set(domains)) != len(domains)):
-                    reason='INVALID_FROZEN_EXPERT_SELECTION'
-                metadata = self._json(invoice.get('metadata_json'))
-                billing = metadata.setdefault('manualBilling', {})
-                closed = self._json(attempt.get('metadata_json')).get('manualBilling', {})
-                closedAt = _utc(closed.get('closedAt') or billing.get('closedAt'))
-                closedReason = closed.get('closedReason') or billing.get('closedReason')
-                if (reason in ('CLOSED_INVOICE', 'CLOSED_ATTEMPT') and evidence.purpose == 'renewal'
-                        and frozen.get('billingMode') == 'monthly_prepaid'
-                        and closedReason in ('RENEWAL_DECLINED','UNPAID_PERIOD_ENDED') and closedAt
-                        and evidence.timingVerified and evidence.provenCaptureAt
-                        and evidence.provenCaptureAt < closedAt and cutoff and evidence.provenCaptureAt < cutoff
-                        and not subscription.get('erasure_pending') and not billing.get('revokedAt')):
-                    reason = None
-                if evidence.purpose == 'renewal':
-                    lifecycle = self._json(subscription.get('billing_state')).get('manualBilling', {}).get('lifecycleId')
-                    if frozen.get('lifecycleId') != lifecycle: reason = 'STALE_LIFECYCLE'
-                    if _utc(invoice.get('period_start')) != _utc(subscription.get('current_period_end')): reason = 'STALE_CYCLE'
-                elif evidence.purpose == 'initial_purchase' and subscription.get('billing_mode') in ('monthly_prepaid','annual_prepaid') and (_utc(subscription.get('current_period_end')) or captureAt) > captureAt:
-                    reason = 'EXISTING_PAID_COVERAGE'
-                if evidence.purpose == 'initial_purchase':
-                    from dateutil.relativedelta import relativedelta
-                    newEnd = captureAt + (relativedelta(years=1) if frozen['billingMode'] == 'annual_prepaid' else relativedelta(months=1))
-                    for paid in existingCoverage:
-                        paidBilling = self._json(paid.get('metadata_json')).get('manualBilling', {})
-                        paidStart, paidEnd = _utc(paid.get('period_start')), _utc(paid.get('period_end'))
-                        if (paidBilling.get('purpose') in ('initial_purchase','renewal')
-                                and not paidBilling.get('revokedAt') and paidStart and paidEnd
-                                and paidStart < newEnd and captureAt < paidEnd):
-                            reason = 'EXISTING_PAID_COVERAGE'
-                if evidence.purpose == 'expert_addition':
-                    pending = subscription.get('pending_additions') or []
-                    pending = json.loads(pending) if isinstance(pending,str) else list(pending)
-                    matches = [item for item in pending if item.get('orderId') == evidence.providerOrderId]
-                    domains = frozen.get('domains') or []
-                    if not matches or any(item.get('state') != 'awaiting_payment' for item in matches): reason = 'CLOSED_EXPERT_ATTEMPT'
-                    elif set(domains) != {item.get('domain') for item in matches}: reason = 'EXPERT_SELECTION_MISMATCH'
-                    elif not _utc(subscription.get('current_period_end')) or _utc(subscription['current_period_end']) <= captureAt or _utc(invoice.get('period_end')) != _utc(subscription['current_period_end']): reason = 'EXPERT_PERIOD_CLOSED'
-                    elif frozen.get('lifecycleId') != self._json(subscription.get('billing_state')).get('manualBilling',{}).get('lifecycleId'): reason = 'STALE_LIFECYCLE'
-                if reason:
-                    cursor.execute('update public.billing_events set event_status = %s, failure_reason = %s where id = %s', ('REQUIRES_RECONCILIATION',reason,captureId))
-                    return self._result(cursor,invoice,subscription,'requires_reconciliation',evidence.attemptId,anomalyId=captureId)
-                if evidence.purpose == 'expert_addition':
-                    return self._finalizeExpertCapture(cursor,invoice,subscription,attempt,evidence,captureId,metadata)
-                if evidence.purpose == 'topup':
-                    return self._finalizeTopupCapture(cursor,invoice,subscription,attempt,evidence,captureId)
-                from dateutil.relativedelta import relativedelta
-                start = captureAt if evidence.purpose == 'initial_purchase' else _utc(invoice['period_start'])
-                end = start + (relativedelta(years=1) if frozen['billingMode'] == 'annual_prepaid' else relativedelta(months=1))
-                if evidence.purpose == 'renewal' and _utc(invoice['period_end']) != end:
-                    raise ValueError('INVALID_FROZEN_CALENDAR_PERIOD')
-                billing.update({'lifecycleId':frozen['lifecycleId'],'domains':frozen.get('domains',[]),
-                    'billingMode':frozen['billingMode'],'purpose':frozen['purpose'],
-                    'creditPeriodId':str(uuid.uuid4()),'coverageState':'scheduled','providerPaymentId':evidence.providerPaymentId})
-                cursor.execute('''update public."Invoices" set status='PAID', "razorpayPaymentId"=%s,
-                    "paidAt"=%s, period_start=%s, period_end=%s, metadata_json=%s where id=%s''',
-                    (evidence.providerPaymentId,captureAt,start,end,Json(metadata),invoice['id']))
-                invoice.update(status='PAID',razorpayPaymentId=evidence.providerPaymentId,period_start=start,period_end=end,metadata_json=metadata)
-                cursor.execute("update public.billing_events set payment_status='captured',event_status='captured',completed_at=%s where id=%s", (evidence.observedAt,attempt['id']))
-                cursor.execute("update public.billing_events set event_status='FINALIZED' where id=%s",(captureId,))
-                self._recordNotification(cursor, subscription, 'payment_receipt',
-                    'receipt:'+evidence.providerPaymentId, {'paymentId':evidence.providerPaymentId,'invoiceId':invoice['id'], 'amount':evidence.amount,'currency':evidence.currency,'periodEnd':end.isoformat()})
-                state = self._json(subscription.get('billing_state'))
-                previousCancellationRequestedAt = state.get('manualBilling',{}).get('cancellationRequestedAt')
-                if evidence.purpose == 'initial_purchase':
-                    state.setdefault('manualBilling',{}).pop('cancellationRequestedAt',None)
-                state.setdefault('manualBilling',{}).update(lifecycleId=frozen['lifecycleId'],paidFutureEnd=end.isoformat())
-                cursor.execute('update public.subscriptions set billing_state=%s where id=%s', (Json(state),subscription['id']))
-                subscription['billing_state'] = state
-                if evidence.purpose == 'initial_purchase':
-                    # Preferences are lifecycle-scoped; retain their old values.
-                    cursor.execute('''insert into public.billing_events(id,user_id,subscription_id,invoice_id,
-                        event_category,event_type,event_status,idempotency_key,metadata_json,occurred_at)
-                        values(%s,%s,%s,%s,'audit','subscription.lifecycle.started','processed',%s,%s,%s)
-                        on conflict(idempotency_key) do nothing''',
-                        (str(uuid.uuid4()), evidence.userId, subscription['id'], invoice['id'],
-                         'lifecycle-start:' + frozen['lifecycleId'], Json({'previousRenewalOptOut':bool(subscription.get('renewal_opt_out')),
-                         'previousCancellationReason':subscription.get('cancellation_reason'),
-                         'previousCancellationRequestedAt':previousCancellationRequestedAt,
-                         'lifecycleId':frozen['lifecycleId']}), evidence.observedAt))
-                    cursor.execute('update public.subscriptions set renewal_opt_out=false,cancellation_reason=null where id=%s', (subscription['id'],))
-                    subscription.update(renewal_opt_out=False, cancellation_reason=None)
-                if frozen['billingMode'] == 'annual_prepaid':
-                    return self._applyAnnualPayment(cursor, invoice, subscription, evidence.observedAt, evidence.attemptId)
-                if subscription.get('renewal_opt_out'):
-                    self._refreshCancellationFactsLocked(cursor, subscription, end)
-                return self._applyCoverage(cursor,invoice,subscription,evidence.observedAt,evidence.attemptId)
+                return self._evaluateCaptureLocked(cursor, subscription, invoice, attempt, evidence, captureId, existingCoverage)
         return self._run(operation)
+
+    def _evaluateCaptureLocked(self, cursor, subscription, invoice, attempt, evidence, captureId, existingCoverage):
+        """Apply the original-purchase rules to one recorded capture under the owner lock.
+
+        Shared by first observation and the audited staff recheck; either the
+        capture finalizes its frozen invoice or it is left REQUIRES_RECONCILIATION.
+        """
+        frozen = self._json(attempt.get('metadata_json')).get('manualBilling', {})
+        cutoff = _utc(frozen.get('expiresAt'))
+        captureAt = evidence.provenCaptureAt if evidence.timingVerified else None
+        # A server observation before the deadline proves captured funds existed then.
+        captureAt = captureAt or evidence.observedAt
+        reason = None
+        if invoice['status'] == 'PAID': reason = 'EXCESS_CAPTURE'
+        elif str(invoice['status']).upper() not in ('UPCOMING','PAYMENT_PENDING'): reason = 'CLOSED_INVOICE'
+        elif frozen.get('closedAt'): reason = 'CLOSED_ATTEMPT'
+        elif cutoff is None or captureAt >= cutoff: reason = 'CAPTURE_OUTSIDE_WINDOW'
+        elif subscription.get('erasure_pending'): reason = 'ERASURE_PENDING'
+        elif evidence.purpose not in ('initial_purchase','renewal','expert_addition','topup'): reason = 'UNSUPPORTED_PURPOSE'
+        domains=frozen.get('domains') or []
+        if evidence.purpose != 'topup' and (not 1 <= len(domains) <= 4 or len(set(domains)) != len(domains)):
+            reason='INVALID_FROZEN_EXPERT_SELECTION'
+        metadata = self._json(invoice.get('metadata_json'))
+        billing = metadata.setdefault('manualBilling', {})
+        closed = self._json(attempt.get('metadata_json')).get('manualBilling', {})
+        closedAt = _utc(closed.get('closedAt') or billing.get('closedAt'))
+        closedReason = closed.get('closedReason') or billing.get('closedReason')
+        if (reason in ('CLOSED_INVOICE', 'CLOSED_ATTEMPT') and evidence.purpose == 'renewal'
+                and frozen.get('billingMode') == 'monthly_prepaid'
+                and closedReason in ('RENEWAL_DECLINED','UNPAID_PERIOD_ENDED') and closedAt
+                and evidence.timingVerified and evidence.provenCaptureAt
+                and evidence.provenCaptureAt < closedAt and cutoff and evidence.provenCaptureAt < cutoff
+                and not subscription.get('erasure_pending') and not billing.get('revokedAt')):
+            reason = None
+        if evidence.purpose == 'renewal':
+            lifecycle = self._json(subscription.get('billing_state')).get('manualBilling', {}).get('lifecycleId')
+            if frozen.get('lifecycleId') != lifecycle: reason = 'STALE_LIFECYCLE'
+            if _utc(invoice.get('period_start')) != _utc(subscription.get('current_period_end')): reason = 'STALE_CYCLE'
+        elif evidence.purpose == 'initial_purchase' and subscription.get('billing_mode') in ('monthly_prepaid','annual_prepaid') and (_utc(subscription.get('current_period_end')) or captureAt) > captureAt:
+            reason = 'EXISTING_PAID_COVERAGE'
+        if evidence.purpose == 'initial_purchase':
+            from dateutil.relativedelta import relativedelta
+            newEnd = captureAt + (relativedelta(years=1) if frozen['billingMode'] == 'annual_prepaid' else relativedelta(months=1))
+            for paid in existingCoverage:
+                paidBilling = self._json(paid.get('metadata_json')).get('manualBilling', {})
+                paidStart, paidEnd = _utc(paid.get('period_start')), _utc(paid.get('period_end'))
+                if (paidBilling.get('purpose') in ('initial_purchase','renewal')
+                        and not paidBilling.get('revokedAt') and paidStart and paidEnd
+                        and paidStart < newEnd and captureAt < paidEnd):
+                    reason = 'EXISTING_PAID_COVERAGE'
+        if evidence.purpose == 'expert_addition':
+            pending = subscription.get('pending_additions') or []
+            pending = json.loads(pending) if isinstance(pending,str) else list(pending)
+            matches = [item for item in pending if item.get('orderId') == evidence.providerOrderId]
+            domains = frozen.get('domains') or []
+            if not matches or any(item.get('state') != 'awaiting_payment' for item in matches): reason = 'CLOSED_EXPERT_ATTEMPT'
+            elif set(domains) != {item.get('domain') for item in matches}: reason = 'EXPERT_SELECTION_MISMATCH'
+            elif not _utc(subscription.get('current_period_end')) or _utc(subscription['current_period_end']) <= captureAt or _utc(invoice.get('period_end')) != _utc(subscription['current_period_end']): reason = 'EXPERT_PERIOD_CLOSED'
+            elif frozen.get('lifecycleId') != self._json(subscription.get('billing_state')).get('manualBilling',{}).get('lifecycleId'): reason = 'STALE_LIFECYCLE'
+        if reason:
+            cursor.execute('update public.billing_events set event_status = %s, failure_reason = %s where id = %s', ('REQUIRES_RECONCILIATION',reason,captureId))
+            return self._result(cursor,invoice,subscription,'requires_reconciliation',evidence.attemptId,anomalyId=captureId)
+        if evidence.purpose == 'expert_addition':
+            return self._finalizeExpertCapture(cursor,invoice,subscription,attempt,evidence,captureId,metadata)
+        if evidence.purpose == 'topup':
+            return self._finalizeTopupCapture(cursor,invoice,subscription,attempt,evidence,captureId)
+        from dateutil.relativedelta import relativedelta
+        start = captureAt if evidence.purpose == 'initial_purchase' else _utc(invoice['period_start'])
+        end = start + (relativedelta(years=1) if frozen['billingMode'] == 'annual_prepaid' else relativedelta(months=1))
+        if evidence.purpose == 'renewal' and _utc(invoice['period_end']) != end:
+            raise ValueError('INVALID_FROZEN_CALENDAR_PERIOD')
+        billing.update({'lifecycleId':frozen['lifecycleId'],'domains':frozen.get('domains',[]),
+            'billingMode':frozen['billingMode'],'purpose':frozen['purpose'],
+            'creditPeriodId':str(uuid.uuid4()),'coverageState':'scheduled','providerPaymentId':evidence.providerPaymentId})
+        cursor.execute('''update public."Invoices" set status='PAID', "razorpayPaymentId"=%s,
+            "paidAt"=%s, period_start=%s, period_end=%s, metadata_json=%s where id=%s''',
+            (evidence.providerPaymentId,captureAt,start,end,Json(metadata),invoice['id']))
+        invoice.update(status='PAID',razorpayPaymentId=evidence.providerPaymentId,period_start=start,period_end=end,metadata_json=metadata)
+        cursor.execute("update public.billing_events set payment_status='captured',event_status='captured',completed_at=%s where id=%s", (evidence.observedAt,attempt['id']))
+        cursor.execute("update public.billing_events set event_status='FINALIZED' where id=%s",(captureId,))
+        self._recordNotification(cursor, subscription, 'payment_receipt',
+            'receipt:'+evidence.providerPaymentId, {'paymentId':evidence.providerPaymentId,'invoiceId':invoice['id'], 'amount':evidence.amount,'currency':evidence.currency,'periodEnd':end.isoformat()})
+        state = self._json(subscription.get('billing_state'))
+        previousCancellationRequestedAt = state.get('manualBilling',{}).get('cancellationRequestedAt')
+        if evidence.purpose == 'initial_purchase':
+            state.setdefault('manualBilling',{}).pop('cancellationRequestedAt',None)
+        state.setdefault('manualBilling',{}).update(lifecycleId=frozen['lifecycleId'],paidFutureEnd=end.isoformat())
+        cursor.execute('update public.subscriptions set billing_state=%s where id=%s', (Json(state),subscription['id']))
+        subscription['billing_state'] = state
+        if evidence.purpose == 'initial_purchase':
+            # Preferences are lifecycle-scoped; retain their old values.
+            cursor.execute('''insert into public.billing_events(id,user_id,subscription_id,invoice_id,
+                event_category,event_type,event_status,idempotency_key,metadata_json,occurred_at)
+                values(%s,%s,%s,%s,'audit','subscription.lifecycle.started','processed',%s,%s,%s)
+                on conflict(idempotency_key) do nothing''',
+                (str(uuid.uuid4()), evidence.userId, subscription['id'], invoice['id'],
+                 'lifecycle-start:' + frozen['lifecycleId'], Json({'previousRenewalOptOut':bool(subscription.get('renewal_opt_out')),
+                 'previousCancellationReason':subscription.get('cancellation_reason'),
+                 'previousCancellationRequestedAt':previousCancellationRequestedAt,
+                 'lifecycleId':frozen['lifecycleId']}), evidence.observedAt))
+            cursor.execute('update public.subscriptions set renewal_opt_out=false,cancellation_reason=null where id=%s', (subscription['id'],))
+            subscription.update(renewal_opt_out=False, cancellation_reason=None)
+        if frozen['billingMode'] == 'annual_prepaid':
+            return self._applyAnnualPayment(cursor, invoice, subscription, evidence.observedAt, evidence.attemptId)
+        if subscription.get('renewal_opt_out'):
+            self._refreshCancellationFactsLocked(cursor, subscription, end)
+        return self._applyCoverage(cursor,invoice,subscription,evidence.observedAt,evidence.attemptId)
+
+    def reconsiderCaptureLocked(self, cursor, capture, evidence):
+        """Re-evaluate one unresolved capture once with provider-attested capture time.
+
+        The caller holds the owner lock and the capture row. Returns
+        (result or None, reasonCode); every original validation still applies,
+        and staff-entered or recheck-time observations never count as timing.
+        """
+        stored = self._json(capture.get('metadata_json'))
+        if stored.get('reconsideredAt') or stored.get('timingKind') == 'provider_captured_at':
+            return None, 'RECHECK_ALREADY_APPLIED'
+        if not (evidence.timingVerified and evidence.provenCaptureAt and evidence.timingKind == 'provider_captured_at'):
+            return None, 'CAPTURE_TIMING_UNVERIFIED'
+        subscription = self._canonical(cursor, evidence.userId)
+        existingCoverage = self._paidInvoicesLocked(cursor, subscription) if evidence.purpose == 'initial_purchase' else []
+        cursor.execute('select * from public."Invoices" where id = %s for update', (evidence.invoiceId,))
+        invoice = cursor.fetchone()
+        cursor.execute('select * from public.billing_events where id = %s for update', (evidence.attemptId,))
+        attempt = cursor.fetchone()
+        frozen = self._json((attempt or {}).get('metadata_json')).get('manualBilling', {})
+        if (not invoice or not attempt or invoice['userId'] != evidence.userId or attempt['user_id'] != evidence.userId
+                or capture['user_id'] != evidence.userId or str(capture.get('invoice_id')) != evidence.invoiceId
+                or capture.get('provider_payment_id') != evidence.providerPaymentId
+                or capture.get('provider_order_id') != evidence.providerOrderId
+                or int(capture.get('amount') or 0) != evidence.amount
+                or str(capture.get('currency')).upper() != evidence.currency.upper()
+                or str(attempt.get('invoice_id')) != evidence.invoiceId
+                or str(attempt.get('subscription_id')) != str(subscription['id'])
+                or attempt.get('provider_order_id') != evidence.providerOrderId
+                or frozen.get('purpose') != evidence.purpose
+                or int(attempt.get('amount') or 0) != evidence.amount
+                or str(attempt.get('currency')).upper() != evidence.currency.upper()
+                or evidence.financialStatus != 'captured'):
+            return None, 'PROVIDER_EVIDENCE_MISMATCH'
+        stored.update(timingKind=evidence.timingKind, provenCaptureAt=evidence.provenCaptureAt.isoformat(),
+                      reconsideredAt=evidence.observedAt.isoformat())
+        cursor.execute('update public.billing_events set metadata_json=%s where id=%s', (Json(stored), str(capture['id'])))
+        result = self._evaluateCaptureLocked(cursor, subscription, invoice, attempt, evidence, str(capture['id']), existingCoverage)
+        if result.state == 'requires_reconciliation':
+            cursor.execute('select failure_reason from public.billing_events where id=%s', (str(capture['id']),))
+            return result, cursor.fetchone()['failure_reason']
+        return result, None
 
     def _recordErasedCapture(self,cursor,attempt,evidence):
         """Retain received-money evidence after anonymisation; grant no access."""

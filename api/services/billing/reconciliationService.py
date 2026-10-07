@@ -18,6 +18,7 @@ __all__ = ["ReconciliationService"]
 
 from api.services.billing.billingEventService import BillingEventService
 from api.commons import client
+from utils.exceptionHandler import CustomException
 from utils.logger import logger
 import datetime
 import os
@@ -331,6 +332,12 @@ class ReconciliationService:
             )
             if not existing:
                 raise ValueError(f"Payment attempt {entityId} not found")
+            if existing[0].get("payment_status") in ("authorized", "captured"):
+                # Received money is resolved only by the audited payment-case
+                # actions; an investigation label must not hide it.
+                raise CustomException(ValueError("PAYMENT_CASE_ACTION_REQUIRED"), statusCode=409,
+                    uiMessage="Payments holding money must be handled as a payment case.",
+                    errorCode="PAYMENT_CASE_ACTION_REQUIRED")
 
             self.client.table("billing_events").update({
                 "event_status": "investigated",

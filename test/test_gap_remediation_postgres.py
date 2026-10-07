@@ -328,3 +328,153 @@ def test_capture_on_another_cycle_boundary_does_not_hold_this_renewal(payment, b
                 (other, case.user, case.sub, case.end + shift, case.end + shift + timedelta(days=30)))
             _recordCapture(sql, case, invoice=other)
     assert case.deliveries.authorizeBillingSubmissionResult(case.delivery, 'hold-worker', 1) == 'AUTHORIZED'
+
+
+# -- audited payment-case actions (fake provider: code paths, not live Razorpay) --
+
+class _AttestedPayments:
+    def __init__(self, entity):
+        self.entity, self.calls = entity, 0
+    def fetch(self, paymentId):
+        self.calls += 1
+        return dict(self.entity)
+
+
+def _renewalCase(payment):
+    """A held T-7 renewal whose real capture was observed after the checkout deadline."""
+    from datetime import datetime, timezone
+    case = _heldReady(payment)
+    period_lifecycle = canonical_row(case.url, case.user)['billing_state']['manualBilling']['lifecycleId']
+    expires = datetime.now(timezone.utc) + timedelta(minutes=30)
+    attempt = case.repo.reserveCheckoutIntent(case.user, 'renewal', case.invoice, case.invoice, {
+        'subscriptionId': case.sub, 'invoiceId': case.invoice, 'lifecycleId': period_lifecycle,
+        'billingMode': 'monthly_prepaid', 'amount': 3000, 'currency': 'INR', 'domains': ['banking'],
+        'expiresAt': expires.isoformat()})
+    order = 'order-' + str(uuid.uuid4())
+    case.repo.bindProviderOrder(attempt.attemptId, {'id': order})
+    late = VerifiedPaymentEvidence(attempt.attemptId, case.invoice, case.user, order, 'pay-' + str(uuid.uuid4()),
+        'renewal', 'INR', 'captured', 'server_observation', 3000, expires + timedelta(hours=1), None, None, False)
+    observed = case.repo.finalizeCapturedPayment(late)
+    assert observed.state == 'requires_reconciliation'
+    case.capture, case.evidence = str(observed.anomalyId), late
+    case.entity = {'id': late.providerPaymentId, 'order_id': order, 'amount': 3000, 'currency': 'INR',
+                   'status': 'captured', 'captured_at': int((expires - timedelta(minutes=20)).timestamp())}
+    return case
+
+
+def _caseService(case):
+    from api.services.adminPaymentCaseService import AdminPaymentCaseService
+    return AdminPaymentCaseService(repository=case.repo, provider=SimpleNamespace(payment=_AttestedPayments(case.entity)))
+
+
+def _caseAction(service, case, action='recheck', key='case-key', admin=None):
+    # Keys are scoped per admin, and this module shares one database.
+    from api.adminModels import AdminPaymentCaseActionRequest
+    from test.test_admin_credit_resets import ADMIN
+    request = AdminPaymentCaseActionRequest(action=action, caseReference='SUP-7', reason='Customer bank statement')
+    return service.act(case.capture, request, key + ':' + case.capture, admin or ADMIN)
+
+
+def _invoiceStatus(case):
+    with psycopg2.connect(case.url) as db:
+        with db.cursor() as sql:
+            sql.execute('select status from public."Invoices" where id=%s', (case.invoice,))
+            return sql.fetchone()[0]
+
+
+def test_recheck_finalizes_original_renewal_with_audit_and_releases_hold(payment):
+    from api.services.billing.manualObligationReport import listObligations
+    case = _renewalCase(payment)
+    assert case.capture in {item['id'] for item in listObligations(case.repo, 500)['items']}
+    assert case.deliveries.authorizeBillingSubmissionResult(case.delivery, 'hold-worker', 1) == 'HELD'
+    result = _caseAction(_caseService(case), case)
+    assert (result['financialStatus'], result['actionOutcome']) == ('FINALIZED', 'FINALIZED_ORIGINAL')
+    assert result['finalization']['state'] == 'paid_scheduled' and _invoiceStatus(case) == 'PAID'
+    assert case.capture not in {item['id'] for item in listObligations(case.repo, 500)['items']}
+    assert case.deliveries.authorizeBillingSubmissionResult(case.delivery, 'hold-worker', 1) == 'REJECTED'
+    with psycopg2.connect(case.url) as db:
+        with db.cursor() as sql:
+            sql.execute("select action,outcome from public.admin_audit_log where target_id=%s", (case.capture,))
+            assert sql.fetchall() == [('billing.payment_case.recheck', 'FINALIZED_ORIGINAL')]
+
+
+def test_two_sessions_note_vs_dispatch_keeps_money_held(payment):
+    case = _renewalCase(payment)
+    service = _caseService(case)
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        sent = pool.submit(case.deliveries.authorizeBillingSubmissionResult, case.delivery, 'hold-worker', 1)
+        noted = pool.submit(_caseAction, service, case, 'note')
+        outcome, note = sent.result(), noted.result()
+    assert outcome == 'HELD' and note['actionOutcome'] == 'NOTE_RECORDED' and note['financialStatus'] == 'OPEN'
+    assert case.deliveries.authorizeBillingSubmissionResult(case.delivery, 'hold-worker', 1) == 'HELD'
+    assert _submissionStarted(case) is None and _invoiceStatus(case) == 'UPCOMING'
+
+
+def test_two_sessions_recheck_finalization_vs_dispatch_never_authorize(payment):
+    case = _renewalCase(payment)
+    service = _caseService(case)
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        sent = pool.submit(case.deliveries.authorizeBillingSubmissionResult, case.delivery, 'hold-worker', 1)
+        rechecked = pool.submit(_caseAction, service, case)
+        outcome, result = sent.result(), rechecked.result()
+    assert result['actionOutcome'] == 'FINALIZED_ORIGINAL'
+    assert outcome in ('HELD', 'REJECTED') and _submissionStarted(case) is None
+
+
+def test_two_sessions_duplicate_rechecks_finalize_once(payment):
+    from api.adminErrors import AdminApiError
+    case = _renewalCase(payment)
+    service = _caseService(case)
+    def attempt(key):
+        try:
+            return _caseAction(service, case, key=key)
+        except AdminApiError as error:
+            return error.statusCode
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        outcomes = list(pool.map(attempt, ['first-key', 'second-key']))
+    assert sorted(str(item if isinstance(item, int) else item['actionOutcome']) for item in outcomes) == ['409', 'FINALIZED_ORIGINAL']
+    winner = 'first-key' if outcomes[0] != 409 else 'second-key'
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        replays = list(pool.map(lambda _: _caseAction(service, case, key=winner), range(2)))
+    assert replays[0] == replays[1] == next(item for item in outcomes if item != 409)
+    with psycopg2.connect(case.url) as db:
+        with db.cursor() as sql:
+            sql.execute("select count(*) from public.billing_events where event_type='admin.payment_case.action' and user_id=%s", (case.user,))
+            assert sql.fetchone()[0] == 1
+            sql.execute("select count(*) from public.billing_events where event_type='email.billing_intent.committed' and user_id=%s and metadata_json->>'notificationType'='payment_receipt' and metadata_json->'metadata'->>'paymentId'=%s",
+                        (case.user, case.evidence.providerPaymentId))
+            assert sql.fetchone()[0] == 1
+
+
+def test_two_sessions_browser_replay_vs_recheck_grant_once(payment):
+    case = _renewalCase(payment)
+    service = _caseService(case)
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        replay = pool.submit(case.repo.finalizeCapturedPayment, case.evidence)
+        rechecked = pool.submit(_caseAction, service, case)
+        browser, result = replay.result(), rechecked.result()
+    assert result['actionOutcome'] == 'FINALIZED_ORIGINAL'
+    assert browser.state in ('requires_reconciliation', 'already_finalized')
+    assert case.repo.finalizeCapturedPayment(case.evidence).state == 'already_finalized'
+    with psycopg2.connect(case.url) as db:
+        with db.cursor() as sql:
+            sql.execute("select count(*) from public.billing_events where provider_payment_id=%s", (case.evidence.providerPaymentId,))
+            assert sql.fetchone()[0] == 1
+
+
+def test_payment_case_audit_failure_rolls_back_original_finalization(payment):
+    from api.adminErrors import AdminApiError
+    from test.test_admin_credit_resets import ADMIN
+    case = _renewalCase(payment)
+    with pytest.raises(AdminApiError) as error:
+        _caseAction(_caseService(case), case, admin=replace(ADMIN, email='   '))
+    assert error.value.statusCode == 503
+    assert _invoiceStatus(case) == 'UPCOMING'
+    with psycopg2.connect(case.url) as db:
+        with db.cursor() as sql:
+            sql.execute('select event_status,metadata_json from public.billing_events where id=%s', (case.capture,))
+            status, metadata = sql.fetchone()
+            assert status == 'REQUIRES_RECONCILIATION' and 'reconsideredAt' not in metadata
+            sql.execute("select count(*) from public.billing_events where event_type='admin.payment_case.action' and user_id=%s", (case.user,))
+            assert sql.fetchone()[0] == 0
+    assert case.deliveries.authorizeBillingSubmissionResult(case.delivery, 'hold-worker', 1) == 'HELD'

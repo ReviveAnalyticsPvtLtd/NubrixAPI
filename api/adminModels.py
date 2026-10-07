@@ -1,5 +1,5 @@
 from enum import Enum
-from typing import Annotated, Literal
+from typing import Annotated, Any, Literal
 
 from pydantic import (
     BaseModel,
@@ -378,3 +378,29 @@ class AdminCreditResetOperationView(_StrictModel):
     cachePendingCount: int = Field(ge=0)
     targets: list[AdminCreditResetTargetView]
     nextAfterUserId: str | None = None
+
+
+class AdminPaymentCaseActionRequest(_StrictModel):
+    """Investigation note or original-payment recheck; never a refund or override."""
+    action: Literal["note", "recheck"]
+    caseReference: str = Field(min_length=1, max_length=128)
+    reason: str = Field(min_length=1, max_length=2000)
+
+    @field_validator("caseReference", "reason", mode="before")
+    @classmethod
+    def normalizeText(cls, value):
+        return value.strip() if isinstance(value, str) else value
+
+
+class AdminPaymentCaseActionView(_StrictModel):
+    actionId: str
+    caseId: str
+    action: Literal["note", "recheck"]
+    userId: str | None = None
+    invoiceId: str | None = None
+    financialStatus: Literal["OPEN", "FINALIZED"]
+    actionOutcome: Literal["NOTE_RECORDED", "STILL_UNRESOLVED", "FINALIZED_ORIGINAL"]
+    reasonCode: str | None = None
+    caseReference: str
+    finalization: dict[str, Any] | None = None
+    recordedAt: str

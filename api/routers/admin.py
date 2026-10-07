@@ -12,6 +12,8 @@ from api.adminModels import (
     AdminLoginRequest,
     AdminLoginResponse,
     AdminLogoutResponse,
+    AdminPaymentCaseActionRequest,
+    AdminPaymentCaseActionView,
     AdminSubscriptionPatch,
     AdminSubscriptionView,
     AdminTokenCostOverviewView,
@@ -41,6 +43,10 @@ from api.services.adminAuthService import (
 from api.services.adminCreditResetService import (
     AdminCreditResetService,
     getAdminCreditResetService,
+)
+from api.services.adminPaymentCaseService import (
+    AdminPaymentCaseService,
+    getAdminPaymentCaseService,
 )
 from api.services.adminManagementService import (
     AdminManagementService,
@@ -228,6 +234,27 @@ def getCreditResetOperation(
     service: AdminCreditResetService = Depends(getAdminCreditResetService),
 ):
     return service.getOperation(operationId, afterUserId, limit)
+
+
+@router.post(
+    "/billing/payment-cases/{captureEventId}/actions",
+    response_model=AdminPaymentCaseActionView,
+)
+def actOnPaymentCase(
+    captureEventId: str,
+    payload: AdminPaymentCaseActionRequest,
+    idempotencyKey: str = Header(alias="Idempotency-Key"),
+    admin: AdminContext = Depends(verifyAdmin),
+    service: AdminPaymentCaseService = Depends(getAdminPaymentCaseService),
+):
+    """
+    Record an investigation note or recheck the original payment of one capture case.
+
+    A note never resolves money. A recheck finalizes only when fresh provider
+    evidence satisfies the original purchase rules; otherwise the case stays
+    OPEN with a reason code. Refunds and overrides are not available here.
+    """
+    return service.act(captureEventId, payload, idempotencyKey, admin)
 
 
 @router.post(

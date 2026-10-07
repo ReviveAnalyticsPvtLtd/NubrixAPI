@@ -749,6 +749,8 @@ def test_admin_routes_declare_strict_response_allowlists():
             adminModels.AdminCreditResetOperationView,
         ("/admin/credits/reset-operations/{operationId}", "GET"):
             adminModels.AdminCreditResetOperationView,
+        ("/admin/billing/payment-cases/{captureEventId}/actions", "POST"):
+            adminModels.AdminPaymentCaseActionView,
         ("/admin/free-trial/extensions", "POST"):
             AdminFreeTrialExtensionResponse,
         ("/admin/free-trial/reductions", "POST"):
