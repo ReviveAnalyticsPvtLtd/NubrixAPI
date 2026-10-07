@@ -278,11 +278,15 @@ class ManualBillingRepository:
 
     # -- checkout intents -----------------------------------------------------
 
-    def reserveCheckout(self, request: CheckoutRequest) -> CheckoutIntent:
+    def reserveCheckout(self, request: CheckoutRequest, *, replayOnly=False) -> CheckoutIntent | None:
         """Freeze server pricing, invoice and attempt in one owner transaction.
 
         Reference-plan transport runs outside locks. A replay lookup precedes
         that fetch, so retries remain possible during a provider outage.
+        A changed initial selection with a fresh/no key supersedes unpaid
+        invoices in the reservation transaction; old money stays auditable.
+        replayOnly resolves request identity without reserving or pricing;
+        unrelated live-intent conflicts are checked after provider recovery.
         """
         from api.services.billing import billingEngine
         from dateutil.relativedelta import relativedelta
@@ -304,43 +308,58 @@ class ManualBillingRepository:
             identity['domains'] = list(domains)
         payload_hash = _payloadHash(identity)
 
-        def lookup(cursor, now):
+        def lookup(cursor, now, matchOnly=False):
             cursor.execute('''select * from public.billing_events where user_id=%s
                 and event_category='payment_attempt' order by id''', (request.userId,))
+            rows = []
             for row in cursor.fetchall():
                 metadata = self._json(row.get('metadata_json'))
                 frozen = metadata.get('manualBilling', {})
-                if frozen.get('purpose') != request.purpose or frozen.get('billingMode') != request.billingMode:
+                if frozen.get('purpose') != request.purpose or (
+                        request.purpose != 'initial_purchase' and frozen.get('billingMode') != request.billingMode):
                     continue
+                rows.append((row, metadata, frozen))
+            # A historical key must replay/conflict before inspecting any
+            # newer live selection, independent of UUID ordering.
+            for row, metadata, frozen in rows:
                 exact = (request.requestKey is not None and row.get('idempotency_key') ==
                     f'{request.purpose}:{request.userId}:{request.requestKey}')
-                expiry = _utc(frozen.get('expiresAt'))
-                live = (row.get('payment_status') in ('created', 'pending_provider_ack', 'authorized')
-                        and (expiry is not None and expiry > now or
-                             row.get('payment_status') == 'pending_provider_ack' and not row.get('provider_order_id')))
                 if exact:
                     if frozen.get('payloadHash') != payload_hash:
                         raise ValueError('IDEMPOTENCY_CONFLICT')
                     if frozen.get('closedReason') == 'ORDER_NOT_CREATED':
                         continue
-                    return self._intentFromAttemptRow(row, metadata, request.userId, request.purpose)
+                    return self._intentFromAttemptRow(row, metadata, request.userId, request.purpose), []
+            replacements = []
+            for row, metadata, frozen in rows:
+                expiry = _utc(frozen.get('expiresAt'))
+                live = (row.get('payment_status') in ('created', 'pending_provider_ack', 'authorized')
+                        and (expiry is not None and expiry > now or
+                             row.get('payment_status') == 'pending_provider_ack' and not row.get('provider_order_id')))
                 if request.requestKey is None and live and frozen.get('payloadHash') == payload_hash:
-                    return self._intentFromAttemptRow(row, metadata, request.userId, request.purpose)
+                    return self._intentFromAttemptRow(row, metadata, request.userId, request.purpose), []
+                if matchOnly:
+                    continue
                 if request.purpose == 'initial_purchase' and live:
-                    raise ValueError('LIVE_INITIAL_CHECKOUT_CONFLICT')
+                    if frozen.get('payloadHash') == payload_hash or (
+                            row.get('payment_status') == 'pending_provider_ack' and not row.get('provider_order_id')):
+                        # An unknown order acknowledgement must be recovered
+                        # before opening a second payment opportunity.
+                        raise ValueError('LIVE_INITIAL_CHECKOUT_CONFLICT')
+                    replacements.append(row)
                 if (request.purpose == 'renewal' and live
                         and str(row.get('invoice_id')) == str(request.payload.get('invoiceId'))):
                     raise ValueError('LIVE_RENEWAL_CHECKOUT_CONFLICT')
-            return None
+            return None, replacements
 
-        def transaction(connection, reference=None, replayOnly=False):
+        def transaction(connection, reference=None, lookupOnly=False):
             with connection.cursor(cursor_factory=RealDictCursor) as cursor:
                 self._lockUser(cursor, request.userId)
                 subscription = self._canonical(cursor, request.userId)
                 cursor.execute('select clock_timestamp() as current_time')
                 now = _utc(cursor.fetchone()['current_time'])
-                existing = lookup(cursor, now)
-                if existing is not None or replayOnly:
+                existing, replacements = lookup(cursor, now, matchOnly=replayOnly)
+                if existing is not None or lookupOnly:
                     return existing
                 coverage = self._coverageSnapshotLocked(cursor, subscription, now, materialize=True)
                 if subscription.get('erasure_pending') or coverage.denialReason == 'account_banned':
@@ -430,6 +449,17 @@ class ManualBillingRepository:
                         'metadata_json': {'manualBilling': billing, 'domains': selected, 'billingMode': request.billingMode}}
                     if request.purpose == 'topup':
                         invoice['metadata_json'].update(tokens=billing['tokens'], packId=billing['packId'])
+                    if replacements:
+                        replacedIds = sorted({str(row['invoice_id']) for row in replacements})
+                        for invoiceId in replacedIds:
+                            cursor.execute('select * from public."Invoices" where id=%s and "userId"=%s for update',
+                                (invoiceId, request.userId))
+                            oldInvoice = cursor.fetchone()
+                            if not oldInvoice or str(oldInvoice['status']).upper() not in ('UPCOMING','PAYMENT_PENDING'):
+                                raise ValueError('CHECKOUT_CLOSED')
+                            self._closeInvoice(cursor, oldInvoice, 'SUPERSEDED_BY_REQUEST',
+                                now=now, replacementInvoiceId=invoice['id'])
+                        invoice['metadata_json']['manualBilling']['replacesInvoiceIds'] = replacedIds
                     cursor.execute('insert into public."Invoices" (' + ','.join('"' + key + '"' for key in invoice) +
                         ') values (' + ','.join('%s' for _ in invoice) + ')',
                         [Json(value) if isinstance(value, (dict, list)) else value for value in invoice.values()])
@@ -442,8 +472,8 @@ class ManualBillingRepository:
                     'tokens': frozen.get('tokens'), 'packId': frozen.get('packId'), 'requestKey': request.requestKey or str(uuid.uuid4())}
                 return self._reserveCheckoutIntentLocked(cursor, subscription, request.userId, request.purpose,
                     snapshot['requestKey'], payload_hash, snapshot, now)
-        existing = self._run(lambda connection: transaction(connection, replayOnly=True))
-        if existing is not None:
+        existing = self._run(lambda connection: transaction(connection, lookupOnly=True))
+        if existing is not None or replayOnly:
             return existing
         reference = None
         if request.purpose in ('initial_purchase', 'expert_addition'):
@@ -519,14 +549,17 @@ class ManualBillingRepository:
                 return {'currentDomains':current,'pendingRemovals':pending,'effectiveAt':end.isoformat()}
         return self._run(operation)
 
-    def _closeInvoice(self,cursor,invoice,reason):
+    def _closeInvoice(self,cursor,invoice,reason,*,now=None,replacementInvoiceId=None):
+        closure = {'closedAt':(now or _now()).isoformat(), 'closedReason':reason}
+        if replacementInvoiceId is not None:
+            closure['supersededByInvoiceId'] = str(replacementInvoiceId)
         metadata=self._json(invoice.get('metadata_json'))
-        metadata.setdefault('manualBilling',{}).update(closedAt=_now().isoformat(),closedReason=reason)
+        metadata.setdefault('manualBilling',{}).update(closure)
         cursor.execute('update public."Invoices" set status=\'VOID\',metadata_json=%s where id=%s',(Json(metadata),invoice['id']))
         cursor.execute("select id,metadata_json from public.billing_events where invoice_id=%s and event_category='payment_attempt' and payment_status in ('created','pending_provider_ack','authorized') order by id for update", (invoice['id'],))
         for row in cursor.fetchall():
             old = self._json(row.get('metadata_json'))
-            old.setdefault('manualBilling', {}).update(closedAt=_now().isoformat(), closedReason=reason)
+            old.setdefault('manualBilling', {}).update(closure)
             cursor.execute("update public.billing_events set payment_status='cancelled',event_status='cancelled',metadata_json=%s where id=%s", (Json(old), row['id']))
 
     def cancelExpertAddition(self,userId,domain):

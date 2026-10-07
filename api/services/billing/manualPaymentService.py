@@ -91,6 +91,11 @@ class ManualPaymentService:
 
     def _createDurableCheckout(self, request):
         self.repository.ensureCanonicalSubscription(request.userId)
+        if request.purpose == 'initial_purchase':
+            replay = self.repository.reserveCheckout(request, replayOnly=True)
+            if replay is not None and (replay.razorpayOrderId or
+                    replay.state not in ('created', 'pending_provider_ack', 'authorized')):
+                return replay
         from api.services.billing.manualBillingRecoveryService import ManualBillingRecoveryService
         recovery = ManualBillingRecoveryService(self.repository, self.razorpayClient)
         for pending in self.repository.orderlessRecoveryRows(request.userId, request.purpose, request.billingMode):
@@ -99,7 +104,9 @@ class ManualPaymentService:
             except Exception as exc:
                 raise RuntimeError('ORDER_ACK_UNKNOWN') from exc
         intent = self.repository.reserveCheckout(request)
-        if intent.razorpayOrderId:
+        if intent.razorpayOrderId or intent.state not in ('created', 'pending_provider_ack', 'authorized'):
+            # Historical-key replays retain closed intent identity. They
+            # must never submit or recover an unsubmitted cancelled order.
             return intent
         if self.razorpayClient is None:
             raise RuntimeError('PAYMENT_PROVIDER_NOT_CONFIGURED')

@@ -1,4 +1,4 @@
-"""IR-01/05/09 races; disposable local PostgreSQL is mandatory."""
+"""IR-01/05/09/20 races; disposable local PostgreSQL is mandatory."""
 import os
 import uuid
 from dataclasses import replace
@@ -17,6 +17,64 @@ from api.services.billing.manualBillingRepository import ManualBillingRepository
 
 pytestmark=pytest.mark.skipif(os.environ.get('RUN_MANUAL_BILLING_INTEGRATION')!='1',reason='Disposable PostgreSQL opt-in required; skipped is UNVERIFIED')
 REFERENCE={'amount':10000,'currency':'INR','source':'razorpay_plan_fetch'}
+
+
+def initial_checkout_user(postgres):
+    user = 'initial-replacement-' + str(uuid.uuid4())
+    with psycopg2.connect(postgres) as db:
+        with db.cursor() as sql:
+            sql.execute('insert into public."Users"("userId") values(%s)', (user,))
+    repo = ManualBillingRepository(lambda: psycopg2.connect(postgres))
+    repo.ensureCanonicalSubscription(user)
+    return repo, user
+
+
+@pytest.mark.parametrize('replacement_key', [None, 'changed-selection'])
+def test_two_sessions_replace_initial_checkout_once(postgres, replacement_key):
+    repo, user = initial_checkout_user(postgres)
+    with patch('api.services.billing.billingEngine._getMonthlyBasePrice', return_value=REFERENCE):
+        first = repo.reserveCheckout(CheckoutRequest(user, 'initial_purchase', 'monthly_prepaid', {'domains': ['banking']}, 'original'))
+        repo.bindProviderOrder(first.attemptId, {'id': 'original-' + str(uuid.uuid4())})
+        changed = CheckoutRequest(user, 'initial_purchase', 'monthly_prepaid', {'domains': ['telecom']}, replacement_key)
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            results = list(pool.map(repo.reserveCheckout, [changed, changed]))
+    assert results[0].attemptId == results[1].attemptId != first.attemptId
+    with psycopg2.connect(postgres) as db:
+        with db.cursor() as sql:
+            sql.execute("select payment_status,count(*) from public.billing_events where user_id=%s and event_category='payment_attempt' group by payment_status", (user,))
+            assert dict(sql.fetchall()) == {'cancelled': 1, 'created': 1}
+            sql.execute('select status from public."Invoices" where id=%s', (first.invoiceId,))
+            assert sql.fetchone()[0] == 'VOID'
+
+
+def test_two_sessions_replace_vs_original_capture_cannot_grant_both(postgres):
+    repo, user = initial_checkout_user(postgres)
+    with patch('api.services.billing.billingEngine._getMonthlyBasePrice', return_value=REFERENCE):
+        first = repo.reserveCheckout(CheckoutRequest(user, 'initial_purchase', 'monthly_prepaid', {'domains': ['banking']}, 'original'))
+        first = repo.bindProviderOrder(first.attemptId, {'id': 'original-' + str(uuid.uuid4())})
+        money = VerifiedPaymentEvidence(first.attemptId, first.invoiceId, user, first.razorpayOrderId,
+            'payment-' + str(uuid.uuid4()), 'initial_purchase', 'INR', 'captured', 'server_observation',
+            first.amount, NOW, NOW, None, True)
+        def replace_checkout():
+            try:
+                return repo.reserveCheckout(CheckoutRequest(user, 'initial_purchase', 'monthly_prepaid', {'domains': ['telecom']}, 'changed'))
+            except ValueError as exc:
+                assert str(exc) == 'EXISTING_PAID_COVERAGE'
+                return None
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            replacement = pool.submit(replace_checkout)
+            capture = pool.submit(repo.finalizeCapturedPayment, money)
+            new_intent, result = replacement.result(), capture.result()
+    if result.finalized:
+        assert new_intent is None
+        assert repo.getCoverageSnapshot(user).currentPeriod.domains == ('banking',)
+    else:
+        assert new_intent is not None and result.state == 'requires_reconciliation'
+        assert not repo.getCoverageSnapshot(user).accessAllowed
+    with psycopg2.connect(postgres) as db:
+        with db.cursor() as sql:
+            sql.execute("select count(*) from public.billing_events where provider_payment_id=%s", (money.providerPaymentId,))
+            assert sql.fetchone()[0] == 1
 
 
 class OrderProvider:
