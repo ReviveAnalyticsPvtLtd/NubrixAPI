@@ -33,7 +33,9 @@ def buildMigrationPlan(appliedVersions:set[str],phase:str)->list[Path]:
         if missing: raise ValueError('EXPANSION_NOT_APPLIED:'+','.join(missing))
         names=(CONTRACT,)
     else: names=EXPAND
-    paths=[ROOT/'supabase/migrations'/name for name in names if name.split('_')[0] not in appliedVersions]
+    # The contraction lives outside supabase/migrations so a blanket push cannot apply it mid-chain.
+    folder='supabase/manual_billing_contract' if phase=='contract' else 'supabase/migrations'
+    paths=[ROOT/folder/name for name in names if name.split('_')[0] not in appliedVersions]
     if not all(path.is_file() for path in paths): raise ValueError('MIGRATION_FILE_MISSING')
     return paths
 

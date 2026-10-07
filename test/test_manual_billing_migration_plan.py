@@ -25,3 +25,13 @@ def test_migration_plan_rejects_unknown_phase():
     from scripts.manual_billing_migration_plan import buildMigrationPlan
     with pytest.raises(ValueError,match='INVALID_MIGRATION_PHASE'):
         buildMigrationPlan(set(),'all')
+
+
+def test_contract_migration_is_outside_the_chronological_migrations_folder():
+    # A blanket `supabase db push` must never apply the contraction mid-chain.
+    from pathlib import Path
+    from scripts.manual_billing_migration_plan import buildMigrationPlan
+    assert not list(Path('supabase/migrations').glob('*_contract_recurring_billing_fields.sql'))
+    applied={path.name.split('_')[0] for path in buildMigrationPlan(set(),'expand')}
+    [contract]=buildMigrationPlan(applied,'contract')
+    assert contract.parent.name=='manual_billing_contract' and contract.is_file()

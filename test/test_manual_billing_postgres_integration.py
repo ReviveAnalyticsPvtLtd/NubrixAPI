@@ -182,7 +182,7 @@ def test_contract_refuses_unretired_or_unmapped_state(postgres,blocker):
                 (user,'monthly_recurring' if blocker=='recurring_mode' else 'monthly_prepaid' if blocker=='credit_identity' else 'none',
                  'test-only-mandate' if blocker=='token' else None))
             with pytest.raises(psycopg2.Error,match='CONTRACT_PRECONDITION_FAILED'):
-                cursor.execute((ROOT/'supabase/migrations/20261005195626_contract_recurring_billing_fields.sql').read_text())
+                cursor.execute((ROOT/'supabase/manual_billing_contract/20261005195626_contract_recurring_billing_fields.sql').read_text())
         connection.rollback()
         with connection.cursor() as cursor:
             cursor.execute("select count(*) from information_schema.columns where table_schema='public' and table_name='subscriptions' and column_name='razorpay_token_id'")
@@ -194,7 +194,7 @@ def test_contract_migration_executes_after_retirement_preconditions(postgres):
     connection=psycopg2.connect(postgres)
     try:
         with connection.cursor() as cursor:
-            cursor.execute((ROOT/'supabase/migrations/20261005195626_contract_recurring_billing_fields.sql').read_text())
+            cursor.execute((ROOT/'supabase/manual_billing_contract/20261005195626_contract_recurring_billing_fields.sql').read_text())
             cursor.execute("select column_name from information_schema.columns where table_schema='public' and table_name='subscriptions'")
             assert not {'razorpay_customer_id','razorpay_token_id','subscription_anchor_day','recurring_failures'} & {row[0] for row in cursor.fetchall()}
         connection.commit()

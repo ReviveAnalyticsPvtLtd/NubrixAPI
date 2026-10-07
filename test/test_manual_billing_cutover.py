@@ -20,7 +20,7 @@ from scripts.manual_billing_backfill import (  # noqa: E402
 
 def _contractSql() -> str:
     matches = list(
-        Path("supabase/migrations").glob("*_contract_recurring_billing_fields.sql")
+        Path("supabase/manual_billing_contract").glob("*_contract_recurring_billing_fields.sql")
     )
     assert len(matches) == 1
     return matches[0].read_text(encoding="utf-8")
