@@ -3,6 +3,8 @@ from fastapi import APIRouter, Depends, Header, Query, Request, status
 from api.adminModels import (
     AdminOverviewPeriod,
     AdminAuditEventView,
+    AdminCreditResetOperationView,
+    AdminCreditResetRequest,
     AdminFreeTrialExtensionRequest,
     AdminFreeTrialExtensionResponse,
     AdminFreeTrialReductionRequest,
@@ -35,6 +37,10 @@ from api.services.adminAuthService import (
     resolveAdminClientIp,
     verifyAdmin,
     verifyAdminForLogout,
+)
+from api.services.adminCreditResetService import (
+    AdminCreditResetService,
+    getAdminCreditResetService,
 )
 from api.services.adminManagementService import (
     AdminManagementService,
@@ -169,6 +175,20 @@ async def startUserErasure(
     service: UserErasureService = Depends(getUserErasureService),
 ):
     return service.start(userId, payload, idempotencyKey, admin)
+
+
+@router.post(
+    "/users/{userId}/credits/reset",
+    response_model=AdminCreditResetOperationView,
+)
+def resetUserCredits(
+    userId: str,
+    payload: AdminCreditResetRequest,
+    idempotencyKey: str = Header(alias="Idempotency-Key"),
+    admin: AdminContext = Depends(verifyAdmin),
+    service: AdminCreditResetService = Depends(getAdminCreditResetService),
+):
+    return service.resetUser(userId, payload, idempotencyKey, admin)
 
 
 @router.post(

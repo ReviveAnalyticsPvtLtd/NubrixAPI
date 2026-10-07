@@ -265,6 +265,20 @@ class CreditService:
     def _redisKey(userId: str) -> str:
         return f"credits:v3:{userId}"
 
+    def invalidateCreditProjection(self, userId: str) -> bool:
+        """Delete one user's Redis projection after a committed SQL change.
+
+        Only eviction: a delayed call can drop a newer projection, which then
+        rebuilds from SQL, but it never publishes a historical snapshot.
+        Returns False on failure without touching the committed SQL result.
+        """
+        try:
+            self._redis().delete(self._redisKey(userId))
+            return True
+        except Exception as e:
+            logger.warning(f"Credit projection invalidation failed: {type(e).__name__}")
+            return False
+
     # ---- durable read helpers -------------------------------------------------
 
     def _dbRow(self, userId: str) -> dict | None:

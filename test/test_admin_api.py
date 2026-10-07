@@ -743,6 +743,8 @@ def test_admin_routes_declare_strict_response_allowlists():
         ("/admin/users/{userId}", "PATCH"): AdminUserView,
         ("/admin/users/{userId}/access", "PATCH"): accessView,
         ("/admin/users/{userId}/erasure", "POST"): AdminUserErasureAcceptedView,
+        ("/admin/users/{userId}/credits/reset", "POST"):
+            adminModels.AdminCreditResetOperationView,
         ("/admin/free-trial/extensions", "POST"):
             AdminFreeTrialExtensionResponse,
         ("/admin/free-trial/reductions", "POST"):

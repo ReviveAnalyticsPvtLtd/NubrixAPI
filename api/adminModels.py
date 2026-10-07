@@ -326,3 +326,55 @@ class AdminTokenCostOverviewView(_StrictModel):
     totalCost: float = Field(ge=0, allow_inf_nan=False)
     currency: Literal["USD"]
     chart: AdminTokenCostChart
+
+
+class AdminCreditResetRequest(_StrictModel):
+    reason: str = Field(min_length=1, max_length=2000)
+
+    @field_validator("reason", mode="before")
+    @classmethod
+    def normalizeReason(cls, value):
+        return value.strip() if isinstance(value, str) else value
+
+
+class AdminCreditSnapshotView(_StrictModel):
+    planTier: str | None = None
+    domainCount: int
+    monthlyTokenQuota: int
+    usedTokens: int
+    remainingTokens: int
+    topupTokens: int
+    subscriptionId: str | None = None
+    lifecycleId: str | None = None
+    creditPeriodId: str | None = None
+    periodStart: str | None = None
+    periodEnd: str | None = None
+    balanceVersion: int
+
+
+class AdminCreditResetTargetView(_StrictModel):
+    userId: str
+    outcome: Literal["PENDING", "RESET", "SKIPPED", "RETRYABLE_FAILED"]
+    reasonCode: str | None = None
+    auditId: str | None = None
+    resetAt: str | None = None
+    before: AdminCreditSnapshotView | None = None
+    after: AdminCreditSnapshotView | None = None
+    cacheState: Literal["NOT_APPLICABLE", "PENDING", "INVALIDATED"]
+
+
+class AdminCreditResetOperationView(_StrictModel):
+    operationId: str
+    scope: Literal["individual", "all"]
+    status: Literal["RUNNING", "COMPLETED"]
+    requestedByAdminId: str
+    reason: str
+    createdAt: str
+    totalTargets: int = Field(ge=0)
+    resetCount: int = Field(ge=0)
+    skippedCount: int = Field(ge=0)
+    pendingCount: int = Field(ge=0)
+    retryableFailureCount: int = Field(ge=0)
+    cachePendingCount: int = Field(ge=0)
+    targets: list[AdminCreditResetTargetView]
+    nextAfterUserId: str | None = None

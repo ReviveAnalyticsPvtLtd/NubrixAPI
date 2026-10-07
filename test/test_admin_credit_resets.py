@@ -13,6 +13,7 @@ from unittest.mock import patch
 import pytest
 
 from api.services.adminAuthService import AdminContext
+from test.test_admin_auth_service import authFixture, passwordHasher  # noqa: F401
 from test.test_manual_billing_runtime import (
     LIFE,
     NOW,
@@ -355,3 +356,211 @@ def test_operation_stores_hashed_key_and_no_token(resets):
     [operation] = rows(path, "SELECT * FROM admin_credit_reset_operations")
     assert "key-1" not in json.dumps(operation) and ADMIN.token not in json.dumps(operation)
     assert len(operation["idempotency_key_hash"]) == 64 and operation["reason"] == REASON
+
+
+# ---- HTTP: genuine admin authentication and the individual endpoint -----------
+
+class FakeCreditProjection:
+    def __init__(self, outcomes=None):
+        self.outcomes = list(outcomes or [])
+        self.calls = []
+
+    def invalidateCreditProjection(self, userId):
+        self.calls.append(userId)
+        return self.outcomes.pop(0) if self.outcomes else True
+
+
+@pytest.fixture
+def api(resets, authFixture):
+    from fastapi.testclient import TestClient
+    from api.services.adminAuthService import getAdminAuthService
+    from api.services.adminCreditResetService import (
+        AdminCreditResetService,
+        getAdminCreditResetService,
+    )
+    from main import app as productionApp
+    from test.test_admin_auth_service import VALID_PASSWORD
+    resetRepository, repository, path = resets
+    projection = FakeCreditProjection()
+    service = AdminCreditResetService(repository=resetRepository, creditService=projection)
+    productionApp.dependency_overrides[getAdminAuthService] = lambda: authFixture.service
+    productionApp.dependency_overrides[getAdminCreditResetService] = lambda: service
+    login = authFixture.service.login("admin@example.com", VALID_PASSWORD, "203.0.113.10")
+    client = TestClient(productionApp, raise_server_exceptions=False)
+    quotaPatch = patch("api.services.credits.creditConfig.getTokenQuotaForPlan", side_effect=quota)
+    quotaPatch.start()
+    try:
+        yield {"client": client, "token": login["token"], "path": path, "projection": projection,
+               "auth": authFixture, "adminId": login["admin"]["id"], "service": service}
+    finally:
+        quotaPatch.stop()
+        client.close()
+        productionApp.dependency_overrides.clear()
+
+
+def headers(api, key="reset-key-1", token=None):
+    values = {"Authorization": "Bearer " + (token or api["token"])}
+    if key is not None:
+        values["Idempotency-Key"] = key
+    return values
+
+
+def resetUser(api, userId=USER, body=None, key="reset-key-1"):
+    return api["client"].post(f"/admin/users/{userId}/credits/reset",
+                              json={"reason": REASON} if body is None else body,
+                              headers=headers(api, key=key))
+
+
+def test_genuine_admin_resets_one_user(api, resets):
+    activateMonthly(resets)
+    response = resetUser(api)
+    assert response.status_code == 200, response.text
+    body = response.json()
+    assert body["scope"] == "individual" and body["status"] == "COMPLETED"
+    assert body["requestedByAdminId"] == api["adminId"] and body["reason"] == REASON
+    assert (body["totalTargets"], body["resetCount"], body["skippedCount"], body["pendingCount"],
+            body["retryableFailureCount"], body["cachePendingCount"]) == (1, 1, 0, 0, 0, 0)
+    [target] = body["targets"]
+    assert target["userId"] == USER and target["outcome"] == "RESET"
+    assert target["before"]["usedTokens"] == 7000 and target["after"]["remainingTokens"] == 10000
+    assert target["after"]["topupTokens"] == 2500 and target["cacheState"] == "INVALIDATED"
+    assert api["projection"].calls == [USER]
+    assert audits(api["path"])[0]["admin_id"] == api["adminId"]
+    assert api["token"] not in response.text
+
+
+def test_ordinary_and_billing_admin_user_tokens_are_rejected(api, resets, monkeypatch):
+    import os
+    from jose import jwt
+    activateMonthly(resets)
+    monkeypatch.setenv("BILLING_ADMIN_USER_IDS", USER)
+    userToken = jwt.encode({"userId": USER, "email": "user@example.com"},
+                           os.environ["SECRET_KEY"], algorithm="HS256")
+    for token in (userToken, "not-a-token"):
+        response = api["client"].post(f"/admin/users/{USER}/credits/reset", json={"reason": REASON},
+                                      headers=headers(api, token=token))
+        assert response.status_code == 401
+    missing = api["client"].post(f"/admin/users/{USER}/credits/reset", json={"reason": REASON},
+                                 headers={"Idempotency-Key": "k"})
+    assert missing.status_code == 401
+    assert not rows(api["path"], "SELECT * FROM admin_credit_reset_operations")
+
+
+def test_revoked_admin_session_cannot_reset(api, resets):
+    activateMonthly(resets)
+    api["auth"].client.rows["admin_sessions"][-1]["revoked_at"] = "2030-01-02T03:04:05+00:00"
+    assert resetUser(api).status_code == 401
+    assert not rows(api["path"], "SELECT * FROM admin_credit_reset_operations")
+
+
+@pytest.mark.parametrize("body,key", [
+    ({"reason": "   "}, "k-1"),
+    ({"reason": "x" * 2001}, "k-1"),
+    ({}, "k-1"),
+    ({"reason": REASON, "amount": 50000}, "k-1"),
+    ({"reason": REASON, "resetTopups": True}, "k-1"),
+    ({"reason": REASON, "adminId": "someone-else"}, "k-1"),
+    ({"reason": REASON}, None),
+    ({"reason": REASON}, "   "),
+    ({"reason": REASON}, "k" * 129),
+])
+def test_invalid_reset_requests_are_rejected_without_mutation(api, resets, body, key):
+    activateMonthly(resets)
+    assert resetUser(api, body=body, key=key).status_code == 422
+    assert not rows(api["path"], "SELECT * FROM admin_credit_reset_operations")
+
+
+def test_overlong_user_id_is_rejected(api):
+    assert resetUser(api, userId="u" * 129).status_code == 422
+    assert not rows(api["path"], "SELECT * FROM admin_credit_reset_operations")
+
+
+def test_unknown_user_is_404_with_audited_operation(api):
+    response = resetUser(api, userId="nobody-here")
+    assert response.status_code == 404
+    errors = response.json()["errors"]
+    assert errors["reasonCode"] == "USER_NOT_FOUND" and errors["operationId"]
+    assert audits(api["path"])[0]["outcome"] == "SKIPPED"
+
+
+def test_ineligible_user_is_409_with_operation_and_replays_same(api, resets):
+    activateMonthly(resets)
+    with sqlTransaction(api["path"]) as connection:
+        connection.execute("UPDATE subscriptions SET status='suspended'")
+    first, again = resetUser(api), resetUser(api)
+    assert first.status_code == again.status_code == 409
+    assert first.json()["errors"]["reasonCode"] == "RESTRICTED_SUBSCRIPTION"
+    assert first.json()["errors"]["operationId"] == again.json()["errors"]["operationId"]
+    assert len(audits(api["path"])) == 1
+
+
+def test_conflicting_key_reuse_is_409_without_second_operation(api, resets):
+    activateMonthly(resets)
+    resetUser(api)
+    assert resetUser(api, body={"reason": "Different reason"}).status_code == 409
+    assert len(rows(api["path"], "SELECT * FROM admin_credit_reset_operations")) == 1
+
+
+def test_cache_failure_stays_pending_and_replay_repairs_without_regrant(api, resets):
+    activateMonthly(resets)
+    api["projection"].outcomes = [False]
+    first = resetUser(api)
+    assert first.status_code == 200
+    assert first.json()["targets"][0]["cacheState"] == "PENDING" and first.json()["cachePendingCount"] == 1
+    version = read_row(api["path"], "credit_balances")["balance_version"]
+    with sqlTransaction(api["path"]) as connection:
+        connection.execute("UPDATE credit_balances SET used_tokens=10,remaining_tokens=9990")
+    again = resetUser(api)
+    assert again.status_code == 200
+    assert again.json()["targets"][0]["cacheState"] == "INVALIDATED"
+    assert again.json()["targets"][0]["after"]["remainingTokens"] == 10000
+    assert read_row(api["path"], "credit_balances")["remaining_tokens"] == 9990
+    assert read_row(api["path"], "credit_balances")["balance_version"] == version
+    assert len(audits(api["path"])) == 1 and api["projection"].calls == [USER, USER]
+
+
+def test_audit_outage_is_503_without_grant(api, resets):
+    before = activateMonthly(resets)
+    with sqlTransaction(api["path"]) as connection:
+        connection.execute("DROP TABLE admin_audit_log")
+    assert resetUser(api).status_code == 503
+    assert read_row(api["path"], "credit_balances") == before
+    assert rows(api["path"], "SELECT outcome FROM admin_credit_reset_targets")[0]["outcome"] == "RETRYABLE_FAILED"
+
+
+def test_legacy_force_reset_route_is_removed():
+    from fastapi.routing import APIRoute
+    from fastapi.testclient import TestClient
+    from main import app as productionApp
+    paths = {route.path for route in productionApp.routes if isinstance(route, APIRoute)}
+    assert not [path for path in paths if "force-reset" in path]
+    with TestClient(productionApp, raise_server_exceptions=False) as client:
+        assert client.post("/billing-admin/credits/force-reset?resetUsage=true").status_code == 404
+
+
+def test_reset_routes_use_genuine_admin_dependency():
+    from fastapi.routing import APIRoute
+    from api.services.adminAuthService import verifyAdmin
+    from main import app as productionApp
+    routes = [route for route in productionApp.routes if isinstance(route, APIRoute)
+              and route.path.startswith("/admin/") and "credits" in route.path]
+    assert routes
+    for route in routes:
+        assert any(dependency.call is verifyAdmin for dependency in route.dependant.dependencies)
+
+
+def test_credit_projection_invalidation_deletes_only_one_key():
+    from api.services.credits.creditService import CreditService
+    deleted = []
+
+    class Redis:
+        def delete(self, *keys):
+            deleted.extend(keys)
+            return 1
+
+    service = CreditService.__new__(CreditService)
+    service._redis = lambda: Redis()
+    assert service.invalidateCreditProjection(USER) is True
+    assert deleted == ["credits:v3:" + USER]
+    service._redis = lambda: (_ for _ in ()).throw(RuntimeError("redis down"))
+    assert service.invalidateCreditProjection(USER) is False

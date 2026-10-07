@@ -356,36 +356,3 @@ async def markInvestigated(
         raiseHttpException(e)
     except Exception as e:
         raiseHttpException(CustomException(e))
-
-
-@router.post("/credits/force-reset")
-async def forceResetAllQuotas(
-    resetUsage: bool = False,
-    adminUserId=Depends(verifyBillingAdmin),
-):
-    """
-    Recompute monthly_token_quota for all users from credits.json, then flush
-    all Redis credit hashes so they rebuild with updated values.
-
-    Query params:
-        resetUsage (bool, default false): when true, also zero out used_tokens
-            and restore remaining_tokens to the full quota for all users,
-            giving everyone a fresh monthly bucket immediately. The billing
-            period itself is left untouched.
-    """
-    try:
-        from api.services.credits.creditService import creditService
-
-        result = creditService.forceResetAllQuotas(resetUsage=resetUsage)
-        logger.info(
-            f"Force credit reset triggered by admin={adminUserId}, "
-            f"resetUsage={resetUsage}: {result}"
-        )
-        return ORJSONResponse(
-            status_code=200,
-            content={"status": "SUCCESS", "data": result},
-        )
-    except CustomException as e:
-        raiseHttpException(e)
-    except Exception as e:
-        raiseHttpException(CustomException(e))
