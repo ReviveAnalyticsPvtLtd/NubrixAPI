@@ -41,6 +41,20 @@ _REFUND_UNAVAILABLE = (RuntimeError, TimeoutError, ConnectionError, psycopg2.Ope
 router = APIRouter()
 
 
+def refuseDeferredRefundOperations() -> None:
+    """Owner-approved pause: no new refund quotes, reservations or submissions.
+
+    Re-enabling requires a reviewed authorization/audit design and code change;
+    a legacy billing allowlist or an environment flag cannot enable refunds.
+    Existing financial history and reconciliation remain available.
+    """
+    raise HTTPException(status_code=status.HTTP_503_SERVICE_UNAVAILABLE,detail={
+        'status':503,
+        'message':'Refund operations are disabled while refund support is deferred.',
+        'errorCode':'REFUND_OPERATIONS_DISABLED',
+    })
+
+
 def verifyBillingAdmin(token=Depends(verifyToken)) -> str:
     """
     Require a valid session token whose JWT userId is explicitly allowlisted.
@@ -147,7 +161,7 @@ def _refundNow():
     return datetime.now(timezone.utc)
 
 
-@router.post("/refunds/quote")
+@router.post("/refunds/quote", dependencies=[Depends(refuseDeferredRefundOperations)])
 async def quoteSubscriptionRefund(
     payload: SubscriptionRefundQuoteRequest,
     adminUserId=Depends(verifyBillingAdmin),
@@ -198,7 +212,7 @@ async def quoteSubscriptionRefund(
         raiseHttpException(CustomException(e))
 
 
-@router.post("/refunds/initiate")
+@router.post("/refunds/initiate", dependencies=[Depends(refuseDeferredRefundOperations)])
 async def initiateSubscriptionRefund(
     payload: SubscriptionRefundInitiateRequest,
     adminUserId=Depends(verifyBillingAdmin),

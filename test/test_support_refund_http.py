@@ -1,4 +1,8 @@
-"""Actual staff route/service/refund transaction against isolated SQL."""
+"""Dormant refund mechanics against isolated SQL, beyond the deferred HTTP gate.
+
+The fixture explicitly overrides that gate to retain financial transaction
+regressions. test_deferred_refund_routes verifies production HTTP denial.
+"""
 from dataclasses import replace
 from datetime import timedelta
 import pytest
@@ -43,6 +47,7 @@ def refund_client(database,monkeypatch):
     async def flat(_,error):
         return JSONResponse(status_code=error.status_code,content=error.detail if isinstance(error.detail,dict) else {'message':error.detail})
     app.dependency_overrides[routes.verifyBillingAdmin]=lambda:'staff'
+    app.dependency_overrides[routes.refuseDeferredRefundOperations]=lambda:None
     return TestClient(app),repo,path,provider,quote
 
 
