@@ -727,3 +727,66 @@ def test_operation_read_is_404_for_unknown_or_malformed_and_requires_admin(api):
     assert getOperation(api, "not-a-uuid").status_code == 404
     unauthenticated = api["client"].get(f"/admin/credits/reset-operations/{uuid.uuid4()}")
     assert unauthenticated.status_code == 401
+
+
+# ---- Final-review regressions ------------------------------------------------
+
+def test_cache_repair_stops_at_first_unavailable_projection():
+    from api.services.adminCreditResetService import AdminCreditResetService
+
+    class Repository:
+        marked = []
+
+        def cachePendingTargets(self, operationId, limit):
+            return ["user-a", "user-b", "user-c"]
+
+        def markCacheInvalidated(self, operationId, userId):
+            self.marked.append(userId)
+            return True
+
+    projection = FakeCreditProjection(outcomes=[True, False, True])
+    service = AdminCreditResetService(repository=Repository(), creditService=projection)
+    service._repairCache(str(uuid.uuid4()))
+    assert projection.calls == ["user-a", "user-b"]
+    assert Repository.marked == ["user-a"]
+
+
+def test_annual_reset_after_due_allowance_rollover(resets):
+    _, _, path = resets
+    activateMonthly(resets)
+    with sqlTransaction(path) as connection:
+        connection.execute("UPDATE subscriptions SET billing_mode='annual_prepaid',plan_type='annual'")
+        connection.execute("UPDATE credit_balances SET plan_tier='annual',period_end=?",
+                           ((NOW - timedelta(minutes=1)).isoformat(),))
+    before = read_row(path, "credit_balances")
+    _, target = reset(resets)
+    after = read_row(path, "credit_balances")
+    assert target["outcome"] == "RESET"
+    assert (after["monthly_token_quota"], after["remaining_tokens"], after["used_tokens"]) == (30000, 30000, 0)
+    assert after["topup_tokens"] == 2500
+    assert after["balance_version"] == before["balance_version"] + 2
+    snapshot = target["before_snapshot"]
+    assert snapshot["periodStart"] == (NOW - timedelta(minutes=1)).isoformat()
+    assert snapshot["creditPeriodId"] != before["credit_period_id"] != after["credit_period_id"]
+
+
+def test_paused_subscription_is_restricted(resets):
+    _, _, path = resets
+    activateMonthly(resets)
+    with sqlTransaction(path) as connection:
+        connection.execute("UPDATE subscriptions SET status='paused'")
+    _, target = reset(resets)
+    assert (target["outcome"], target["reason_code"]) == ("SKIPPED", "RESTRICTED_SUBSCRIPTION")
+    assert read_row(path, "credit_balances")["remaining_tokens"] == 3000
+
+
+def test_future_only_paid_coverage_is_not_reset(resets):
+    _, _, path = resets
+    activateMonthly(resets)
+    with sqlTransaction(path) as connection:
+        connection.execute('UPDATE "Invoices" SET period_start=?,period_end=?',
+                           ((NOW + timedelta(days=1)).isoformat(), (NOW + timedelta(days=31)).isoformat()))
+    before = read_row(path, "credit_balances")
+    _, target = reset(resets)
+    assert (target["outcome"], target["reason_code"]) == ("SKIPPED", "NO_ACTIVE_COVERAGE")
+    assert read_row(path, "credit_balances")["credit_period_id"] == before["credit_period_id"]

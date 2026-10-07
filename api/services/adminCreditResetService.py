@@ -144,7 +144,12 @@ class AdminCreditResetService:
                                  type(recordExc).__name__)
 
     def _repairCache(self, operationId: str) -> None:
-        """Invalidate committed resets' projections; never regrants."""
+        """Invalidate committed resets' projections; never regrants.
+
+        Stops at the first unavailable projection so a Redis outage cannot
+        hold the request open for every remaining target; the next same-key
+        POST retries what is still PENDING.
+        """
         try:
             pending = self.repository.cachePendingTargets(operationId, MAX_TARGETS_PER_REQUEST)
         except Exception as exc:
@@ -152,7 +157,7 @@ class AdminCreditResetService:
             return
         for userId in pending:
             if not self.creditService.invalidateCreditProjection(userId):
-                continue
+                break
             try:
                 self.repository.markCacheInvalidated(operationId, userId)
             except Exception as exc:

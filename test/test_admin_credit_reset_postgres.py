@@ -105,6 +105,24 @@ def test_real_migration_enforces_rls_grants_and_terminal_immutability(active):
                      "where operation_id=%s", (stored["id"],))
 
 
+def test_live_trial_without_balance_is_initialized_by_reset(postgres):
+    from api.services.adminCreditResetRepository import AdminCreditResetRepository
+    from api.services.billing.manualBillingRepository import ManualBillingRepository
+    userId = "trial-reset-" + str(uuid.uuid4())
+    execute(postgres, 'insert into public."Users"("userId") values(%s)', (userId,))
+    execute(postgres, """insert into public.subscriptions(id,user_id,is_canonical,billing_mode,status,plan_type,
+        current_period_start,current_period_end,domain_count)
+        values(%s,%s,true,'none','trial','free',clock_timestamp()-interval '1 day',
+               clock_timestamp()+interval '11 days',4)""", (str(uuid.uuid4()), userId))
+    resets = AdminCreditResetRepository(ManualBillingRepository(lambda: psycopg2.connect(postgres)))
+    target = resets.resetTarget(str(operation(resets, userId)["id"]), userId)
+    assert target["outcome"] == "RESET" and target["before_snapshot"] is None
+    created = balance(postgres, userId)
+    assert (created["monthly_token_quota"], created["remaining_tokens"], created["topup_tokens"],
+            created["balance_version"]) == (5000, 5000, 0, 1)
+    assert len(audits(postgres, userId)) == 1
+
+
 def test_reset_commits_balance_allocation_target_and_strict_audit(active):
     resets, _, userId, url = active
     before = balance(url, userId)

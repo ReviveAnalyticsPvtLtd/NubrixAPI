@@ -57,10 +57,10 @@ create table if not exists public.admin_credit_reset_targets (
         check (reason_code is null or reason_code ~ '^[A-Z0-9_]{1,80}$'),
     constraint admin_credit_reset_targets_terminal_audit_chk
         check (outcome not in ('RESET', 'SKIPPED') or audit_id is not null),
+    -- before_snapshot is null only when the reset initialized a live trial's missing balance.
     constraint admin_credit_reset_targets_reset_chk
         check (outcome <> 'RESET'
-               or (reset_at is not null and before_snapshot is not null
-                   and after_snapshot is not null)),
+               or (reset_at is not null and after_snapshot is not null)),
     constraint admin_credit_reset_targets_skip_chk
         check (outcome <> 'SKIPPED' or (reason_code is not null and after_snapshot is null)),
     constraint admin_credit_reset_targets_cache_outcome_chk
