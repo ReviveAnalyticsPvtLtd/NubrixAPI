@@ -13,6 +13,7 @@ EXPAND=(
     '20261006131717_enforce_manual_checkout_order_identity.sql',
     '20261006173531_fence_billing_notification_revisions.sql',
     '20261007100919_index_manual_billing_recovery_obligations.sql',
+    '20261007134945_admin_credit_reset_operations.sql',
 )
 CONTRACT='20261005195626_contract_recurring_billing_fields.sql'
 RETIREMENT_EVIDENCE=(

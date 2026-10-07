@@ -6,6 +6,13 @@ from api.services.billing.manualBillingContracts import CreditOperationContext
 from api.services.billing.manualBillingRepository import getManualBillingRepository, _utc
 
 
+class CreditResetIneligible(ValueError):
+    """Stable reason a reset cannot grant; raised before any reset write."""
+    def __init__(self, code):
+        super().__init__(code)
+        self.code = code
+
+
 class ManualCreditRepository:
     def __init__(self, repository=None):
         from api.services.billing.manualBillingRepository import getManualBillingRepository
@@ -53,6 +60,82 @@ class ManualCreditRepository:
             data=self.repository._json(allocation['metadata_json'])
             data['quotaWatermark']=int(watermark)
             cursor.execute('update public.billing_events set metadata_json=%s where id=%s',(Json(data),allocation['id']))
+
+    _RESET_DENIALS = {'erasure_pending':'ERASURE_PENDING','account_banned':'ACCOUNT_BANNED',
+        'restricted_subscription':'RESTRICTED_SUBSCRIPTION'}
+    RESET_CHANGED_FIELDS = ('domain_count','monthly_token_quota','used_tokens','remaining_tokens',
+        'credit_period_id','balance_version','last_reset_at','updated_at')
+
+    @staticmethod
+    def creditSnapshot(balance):
+        if not balance:
+            return None
+        iso = lambda value: _utc(value).isoformat() if _utc(value) else None
+        return {'planTier':balance.get('plan_tier'),'domainCount':int(balance.get('domain_count') or 0),
+            'monthlyTokenQuota':int(balance.get('monthly_token_quota') or 0),'usedTokens':int(balance.get('used_tokens') or 0),
+            'remainingTokens':int(balance.get('remaining_tokens') or 0),'topupTokens':int(balance.get('topup_tokens') or 0),
+            'subscriptionId':str(balance['subscription_id']) if balance.get('subscription_id') else None,
+            'lifecycleId':str(balance['lifecycle_id']) if balance.get('lifecycle_id') else None,
+            'creditPeriodId':str(balance['credit_period_id']) if balance.get('credit_period_id') else None,
+            'periodStart':iso(balance.get('period_start')),'periodEnd':iso(balance.get('period_end')),
+            'balanceVersion':int(balance.get('balance_version') or 0)}
+
+    def resetQuotaLocked(self,cursor,subscription,now):
+        """Refresh the current configured allowance inside the caller's owner-locked transaction.
+
+        Naturally due coverage is materialized first; ineligible or corrupt states raise
+        CreditResetIneligible before any reset write. Purchased top-ups, coverage dates and
+        future paid intervals are never touched.
+        """
+        from api.services.credits.creditConfig import getTokenQuotaForPlan
+        userId=subscription['user_id']
+        coverage=self.repository._coverageSnapshotLocked(cursor,subscription,now,materialize=True)
+        subscription=self.repository._canonical(cursor,userId)
+        code=self._RESET_DENIALS.get(coverage.denialReason)
+        if code:
+            raise CreditResetIneligible(code)
+        if not self._eligibleLocked(cursor,subscription,now):
+            raise CreditResetIneligible('NO_ACTIVE_COVERAGE')
+        mode=subscription.get('billing_mode') or 'none'
+        plan='annual' if mode=='annual_prepaid' else 'pro' if mode=='monthly_prepaid' else 'free'
+        lifecycle=self.repository._json(subscription.get('billing_state')).get('manualBilling',{}).get('lifecycleId') or str(subscription['id'])
+        cursor.execute('select * from public.credit_balances where user_id=%s for update',(userId,))
+        existing=cursor.fetchone()
+        # Mirror _balanceLocked's integrity checks before any write: no partial repair on refusal.
+        if existing is None and plan!='free':
+            raise CreditResetIneligible('PAID_BALANCE_MISSING')
+        if existing is not None and (existing.get('plan_tier')!=plan
+                or (existing.get('credit_period_id') and existing.get('lifecycle_id')
+                    and (str(existing.get('subscription_id'))!=str(subscription['id'])
+                         or str(existing.get('lifecycle_id'))!=str(lifecycle)))):
+            raise CreditResetIneligible('ALLOCATION_OWNERSHIP_INVALID')
+        balance=self._balanceLocked(cursor,subscription,now)
+        count=max(1,min(4,int(subscription.get('domain_count') or 1)))
+        quota=int(getTokenQuotaForPlan(plan,count))
+        if existing is None:
+            # A newly created live-trial balance is already one fresh allocation.
+            cursor.execute('''update public.credit_balances set domain_count=%s,monthly_token_quota=%s,used_tokens=0,
+                remaining_tokens=%s,last_reset_at=%s,updated_at=%s where user_id=%s''',(count,quota,quota,now,now,userId))
+            periodId=str(balance['credit_period_id'])
+            before=None
+        else:
+            before=self.creditSnapshot(balance)
+            periodId=str(uuid.uuid4())
+            cursor.execute('''update public.credit_balances set domain_count=%s,monthly_token_quota=%s,used_tokens=0,
+                remaining_tokens=%s,credit_period_id=%s,balance_version=balance_version+1,last_reset_at=%s,updated_at=%s
+                where user_id=%s and balance_version=%s''',
+                (count,quota,quota,periodId,now,now,userId,balance['balance_version']))
+            if cursor.rowcount!=1:
+                raise RuntimeError('CREDIT_BALANCE_VERSION_CHANGED')
+        cursor.execute('select * from public.credit_balances where user_id=%s',(userId,))
+        after=cursor.fetchone()
+        allocation={'userId':userId,'subscriptionId':str(subscription['id']),'billingMode':mode,
+            'lifecycleId':str(after['lifecycle_id']),'creditPeriodId':periodId,'quotaWatermark':quota,
+            'operationType':'admin_credit_reset','source':'admin_credit_reset','admittedAt':now.isoformat()}
+        cursor.execute('''insert into public.billing_events(id,user_id,subscription_id,event_category,event_type,event_status,idempotency_key,metadata_json,occurred_at)
+            values(%s,%s,%s,'audit','credit.allocation_started','ACTIVE',%s,%s,%s)''',
+            (str(uuid.uuid4()),userId,subscription['id'],'credit-allocation:'+userId+':'+periodId,Json(allocation),now))
+        return {'before':before,'after':self.creditSnapshot(after),'changedFields':list(self.RESET_CHANGED_FIELDS)}
 
     @staticmethod
     def _context(data):
