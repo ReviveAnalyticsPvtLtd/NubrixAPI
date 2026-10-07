@@ -19,6 +19,15 @@ pytestmark=pytest.mark.skipif(os.environ.get('RUN_MANUAL_BILLING_INTEGRATION')!=
 REFERENCE={'amount':10000,'currency':'INR','source':'razorpay_plan_fetch'}
 
 
+def canonical_row(url, userId):
+    """Full canonical subscription row (ensureCanonicalSubscription returns a projection)."""
+    from psycopg2.extras import RealDictCursor
+    with psycopg2.connect(url) as db:
+        with db.cursor(cursor_factory=RealDictCursor) as sql:
+            sql.execute('select * from public.subscriptions where user_id=%s and is_canonical', (userId,))
+            return dict(sql.fetchone())
+
+
 def initial_checkout_user(postgres):
     user = 'initial-replacement-' + str(uuid.uuid4())
     with psycopg2.connect(postgres) as db:
@@ -127,7 +136,7 @@ def test_two_sessions_cancel_addition_does_not_lose_other_reservation(payment):
             cancel=pool.submit(repo.cancelExpertAddition,initial.userId,'telecom')
             other=pool.submit(reserve,'manufacturing','other')
             cancel.result();second=other.result()
-    row=repo.ensureCanonicalSubscription(initial.userId)
+    row=canonical_row(url,initial.userId)
     states={item['attemptId']:item['state'] for item in row['pending_additions']}
     assert states[first.attemptId]=='cancelled' and states[second.attemptId]=='awaiting_payment'
 
@@ -144,7 +153,7 @@ def test_two_sessions_cancel_vs_capture_cannot_overwrite_activated_addition(paym
     with ThreadPoolExecutor(max_workers=2) as pool:
         closed=pool.submit(cancel);captured=pool.submit(repo.finalizeCapturedPayment,money)
         closed.result();result=captured.result()
-    row=repo.ensureCanonicalSubscription(initial.userId)
+    row=canonical_row(url,initial.userId)
     state=next(item['state'] for item in row['pending_additions'] if item['attemptId']==intent.attemptId)
     if result.finalized:
         assert state=='activated' and 'telecom' in row['subscribed_experts']
