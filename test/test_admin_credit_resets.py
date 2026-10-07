@@ -564,3 +564,166 @@ def test_credit_projection_invalidation_deletes_only_one_key():
     assert deleted == ["credits:v3:" + USER]
     service._redis = lambda: (_ for _ in ()).throw(RuntimeError("redis down"))
     assert service.invalidateCreditProjection(USER) is False
+
+
+# ---- HTTP: resumable all-user reset and operation inspection -------------------
+
+def addUsers(path, count, prefix="bulk-user-"):
+    ids = [f"{prefix}{index:03d}" for index in range(count)]
+    with sqlTransaction(path) as connection:
+        connection.executemany('INSERT INTO "Users"("userId") VALUES(?)', [(userId,) for userId in ids])
+    return ids
+
+
+def resetAll(api, key="bulk-key-1", body=None, token=None):
+    return api["client"].post("/admin/credits/reset-all",
+                              json={"reason": REASON} if body is None else body,
+                              headers=headers(api, key=key, token=token))
+
+
+def getOperation(api, operationId, **params):
+    return api["client"].get(f"/admin/credits/reset-operations/{operationId}", params=params,
+                             headers={"Authorization": "Bearer " + api["token"]})
+
+
+def targetRows(path):
+    return rows(path, "SELECT * FROM admin_credit_reset_targets ORDER BY user_id")
+
+
+def test_empty_bulk_completes_with_zero_counts(api):
+    with sqlTransaction(api["path"]) as connection:
+        connection.execute('DELETE FROM "Users"')
+    response = resetAll(api)
+    assert response.status_code == 200
+    body = response.json()
+    assert body["status"] == "COMPLETED" and body["scope"] == "all" and body["totalTargets"] == 0
+    assert body["targets"] == [] and body["nextAfterUserId"] is None
+
+
+def test_bulk_resets_eligible_and_audits_skips(api, resets):
+    activateMonthly(resets)
+    addUsers(api["path"], 3)
+    with sqlTransaction(api["path"]) as connection:
+        connection.execute('UPDATE "Users" SET "isBanned"=1 WHERE "userId"=?', ("bulk-user-001",))
+    response = resetAll(api)
+    body = response.json()
+    assert response.status_code == 200 and body["status"] == "COMPLETED"
+    assert (body["totalTargets"], body["resetCount"], body["skippedCount"]) == (4, 1, 3)
+    outcomes = {row["user_id"]: (row["outcome"], row["reason_code"]) for row in targetRows(api["path"])}
+    assert outcomes[USER] == ("RESET", None)
+    assert outcomes["bulk-user-000"] == ("SKIPPED", "CANONICAL_SUBSCRIPTION_MISSING")
+    assert len(audits(api["path"])) == 4
+    assert read_row(api["path"], "credit_balances")["topup_tokens"] == 2500
+
+
+def test_bulk_processes_bounded_batches_and_freezes_membership(api, resets):
+    activateMonthly(resets)
+    addUsers(api["path"], 105)
+    first = resetAll(api)
+    assert first.status_code == 202
+    body = first.json()
+    assert body["status"] == "RUNNING" and body["totalTargets"] == 106
+    assert body["resetCount"] + body["skippedCount"] == 100 and body["pendingCount"] == 6
+    addUsers(api["path"], 2, prefix="late-user-")
+    with sqlTransaction(api["path"]) as connection:
+        connection.execute('DELETE FROM "Users" WHERE "userId"=?', ("bulk-user-104",))
+    second = resetAll(api)
+    assert second.status_code == 200 and second.json()["status"] == "COMPLETED"
+    assert second.json()["totalTargets"] == 106
+    outcomes = {row["user_id"]: row for row in targetRows(api["path"])}
+    assert "late-user-000" not in outcomes
+    assert outcomes["bulk-user-104"]["reason_code"] == "USER_NOT_FOUND"
+    assert len(audits(api["path"])) == 106
+    version = read_row(api["path"], "credit_balances")["balance_version"]
+    third = resetAll(api)
+    assert third.status_code == 200 and len(audits(api["path"])) == 106
+    assert read_row(api["path"], "credit_balances")["balance_version"] == version
+
+
+def test_bulk_partial_failure_retries_only_unfinished_targets(api, resets):
+    activateMonthly(resets)
+    addUsers(api["path"], 2)
+    repository = api["service"].repository
+    original = repository.resetTarget
+    failures = {"bulk-user-001": 1}
+
+    def flaky(operationId, userId):
+        if failures.get(userId):
+            failures[userId] -= 1
+            raise RuntimeError("audit database unavailable")
+        return original(operationId, userId)
+
+    repository.resetTarget = flaky
+    first = resetAll(api)
+    assert first.status_code == 202
+    body = first.json()
+    assert (body["resetCount"], body["skippedCount"], body["retryableFailureCount"], body["pendingCount"]) == (1, 1, 1, 0)
+    version = read_row(api["path"], "credit_balances")["balance_version"]
+    second = resetAll(api)
+    assert second.status_code == 200 and second.json()["retryableFailureCount"] == 0
+    assert read_row(api["path"], "credit_balances")["balance_version"] == version
+    assert sorted(row["target_id"] for row in audits(api["path"])) == sorted([USER, "bulk-user-000", "bulk-user-001"])
+
+
+def test_bulk_cache_failure_keeps_completed_status_and_repairs_on_replay(api, resets):
+    activateMonthly(resets)
+    api["projection"].outcomes = [False]
+    first = resetAll(api)
+    assert first.status_code == 200
+    assert first.json()["status"] == "COMPLETED" and first.json()["cachePendingCount"] == 1
+    version = read_row(api["path"], "credit_balances")["balance_version"]
+    operationId = first.json()["operationId"]
+    inspected = getOperation(api, operationId)
+    assert inspected.json()["cachePendingCount"] == 1 and api["projection"].calls == [USER]
+    second = resetAll(api)
+    assert second.json()["cachePendingCount"] == 0
+    assert read_row(api["path"], "credit_balances")["balance_version"] == version
+    assert len(audits(api["path"])) == 1
+
+
+def test_bulk_key_conflicts_across_scopes_and_is_scoped_to_admin(api, resets, authFixture):
+    from test.test_admin_auth_service import OTHER_PASSWORD
+    activateMonthly(resets)
+    assert resetUser(api, key="shared-key").status_code == 200
+    assert resetAll(api, key="shared-key").status_code == 409
+    other = authFixture.service.login("other@example.com", OTHER_PASSWORD, "203.0.113.11")
+    response = resetAll(api, key="shared-key", token=other["token"])
+    assert response.status_code == 200
+    assert response.json()["requestedByAdminId"] == other["admin"]["id"]
+    assert len(rows(api["path"], "SELECT * FROM admin_credit_reset_operations")) == 2
+
+
+def test_bulk_requires_genuine_admin_and_valid_input(api, resets):
+    import os
+    from jose import jwt
+    activateMonthly(resets)
+    userToken = jwt.encode({"userId": USER, "email": "user@example.com"}, os.environ["SECRET_KEY"], algorithm="HS256")
+    assert resetAll(api, token=userToken).status_code == 401
+    assert resetAll(api, body={"reason": ""}).status_code == 422
+    assert resetAll(api, body={"reason": REASON, "userIds": [USER]}).status_code == 422
+    assert resetAll(api, key=None).status_code == 422
+    assert not rows(api["path"], "SELECT * FROM admin_credit_reset_operations")
+
+
+def test_operation_read_paginates_by_user_id(api, resets):
+    activateMonthly(resets)
+    addUsers(api["path"], 60)
+    operationId = resetAll(api).json()["operationId"]
+    first = getOperation(api, operationId)
+    assert first.status_code == 200
+    page = first.json()
+    assert len(page["targets"]) == 50 and page["totalTargets"] == 61
+    assert page["targets"][-1]["userId"] == page["nextAfterUserId"]
+    rest = getOperation(api, operationId, afterUserId=page["nextAfterUserId"], limit=100).json()
+    assert len(rest["targets"]) == 11 and rest["nextAfterUserId"] is None
+    seen = [target["userId"] for target in page["targets"] + rest["targets"]]
+    assert seen == sorted(seen) and len(set(seen)) == 61
+    assert getOperation(api, operationId, limit=101).status_code == 422
+    assert getOperation(api, operationId, limit=0).status_code == 422
+
+
+def test_operation_read_is_404_for_unknown_or_malformed_and_requires_admin(api):
+    assert getOperation(api, str(uuid.uuid4())).status_code == 404
+    assert getOperation(api, "not-a-uuid").status_code == 404
+    unauthenticated = api["client"].get(f"/admin/credits/reset-operations/{uuid.uuid4()}")
+    assert unauthenticated.status_code == 401

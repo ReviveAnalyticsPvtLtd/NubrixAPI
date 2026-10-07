@@ -6,6 +6,8 @@ repository; this service drives bounded processing, maps outcomes to the
 admin error contract and repairs the per-user Redis projection after commit.
 """
 
+import uuid
+
 from loguru import logger
 
 from api.adminErrors import AdminApiError
@@ -82,6 +84,33 @@ class AdminCreditResetService:
         if target["outcome"] == "SKIPPED":
             raise AdminApiError(409, "Credit reset was not applied", errors)
         raise AdminApiError(503, _UNAVAILABLE, errors)
+
+    def resetAll(self, request: AdminCreditResetRequest, idempotencyKey: str,
+                 admin: AdminContext) -> dict:
+        """Create or resume one frozen all-user operation.
+
+        Each call processes at most MAX_TARGETS_PER_REQUEST unfinished targets;
+        there is no background worker. Repeat the same request and key to
+        continue. Terminal targets are never reset again.
+        """
+        key = _validIdempotencyKey(idempotencyKey)
+        operation = self._createOrGet("all", None, request.reason, key, admin)
+        operationId = str(operation["id"])
+        self._process(operationId, limit=MAX_TARGETS_PER_REQUEST)
+        self._repairCache(operationId)
+        return self._view(operationId)
+
+    def getOperation(self, operationId: str, afterUserId: str | None = None,
+                     limit: int = DEFAULT_PAGE_SIZE) -> dict:
+        """Read-only summary and keyset page; performs no cache repair."""
+        try:
+            operationId = str(uuid.UUID(str(operationId)))
+        except (TypeError, ValueError, AttributeError) as exc:
+            raise AdminApiError(404, "Credit reset operation not found") from exc
+        if afterUserId is not None and (not afterUserId.strip() or len(afterUserId) > 128):
+            raise AdminApiError(422, "Validation failed",
+                                {"afterUserId": "Must be 1-128 non-blank characters"})
+        return self._view(operationId, afterUserId, max(1, min(int(limit), MAX_PAGE_SIZE)))
 
     # -- internals --------------------------------------------------------------
 
