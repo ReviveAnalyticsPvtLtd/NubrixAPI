@@ -76,6 +76,8 @@ def postgres():
                 DO $$ BEGIN CREATE ROLE authenticated; EXCEPTION WHEN duplicate_object THEN NULL; END $$;
                 DO $$ BEGIN CREATE ROLE service_role; EXCEPTION WHEN duplicate_object THEN NULL; END $$;""")
             for name in ('20260813112853_create_admin_auth.sql',
+                         '20260817090000_create_admin_audit_log.sql',
+                         '20260823153903_add_user_access_bans.sql',
                          '20260823220448_create_admin_free_trial_extensions.sql',
                          '20260901194813_simplify_admin_trial_extensions.sql',
                          '20260911120000_create_admin_free_trial_reductions.sql'):
