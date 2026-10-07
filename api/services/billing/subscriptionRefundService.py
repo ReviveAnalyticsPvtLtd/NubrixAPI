@@ -247,6 +247,8 @@ class SubscriptionRefundService:
         from api.services.billing.manualBillingContracts import RefundQuote
 
         userId = str(payload.get("userId") or "").strip()
+        if staffId == userId:
+            raise RefundConflictError('SELF_SERVICE_REFUND_FORBIDDEN')
         caseReference = str(payload.get("caseReference") or "").strip()
         reason = str(payload.get("reason") or "").strip()
         if not userId:
@@ -323,7 +325,7 @@ class SubscriptionRefundService:
             raise RefundConflictError("REFUND_QUOTE_SELECTION_MISMATCH")
         replay=repository.findRefundReservation(payload['userId'],requestKey,payload['quoteId'],int(payload['expectedTotalAmount']),payload['caseReference'],payload['reason'])
         if replay is not None:
-            return replay
+            return submitReservedRefund(repository, self.provider, replay)
         # Provider reads occur before acquiring database locks. An external
         # return requires support reconciliation rather than silently reducing
         # the approved amount or closing access against already-returned money.
@@ -338,20 +340,7 @@ class SubscriptionRefundService:
             # retains the refreshed approval without reserving money or access.
             repository.saveRefundQuote(staffId,conflict.quote,payload['reason'])
             raise
-        state = intent.refundState
-        for item in intent.items:
-            if not repository.claimRefundSubmission(intent.refundIntentId,item["paymentId"]):
-                continue
-            try:
-                result = self.provider.refund(item["paymentId"],item["amount"],intent.refundIntentId)
-                state = repository.settleRefundEvidence(intent.refundIntentId,{"refunds":[result]})["refundState"]
-            except Exception as error:
-                # Submission may have succeeded. Its persisted unknown outcome
-                # is resolved by correlated webhook/provider lookup, never resend.
-                from utils.logger import logger
-                logger.warning("Refund submission requires reconciliation: {}",type(error).__name__)
-                state = "unknown"
-        return replace(intent,refundState=state)
+        return submitReservedRefund(repository, self.provider, intent)
 
     def _computeItem(self, interval: dict, cutoff: datetime) -> dict:
         start = interval.get("start")
@@ -402,6 +391,9 @@ class SubscriptionRefundService:
         requestKey: str,
     ) -> "RefundIntent":
         from api.services.billing.manualBillingContracts import RefundIntent
+
+        if staffId == payload.get('userId'):
+            raise RefundConflictError('SELF_SERVICE_REFUND_FORBIDDEN')
 
         if isinstance(self.store, _ProductionRefundStore):
             return self._initiateProductionRefund(staffId, payload, requestKey)
@@ -551,6 +543,27 @@ class SubscriptionRefundService:
             "refundState": newState,
             "accessRestored": False,
         }
+
+
+def submitReservedRefund(repository, provider, intent):
+    """Resume only items that have never acquired a submission claim.
+
+    A durable claim precedes every network call. Claimed unknown items remain
+    lookup-only, including a crash between claiming and sending.
+    """
+    from dataclasses import replace
+    state = intent.refundState
+    for item in intent.items:
+        if not repository.claimRefundSubmission(intent.refundIntentId, item['paymentId']):
+            continue
+        try:
+            result = provider.refund(item['paymentId'], item['amount'], intent.refundIntentId)
+            state = repository.settleRefundEvidence(intent.refundIntentId, {'refunds':[result]})['refundState']
+        except Exception as error:
+            from utils.logger import logger
+            logger.warning('Refund submission requires reconciliation: {}', type(error).__name__)
+            state = 'unknown'
+    return replace(intent, refundState=state)
 
 
 def _parseOrNone(value):

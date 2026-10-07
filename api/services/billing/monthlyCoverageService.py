@@ -21,8 +21,8 @@ class _MemoryStore:
     """Unit-test persistence double.
 
     Production uses ManualBillingRepository; the same activation identities
-    (activate:{lifecycleId}:{invoiceId}:{periodStart}) are enforced there via
-    the unique operation-key index inside one transaction.
+    are enforced through the owner lock and the invoice coverage state inside
+    one transaction; this double's keys are not populated in production.
     """
 
     def __init__(self):

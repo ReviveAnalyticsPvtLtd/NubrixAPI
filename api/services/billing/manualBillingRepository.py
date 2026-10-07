@@ -107,17 +107,20 @@ class ManualBillingRepository:
         def operation(connection):
             with connection.cursor(cursor_factory=RealDictCursor) as cursor:
                 cursor.execute('''select * from public.billing_events where
-                    ((event_category='payment_attempt'
-                      and payment_status <> 'captured') or (event_type='refund.intent' and event_status <> 'processed'))
-                    and coalesce((metadata_json->>'lastRecoveryAt')::timestamptz,created_at) < now()-interval '15 minutes'
-                    order by coalesce((metadata_json->>'lastRecoveryAt')::timestamptz,created_at),id limit %s''',(limit,))
+                    ((event_category='payment_attempt' and metadata_json->'manualBilling' is not null
+                      and (payment_status in ('created','pending_provider_ack','authorized')
+                        or (payment_status<>'captured' and metadata_json->'manualBilling'->>'closedAt' is not null
+                          and metadata_json->'manualBilling'->>'closureReconciledAt' is null)))
+                      or (event_type='refund.intent' and event_status <> 'processed'))
+                    and updated_at < now()-interval '15 minutes'
+                    order by updated_at,id limit %s''',(limit,))
                 return list(cursor.fetchall())
         return self._run(operation)
 
     def recordRecoveryCheck(self, eventId, outcome=None):
         def operation(connection):
             with connection.cursor() as cursor:
-                cursor.execute("update public.billing_events set metadata_json=coalesce(metadata_json,'{}'::jsonb) || %s where id=%s",
+                cursor.execute("update public.billing_events set metadata_json=coalesce(metadata_json,'{}'::jsonb) || %s,updated_at=clock_timestamp() where id=%s",
                     (Json({'lastRecoveryAt':_now().isoformat(),'lastRecoveryOutcome':outcome or 'checked'}),eventId))
         return self._run(operation)
 
@@ -137,6 +140,63 @@ class ManualBillingRepository:
                 if metadata.get('manualBilling',{}).get('closedAt'):
                     metadata['manualBilling']['closureReconciledAt'] = _now().isoformat()
                     cursor.execute('update public.billing_events set metadata_json=%s where id=%s',(Json(metadata),attemptId))
+        return self._run(operation)
+
+    def orderlessRecoveryRows(self, userId, purpose, mode):
+        def operation(connection):
+            with connection.cursor(cursor_factory=RealDictCursor) as cursor:
+                cursor.execute('''select * from public.billing_events where user_id=%s
+                    and event_category='payment_attempt' and provider_order_id is null
+                    and payment_status='pending_provider_ack' order by id''', (userId,))
+                return [row for row in cursor.fetchall()
+                        if self._json(row.get('metadata_json')).get('manualBilling', {}).get('purpose') == purpose
+                        and self._json(row.get('metadata_json')).get('manualBilling', {}).get('billingMode') == mode]
+        return self._run(operation)
+
+    def closeUncreatedOrder(self, attemptId):
+        """Close after a complete zero-match receipt lookup and a grace period.
+
+        This is operational absence evidence, never capture-timing proof.
+        Retain the receipt: subsequently discovered money is an anomaly on
+        this closed attempt, not a grant on the replacement checkout.
+        """
+        def operation(connection):
+            with connection.cursor(cursor_factory=RealDictCursor) as cursor:
+                cursor.execute('select user_id,invoice_id from public.billing_events where id=%s', (attemptId,))
+                owner = cursor.fetchone()
+                if not owner or owner['user_id'] is None:
+                    return False
+                self._lockUser(cursor, owner['user_id'])
+                subscription = self._canonical(cursor, owner['user_id'])
+                cursor.execute('select * from public."Invoices" where id=%s for update', (owner['invoice_id'],))
+                invoice = cursor.fetchone()
+                cursor.execute('select * from public.billing_events where id=%s for update', (attemptId,))
+                attempt = cursor.fetchone()
+                metadata = self._json(attempt.get('metadata_json'))
+                billing = metadata.get('manualBilling', {})
+                cursor.execute('select clock_timestamp() as current_time')
+                now = _utc(cursor.fetchone()['current_time'])
+                claimed = _utc(billing.get('orderCreationClaimedAt') or attempt.get('attempted_at'))
+                if (attempt.get('provider_order_id') or attempt['payment_status'] == 'captured'
+                        or not claimed or now < claimed + timedelta(minutes=32) or invoice['status'] == 'PAID'):
+                    return False
+                if billing.get('closedAt'):
+                    billing['closureReconciledAt'] = now.isoformat()
+                    cursor.execute('update public.billing_events set metadata_json=%s where id=%s', (Json(metadata), attemptId))
+                    return True
+                billing.update(closedAt=now.isoformat(), closedReason='ORDER_NOT_CREATED',
+                    zeroOrderLookupAt=now.isoformat(), closureReconciledAt=now.isoformat())
+                cursor.execute("update public.billing_events set payment_status='failed',event_status='failed',metadata_json=%s where id=%s",
+                    (Json(metadata), attemptId))
+                if billing.get('purpose') != 'renewal':
+                    self._closeInvoice(cursor, invoice, 'ORDER_NOT_CREATED')
+                if billing.get('purpose') == 'expert_addition':
+                    pending = self._jsonList(subscription.get('pending_additions'))
+                    for item in pending:
+                        if item.get('attemptId') == attemptId and item.get('state') == 'awaiting_payment':
+                            item.update(state='failed', closedReason='ORDER_NOT_CREATED')
+                    cursor.execute('update public.subscriptions set pending_additions=%s where id=%s', (Json(pending), subscription['id']))
+                return True
         return self._run(operation)
 
     def ensureCanonicalSubscription(self, userId: str) -> dict:
@@ -261,11 +321,16 @@ class ManualBillingRepository:
                 if exact:
                     if frozen.get('payloadHash') != payload_hash:
                         raise ValueError('IDEMPOTENCY_CONFLICT')
+                    if frozen.get('closedReason') == 'ORDER_NOT_CREATED':
+                        continue
                     return self._intentFromAttemptRow(row, metadata, request.userId, request.purpose)
                 if request.requestKey is None and live and frozen.get('payloadHash') == payload_hash:
                     return self._intentFromAttemptRow(row, metadata, request.userId, request.purpose)
                 if request.purpose == 'initial_purchase' and live:
                     raise ValueError('LIVE_INITIAL_CHECKOUT_CONFLICT')
+                if (request.purpose == 'renewal' and live
+                        and str(row.get('invoice_id')) == str(request.payload.get('invoiceId'))):
+                    raise ValueError('LIVE_RENEWAL_CHECKOUT_CONFLICT')
             return None
 
         def transaction(connection, reference=None, replayOnly=False):
@@ -458,7 +523,11 @@ class ManualBillingRepository:
         metadata=self._json(invoice.get('metadata_json'))
         metadata.setdefault('manualBilling',{}).update(closedAt=_now().isoformat(),closedReason=reason)
         cursor.execute('update public."Invoices" set status=\'VOID\',metadata_json=%s where id=%s',(Json(metadata),invoice['id']))
-        cursor.execute("update public.billing_events set payment_status='cancelled',event_status='cancelled' where invoice_id=%s and event_category='payment_attempt' and payment_status in ('created','pending_provider_ack','authorized')",(invoice['id'],))
+        cursor.execute("select id,metadata_json from public.billing_events where invoice_id=%s and event_category='payment_attempt' and payment_status in ('created','pending_provider_ack','authorized') order by id for update", (invoice['id'],))
+        for row in cursor.fetchall():
+            old = self._json(row.get('metadata_json'))
+            old.setdefault('manualBilling', {}).update(closedAt=_now().isoformat(), closedReason=reason)
+            cursor.execute("update public.billing_events set payment_status='cancelled',event_status='cancelled',metadata_json=%s where id=%s", (Json(old), row['id']))
 
     def cancelExpertAddition(self,userId,domain):
         def operation(connection):
@@ -568,13 +637,14 @@ class ManualBillingRepository:
             intent=self._intentFromAttemptRow(existing,storedMeta,userId,purpose)
             if intent.expiresAt > now and intent.state in ('created','pending_provider_ack','authorized'):
                 return intent
-            if not intent.razorpayOrderId:
+            if not intent.razorpayOrderId and intent.state in ('created', 'pending_provider_ack', 'authorized'):
                 # Unknown provider creation must be recovered before a new opportunity.
                 return intent
             if invoice['status'] == 'PAID': return intent
-            storedBilling.update(closedAt=now.isoformat(),closedReason='CHECKOUT_EXPIRED')
-            cursor.execute("update public.billing_events set payment_status='expired',event_status='expired',metadata_json=%s where id=%s",
-                (Json(storedMeta),existing['id']))
+            if storedBilling.get('closedReason') != 'ORDER_NOT_CREATED':
+                storedBilling.update(closedAt=now.isoformat(),closedReason='CHECKOUT_EXPIRED')
+                cursor.execute("update public.billing_events set payment_status='expired',event_status='expired',metadata_json=%s where id=%s",
+                    (Json(storedMeta),existing['id']))
             revision=int(storedBilling.get('revision') or 1)+1
             namespaceKey += ':revision:'+str(revision)
             manualBilling['revision']=revision
@@ -761,7 +831,19 @@ class ManualBillingRepository:
         """Persist an unknown outcome before the network call; retries must reconcile."""
         def operation(connection):
             with connection.cursor(cursor_factory=RealDictCursor) as cursor:
-                cursor.execute("update public.billing_events set payment_status='pending_provider_ack',event_status='pending_provider_ack' where id=%s and payment_status='created' returning id",(attemptId,))
+                cursor.execute('select user_id,invoice_id from public.billing_events where id=%s', (attemptId,))
+                owner = cursor.fetchone()
+                if not owner or owner['user_id'] is None:
+                    return False
+                self._lockUser(cursor, owner['user_id'])
+                self._canonical(cursor, owner['user_id'])
+                cursor.execute('select id from public."Invoices" where id=%s for update', (owner['invoice_id'],))
+                cursor.fetchone()
+                cursor.execute('select metadata_json from public.billing_events where id=%s for update', (attemptId,))
+                metadata = self._json(cursor.fetchone()['metadata_json'])
+                cursor.execute('select clock_timestamp() as current_time')
+                metadata.setdefault('manualBilling', {})['orderCreationClaimedAt'] = _utc(cursor.fetchone()['current_time']).isoformat()
+                cursor.execute("update public.billing_events set payment_status='pending_provider_ack',event_status='pending_provider_ack',metadata_json=%s where id=%s and payment_status='created' returning id",(Json(metadata), attemptId))
                 return cursor.fetchone() is not None
         return self._run(operation)
 
@@ -866,7 +948,7 @@ class ManualBillingRepository:
                 closedReason = closed.get('closedReason') or billing.get('closedReason')
                 if (reason in ('CLOSED_INVOICE', 'CLOSED_ATTEMPT') and evidence.purpose == 'renewal'
                         and frozen.get('billingMode') == 'monthly_prepaid'
-                        and closedReason == 'RENEWAL_DECLINED' and closedAt
+                        and closedReason in ('RENEWAL_DECLINED','UNPAID_PERIOD_ENDED') and closedAt
                         and evidence.timingVerified and evidence.provenCaptureAt
                         and evidence.provenCaptureAt < closedAt and cutoff and evidence.provenCaptureAt < cutoff
                         and not subscription.get('erasure_pending') and not billing.get('revokedAt')):
@@ -920,9 +1002,25 @@ class ManualBillingRepository:
                 self._recordNotification(cursor, subscription, 'payment_receipt',
                     'receipt:'+evidence.providerPaymentId, {'paymentId':evidence.providerPaymentId,'invoiceId':invoice['id'], 'amount':evidence.amount,'currency':evidence.currency,'periodEnd':end.isoformat()})
                 state = self._json(subscription.get('billing_state'))
+                previousCancellationRequestedAt = state.get('manualBilling',{}).get('cancellationRequestedAt')
+                if evidence.purpose == 'initial_purchase':
+                    state.setdefault('manualBilling',{}).pop('cancellationRequestedAt',None)
                 state.setdefault('manualBilling',{}).update(lifecycleId=frozen['lifecycleId'],paidFutureEnd=end.isoformat())
                 cursor.execute('update public.subscriptions set billing_state=%s where id=%s', (Json(state),subscription['id']))
                 subscription['billing_state'] = state
+                if evidence.purpose == 'initial_purchase':
+                    # Preferences are lifecycle-scoped; retain their old values.
+                    cursor.execute('''insert into public.billing_events(id,user_id,subscription_id,invoice_id,
+                        event_category,event_type,event_status,idempotency_key,metadata_json,occurred_at)
+                        values(%s,%s,%s,%s,'audit','subscription.lifecycle.started','processed',%s,%s,%s)
+                        on conflict(idempotency_key) do nothing''',
+                        (str(uuid.uuid4()), evidence.userId, subscription['id'], invoice['id'],
+                         'lifecycle-start:' + frozen['lifecycleId'], Json({'previousRenewalOptOut':bool(subscription.get('renewal_opt_out')),
+                         'previousCancellationReason':subscription.get('cancellation_reason'),
+                         'previousCancellationRequestedAt':previousCancellationRequestedAt,
+                         'lifecycleId':frozen['lifecycleId']}), evidence.observedAt))
+                    cursor.execute('update public.subscriptions set renewal_opt_out=false,cancellation_reason=null where id=%s', (subscription['id'],))
+                    subscription.update(renewal_opt_out=False, cancellation_reason=None)
                 if frozen['billingMode'] == 'annual_prepaid':
                     return self._applyAnnualPayment(cursor, invoice, subscription, evidence.observedAt, evidence.attemptId)
                 if subscription.get('renewal_opt_out'):
@@ -960,6 +1058,25 @@ class ManualBillingRepository:
                 return self._activateDueCoverageLocked(cursor, subscription, _utc(now))
         return self._run(operation)
 
+    def _unresolvedCycleCaptureLocked(self, cursor, subscription, cycleEnd):
+        """One owned-cycle predicate shared by commit, sweep and dispatch."""
+        cursor.execute('''select e.id from public.billing_events e
+            join public."Invoices" i on i.id=e.invoice_id
+            where e.user_id=%s and i."userId"=%s and i.subscription_id=%s
+            and i.billing_reason='renewal' and i.period_start=%s
+            and ((e.event_type='payment.capture' and e.event_status in ('OBSERVED','REQUIRES_RECONCILIATION'))
+              or (e.event_category='payment_attempt' and e.payment_status in ('authorized','captured') and upper(i.status)<>'PAID'))
+            limit 1''', (subscription['user_id'], subscription['user_id'], subscription['id'], cycleEnd))
+        return cursor.fetchone() is not None
+
+    def hasUnresolvedCycleCapture(self, userId, cycleEnd):
+        def operation(connection):
+            with connection.cursor(cursor_factory=RealDictCursor) as cursor:
+                self._lockUser(cursor, userId)
+                subscription = self._canonical(cursor, userId)
+                return self._unresolvedCycleCaptureLocked(cursor, subscription, cycleEnd)
+        return self._run(operation)
+
     def _paidInvoicesLocked(self, cursor, subscription):
         cursor.execute('''select * from public."Invoices" where "userId"=%s and subscription_id=%s
             and status='PAID' order by id for update''', (subscription['user_id'], subscription['id']))
@@ -981,6 +1098,12 @@ class ManualBillingRepository:
                 result = self._applyCoverage(cursor, invoice, subscription, now, None)
         end = _utc(subscription.get('current_period_end'))
         if subscription.get('billing_mode') == 'monthly_prepaid' and end and end <= now:
+            cursor.execute('''select * from public."Invoices" where "userId"=%s and subscription_id=%s
+                and billing_reason='renewal' and period_start=%s and status in ('UPCOMING','PAYMENT_PENDING') order by id for update''',
+                (subscription['user_id'], subscription['id'], end))
+            for unpaid in cursor.fetchall():
+                self._closeInvoice(cursor, unpaid, 'UNPAID_PERIOD_ENDED')
+                cursor.execute("update public.\"Invoices\" set status='EXPIRED' where id=%s", (unpaid['id'],))
             if subscription.get('status') == 'expired':
                 return self._result(cursor,{}, subscription, 'expired', None)
             cursor.execute("""update public.subscriptions set status='expired',plan_type='none',
@@ -989,7 +1112,7 @@ class ManualBillingRepository:
             cursor.execute('''update public.credit_balances set plan_tier='none',domain_count=0,
                 monthly_token_quota=0,remaining_tokens=0,balance_version=balance_version+1,
                 updated_at=%s where user_id=%s''', (now, subscription['user_id']))
-            if not subscription.get('renewal_opt_out'):
+            if not subscription.get('renewal_opt_out') and not self._unresolvedCycleCaptureLocked(cursor, subscription, end):
                 self._recordNotification(cursor, subscription, 'monthly_subscription_expired',
                     'monthly:' + str(lifecycle) + ':' + end.isoformat() + ':expired',
                     {'periodEnd': end.isoformat(), 'lifecycleId': lifecycle,
@@ -1235,7 +1358,13 @@ class ManualBillingRepository:
         # Paid future invoices remain immutable.
         cursor.execute('''select * from public."Invoices" where "userId"=%s and subscription_id=%s
             and billing_reason='renewal' and status in ('UPCOMING','PAYMENT_PENDING') order by id for update''',(evidence.userId,subscription['id']))
-        for unpaid in cursor.fetchall(): self._closeInvoice(cursor,unpaid,'EXPERT_SELECTION_CHANGED')
+        for unpaid in cursor.fetchall():
+            self._closeInvoice(cursor, unpaid, 'EXPERT_SELECTION_CHANGED')
+            if subscription.get('billing_mode') == 'annual_prepaid':
+                # Annual preparation reuses EXPIRED estimates for repricing.
+                old = self._json(unpaid.get('metadata_json'))
+                old.update(repricingRequired=True, repricingReason='expert_selection_changed')
+                cursor.execute('update public."Invoices" set status=\'EXPIRED\',metadata_json=%s where id=%s', (Json(old), unpaid['id']))
         self._recordNotification(cursor,subscription,'payment_receipt','receipt:'+evidence.providerPaymentId,
             {'paymentId':evidence.providerPaymentId,'invoiceId':invoice['id'],'amount':evidence.amount,'currency':evidence.currency})
         return self._result(cursor,invoice,subscription,'expert_activated',evidence.attemptId)
@@ -1319,6 +1448,22 @@ class ManualBillingRepository:
 
     # -- renewal opt-out ------------------------------------------------------
 
+    def _renewalPreferenceFactsLocked(self, cursor, subscription, finalEnd):
+        from api.services.billing.manualBillingPresentation import serializePeriod
+        snapshot = self._coverageSnapshotLocked(cursor, subscription, _now(), materialize=False)
+        cursor.execute('''select id from public."Invoices" where "userId"=%s and subscription_id=%s
+            and billing_reason='renewal' and status in ('UPCOMING','PAYMENT_PENDING') order by id limit 1''',
+            (subscription['user_id'], subscription['id']))
+        payable = cursor.fetchone()
+        optOut = bool(subscription.get('renewal_opt_out'))
+        facts = {'renewalOptOut':optOut,'effectiveAt':finalEnd.isoformat(),
+            'currentPeriod':serializePeriod(snapshot.currentPeriod),'nextPeriod':serializePeriod(snapshot.nextPeriod),
+            'invoiceId':snapshot.nextPeriod.invoiceId if snapshot.nextPeriod else str(payable['id']) if payable else None,
+            'state':'cancelled' if optOut else 'activated','refundInitiated':False,
+            'cancellationReason':subscription.get('cancellation_reason'),
+            'cancellationRequestedAt':self._json(subscription.get('billing_state')).get('manualBilling',{}).get('cancellationRequestedAt')}
+        return {**subscription,'finalPaidEnd':finalEnd.isoformat(),'preferenceResult':facts}
+
     def setRenewalOptOut(
         self,
         userId: str,
@@ -1338,8 +1483,7 @@ class ManualBillingRepository:
                 finalEnd = max(filter(None, [_utc(previous.get('current_period_end')), _utc(state.get('paidFutureEnd'))]), default=None)
                 if finalEnd is None or finalEnd <= _now(): raise ValueError('NO_PAID_ACCESS_TO_CANCEL_OR_RESUME')
                 if bool(previous.get('renewal_opt_out')) == optOut:
-                    previous['finalPaidEnd'] = finalEnd.isoformat()
-                    return previous
+                    return self._renewalPreferenceFactsLocked(cursor, previous, finalEnd)
                 cursor.execute(
                     """
                     update public.subscriptions
@@ -1359,6 +1503,14 @@ class ManualBillingRepository:
                     raise ValueError(
                         f"No canonical subscription row for user {userId}"
                     )
+                billingState = self._json(row.get('billing_state'))
+                preference = billingState.setdefault('manualBilling',{})
+                if optOut:
+                    preference['cancellationRequestedAt'] = _now().isoformat()
+                else:
+                    preference.pop('cancellationRequestedAt',None)
+                cursor.execute('update public.subscriptions set billing_state=%s where id=%s', (Json(billingState), row['id']))
+                row['billing_state'] = billingState
                 if optOut:
                     cursor.execute('''select id,metadata_json from public."Invoices" where "userId"=%s
                         and subscription_id=%s and billing_reason='renewal' and status in ('UPCOMING','PAYMENT_PENDING') order by id for update''',(userId,row['id']))
@@ -1373,8 +1525,7 @@ class ManualBillingRepository:
                             cursor.execute("update public.billing_events set payment_status='cancelled',event_status='cancelled',metadata_json=%s where id=%s",(Json(attemptMetadata),attempt['id']))
                     self._recordNotification(cursor,row,'monthly_cancellation_confirmation','cancel:'+str(row['id'])+':'+str(previous.get('version',0)),
                         {'finalPaidEnd':finalEnd.isoformat(),'periodEnd':finalEnd.isoformat(),'holdForRenewalEvidence':True})
-                row['finalPaidEnd'] = finalEnd.isoformat()
-                return dict(row)
+                return self._renewalPreferenceFactsLocked(cursor, row, finalEnd)
 
         return self._run(operation)
 

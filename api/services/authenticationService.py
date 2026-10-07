@@ -14,6 +14,8 @@ __author__ = "Rauhan Ahmed Siddiqui"
 __all__ = ["authenticationService"]
 
 
+from api.services.billing.manualBillingPresentation import subscriptionDisplayFacts
+
 from utils.exceptionHandler import CustomException, accountAccessRevokedException
 from utils.logger import logger
 from api.commons import client
@@ -436,6 +438,7 @@ class AuthenticationService:
                 "subscriptionExpiry": subscription.get("current_period_end") if subscription else None,
                 "subscriptionDaysLeft": subscriptionDaysLeft,
                 "subscriptionPlan": subscriptionPlan,
+                    **subscriptionDisplayFacts(subscription),
                 "profileImage": profileImage,
                 "credits": credits,
             }
@@ -577,6 +580,7 @@ class AuthenticationService:
                 "subscriptionExpiry": subscription.get("current_period_end") if subscription else None,
                 "subscriptionDaysLeft": subscriptionDaysLeft,
                 "subscriptionPlan": subscriptionPlan,
+                    **subscriptionDisplayFacts(subscription),
                 "profileImage": profileImage,
                 "credits": credits,
             }

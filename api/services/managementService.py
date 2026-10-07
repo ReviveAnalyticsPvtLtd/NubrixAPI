@@ -8,6 +8,8 @@ __author__ = "Rauhan Ahmed Siddiqui"
 __all__ = ["managementService"] 
 
 
+from api.services.billing.manualBillingPresentation import subscriptionDisplayFacts
+
 from nubrix.components.metadataGenerator import MetadataGenerator
 from nubrix.components.llmChainFactory import buildLlmChain
 from nubrix.components.reportGenerator import ReportGenerator
@@ -1346,6 +1348,7 @@ class ManagementService:
                     "subscriptionDaysLeft": subscriptionDaysLeft,
                     "billingMode": subscription.get("billing_mode"),
                     "renewalDueAt": subscription.get("renewal_due_at"),
+                    **subscriptionDisplayFacts(subscription),
                 }
             }
             if refreshedAccessToken:
@@ -1476,6 +1479,7 @@ class ManagementService:
                     "subscriptionDaysLeft": subscriptionDaysLeft,
                     "billingMode": subscription.get("billing_mode"),
                     "renewalDueAt": subscription.get("renewal_due_at"),
+                    **subscriptionDisplayFacts(subscription),
                 }
             }
             return profileResponse

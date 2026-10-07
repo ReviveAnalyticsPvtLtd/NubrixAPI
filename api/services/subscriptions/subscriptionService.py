@@ -55,6 +55,16 @@ import json
 import os
 
 
+def _manualPolicyException(error):
+    if isinstance(error, _CHECKOUT_UNAVAILABLE):
+        return CustomException(error,statusCode=503,uiMessage='Billing state is temporarily unavailable. Please try again later.')
+    if isinstance(error, ValueError):
+        code=str(error).split(':',1)[0]
+        status=422 if code.startswith('INVALID_') else 403 if code in ('PAID_COVERAGE_REQUIRED','NO_PAID_ACCESS_TO_CANCEL_OR_RESUME') else 404 if code.endswith('_NOT_FOUND') else 409
+        return CustomException(error,statusCode=status,uiMessage='Subscription request cannot be completed.',errorCode=code)
+    return CustomException(error)
+
+
 class SubscriptionService:
     """
     Service class for user subscription management.
@@ -542,54 +552,24 @@ class SubscriptionService:
         Returns:
             dict: The (possibly refreshed) subscription row.
         """
-        pendingAdditions = subscriptionPendingAdditions(subscription)
-        userId = subscription.get("user_id")
-        changed = False
-        for item in pendingAdditions:
-            if item.get("state") != "awaiting_payment":
+        from api.services.billing.manualBillingRepository import getManualBillingRepository
+        from api.services.billing.manualBillingRecoveryService import ManualBillingRecoveryService
+        repository = getManualBillingRepository()
+        recovery = ManualBillingRecoveryService(repository, self.razorpayClient)
+        seen = set()
+        for item in subscriptionPendingAdditions(subscription):
+            orderId = item.get('orderId')
+            if item.get('state') != 'awaiting_payment' or not orderId or orderId in seen:
                 continue
-            orderId = item.get("orderId")
-            if not orderId:
-                continue
+            seen.add(orderId)
             try:
-                order = self.razorpayClient.order.fetch(orderId)
-            except Exception as fetchErr:
-                logger.error(f"Failed to fetch order {orderId}: {fetchErr}")
-                continue
-            if order["status"] == "paid":
-                notes = order.get("notes", {})
-                self._activatePaidDomains(
-                    userId=userId,
-                    domains=[d.strip() for d in notes.get("domains", "").split(",") if d.strip()],
-                    targetQuantity=int(notes.get("targetQuantity", 0)),
-                    referenceId=orderId,
-                )
-                changed = True
-            elif order["status"] in ("expired", "cancelled"):
-                item["state"] = "expired"
-                changed = True
-            elif order["status"] == "created":
-                requestedAt = item.get("requestedAt")
-                if requestedAt:
-                    try:
-                        requestedAtUtc = parseUtc(requestedAt)
-                        age = utcNow() - requestedAtUtc if requestedAtUtc else datetime.timedelta.max
-                        if age > datetime.timedelta(minutes=self._STALE_ORDER_THRESHOLD_MINUTES):
-                            item["state"] = "expired"
-                            changed = True
-                            logger.info(
-                                f"Expired stale awaiting_payment order {orderId} "
-                                f"for user {userId} (age: {age})"
-                            )
-                    except (ValueError, TypeError):
-                        pass
-        if changed:
-            cleanedPending = [item for item in pendingAdditions if item.get("state") not in ("expired", "activated")]
-            self.client.table("subscriptions").update({
-                "pending_additions": cleanedPending
-            }).eq("id", subscription["id"]).execute()
-            subscription = self._getCanonicalSubscription(userId=userId, required=True)
-        return subscription
+                attempt = repository.attemptForOrder(orderId)
+                if attempt['user_id'] != subscription['user_id']:
+                    raise ValueError('EXPERT_ATTEMPT_OWNER_MISMATCH')
+                recovery.recoverAttempt(attempt)
+            except Exception as error:
+                logger.warning('Expert payment awaits shared reconciliation: {}', type(error).__name__)
+        return self._getCanonicalSubscription(userId=subscription['user_id'], required=True)
 
     def _activatePaidDomains(self, userId: str, domains: list[str], targetQuantity: int, referenceId: str) -> None:
         """
@@ -890,7 +870,7 @@ class SubscriptionService:
         except CustomException:
             raise
         except Exception as e:
-            exception = CustomException(e)
+            exception = _manualPolicyException(e)
             logger.error(exception)
             raise exception
 
@@ -927,93 +907,14 @@ class SubscriptionService:
                 .execute()
             if not userRecord.data:
                 raise Exception("User not found")
-            subscription = self._getCanonicalSubscription(userId=userId, required=True)
-            pendingAdditions = subscriptionPendingAdditions(subscription)
-            targetItem = None
-            for item in pendingAdditions:
-                if (
-                    item["domain"] == normalizedDomain
-                    and item.get("state") not in ("activated", "cancelled", "expired")
-                ):
-                    targetItem = item
-                    break
-            if targetItem is None:
-                raise Exception(f"No cancellable pending addition found for domain '{normalizedDomain}'")
-            if targetItem.get("state") == "paid_captured":
-                raise CustomException(
-                    ValueError("This addition was already paid and captured"),
-                    statusCode=409,
-                    uiMessage=(
-                        "This addition payment was captured and needs support "
-                        "review; contact us for a refund."
-                    ),
-                )
-            cancelledOrderId = targetItem.get("orderId")
-            cancelledAt = utcNow().isoformat()
-            # Close the WHOLE shared-order attempt durably: a later capture
-            # against the old order cannot activate any of its domains.
-            closedDomains = []
-            for item in pendingAdditions:
-                if (
-                    item.get("orderId") == cancelledOrderId
-                    and item.get("state") not in ("activated", "cancelled", "expired")
-                ):
-                    item["state"] = "cancelled"
-                    item["cancelledAt"] = cancelledAt
-                    closedDomains.append(item["domain"])
-            self.client.table("subscriptions").update({
-                "pending_additions": pendingAdditions
-            }).eq("id", subscription["id"]).execute()
-            # Void the shared invoice so its Pay action disappears and a new
-            # session against it is rejected.
-            if cancelledOrderId:
-                payable = (
-                    self.client.table("Invoices")
-                    .select("id, status, metadata_json")
-                    .eq("razorpay_order_id", cancelledOrderId)
-                    .in_("status", ["UPCOMING", "PAYMENT_PENDING"])
-                    .limit(1)
-                    .execute()
-                    .data
-                )
-                for invoice in payable or []:
-                    existingMetadata = invoice.get("metadata_json")
-                    metadata = dict(existingMetadata) if isinstance(existingMetadata, dict) else {}
-                    metadata["voidReason"] = "pending_addition_cancelled"
-                    metadata["voidedAt"] = cancelledAt
-                    metadata["closedAttemptDomains"] = closedDomains
-                    self.client.table("Invoices").update({
-                        "status": "VOID",
-                        "metadata_json": metadata,
-                    }).eq("id", invoice["id"]).execute()
-            self._auditLog(
-                userId, "domain.add_cancelled",
-                status="CANCELLED",
-                metadata={
-                    "domain": normalizedDomain,
-                    "closedAttemptDomains": closedDomains,
-                    "orderId": cancelledOrderId,
-                    "currentDomainCount": subscriptionDomainCount(subscription),
-                    "effectiveAt": "immediate",
-                    "durableClosure": True,
-                }
-            )
-            logger.info(
-                f"Pending addition bundle cancelled for domain '{normalizedDomain}', "
-                f"user {userId}, order {cancelledOrderId}"
-            )
-            return {
-                "domain": normalizedDomain,
-                "cancelled": True,
-                "closedAttemptDomains": closedDomains,
-                "orderId": cancelledOrderId,
-            }
+            from api.services.billing.manualBillingRepository import getManualBillingRepository
+            return getManualBillingRepository().cancelExpertAddition(userId, normalizedDomain)
         except CustomException:
             raise
-        except Exception as e:
-            exception = CustomException(e)
-            logger.error(exception)
-            raise exception
+        except ValueError as error:
+            raise CustomException(error, statusCode=409, uiMessage=str(error)) from error
+        except Exception as error:
+            raise CustomException(error) from error
 
     def cancelSubscription(self, reason: str | None, token: str) -> dict:
         """
@@ -1048,10 +949,7 @@ class SubscriptionService:
             if billingMode == "monthly_prepaid":
                 from api.services.billing.manualBillingRepository import getManualBillingRepository
                 row = getManualBillingRepository().setRenewalOptOut(userId, True, reason, "cancel:"+userId)
-                return {'cancelled':True,'renewalOptOut':True,'effectiveAt':row['finalPaidEnd'],
-                    'cancellationReason':row.get('cancellation_reason'),'refundInitiated':False,
-                    'currentPeriod':{'start':row.get('current_period_start'),'end':row.get('current_period_end'),
-                        'domains':row.get('subscribed_experts') or []}}
+                return {'cancelled':True, **row['preferenceResult']}
 
             # Annual: existing policy — mandatory reason, status cancelled.
             if not reason or not isinstance(reason, str) or not reason.strip():
@@ -1082,7 +980,7 @@ class SubscriptionService:
         except CustomException:
             raise
         except Exception as e:
-            exception = CustomException(e)
+            exception = _manualPolicyException(e)
             logger.error(exception)
             raise exception
 
@@ -1140,12 +1038,13 @@ class SubscriptionService:
             row = getManualBillingRepository().setRenewalOptOut(userId, False, None, "resume:"+userId)
             end = parseUtc(row['finalPaidEnd'])
             if not repeated and utcNow() >= parseUtc(row["current_period_end"]) - datetime.timedelta(days=7):
-                self.prepareRenewalInvoice(token)
-            return {"renewalOptOut":False,"repeated":repeated,"effectiveAt":end.isoformat(),"creditsRefilled":False}
+                prepared = self.prepareRenewalInvoice(token)
+                row['preferenceResult']['invoiceId'] = prepared.get('invoiceId')
+            return {**row['preferenceResult'], 'repeated':repeated, 'creditsRefilled':False}
         except CustomException:
             raise
         except Exception as e:
-            exception = CustomException(e)
+            exception = _manualPolicyException(e)
             logger.error(exception)
             raise exception
 
@@ -1235,7 +1134,8 @@ class SubscriptionService:
                 .eq("userId", userId) \
                 .order("createdAt", desc=True) \
                 .execute()
-            return result.data
+            from api.services.billing.manualBillingPresentation import serializeInvoice
+            return [serializeInvoice(row) for row in result.data]
         except Exception as e:
             exception = CustomException(e)
             logger.error(exception)
@@ -1334,7 +1234,7 @@ class SubscriptionService:
         from api.services.billing.manualPaymentService import ManualPaymentService
         result = ManualPaymentService.forProduction(self.razorpayClient, repository).finalizeCapturedPayment(VerifiedPaymentEvidence(
             str(attempt["id"]), str(invoiceId), attempt["user_id"], orderId, paymentId,
-            frozen["purpose"], str(paymentEntity.get("currency") or ""),
+            frozen.get("purpose", "erased_checkout") if attempt['user_id'] is None else frozen["purpose"], str(paymentEntity.get("currency") or ""),
             str(paymentEntity.get("status") or "").lower(), "server_observation",
             int(paymentEntity.get("amount") or 0), now or utcNow(), None, None, False))
         from api.services.billing.manualBillingPresentation import serializeFinalizationResult
@@ -1404,7 +1304,7 @@ class SubscriptionService:
         except CustomException:
             raise
         except Exception as e:
-            exception = CustomException(e)
+            exception = _manualPolicyException(e)
             logger.error(exception)
             raise exception
 

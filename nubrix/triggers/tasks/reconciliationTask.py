@@ -80,7 +80,7 @@ class ReconciliationTask:
 
         staleAttempts = (
             self.client.table("billing_events")
-            .select("id, provider_payment_id, provider_order_id, user_id, payment_status, metadata_json")
+            .select("id, provider_payment_id, provider_order_id, user_id, payment_status, payment_attempt_type, metadata_json")
             .eq("event_category", "payment_attempt")
             .in_("payment_status", ["created", "pending_provider_ack", "authorized"])
             .lte("attempted_at", cutoff)
@@ -97,7 +97,9 @@ class ReconciliationTask:
         errors = 0
 
         for attempt in staleAttempts:
-            if (attempt.get('metadata_json') or {}).get('manualBilling',{}).get('billingMode') == 'monthly_prepaid':
+            if (attempt.get('payment_attempt_type') == 'authenticated_checkout'
+                    or (attempt.get('metadata_json') or {}).get('manualBilling')):
+                # Manual money belongs to the transactional recovery/finalizer.
                 continue
             attemptId = attempt["id"]
             try:

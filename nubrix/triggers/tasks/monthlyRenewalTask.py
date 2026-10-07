@@ -188,6 +188,9 @@ class MonthlyRenewalTask:
         if now - periodEnd > timedelta(hours=25):
             outcome["skipped"] = 1
             return outcome
+        if repository.hasUnresolvedCycleCapture(userId, periodEnd):
+            outcome['skipped'] = 1
+            return outcome
         expiryIntent = buildBillingNotificationIntent(
             {"type": "monthly_subscription_expired"},
             {

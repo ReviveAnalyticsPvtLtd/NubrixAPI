@@ -318,8 +318,9 @@ def requireCredits(operationType: str):
                             if topupAvailable
                             else "Your quota "
                         )
-                        + "resets at the start of your next billing period "
-                        f"({snapshot.get('periodEnd')})."
+                        + (f"refills when the paid period starts ({snapshot['nextRefillAt']})."
+                            if snapshot.get('nextRefillAt') else
+                            "will refill after a new paid period starts. Complete renewal checkout to continue.")
                     ),
                     "errorCode": "MONTHLY_QUOTA_EXHAUSTED",
                     "topupAvailable": topupAvailable,

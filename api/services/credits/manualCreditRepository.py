@@ -123,11 +123,24 @@ class ManualCreditRepository:
                 subscription=self.repository._canonical(cursor,userId)
                 cursor.execute('select clock_timestamp() as current_time')
                 now=_utc(cursor.fetchone()['current_time'])
-                if self._eligibleLocked(cursor,subscription,now):
-                    return self._balanceLocked(cursor,subscription,now)
-                cursor.execute('select * from public.credit_balances where user_id=%s for update',(userId,))
-                balance=cursor.fetchone() or {'user_id':userId,'topup_tokens':0}
-                return {**balance,'monthly_token_quota':0,'remaining_tokens':0}
+                eligible = self._eligibleLocked(cursor,subscription,now)
+                if eligible:
+                    balance = self._balanceLocked(cursor,subscription,now)
+                else:
+                    cursor.execute('select * from public.credit_balances where user_id=%s for update',(userId,))
+                    balance = cursor.fetchone() or {'user_id':userId,'topup_tokens':0}
+                    balance = {**balance,'monthly_token_quota':0,'remaining_tokens':0}
+                coverage = self.repository._coverageSnapshotLocked(cursor,subscription,now,materialize=False)
+                nextRefill = None
+                if subscription.get('billing_mode') == 'monthly_prepaid' and coverage.nextPeriod:
+                    nextRefill = coverage.nextPeriod.start
+                elif subscription.get('billing_mode') == 'annual_prepaid' and eligible:
+                    boundary = _utc(balance.get('period_end'))
+                    if boundary and coverage.finalPaidEnd and boundary < coverage.finalPaidEnd:
+                        nextRefill = boundary
+                stored = int(balance.get('topup_tokens') or 0)
+                return {**balance,'stored_topup_tokens':stored,'spendable_topup_tokens':stored if eligible else 0,
+                    'access_allowed':eligible,'next_refill_at':nextRefill.isoformat() if nextRefill else None}
         return self.repository._run(operation)
 
     def admit(self,userId,operationType,operationId):
@@ -180,7 +193,8 @@ class ManualCreditRepository:
         return self.repository._run(operation)
 
     def settle(self, context, tokensUsed, runId):
-        if tokensUsed <= 0: return {'settled': False}
+        if isinstance(tokensUsed, bool) or int(tokensUsed) != tokensUsed or tokensUsed < 0:
+            raise ValueError('INVALID_MEASURED_USAGE')
         key = 'credit-settle:'+context.userId+':'+context.operationId+':'+str(runId)
         def operation(connection):
             with connection.cursor(cursor_factory=RealDictCursor) as cursor:
@@ -237,6 +251,7 @@ class ManualCreditRepository:
     def _markUsageSettled(self,cursor,context,runId):
         cursor.execute("update public.billing_events set event_status='SETTLED' where idempotency_key=%s",
             ('credit-report:'+context.userId+':'+context.operationId+':'+str(runId),))
+        cursor.execute("update public.billing_events set event_status='MEASURED' where idempotency_key=%s", ('credit-admit:'+context.userId+':'+context.operationId,))
 
     def reportUsage(self,context,tokensUsed,runId):
         """Commit measured usage before attempting its balance settlement."""

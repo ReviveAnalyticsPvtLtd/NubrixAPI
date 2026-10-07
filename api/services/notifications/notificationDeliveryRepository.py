@@ -354,7 +354,10 @@ class NotificationDeliveryRepository:
                 observedAt = parseUtc(cursor.fetchone()['observed_at'])
                 if row.get('lease_expires_at') and parseUtc(row['lease_expires_at']) <= observedAt: return False
                 subscription['billing_state'] = repository._json(subscription.get('billing_state'))
-                if not isBillingNotificationEligible(row,{'subscription':subscription,'invoice':invoice},observedAt): return False
+                held = (row['notification_type'] == 'monthly_subscription_expired'
+                    and repository._unresolvedCycleCaptureLocked(cursor, subscription, parseUtc(row.get('period_end'))))
+                if not isBillingNotificationEligible(row,{'subscription':subscription,'invoice':invoice,
+                        'unresolvedOwnedCapture':held},observedAt): return False
                 cursor.execute('update public.notification_deliveries set submission_started_at=clock_timestamp() where id=%s',(deliveryId,))
                 return True
         return repository._run(operation)

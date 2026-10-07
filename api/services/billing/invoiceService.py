@@ -108,6 +108,7 @@ def createUpcomingRenewalInvoice(subscription: dict, user: dict) -> dict | None:
         .eq("billing_reason", "renewal")
         .eq("period_start", nextPeriodStart)
         .eq("period_end", nextPeriodEnd)
+        .in_("status", ["UPCOMING", "PAYMENT_PENDING", "PAID", "EXPIRED", "upcoming", "payment_pending", "paid", "expired"])
         .limit(1)
         .execute()
         .data
@@ -199,6 +200,7 @@ def createUpcomingRenewalInvoice(subscription: dict, user: dict) -> dict | None:
                 .eq("billing_reason", "renewal")
                 .eq("period_start", nextPeriodStart)
                 .eq("period_end", nextPeriodEnd)
+                .in_("status", ["UPCOMING", "PAYMENT_PENDING", "PAID", "EXPIRED", "upcoming", "payment_pending", "paid", "expired"])
                 .limit(1)
                 .execute()
                 .data or [None]
@@ -289,6 +291,12 @@ def prepareDashboardRenewalInvoice(invoice: dict) -> dict | None:
         "paymentFlow": "razorpay_order_checkout",
         "dashboardRenewalUrl": dashboardRenewalUrl,
     }
+    if existingMetadata.get('repricingRequired'):
+        manual = dict(existingMetadata.get('manualBilling') or {})
+        for key in ('closedAt', 'closedReason'):
+            manual.pop(key, None)
+        manual.update(domains=renewalMetadata['renewalDomains'], revision=int(manual.get('revision') or 1) + 1)
+        metadata.update(manualBilling=manual, repricingRequired=False)
     updatePayload = {
         "payment_flow": "razorpay_order_checkout",
         "requires_customer_auth": True,

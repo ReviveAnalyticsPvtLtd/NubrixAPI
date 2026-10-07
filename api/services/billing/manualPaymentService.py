@@ -41,8 +41,8 @@ class _OperationStore:
     """In-memory exactly-once guard doubles for unit tests.
 
     Production uses ManualBillingRepository: the same identities are enforced
-    there through the idx_billing_events_operation_key unique index inside
-    one PostgreSQL transaction.
+    through owner locks, immutable provider-payment identity, invoice state
+    and coverage/allocation identity inside one PostgreSQL transaction.
     """
 
     def __init__(self):
@@ -91,6 +91,13 @@ class ManualPaymentService:
 
     def _createDurableCheckout(self, request):
         self.repository.ensureCanonicalSubscription(request.userId)
+        from api.services.billing.manualBillingRecoveryService import ManualBillingRecoveryService
+        recovery = ManualBillingRecoveryService(self.repository, self.razorpayClient)
+        for pending in self.repository.orderlessRecoveryRows(request.userId, request.purpose, request.billingMode):
+            try:
+                recovery.recoverAttempt(pending)
+            except Exception as exc:
+                raise RuntimeError('ORDER_ACK_UNKNOWN') from exc
         intent = self.repository.reserveCheckout(request)
         if intent.razorpayOrderId:
             return intent

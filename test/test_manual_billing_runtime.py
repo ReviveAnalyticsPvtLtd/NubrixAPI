@@ -138,7 +138,7 @@ def database(tmp_path):
         provider_order_id TEXT, provider_payment_id TEXT UNIQUE,
         amount INTEGER, currency TEXT, idempotency_key TEXT UNIQUE,
         metadata_json TEXT DEFAULT '{}', period_start TEXT, period_end TEXT,
-        attempted_at TEXT, occurred_at TEXT, completed_at TEXT,
+        attempted_at TEXT, occurred_at TEXT, completed_at TEXT, created_at TEXT,
         failure_reason TEXT, updated_at TEXT, cycle_key TEXT
       );
       CREATE TABLE credit_balances (

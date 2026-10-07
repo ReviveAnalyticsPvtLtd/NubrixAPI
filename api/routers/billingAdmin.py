@@ -28,6 +28,14 @@ from api.commons import verifyToken
 from utils.logger import logger
 from jose import jwt
 import os
+import psycopg2
+import requests
+import httpx
+import razorpay
+
+_REFUND_UNAVAILABLE = (RuntimeError, TimeoutError, ConnectionError, psycopg2.OperationalError,
+    psycopg2.InterfaceError, requests.RequestException, httpx.HTTPError,
+    razorpay.errors.GatewayError, razorpay.errors.ServerError)
 
 
 router = APIRouter()
@@ -149,6 +157,9 @@ async def quoteSubscriptionRefund(
     estimate and coverage effects. Quote only — no entitlement change.
     """
     try:
+        if adminUserId == payload.userId:
+            raise CustomException(ValueError('SELF_SERVICE_REFUND_FORBIDDEN'),statusCode=403,
+                uiMessage='Staff refunds require a different target account.',errorCode='SELF_SERVICE_REFUND_FORBIDDEN')
         paidIntervals = _loadPaidIntervalsForInvoices(
             payload.userId, payload.invoiceIds
         )
@@ -240,8 +251,10 @@ async def initiateSubscriptionRefund(
             'errorCode':conflict.code,'quote':jsonable_encoder(conflict.quote)})
     except (RefundConflictError,ValueError) as error:
         code = str(error)
-        statusCode = 422 if code == 'REFUND_APPROVAL_REQUIRED' else 404 if code == 'REFUND_QUOTE_MISSING' else 403 if code == 'REFUND_QUOTE_OWNERSHIP_MISMATCH' else 409
+        statusCode = 422 if code == 'REFUND_APPROVAL_REQUIRED' else 404 if code == 'REFUND_QUOTE_MISSING' else 403 if code in ('REFUND_QUOTE_OWNERSHIP_MISMATCH','SELF_SERVICE_REFUND_FORBIDDEN') else 409
         return ORJSONResponse(status_code=statusCode,content={'status':statusCode,'message':code,'errorCode':code})
+    except _REFUND_UNAVAILABLE as error:
+        return ORJSONResponse(status_code=503,content={'status':503,'message':'Refund confirmation is temporarily unavailable. Please try again later.','errorCode':'REFUND_PROVIDER_UNAVAILABLE'})
     except CustomException as e:
         raiseHttpException(e)
     except Exception as e:

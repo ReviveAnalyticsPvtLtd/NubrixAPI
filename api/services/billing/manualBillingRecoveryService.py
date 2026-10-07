@@ -14,7 +14,12 @@ class ManualBillingRecoveryService:
     def _pages(fetch, parameters=None):
         skip = 0
         while True:
-            items = fetch({**(parameters or {}), 'count':100, 'skip':skip}).get('items', [])
+            page = fetch({**(parameters or {}), 'count':100, 'skip':skip})
+            if not isinstance(page,dict) or not isinstance(page.get('items'),list):
+                raise ValueError('RECOVERY_LISTING_INVALID')
+            items = page['items']
+            if any(not isinstance(item,dict) for item in items):
+                raise ValueError('RECOVERY_LISTING_INVALID')
             yield from items
             if len(items) < 100:
                 return
@@ -24,7 +29,9 @@ class ManualBillingRecoveryService:
         orderId = attempt.get('provider_order_id')
         if not orderId:
             matches = []
+            listed = False
             for order in self._pages(self.provider.order.all, {'receipt':str(attempt['id'])}):
+                listed = True
                 notes = order.get('notes') or {}
                 if (order.get('receipt') == str(attempt['id'])
                     and notes.get('attemptId') == str(attempt['id'])
@@ -33,6 +40,8 @@ class ManualBillingRecoveryService:
                     and int(order.get('amount',-1)) == int(attempt['amount'])
                     and order.get('currency') == attempt['currency']):
                     matches.append(order)
+            if not matches and not listed:
+                return int(self.repository.closeUncreatedOrder(attempt['id']))
             if len(matches) != 1:
                 return 0
             order = matches[0]
@@ -63,6 +72,13 @@ class ManualBillingRecoveryService:
     def recoverRefund(self, intent):
         metadata = intent['metadata_json']
         metadata = json.loads(metadata) if isinstance(metadata,str) else metadata
+        from api.services.billing.subscriptionRefundService import submitReservedRefund, _ProductionRefundProvider
+        # Old intents without the durable submissions map have unknown send
+        # history; never infer that they were not submitted.
+        if 'submissions' in metadata and any(item['paymentId'] not in metadata['submissions'] for item in metadata['items']):
+            submitted = submitReservedRefund(self.repository, _ProductionRefundProvider(self.provider), self.repository._refundIntent(metadata))
+            if submitted.refundState == 'processed':
+                return 1
         resolved = 0
         for item in metadata['items']:
             paymentId = item['paymentId']

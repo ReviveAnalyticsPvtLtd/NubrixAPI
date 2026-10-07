@@ -807,44 +807,6 @@ class CreditService:
             return -1
         return parts["monthly"] + parts["topup"]
 
-    def resetMonthlyTokens(self, userId: str) -> None:
-        """Event-driven monthly reset (e.g. annual renewal). Restores the full quota."""
-        if self._manualBalance(userId) is not None:
-            from api.services.credits.manualCreditRepository import ManualCreditRepository
-            from api.services.billing.manualBillingRepository import getManualBillingRepository
-            repository=getManualBillingRepository()
-            snapshot=repository.getCoverageSnapshot(userId)
-            if snapshot.accessAllowed or snapshot.billingMode=='none':
-                row=repository.selectCanonicalSubscription(userId)
-                ManualCreditRepository(repository).resizeQuota(userId,row.get('domain_count') or 1,False)
-            return
-        try:
-            row = self._dbRow(userId)
-            if not row:
-                logger.warning(f"No credit_balances row for userId={userId}, skipping reset")
-                return
-            quota = row.get("monthly_token_quota", 0)
-            now = datetime.now(timezone.utc)
-            oldEnd = row.get("period_end")
-            periodStart = dateparser.parse(oldEnd) if oldEnd else now
-            periodEnd = creditMath.nextPeriodEnd(periodStart)
-
-            self._writePeriod(userId, periodStart, periodEnd, quota, now)
-
-            try:
-                r = self._redis()
-                r.hset(self._redisKey(userId), mapping={
-                    "trem": quota,
-                    "tquota": quota,
-                    "pend": int(periodEnd.timestamp()),
-                    "pnext": int(creditMath.nextPeriodEnd(periodEnd).timestamp()),
-                })
-            except Exception:
-                pass
-            logger.info(f"Monthly token reset for userId={userId}, quota={quota}")
-        except Exception as e:
-            logger.error(f"Token reset failed for userId={userId}: {e}")
-
     def grantTopupTokens(self, userId: str, orderId: str, paymentId: str) -> dict:
         """Recovery alias; the owned durable attempt is the only grant authority."""
         from api.services.billing.manualBillingRepository import getManualBillingRepository
@@ -944,9 +906,12 @@ class CreditService:
             "topupCredits": 0.0, "remainingCredits": 0.0, "usagePercentage": 0.0,
             "periodStart": None, "periodEnd": None, "lastResetAt": None,
             "initialized": False,
+            "nextRefillAt":None,"storedTopupTokens":None,"spendableTopupTokens":None,
+            "spendableTokens":None,"accessAllowed":None,
         }
         try:
-            row = self._dbRow(userId)
+            authoritative = self._manualBalance(userId)
+            row = authoritative if authoritative is not None else self._dbRow(userId)
             if not row:
                 return defaults
 
@@ -992,6 +957,11 @@ class CreditService:
                 "periodEnd": row.get("period_end"),
                 "lastResetAt": row.get("last_reset_at"),
                 "initialized": True,
+                "nextRefillAt":authoritative.get('next_refill_at') if authoritative else None,
+                "storedTopupTokens":topup,
+                "spendableTopupTokens":authoritative.get('spendable_topup_tokens') if authoritative else None,
+                "spendableTokens":monthlyRemaining + int(authoritative.get('spendable_topup_tokens') or 0) if authoritative else None,
+                "accessAllowed":authoritative.get('access_allowed') if authoritative else None,
             }
         except Exception as e:
             logger.warning(f"getBalanceSnapshot failed for userId={userId}: {e}")

@@ -275,6 +275,8 @@ def isBillingNotificationEligible(
         return _invoiceUnpaid(snapshot or {})
 
     # Expiry notice: only unpaid, uncancelled, no valid paid continuation.
+    if (snapshot or {}).get('unresolvedOwnedCapture'):
+        return False
     invoice = (snapshot or {}).get("invoice")
     if invoice is not None and (invoice.get("status") or "").upper() == "PAID":
         return False

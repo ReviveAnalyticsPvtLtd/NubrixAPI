@@ -31,3 +31,33 @@ def serializeFinalizationResult(result):
         'creditsRefilled':result.creditsRefilled, 'creditState':result.creditState,
         'renewalOptOut':result.renewalOptOut, 'anomalyId':result.anomalyId,
         'invoiceStatus':result.invoiceStatus}
+
+
+def serializeInvoice(invoice):
+    """Financial history with an allowlisted public coverage snapshot."""
+    import json
+    fields = ('id','subscription_id','status','amount','total_amount','currency','billing_reason',
+        'payment_flow','requires_customer_auth','due_date','expires_at','period_start','period_end',
+        'amount_before_tax','tax_amount','tax_breakdown_json','tax_rule_version','place_of_supply_snapshot',
+        'pricing_version','razorpayPaymentId','razorpay_order_id','paidAt','createdAt','created_at','updated_at')
+    public = {key:invoice[key] for key in fields if key in invoice}
+    metadata = invoice.get('metadata_json') or {}
+    metadata = json.loads(metadata) if isinstance(metadata,str) else metadata
+    billing = metadata.get('manualBilling') or {}
+    public['coverage'] = {key:billing[key] for key in ('coverageState','billingMode','purpose','domains','revokedAt') if key in billing}
+    public['domains'] = billing.get('domains') or metadata.get('renewalDomains') or metadata.get('domains') or []
+    return public
+
+
+def subscriptionDisplayFacts(subscription):
+    """Display real paid periods; unavailable reads expose an unknown state."""
+    from api.services.billing.manualBillingRepository import getManualBillingRepository
+    facts = {'billingStateAvailable':False,'renewalOptOut':subscription.get('renewal_opt_out'),
+        'cancellationEffectiveEnd':None,'currentPeriod':None,'nextPeriod':None}
+    try:
+        coverage = getManualBillingRepository().getCoverageSnapshot(subscription['user_id'])
+        return {'billingStateAvailable':True,'renewalOptOut':coverage.renewalOptOut,
+            'cancellationEffectiveEnd':coverage.finalPaidEnd.isoformat() if coverage.renewalOptOut and coverage.finalPaidEnd else None,
+            'currentPeriod':serializePeriod(coverage.currentPeriod),'nextPeriod':serializePeriod(coverage.nextPeriod)}
+    except Exception:
+        return facts
