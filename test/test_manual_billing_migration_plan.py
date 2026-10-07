@@ -27,6 +27,19 @@ def test_migration_plan_rejects_unknown_phase():
         buildMigrationPlan(set(),'all')
 
 
+def test_contract_requires_both_financial_forward_fixes():
+    from scripts.manual_billing_migration_plan import buildMigrationPlan
+    expansion=buildMigrationPlan(set(),'expand')
+    fixes=[path for path in expansion if path.name.endswith((
+        '_allow_inactive_credit_domains.sql','_restrict_financial_data_access.sql'))]
+    assert len(fixes)==2
+    applied={path.name.split('_')[0] for path in expansion}
+    for fix in fixes:
+        missing=fix.name.split('_')[0]
+        with pytest.raises(ValueError,match='EXPANSION_NOT_APPLIED:'+missing):
+            buildMigrationPlan(applied-{missing},'contract')
+
+
 def test_contract_migration_is_outside_the_chronological_migrations_folder():
     # A blanket `supabase db push` must never apply the contraction mid-chain.
     from pathlib import Path

@@ -907,7 +907,7 @@ class ManualBillingRepository:
                 cursor.execute('''insert into public.billing_events(id,event_category,event_type,event_status,
                     provider,amount,currency,idempotency_key,metadata_json,occurred_at)
                     values(%s,'reconciliation','payment.unmapped','REQUIRES_RECONCILIATION','razorpay',%s,%s,%s,%s,%s)
-                    on conflict(idempotency_key) do nothing''', (str(uuid.uuid4()),int(payment.get('amount') or 0),
+                    on conflict(idempotency_key) where idempotency_key is not null do nothing''', (str(uuid.uuid4()),int(payment.get('amount') or 0),
                     payment.get('currency') or 'INR','unmapped:'+str(payment.get('id'))+':'+str(payment.get('status')),
                     Json({'paymentId':payment.get('id'),'orderId':payment.get('order_id'),
                           'financialStatus':payment.get('status'),'reason':'PAYMENT_ATTEMPT_MISSING'}),_now()))
@@ -1056,7 +1056,7 @@ class ManualBillingRepository:
             cursor.execute('''insert into public.billing_events(id,user_id,subscription_id,invoice_id,
                 event_category,event_type,event_status,idempotency_key,metadata_json,occurred_at)
                 values(%s,%s,%s,%s,'audit','subscription.lifecycle.started','processed',%s,%s,%s)
-                on conflict(idempotency_key) do nothing''',
+                on conflict(idempotency_key) where idempotency_key is not null do nothing''',
                 (str(uuid.uuid4()), evidence.userId, subscription['id'], invoice['id'],
                  'lifecycle-start:' + frozen['lifecycleId'], Json({'previousRenewalOptOut':bool(subscription.get('renewal_opt_out')),
                  'previousCancellationReason':subscription.get('cancellation_reason'),
@@ -1500,7 +1500,7 @@ class ManualBillingRepository:
         cursor.execute('''insert into public.billing_events(id,user_id,subscription_id,event_category,
             event_type,event_status,idempotency_key,metadata_json,occurred_at)
             values(%s,%s,%s,'notification','email.billing_intent.committed','COMMITTED',%s,%s,%s)
-            on conflict(idempotency_key) do nothing''',
+            on conflict(idempotency_key) where idempotency_key is not null do nothing''',
             (str(uuid.uuid4()),subscription['user_id'],subscription['id'],'notification:'+dedupeKey,Json(intent),_now()))
         cursor.execute('select id,metadata_json from public.billing_events where idempotency_key=%s for update',('notification:'+dedupeKey,))
         existing = cursor.fetchone()

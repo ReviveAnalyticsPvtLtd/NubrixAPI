@@ -15,6 +15,8 @@ EXPAND=(
     '20261007100919_index_manual_billing_recovery_obligations.sql',
     '20261007134945_admin_credit_reset_operations.sql',
     '20261007154210_index_unresolved_cycle_money.sql',
+    '20261007194402_allow_inactive_credit_domains.sql',
+    '20261007194411_restrict_financial_data_access.sql',
 )
 CONTRACT='20261005195626_contract_recurring_billing_fields.sql'
 RETIREMENT_EVIDENCE=(
