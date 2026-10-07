@@ -18,6 +18,7 @@ def _delivery(deliveryId="11111111-1111-4111-8111-111111111111", **overrides):
         "subscription_id": "22222222-2222-4222-8222-222222222222",
         "period_end": "2026-09-19T01:00:00+00:00",
         "attempt_count": 1,
+        "payload_version": 1,
         "metadata_json": {"trialStartDate": "2026-09-07T01:00:00+00:00"},
     }
     row.update(overrides)
@@ -99,11 +100,16 @@ class FakeRepository:
         self.rows = self.rows[limit:]
         return claimed
 
-    def markAccepted(self, *args):
+    authorization = "AUTHORIZED"
+
+    def authorizeBillingSubmissionResult(self, *args):
+        return self.authorization
+
+    def markAccepted(self, *args, **kwargs):
         self.accepted.append(args)
         return True
 
-    def scheduleRetry(self, *args):
+    def scheduleRetry(self, *args, **kwargs):
         self.retries.append(args)
         return True
 
@@ -148,6 +154,9 @@ class FakeEdgeClient:
         if isinstance(result, Exception):
             raise result
         return result
+
+    def sendBilling(self, payload):
+        return self.sendTrialExpiry(payload)
 
 
 class FakeLedger:
@@ -213,6 +222,31 @@ def test_globalValidationOccursBeforeClaimingRows():
         assert str(error) == "EDGE_VALIDATION_FAILED"
 
     assert repository.claimCalls == 0
+
+
+def test_heldBillingSolicitationIsRescheduledNotCancelled():
+    delivery = _delivery(notification_type="monthly_subscription_expired",
+        period_end="2026-09-16T01:00:00+00:00", metadata_json={})
+    repository = FakeRepository([delivery])
+    repository.authorization = "HELD"
+    edge = FakeEdgeClient([])
+    service = _service(repository, edge, subscriptions=[_subscription(status="expired",
+        billing_mode="monthly_prepaid", current_period_end="2026-09-16T01:00:00+00:00")])
+    result = service.dispatchBatch("worker-a")
+    assert result["cancelled"] == 0 and repository.terminals == []
+    assert edge.payloads == []
+    assert len(repository.retries) == 1 and repository.retries[0][2] == "PAYMENT_HOLD"
+
+
+def test_committedBillingReceiptDispatchesEvenAfterSubscriptionExpires():
+    delivery = _delivery(notification_type="payment_receipt", metadata_json={"paymentId":"pay_123","amount":3000,"currency":"INR"})
+    repository = FakeRepository([delivery])
+    edge = FakeEdgeClient([EdgeSendResult(outcome="ACCEPTED", messageId="receipt-message")])
+    service = _service(repository, edge, subscriptions=[_subscription(status="expired",billing_mode="monthly_prepaid")])
+    result = service.dispatchBatch("worker-a")
+    assert result["accepted"] == 1 and result["cancelled"] == 0
+    assert edge.payloads[0]["notificationType"] == "payment_receipt"
+    assert edge.payloads[0]["metadata"]["paymentId"] == "pay_123"
 
 
 def test_acceptedResponsePersistsMessageIdAndSafeAudit():

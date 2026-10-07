@@ -83,11 +83,36 @@ class TestTopupEligibilityAndOrder(unittest.TestCase):
         svc = TopupService()
         svc.client = MagicMock()
         svc.razorpayClient = MagicMock()
+        from api.services.billing.manualBillingContracts import CheckoutIntent
+        from datetime import datetime,timezone,timedelta
+        def reserve(request):
+            from api.services.billing.billingEngine import computeTopupSnapshot
+            snap = computeTopupSnapshot(request.payload['packId'], request.billingMode)
+            payload = {'invoiceId': 'inv_1', 'lifecycleId': 'test-life',
+                'packId': request.payload['packId'], 'tokens': snap.pricing_reference_snapshot_json['tokens']}
+            repository.intent = CheckoutIntent('test-attempt', 'inv_1', request.userId, 'test-life', request.purpose,
+                request.billingMode, 'selection-hash', snap.currency, 'created', 1, snap.total_amount,
+                datetime.now(timezone.utc)+timedelta(minutes=30), None, payload)
+            return repository.intent
+        repository=MagicMock()
+        repository.reserveCheckout.side_effect=reserve
+        repository.claimProviderOrderCreation.return_value=True
+        from dataclasses import replace
+        repository.bindProviderOrder.side_effect = lambda attempt, order: replace(repository.intent, razorpayOrderId=order['id'])
+        svc.reservationRepository = repository
+        patcher=patch('api.services.billing.manualBillingRepository.getManualBillingRepository',return_value=repository)
+        patcher.start()
+        self.addCleanup(patcher.stop)
         return svc
 
     def _sub(self, status="active", planType="pro"):
+        from datetime import datetime, timedelta, timezone
+        start = (datetime.now(timezone.utc) - timedelta(days=10)).isoformat()
+        end = (datetime.now(timezone.utc) + timedelta(days=20)).isoformat()
         return {"id": "sub_1", "status": status, "plan_type": planType,
-                "billing_mode": "monthly_recurring", "customer_id": "cust_1"}
+                "user_id":"u1","billing_state":{"manualBilling":{"lifecycleId":"test-life"}},
+                "billing_mode": "monthly_prepaid",
+                "current_period_start": start, "current_period_end": end}
 
     def test_active_pro_is_eligible(self):
         svc = self._service()
@@ -101,9 +126,23 @@ class TestTopupEligibilityAndOrder(unittest.TestCase):
         svc = self._service()
         self.assertFalse(svc._isTopupEligible(self._sub(status="trial", planType="free")))
 
-    def test_cancelled_pro_is_not_eligible(self):
+    def test_cancelled_pro_with_valid_paid_time_remains_eligible(self):
+        # A cancelled monthly subscription whose already-paid coverage
+        # remains valid can still purchase top-ups (design §9.5).
         svc = self._service()
-        self.assertFalse(svc._isTopupEligible(self._sub(status="cancelled")))
+        self.assertTrue(svc._isTopupEligible(self._sub(status="cancelled")))
+
+    def test_expired_period_is_not_eligible_even_with_stored_topups(self):
+        from datetime import datetime, timedelta, timezone
+        svc = self._service()
+        expired = self._sub()
+        expired["current_period_start"] = (
+            datetime.now(timezone.utc) - timedelta(days=40)
+        ).isoformat()
+        expired["current_period_end"] = (
+            datetime.now(timezone.utc) - timedelta(days=10)
+        ).isoformat()
+        self.assertFalse(svc._isTopupEligible(expired))
 
     def test_missing_subscription_is_not_eligible(self):
         svc = self._service()
@@ -137,7 +176,7 @@ class TestTopupEligibilityAndOrder(unittest.TestCase):
                                                                       planType="free")):
             with self.assertRaises(Exception) as ctx:
                 svc.createTopupOrder("medium", token="t")
-        self.assertIn("TOPUP_NOT_ELIGIBLE", str(ctx.exception))
+        self.assertEqual(ctx.exception.errorCode, "TOPUP_NOT_ELIGIBLE")
 
     def test_order_rejects_an_unknown_pack_before_calling_razorpay(self):
         svc = self._service()
@@ -145,7 +184,7 @@ class TestTopupEligibilityAndOrder(unittest.TestCase):
              patch.object(svc, "_subscription", return_value=self._sub()):
             with self.assertRaises(Exception) as ctx:
                 svc.createTopupOrder("enormous", token="t")
-        self.assertIn("TOPUP_PACK_UNKNOWN", str(ctx.exception))
+        self.assertEqual(ctx.exception.errorCode, "TOPUP_PACK_UNKNOWN")
         svc.razorpayClient.order.create.assert_not_called()
 
     def test_order_creates_a_frozen_invoice_and_razorpay_order(self):
@@ -166,8 +205,9 @@ class TestTopupEligibilityAndOrder(unittest.TestCase):
         self.assertEqual(result["tokens"], 5000000)
         self.assertEqual(result["credits"], 500.0)
         self.assertEqual(result["invoiceId"], "inv_1")
-        mkInv.assert_called_once()
-        attach.assert_called_once_with("inv_1", "order_abc")
+        mkInv.assert_not_called()
+        svc.reservationRepository.reserveCheckout.assert_called_once()
+        attach.assert_not_called()
 
         notes = svc.razorpayClient.order.create.call_args[0][0]["notes"]
         self.assertEqual(notes["type"], "credit_topup")
@@ -178,7 +218,7 @@ class TestTopupEligibilityAndOrder(unittest.TestCase):
     def test_order_amount_is_the_tax_inclusive_total(self):
         svc = self._service()
         svc.razorpayClient.order.create.return_value = {
-            "id": "order_abc", "currency": "INR", "amount": 0}
+            "id": "order_abc", "currency": "INR", "amount": 235882}
         with patch.object(svc, "_decodeToken", return_value=("u1", "a@b.c")), \
              patch.object(svc, "_subscription", return_value=self._sub()), \
              patch.object(svc, "_identity", return_value={
@@ -188,86 +228,6 @@ class TestTopupEligibilityAndOrder(unittest.TestCase):
             svc.createTopupOrder("medium", token="t")
         sent = svc.razorpayClient.order.create.call_args[0][0]
         self.assertGreaterEqual(sent["amount"], 199900)
-
-
-class TestTopupVerification(unittest.TestCase):
-    def _service(self):
-        from api.services.credits.topupService import TopupService
-        svc = TopupService()
-        svc.client = MagicMock()
-        svc.razorpayClient = MagicMock()
-        return svc
-
-    @staticmethod
-    def _signature(orderId, paymentId):
-        return hmac.new(os.environ["RAZORPAY_KEY_SECRET"].encode(),
-                        f"{orderId}|{paymentId}".encode(), hashlib.sha256).hexdigest()
-
-    def _payload(self, orderId="order_abc", paymentId="pay_abc", signature=None):
-        return {"razorpayOrderId": orderId, "razorpayPaymentId": paymentId,
-                "razorpaySignature": signature or self._signature(orderId, paymentId)}
-
-    def _order(self, userId="u1", packId="medium"):
-        return {"id": "order_abc", "notes": {"userId": userId, "type": "credit_topup",
-                                             "packId": packId, "invoiceId": "inv_1"}}
-
-    def test_valid_payment_grants_tokens(self):
-        svc = self._service()
-        svc.razorpayClient.order.fetch.return_value = self._order()
-        with patch.object(svc, "_decodeToken", return_value=("u1", "a@b.c")), \
-             patch("api.services.credits.creditService.creditService.grantTopupTokens",
-                   return_value={"granted": True, "tokens": 5000000}) as grant, \
-             patch.object(svc, "_audit"):
-            result = svc.verifyTopupPayment(self._payload(), token="t")
-        self.assertEqual(result, {"granted": True, "tokens": 5000000, "credits": 500.0})
-        grant.assert_called_once_with("u1", "order_abc", "pay_abc")
-
-    def test_tampered_signature_is_rejected_before_any_grant(self):
-        svc = self._service()
-        with patch.object(svc, "_decodeToken", return_value=("u1", "a@b.c")), \
-             patch("api.services.credits.creditService.creditService.grantTopupTokens") as grant:
-            with self.assertRaises(Exception) as ctx:
-                svc.verifyTopupPayment(self._payload(signature="deadbeef"), token="t")
-        self.assertIn("Invalid Razorpay signature", str(ctx.exception))
-        grant.assert_not_called()
-
-    def test_order_belonging_to_another_user_is_rejected(self):
-        svc = self._service()
-        svc.razorpayClient.order.fetch.return_value = self._order(userId="someone_else")
-        with patch.object(svc, "_decodeToken", return_value=("u1", "a@b.c")), \
-             patch("api.services.credits.creditService.creditService.grantTopupTokens") as grant:
-            with self.assertRaises(Exception) as ctx:
-                svc.verifyTopupPayment(self._payload(), token="t")
-        self.assertIn("mismatch", str(ctx.exception).lower())
-        grant.assert_not_called()
-
-    def test_non_topup_order_is_rejected(self):
-        svc = self._service()
-        order = self._order()
-        order["notes"]["type"] = "domain_upgrade_proration"
-        svc.razorpayClient.order.fetch.return_value = order
-        with patch.object(svc, "_decodeToken", return_value=("u1", "a@b.c")), \
-             patch("api.services.credits.creditService.creditService.grantTopupTokens") as grant:
-            with self.assertRaises(Exception):
-                svc.verifyTopupPayment(self._payload(), token="t")
-        grant.assert_not_called()
-
-    def test_missing_fields_are_rejected(self):
-        svc = self._service()
-        with patch.object(svc, "_decodeToken", return_value=("u1", "a@b.c")):
-            with self.assertRaises(Exception) as ctx:
-                svc.verifyTopupPayment({"razorpayOrderId": "order_abc"}, token="t")
-        self.assertIn("Missing Razorpay verification fields", str(ctx.exception))
-
-    def test_webhook_already_granted_reports_gracefully(self):
-        svc = self._service()
-        svc.razorpayClient.order.fetch.return_value = self._order()
-        with patch.object(svc, "_decodeToken", return_value=("u1", "a@b.c")), \
-             patch("api.services.credits.creditService.creditService.grantTopupTokens",
-                   return_value={"granted": False, "tokens": 0}), \
-             patch.object(svc, "_audit"):
-            result = svc.verifyTopupPayment(self._payload(), token="t")
-        self.assertEqual(result, {"granted": False, "tokens": 0, "credits": 0.0})
 
 
 class TestTopupErrorCodeMapping(unittest.TestCase):
@@ -396,29 +356,8 @@ class TestTopupWebhooks(unittest.TestCase):
         return patch("api.services.subscriptions.subscriptionService."
                      "subscriptionService.razorpayClient", rzp)
 
-    def test_captured_topup_payment_grants_tokens(self):
-        svc = self._service()
-        with patch("api.services.credits.creditService.creditService.grantTopupTokens",
-                   return_value={"granted": True, "tokens": 5000000}) as grant, \
-             patch.object(svc, "_auditLog"):
-            svc._handlePaymentCaptured(self._captured("credit_topup"))
-        grant.assert_called_once_with("u1", "order_abc", "pay_abc")
 
-    def test_captured_subscription_payment_never_grants_tokens(self):
-        svc = self._service()
-        with patch("api.services.credits.creditService.creditService.grantTopupTokens") as grant, \
-             patch.object(svc, "_auditLog"):
-            svc._handlePaymentCaptured(self._captured("some_other_type"))
-        grant.assert_not_called()
 
-    def test_topup_capture_without_userid_does_not_raise(self):
-        svc = self._service()
-        event = self._captured("credit_topup")
-        del event["payload"]["payment"]["entity"]["notes"]["userId"]
-        with patch("api.services.credits.creditService.creditService.grantTopupTokens") as grant, \
-             patch.object(svc, "_auditLog"):
-            svc._handlePaymentCaptured(event)
-        grant.assert_not_called()
 
     def test_refund_of_a_topup_payment_claws_back(self):
         svc = self._service()

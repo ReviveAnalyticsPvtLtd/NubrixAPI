@@ -67,6 +67,8 @@ class FakeCursor:
             )
         elif "from public.user_erasure_requests" in normalized:
             self.current = self.state.get("requestRow")
+        elif "event_type='refund.intent'" in normalized:
+            self.current = self.state.get('pendingRefund')
         else:
             self.current = None
 

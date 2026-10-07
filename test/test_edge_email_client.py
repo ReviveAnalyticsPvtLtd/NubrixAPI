@@ -1,6 +1,15 @@
 import requests
+import pytest
 
 from api.services.notifications.edgeEmailClient import EdgeEmailClient
+
+
+@pytest.mark.parametrize('status,payload',[(200,{}),(200,{'status':'accepted','provider':'brevo'}),(504,{'errorCode':'AMBIGUOUS_SEND'})])
+def test_billing_uncertain_acceptance_requires_reconciliation(monkeypatch,status,payload):
+    monkeypatch.setenv('BILLING_NOTIFICATION_EMAIL_URL','https://example.test/billingEmail')
+    response=FakeResponse(status,payload)
+    result=EdgeEmailClient(edgeUrl='https://example.test/warningEmail',apiKey='test',requestPost=lambda *args,**kwargs:response).sendBilling({})
+    assert result.outcome=='AMBIGUOUS' and result.errorCode=='AMBIGUOUS_SEND'
 
 
 class FakeResponse:

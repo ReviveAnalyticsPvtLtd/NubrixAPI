@@ -14,19 +14,45 @@ __all__ = ["router"]
 from api.models import (
     MarkReconciliationInvestigatedRequest,
     ReplayWebhookEventRequest,
+    SubscriptionRefundInitiateRequest,
+    SubscriptionRefundQuoteRequest,
 )
 from api.services.billing.billingMetricsService import BillingMetricsService
 from api.services.billing.reconciliationService import ReconciliationService
+from api.services.billing.subscriptionRefundService import SubscriptionRefundService, RefundConflictError
+from api.services.billing.manualBillingContracts import RefundQuoteConflict
 from utils.exceptionHandler import CustomException, raiseHttpException
 from fastapi.responses import ORJSONResponse
-from fastapi import APIRouter, Depends, HTTPException, status
+from fastapi import APIRouter, Depends, Header, HTTPException, Query, status
 from api.commons import verifyToken
 from utils.logger import logger
 from jose import jwt
 import os
+import psycopg2
+import requests
+import httpx
+import razorpay
+
+_REFUND_UNAVAILABLE = (RuntimeError, TimeoutError, ConnectionError, psycopg2.OperationalError,
+    psycopg2.InterfaceError, requests.RequestException, httpx.HTTPError,
+    razorpay.errors.GatewayError, razorpay.errors.ServerError)
 
 
 router = APIRouter()
+
+
+def refuseDeferredRefundOperations() -> None:
+    """Owner-approved pause: no new refund quotes, reservations or submissions.
+
+    Re-enabling requires a reviewed authorization/audit design and code change;
+    a legacy billing allowlist or an environment flag cannot enable refunds.
+    Existing financial history and reconciliation remain available.
+    """
+    raise HTTPException(status_code=status.HTTP_503_SERVICE_UNAVAILABLE,detail={
+        'status':503,
+        'message':'Refund operations are disabled while refund support is deferred.',
+        'errorCode':'REFUND_OPERATIONS_DISABLED',
+    })
 
 
 def verifyBillingAdmin(token=Depends(verifyToken)) -> str:
@@ -65,6 +91,188 @@ def verifyBillingAdmin(token=Depends(verifyToken)) -> str:
             detail="Billing admin access denied",
         )
     return userId
+
+
+def _loadPaidIntervalsForInvoices(userId: str, invoiceIds: list[str]) -> list[dict]:
+    """Resolve the owned paid-service intervals targeted by a refund case.
+
+    Amounts come from each invoice's frozen snapshot; ownership is enforced
+    against the target user. Top-ups (billing_reason='add_on') are excluded
+    here — their clawback is a separately approved path.
+    """
+    from api.commons import client
+    from api.services.subscriptions.paymentValidationService import parseUtc
+
+    intervals = []
+    if not invoiceIds:
+        return intervals
+    rows = (
+        client.table("Invoices")
+        .select(
+            "id, userId, billing_reason, period_start, period_end, "
+            "total_amount, amount, currency, status, metadata_json, "
+            "razorpayPaymentId"
+        )
+        .eq("userId", userId)
+        .in_("id", invoiceIds)
+        .execute()
+        .data
+    )
+    byId = {row["id"]: row for row in rows or []}
+    for invoiceId in invoiceIds:
+        row = byId.get(invoiceId)
+        if row is None:
+            raise CustomException(
+                ValueError(f"Invoice {invoiceId} not found for user {userId}"),
+                statusCode=404,
+                uiMessage="Target invoice not found.",
+            )
+        if (row.get("billing_reason") or "") == "add_on":
+            continue  # top-up refunds use the separate clawback path
+        if (row.get("status") or "").upper() != "PAID":
+            continue  # only captured money is refundable
+        start = parseUtc(row.get("period_start"))
+        end = parseUtc(row.get("period_end"))
+        if start is None or end is None or end <= start:
+            continue
+        metadata = row.get("metadata_json") or {}
+        manualBilling = (
+            metadata.get("manualBilling") or {} if isinstance(metadata, dict) else {}
+        )
+        coverageState = manualBilling.get("coverageState")
+        kind = "future" if start > _refundNow() else "current"
+        if coverageState == "revoked":
+            kind = "revoked"
+        intervals.append({
+            "invoiceId": row["id"],
+            "paymentId": row.get("razorpayPaymentId"),
+            "start": start,
+            "end": end,
+            "amount": int(row.get("total_amount") or row.get("amount") or 0),
+            "currency": row.get("currency") or "INR",
+            "kind": kind,
+        })
+    return intervals
+
+
+def _refundNow():
+    from datetime import datetime, timezone
+
+    return datetime.now(timezone.utc)
+
+
+@router.post("/refunds/quote", dependencies=[Depends(refuseDeferredRefundOperations)])
+async def quoteSubscriptionRefund(
+    payload: SubscriptionRefundQuoteRequest,
+    adminUserId=Depends(verifyBillingAdmin),
+):
+    """
+    Quote a staff-approved unused-time refund: per-payment amounts, cutoff
+    estimate and coverage effects. Quote only — no entitlement change.
+    """
+    try:
+        if adminUserId == payload.userId:
+            raise CustomException(ValueError('SELF_SERVICE_REFUND_FORBIDDEN'),statusCode=403,
+                uiMessage='Staff refunds require a different target account.',errorCode='SELF_SERVICE_REFUND_FORBIDDEN')
+        paidIntervals = _loadPaidIntervalsForInvoices(
+            payload.userId, payload.invoiceIds
+        )
+        service = SubscriptionRefundService.forProduction()
+        quote = service.quoteUnusedTimeRefund(
+            staffId=adminUserId,
+            payload=payload.dict(),
+            paidIntervals=paidIntervals,
+            subscription={"user_id": payload.userId},
+        )
+        logger.info(
+            f"Refund quote issued by admin={adminUserId} for user="
+            f"{payload.userId} case={payload.caseReference} amount={quote.amount}"
+        )
+        return ORJSONResponse(
+            status_code=200,
+            content={
+                "status": "SUCCESS",
+                "data": {
+                    "quoteId": quote.quoteId,
+                    "userId": quote.userId,
+                    "caseReference": quote.caseReference,
+                    "currency": quote.currency,
+                    "cutoff": quote.cutoff.isoformat(),
+                    "expiresAt": quote.expiresAt.isoformat(),
+                    "amount": quote.amount,
+                    "items": list(quote.items),
+                    "accessExpired": quote.accessExpired,
+                    "currentAccessPreserved": quote.currentAccessPreserved,
+                },
+            },
+        )
+    except CustomException as e:
+        raiseHttpException(e)
+    except Exception as e:
+        raiseHttpException(CustomException(e))
+
+
+@router.post("/refunds/initiate", dependencies=[Depends(refuseDeferredRefundOperations)])
+async def initiateSubscriptionRefund(
+    payload: SubscriptionRefundInitiateRequest,
+    adminUserId=Depends(verifyBillingAdmin),
+    idempotencyKey: str | None = Header(default=None, alias="Idempotency-Key", min_length=1, max_length=128),
+):
+    """
+    Execute an approved unused-time refund: fresh cutoff recomputation under
+    lock, durable reservation, affected coverage closure, then provider
+    submission outside DB locks.
+    """
+    try:
+        if not idempotencyKey or not idempotencyKey.strip():
+            raise CustomException(
+                ValueError("Idempotency-Key header is required"),
+                statusCode=422,
+                uiMessage="Idempotency-Key header is required.",
+            )
+        service = SubscriptionRefundService.forProduction()
+        intent = service.initiateUnusedTimeRefund(
+            staffId=adminUserId,
+            payload=payload.dict(),
+            requestKey=idempotencyKey.strip(),
+        )
+        logger.info(
+            f"Refund initiated by admin={adminUserId} for user={payload.userId} "
+            f"case={payload.caseReference} intent={intent.refundIntentId} "
+            f"state={intent.refundState}"
+        )
+        return ORJSONResponse(
+            status_code=200,
+            content={
+                "status": "SUCCESS",
+                "data": {
+                    "refundIntentId": intent.refundIntentId,
+                    "userId": intent.userId,
+                    "refundState": intent.refundState,
+                    "cutoff": intent.cutoff.isoformat(),
+                    "amount": intent.amount,
+                    "items": list(intent.items),
+                    "accessExpired": intent.accessExpired,
+                    "currentAccessPreserved": intent.currentAccessPreserved,
+                    "accessRestored": intent.accessRestored,
+                },
+            },
+        )
+    except RefundQuoteConflict as conflict:
+        from fastapi.encoders import jsonable_encoder
+        return ORJSONResponse(status_code=409,content={
+            'status':409,'message':'Refund quote changed. Review and approve the refreshed quote.',
+            'errorCode':conflict.code,'quote':jsonable_encoder(conflict.quote)})
+    except (RefundConflictError,ValueError) as error:
+        code = str(error)
+        statusCode = 422 if code == 'REFUND_APPROVAL_REQUIRED' else 404 if code == 'REFUND_QUOTE_MISSING' else 403 if code in ('REFUND_QUOTE_OWNERSHIP_MISMATCH','SELF_SERVICE_REFUND_FORBIDDEN') else 409
+        return ORJSONResponse(status_code=statusCode,content={'status':statusCode,'message':code,'errorCode':code})
+    except _REFUND_UNAVAILABLE as error:
+        return ORJSONResponse(status_code=503,content={'status':503,'message':'Refund confirmation is temporarily unavailable. Please try again later.','errorCode':'REFUND_PROVIDER_UNAVAILABLE'})
+    except CustomException as e:
+        raiseHttpException(e)
+    except Exception as e:
+        raiseHttpException(CustomException(e))
 
 
 @router.get("/reconciliation/report")
@@ -107,6 +315,15 @@ async def getBillingMetrics(_adminUserId=Depends(verifyBillingAdmin)):
         raiseHttpException(CustomException(e))
 
 
+@router.get('/reconciliation/obligations')
+async def getManualObligations(limit:int=Query(100,ge=1,le=500),cursor:str|None=None,
+                               _adminUserId=Depends(verifyBillingAdmin)):
+    try:
+        return ORJSONResponse(content={'status':'SUCCESS','data':ReconciliationService().listManualObligations(limit,cursor)})
+    except ValueError as error:
+        raiseHttpException(CustomException(error,statusCode=422,uiMessage=str(error)))
+
+
 @router.post("/reconciliation/webhooks/replay")
 async def replayWebhookEvent(
     payload: ReplayWebhookEventRequest,
@@ -144,39 +361,6 @@ async def markInvestigated(
             entityId=payload.entityId,
             adminUserId=adminUserId,
             note=payload.note,
-        )
-        return ORJSONResponse(
-            status_code=200,
-            content={"status": "SUCCESS", "data": result},
-        )
-    except CustomException as e:
-        raiseHttpException(e)
-    except Exception as e:
-        raiseHttpException(CustomException(e))
-
-
-@router.post("/credits/force-reset")
-async def forceResetAllQuotas(
-    resetUsage: bool = False,
-    adminUserId=Depends(verifyBillingAdmin),
-):
-    """
-    Recompute monthly_token_quota for all users from credits.json, then flush
-    all Redis credit hashes so they rebuild with updated values.
-
-    Query params:
-        resetUsage (bool, default false): when true, also zero out used_tokens
-            and restore remaining_tokens to the full quota for all users,
-            giving everyone a fresh monthly bucket immediately. The billing
-            period itself is left untouched.
-    """
-    try:
-        from api.services.credits.creditService import creditService
-
-        result = creditService.forceResetAllQuotas(resetUsage=resetUsage)
-        logger.info(
-            f"Force credit reset triggered by admin={adminUserId}, "
-            f"resetUsage={resetUsage}: {result}"
         )
         return ORJSONResponse(
             status_code=200,

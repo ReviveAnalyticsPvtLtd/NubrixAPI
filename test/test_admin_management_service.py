@@ -126,9 +126,9 @@ EXPECTED_SUBSCRIPTION_FIELD_ORDER = (
     "current_period_end", "renewal_due_at", "auto_renew_enabled",
     "payment_collection_mode", "status", "default_currency",
     "subscribed_experts", "domain_count", "pending_removals",
-    "pending_additions", "billing_state", "razorpay_customer_id",
-    "razorpay_token_id", "subscription_anchor_day", "recurring_failures",
-    "cancellation_reason", "version", "plan_type", "created_at", "updated_at",
+    "pending_additions", "billing_state", "is_canonical", "renewal_opt_out",
+    "cancellation_reason", "version", "plan_type", "created_at",
+    "updated_at",
 )
 EXPECTED_SUBSCRIPTION_FIELDS = set(EXPECTED_SUBSCRIPTION_FIELD_ORDER)
 EXPECTED_SUBSCRIPTION_SELECT = ",".join(EXPECTED_SUBSCRIPTION_FIELD_ORDER)
@@ -1197,7 +1197,9 @@ def test_status_change_derives_plan_and_revokes_sessions_without_loading_billing
             ADMIN_CONTEXT,
         )
 
-    assert client.lastUpdate("subscriptions")["plan_type"] == "pro"
+    # Manual monthly contract: an expired/reset paid row derives plan_type
+    # none — historical billing mode must not force an active pro tier.
+    assert client.lastUpdate("subscriptions")["plan_type"] == "none"
     assert client.deletedFilters("Sessions") == [("userId", "user-1")]
     assert result["status"] == "expired"
 

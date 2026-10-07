@@ -165,7 +165,7 @@ class VerifySubscriptionRequest(BaseModel):
 class CreateSubscriptionRequest(BaseModel):
     domains: list[str]
     contact: str
-    billingMode: str | None = "monthly_recurring"
+    billingMode: str | None = "monthly_prepaid"
 
 class AddDomainsRequest(BaseModel):
     domains: list[str]
@@ -183,7 +183,10 @@ class CancelPendingAdditionRequest(BaseModel):
     domain: str
 
 class CancelSubscriptionRequest(BaseModel):
-    reason: str
+    reason: str | None = None
+
+class ResumeRenewalRequest(BaseModel):
+    pass
 
 class SubscriptionStatus(str, Enum):
     NONE = "NONE"
@@ -198,6 +201,28 @@ class CreateAnnualRenewalSessionRequest(BaseModel):
     invoiceId: str
 
 class VerifyAnnualRenewalPaymentRequest(BaseModel):
+    invoiceId: str
+    razorpayOrderId: str
+    razorpayPaymentId: str
+    razorpaySignature: str
+
+class PrepareRenewalInvoiceRequest(BaseModel):
+    pass
+
+class SubscriptionRefundQuoteRequest(BaseModel):
+    userId: str = Field(min_length=1)
+    invoiceIds: list[str] = Field(min_length=1)
+    caseReference: str = Field(min_length=1, max_length=200)
+    reason: str = Field(min_length=1, max_length=2000)
+
+class SubscriptionRefundInitiateRequest(SubscriptionRefundQuoteRequest):
+    quoteId: str = Field(min_length=1)
+    expectedTotalAmount: int = Field(ge=0)
+
+class CreateRenewalSessionRequest(BaseModel):
+    invoiceId: str
+
+class VerifyRenewalPaymentRequest(BaseModel):
     invoiceId: str
     razorpayOrderId: str
     razorpayPaymentId: str

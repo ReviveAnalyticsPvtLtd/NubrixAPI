@@ -67,6 +67,8 @@ dependencies = [
     "pwdlib[argon2]>=0.3.1",
     "email-validator>=2.3.0",
     "pymysql>=1.2.3",
+    "standard-imghdr==3.13.0 ; python_full_version >= '3.13'",
+    "standard-cgi==3.13.0 ; python_full_version >= '3.13'",
 ]
 
 [dependency-groups]
@@ -77,3 +79,6 @@ dev = [
 [tool.pytest.ini_options]
 pythonpath = ["."]
 testpaths = ["test"]
+
+[tool.uv.extra-build-dependencies]
+htmlmin = ["standard-cgi==3.13.0 ; python_version >= '3.13'"]

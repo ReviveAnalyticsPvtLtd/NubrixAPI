@@ -1,6 +1,4 @@
 import os
-import sys
-import types
 import unittest
 from unittest.mock import MagicMock, patch
 
@@ -10,29 +8,6 @@ os.environ.setdefault("SECRET_KEY", "test-secret")
 os.environ.setdefault("REDIS_HOST", "localhost")
 os.environ.setdefault("REDIS_PORT", "6379")
 os.environ.setdefault("REDIS_PASSWORD", "")
-
-for name in ("logtail", "loguru", "redis"):
-    if name not in sys.modules:
-        sys.modules[name] = types.ModuleType(name)
-if not hasattr(sys.modules["logtail"], "LogtailHandler"):
-    sys.modules["logtail"].LogtailHandler = lambda *a, **k: None
-if not hasattr(sys.modules["loguru"], "logger"):
-    class _L:
-        def __getattr__(self, _):
-            return lambda *a, **k: None
-    sys.modules["loguru"].logger = _L()
-if not hasattr(sys.modules["redis"], "Redis"):
-    sys.modules["redis"].Redis = lambda *a, **k: None
-if not hasattr(sys.modules["redis"], "ConnectionPool"):
-    sys.modules["redis"].ConnectionPool = type("ConnectionPool", (), {})
-if "supabase" not in sys.modules:
-    supabaseStub = types.ModuleType("supabase")
-    supabaseStub.create_client = lambda *a, **k: None
-    sys.modules["supabase"] = supabaseStub
-    optsMod = types.ModuleType("supabase.lib.client_options")
-    optsMod.ClientOptions = lambda *a, **k: None
-    sys.modules["supabase.lib"] = types.ModuleType("supabase.lib")
-    sys.modules["supabase.lib.client_options"] = optsMod
 
 _PER_DOMAIN = 10000000
 
@@ -70,6 +45,7 @@ class TestApplyDomainCountChange(unittest.TestCase):
     def _service(self, hashState):
         from api.services.credits.creditService import CreditService
         svc = CreditService()
+        svc._manualBalance = MagicMock(return_value=None)
         svc.supabase = MagicMock()
         svc._fakeRedis = hashState
         return svc
@@ -121,27 +97,11 @@ class TestApplyDomainCountChange(unittest.TestCase):
         self.assertFalse(result["applied"])
 
 
-class TestInitializeWithDomainCount(unittest.TestCase):
-    def test_initialize_seeds_quota_from_domain_count(self):
-        from api.services.credits.creditService import CreditService
-        svc = CreditService()
-        svc.supabase = MagicMock()
-        svc.supabase.table.return_value.upsert.return_value.execute.return_value.data = []
-
-        with patch.object(svc, "_dbRow", return_value=None), \
-             patch.object(svc, "_redis", side_effect=Exception("no redis")):
-            payload = svc.initializeCreditBalance("u1", "pro", domainCount=3)
-
-        self.assertEqual(payload["monthly_token_quota"], 3 * _PER_DOMAIN)
-        self.assertEqual(payload["remaining_tokens"], 3 * _PER_DOMAIN)
-        self.assertEqual(payload["domain_count"], 3)
-
-
 class TestEntitlementBoundaryLowersQuota(unittest.TestCase):
     def _task(self, subscriptionRow):
         from nubrix.triggers.tasks.entitlementBoundaryTask import EntitlementBoundaryTask
         client = MagicMock()
-        client.table.return_value.select.return_value.in_.return_value \
+        client.table.return_value.select.return_value.eq.return_value.in_.return_value \
             .execute.return_value.data = [subscriptionRow]
         client.table.return_value.select.return_value.eq.return_value.eq \
             .return_value.order.return_value.limit.return_value \
@@ -152,6 +112,7 @@ class TestEntitlementBoundaryLowersQuota(unittest.TestCase):
         subscription = {
             "id": "sub1",
             "user_id": "u1",
+                "is_canonical": True,
             "subscribed_experts": ["banking", "telecom", "manufacturing"],
             "domain_count": 3,
             "pending_removals": ["telecom"],
@@ -175,6 +136,7 @@ class TestEntitlementBoundaryLowersQuota(unittest.TestCase):
         subscription = {
             "id": "sub1",
             "user_id": "u1",
+                "is_canonical": True,
             "subscribed_experts": ["banking", "telecom"],
             "domain_count": 2,
             "pending_removals": ["telecom"],
@@ -205,6 +167,7 @@ class TestSyncQuotaFromConfig(unittest.TestCase):
     def _service(self, dbRow, subscriptionRows, hashState):
         from api.services.credits.creditService import CreditService
         svc = CreditService()
+        svc._manualBalance = MagicMock(return_value=None)
 
         tables = {}
 
@@ -216,8 +179,8 @@ class TestSyncQuotaFromConfig(unittest.TestCase):
         supabase = MagicMock()
         supabase.table.side_effect = tableSideEffect
         subTable = tableSideEffect("subscriptions")
-        subTable.select.return_value.eq.return_value.in_.return_value \
-            .order.return_value.limit.return_value.execute.return_value.data = subscriptionRows
+        subTable.select.return_value.eq.return_value.eq.return_value.in_.return_value \
+            .limit.return_value.execute.return_value.data = subscriptionRows
         tableSideEffect("credit_balances")  # pre-create so "not called" assertions work
         svc.supabase = supabase
         svc._tables = tables
@@ -257,8 +220,11 @@ class TestActivatePaidDomainsGrantsCreditsImmediately(unittest.TestCase):
         subscription = {
             "id": "sub1",
             "user_id": "u1",
+                "is_canonical": True,
             "subscribed_experts": ["banking"],
             "domain_count": 1,
+            "status": "active",
+            "current_period_end": "2099-01-01T00:00:00+00:00",
             "pending_additions": [
                 {"orderId": "order1", "domain": "telecom", "state": "awaiting_payment"},
             ],

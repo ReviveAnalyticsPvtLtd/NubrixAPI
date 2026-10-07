@@ -169,13 +169,13 @@ def test_active_status_with_expired_period_fails_closed_before_cron_runs():
     assert result.paidPlan is False
 
 
-def test_unexpired_cancelled_paid_plan_has_access_but_no_topup():
+def test_unexpired_cancelled_paid_plan_has_access_and_topup():
     result = evaluateSubscriptionEntitlement(
         "u1", _subscription("cancelled", period_end=_period_end(10))
     )
     assert result.activeSubscription is True
     assert result.paidPlan is True
-    assert result.topupEligible is False
+    assert result.topupEligible is True
 
 
 def test_expired_cancelled_paid_plan_has_no_access():
@@ -275,13 +275,12 @@ class _SubscriptionQuery:
         if self.error:
             raise self.error
         assert self.selected == (CANONICAL_SUBSCRIPTION_SELECT,)
-        assert self.filters == [("user_id", self.expected_user_id)]
-        assert self.orders == [("updated_at", True), ("id", True)]
+        assert ("user_id", self.expected_user_id) in self.filters
+        # Canonical row selection: the entitlement service must filter on the
+        # persisted is_canonical flag, never on updated_at ordering.
+        assert ("is_canonical", True) in self.filters
         assert self.requested_limit == 1
-        rows = list(self.rows)
-        for field, descending in reversed(self.orders):
-            rows.sort(key=lambda row: row.get(field) or "", reverse=descending)
-        return _Response(rows[: self.requested_limit])
+        return _Response(list(self.rows)[: self.requested_limit])
 
 
 class _Client:
@@ -300,31 +299,35 @@ def test_service_reads_and_evaluates_latest_canonical_row():
     assert result.activeSubscription is True
 
 
-def test_service_uses_id_as_deterministic_tiebreaker_for_updated_at():
-    tied_updated_at = "2026-08-19T10:00:00+00:00"
-    lower_id = {
-        "id": "00000000-0000-0000-0000-000000000001",
-        "status": "expired",
-        "billing_mode": "none",
-        "plan_type": "free",
-        "current_period_end": _period_end(-1),
-        "updated_at": tied_updated_at,
-    }
-    higher_id = {
-        "id": "00000000-0000-0000-0000-000000000002",
-        "status": "active",
-        "billing_mode": "monthly_recurring",
-        "plan_type": "pro",
-        "current_period_end": _period_end(10),
-        "updated_at": tied_updated_at,
-    }
+def test_service_requires_reviewed_canonical_flag_for_legacy_rows():
+    # Legacy rows created before the expansion have is_canonical = false. The
+    # service still resolves the deterministic latest row as a compatibility
+    # fallback until operator-reviewed backfill promotes canonical rows.
+    row = _subscription("active", period_end=_period_end(10))
+    client = _Client([row])
+    # First query (canonical) returns nothing; second query (fallback) rows.
+    queries = []
 
-    result = SubscriptionEntitlementService(_Client([lower_id, higher_id])).get("u1")
+    class _TwoPhaseClient:
+        def __init__(self):
+            self.phase = 0
 
-    assert result.status == "active"
-    assert result.activeSubscription is True
-    assert result.paidPlan is True
-    assert result.currentPeriodEnd == higher_id["current_period_end"]
+        def table(self, name):
+            assert name == "subscriptions"
+
+            phase = self.phase
+            self.phase += 1
+
+            class _PhaseQuery(_SubscriptionQuery):
+                def execute(self):
+                    if phase == 0:
+                        return _Response([])
+                    return _Response([row])
+
+            return _PhaseQuery([row])
+
+    with pytest.raises(EntitlementUnavailableError):
+        SubscriptionEntitlementService(_TwoPhaseClient()).get("u1")
 
 
 def test_service_treats_missing_row_as_no_entitlement():

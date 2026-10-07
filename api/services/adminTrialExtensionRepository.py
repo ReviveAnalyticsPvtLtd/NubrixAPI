@@ -169,7 +169,7 @@ class AdminTrialExtensionRepository:
                            current_period_start, current_period_end,
                            erasure_pending
                     from public.subscriptions
-                    where user_id = %s
+                    where user_id = %s and is_canonical = true
                     limit 1
                     for update
                     """,
@@ -221,7 +221,7 @@ class AdminTrialExtensionRepository:
                         current_period_start = %s, current_period_end = %s,
                         renewal_due_at = %s, auto_renew_enabled = false,
                         payment_collection_mode = 'authenticated_checkout',
-                        recurring_failures = 0, cancellation_reason = null,
+                        cancellation_reason = null,
                         billing_state = jsonb_set(
                             coalesce(billing_state, '{}'::jsonb),
                             '{lifecycle_snapshot}', %s::jsonb, true
@@ -245,9 +245,10 @@ class AdminTrialExtensionRepository:
                     insert into public.credit_balances (
                         user_id, subscription_id, plan_tier, domain_count,
                         monthly_token_quota, used_tokens, remaining_tokens,
-                        period_start, period_end, last_reset_at, updated_at
+                        period_start, period_end, last_reset_at, updated_at,
+                        lifecycle_id,credit_period_id,balance_version
                     )
-                    values (%s, %s, 'free', %s, %s, 0, %s, %s, %s, %s, %s)
+                    values (%s, %s, 'free', %s, %s, 0, %s, %s, %s, %s, %s,%s,gen_random_uuid(),1)
                     on conflict (user_id) do update
                     set subscription_id = excluded.subscription_id,
                         plan_tier = 'free', domain_count = excluded.domain_count,
@@ -257,7 +258,10 @@ class AdminTrialExtensionRepository:
                         period_start = excluded.period_start,
                         period_end = excluded.period_end,
                         last_reset_at = excluded.last_reset_at,
-                        updated_at = excluded.updated_at
+                        updated_at = excluded.updated_at,
+                        lifecycle_id = coalesce(credit_balances.lifecycle_id,excluded.lifecycle_id),
+                        credit_period_id = excluded.credit_period_id,
+                        balance_version = credit_balances.balance_version+1
                     returning topup_tokens
                     """,
                     (
@@ -270,6 +274,7 @@ class AdminTrialExtensionRepository:
                         creditPeriodEnd,
                         now,
                         now,
+                        subscription['id'],
                     ),
                 )
                 creditRow = cursor.fetchone() or {}

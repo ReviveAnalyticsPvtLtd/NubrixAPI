@@ -25,10 +25,6 @@ __all__ = [
     "buildRenewalPricingMetadata",
     "subscriptionDomainCount",
     "subscriptionBillingState",
-    "subscriptionCustomerId",
-    "subscriptionTokenId",
-    "subscriptionAnchorDay",
-    "subscriptionRecurringFailures",
     "subscriptionErasurePending",
     "toSubscriptionBillingPayload",
     "toApiPlanFields",
@@ -39,14 +35,14 @@ __all__ = [
 
 SUBSCRIPTION_BILLING_FIELDS_SELECT = (
     "subscribed_experts, domain_count, pending_removals, pending_additions, "
-    "billing_state, razorpay_customer_id, razorpay_token_id, "
-    "subscription_anchor_day, recurring_failures, cancellation_reason"
+    "billing_state, cancellation_reason"
 )
 
 CANONICAL_SUBSCRIPTION_SELECT = (
     "id, user_id, billing_mode, status, plan_type, current_period_start, current_period_end, "
     "renewal_due_at, auto_renew_enabled, payment_collection_mode, "
     "default_currency, version, erasure_pending, "
+    "is_canonical, renewal_opt_out, "
     f"{SUBSCRIPTION_BILLING_FIELDS_SELECT}"
 )
 
@@ -119,32 +115,6 @@ def subscriptionBillingState(subscription: dict | None):
     return (subscription or {}).get("billing_state") or {}
 
 
-def subscriptionCustomerId(subscription: dict | None) -> str | None:
-    return (subscription or {}).get("razorpay_customer_id")
-
-
-def subscriptionTokenId(subscription: dict | None) -> str | None:
-    return (subscription or {}).get("razorpay_token_id")
-
-
-def subscriptionAnchorDay(subscription: dict | None) -> int | None:
-    value = (subscription or {}).get("subscription_anchor_day")
-    if value is None:
-        return None
-    try:
-        return int(value)
-    except (TypeError, ValueError):
-        return None
-
-
-def subscriptionRecurringFailures(subscription: dict | None) -> int:
-    value = (subscription or {}).get("recurring_failures")
-    try:
-        return int(value or 0)
-    except (TypeError, ValueError):
-        return 0
-
-
 def subscriptionErasurePending(subscription: dict | None) -> bool:
     value = (subscription or {}).get("erasure_pending", False)
     if isinstance(value, str):
@@ -159,15 +129,13 @@ def toSubscriptionBillingPayload(
     pendingRemovals=None,
     pendingAdditions=None,
     billingState=None,
-    razorpayCustomerId=None,
-    razorpayTokenId=None,
-    subscriptionAnchorDay=None,
-    recurringFailures=None,
     cancellationReason=None,
 ) -> dict:
     """
     Convert camelCase service arguments into subscription table column names.
     Values left as ``None`` are omitted so callers can do partial updates.
+    The contracted recurring-provider columns (customer/token/anchor/failures)
+    are no longer writable through this helper.
     """
     payload = {}
     if subscribedExperts is not None:
@@ -180,14 +148,6 @@ def toSubscriptionBillingPayload(
         payload["pending_additions"] = pendingAdditions if isinstance(pendingAdditions, list) else []
     if billingState is not None:
         payload["billing_state"] = billingState or {}
-    if razorpayCustomerId is not None:
-        payload["razorpay_customer_id"] = razorpayCustomerId
-    if razorpayTokenId is not None:
-        payload["razorpay_token_id"] = razorpayTokenId
-    if subscriptionAnchorDay is not None:
-        payload["subscription_anchor_day"] = int(subscriptionAnchorDay)
-    if recurringFailures is not None:
-        payload["recurring_failures"] = int(recurringFailures)
     if cancellationReason is not None:
         payload["cancellation_reason"] = cancellationReason
     return payload
@@ -213,12 +173,24 @@ def mapBillingModeToPlanType(billingMode: str | None, status: str | None = None)
     Derive API plan tier labels from canonical subscription billing_mode and status.
 
     Paid tiers are resolved from billing_mode first so lifecycle status alone cannot
-    collapse a paid row to ``none``. No-plan rows use status to distinguish trial,
-    expired trial, and brand-new users.
+    collapse a paid row to ``none`` — EXCEPT the terminal expired/reset statuses,
+    where a historical billing mode must not force an active pro tier. No-plan rows
+    use status to distinguish trial, expired trial, and brand-new users.
     """
     normalizedStatus = (status or "").strip().lower()
     normalizedBillingMode = (billingMode or "").strip().lower()
 
+    isPaidMode = normalizedBillingMode in (
+        "monthly_prepaid",
+        "monthly_recurring",
+        "annual_prepaid",
+    )
+    if isPaidMode and normalizedStatus == "expired":
+        # A reset monthly/annual row is none regardless of its billing-mode
+        # history; historical mode must not force an active paid tier.
+        return "none"
+    if normalizedBillingMode == "monthly_prepaid":
+        return "pro"
     if normalizedBillingMode == "monthly_recurring":
         return "pro"
     if normalizedBillingMode == "annual_prepaid":
@@ -239,7 +211,7 @@ def buildChurnResetPayload(
     """
     Build a partial-reset payload for a churned subscription.
 
-    Preserves ``billing_mode``, ``razorpay_customer_id``, ``subscribed_experts``,
+    Preserves ``billing_mode``, ``subscribed_experts``,
     ``domain_count``, and identity fields while clearing period dates, pending
     changes, and stale payment tokens.  Domain fields are intentionally kept so
     expired users retain access to their project data in the frontend.
@@ -286,9 +258,6 @@ def buildChurnResetPayload(
         "renewal_due_at": None,
         "pending_removals": [],
         "pending_additions": [],
-        "razorpay_token_id": None,
-        "subscription_anchor_day": None,
-        "recurring_failures": 0,
         "auto_renew_enabled": False,
         "payment_collection_mode": "authenticated_checkout",
         "cancellation_reason": None,

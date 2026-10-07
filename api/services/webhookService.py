@@ -20,9 +20,6 @@ from api.commons import client
 from api.services.billing.billingEventService import BillingEventService
 from api.services.subscriptions.subscriptionFieldUtils import (
     CANONICAL_SUBSCRIPTION_SELECT,
-    subscriptionCustomerId,
-    subscriptionRecurringFailures,
-    subscriptionTokenId,
 )
 from api.services.subscriptions.paymentValidationService import (
     normalizeChurnedSubscription,
@@ -49,6 +46,8 @@ EVENT_HANDLERS = {
     "order.paid": "_handleOrderPaid",
     "payment.failed": "_handlePaymentFailed",
     "refund.processed": "_handleRefundProcessed",
+    "refund.created": "_handleRefundProcessed",
+    "refund.failed": "_handleRefundProcessed",
     "token.confirmed": "_handleTokenConfirmed",
     "token.cancelled": "_handleTokenCancelled",
 }
@@ -315,38 +314,10 @@ class WebhookService:
         result = self.client.table("subscriptions") \
             .select(CANONICAL_SUBSCRIPTION_SELECT) \
             .eq("user_id", userId) \
-            .order("updated_at", desc=True) \
+            .eq("is_canonical", True) \
             .limit(1) \
             .execute()
         return result.data[0] if result.data else None
-
-    def _findUserByCustomerId(self, customerId: str) -> dict | None:
-        """
-        Look up a user by their Razorpay customer ID.
-
-        Args:
-            customerId (str): The Razorpay customer ID.
-
-        Returns:
-            dict | None: The user record or None if not found.
-        """
-        subscriptionResult = self.client.table("subscriptions") \
-            .select(CANONICAL_SUBSCRIPTION_SELECT) \
-            .eq("razorpay_customer_id", customerId) \
-            .order("updated_at", desc=True) \
-            .limit(1) \
-            .execute()
-        if not subscriptionResult.data:
-            return None
-        subscription = subscriptionResult.data[0]
-        result = self.client.table("Users") \
-            .select("userId, email, fullName, phoneNumber") \
-            .eq("userId", subscription["user_id"]).execute()
-        if not result.data:
-            return None
-        user = result.data[0]
-        user["subscription"] = subscription
-        return user
 
     def _findInvoiceById(self, invoiceId: str) -> dict | None:
         """
@@ -452,363 +423,51 @@ class WebhookService:
             logger.error(f"billing_events insert failed for user {userId}, event {eventType}: {e}")
 
     def _handlePaymentAuthorized(self, event: dict) -> None:
-        """
-        Handle the payment.authorized webhook event.
-
-        Args:
-            event (dict): The Razorpay webhook event.
-        """
-        paymentEntity = event.get("payload", {}).get("payment", {}).get("entity", {})
-        notes = paymentEntity.get("notes", {})
-        userId = notes.get("userId", "unknown")
-        self._auditLog(
-            userId, "payment.authorized",
-            paymentId=paymentEntity.get("id"),
-            amount=paymentEntity.get("amount"),
-            currency=paymentEntity.get("currency", "INR"),
-            status="AUTHORIZED"
-        )
-        logger.info(f"Payment authorized: {paymentEntity.get('id')}")
+        payment = event.get('payload', {}).get('payment', {}).get('entity', {}) or {}
+        from api.services.billing.manualBillingRepository import getManualBillingRepository
+        repository = getManualBillingRepository()
+        try:
+            attempt = repository.attemptForOrder(payment.get('order_id'))
+        except ValueError as exc:
+            if str(exc) != 'PAYMENT_ATTEMPT_MISSING':
+                raise
+            repository.recordUnmappedPayment(payment)
+            return
+        from api.services.subscriptions.subscriptionService import subscriptionService
+        subscriptionService._finalizeManualCheckout(str(attempt['invoice_id']),
+            payment.get('order_id'), payment.get('id'), payment)
 
     def _handlePaymentCaptured(self, event: dict) -> None:
-        """
-        Handle the payment.captured webhook event.
-
-        Branches by payment source via notes.type:
-        - recurring_renewal: extends billing cycle by 1 month, resets dunning counter
-        - annual_renewal: extends billing cycle by 12 months, marks invoice paid
-        - domain_upgrade_proration: activates paid domains (webhook backup for verifyDomainUpgrade)
-        - credit_topup: grants purchased tokens (webhook backup for verifyTopupPayment;
-          the grant is idempotent, so racing that endpoint is safe)
-        - default: log-only
-
-        Args:
-            event (dict): The Razorpay webhook event.
-        """
-        paymentEntity = event.get("payload", {}).get("payment", {}).get("entity", {})
-        notes = paymentEntity.get("notes", {})
-        paymentType = notes.get("type", "")
-        paymentId = paymentEntity.get("id")
-        invoiceId = notes.get("invoiceId")
-
-        if paymentType == "recurring_renewal":
-            userId = notes.get("userId")
-            if not userId:
-                logger.error(f"recurring_renewal payment {paymentId} missing userId in notes")
-                return
-            if not invoiceId:
-                logger.error(f"recurring_renewal payment {paymentId} missing invoiceId in notes")
-                return
-            frozenInvoice = self._findInvoiceById(invoiceId)
-            if not frozenInvoice:
-                raise Exception(f"Frozen invoice not found for recurring payment: {invoiceId}")
-            self._validateFrozenInvoicePaymentMatch(frozenInvoice, paymentEntity)
-            user = self._findUserById(userId)
-            if not user:
-                logger.error(f"No user found for userId {userId} during payment.captured")
-                return
-            subscription = self._findSubscriptionByUserId(userId)
-            if not subscription:
-                logger.error(
-                    f"No canonical subscription row found for userId {userId} "
-                    f"during payment.captured"
-                )
-                return
-            previousExpiry = subscription.get("current_period_end")
-            if previousExpiry:
-                expiryDt = parser.isoparse(previousExpiry.replace("Z", "+00:00"))
-                if expiryDt.tzinfo is not None:
-                    expiryDt = expiryDt.replace(tzinfo=None)
-            else:
-                expiryDt = utcNow().replace(tzinfo=None)
-            newExpiry = expiryDt + relativedelta(months=1)
-            self.client.table("subscriptions").update({
-                "status": "active",
-                "plan_type": "pro",
-                "current_period_start": expiryDt.isoformat(),
-                "current_period_end": newExpiry.isoformat(),
-                "renewal_due_at": newExpiry.isoformat(),
-                "recurring_failures": 0,
-            }).eq("id", subscription["id"]).execute()
-            self._markInvoicePaid(invoiceId=invoiceId, paymentEntity=paymentEntity)
-            self._auditLog(
-                userId, "billing.renewal_charged",
-                paymentId=paymentId,
-                amount=paymentEntity.get("amount"),
-                currency=paymentEntity.get("currency", "INR"),
-                status="CHARGED",
-                metadata={
-                    "invoiceId": invoiceId,
-                    "previousExpiry": str(expiryDt),
-                    "newExpiry": str(newExpiry),
-                }
-            )
-            logger.info(f"Recurring renewal charged for user {userId}, new expiry {newExpiry}")
-        elif paymentType == "domain_upgrade_proration":
-            userId = notes.get("userId")
-            if not userId:
-                logger.error(f"domain_upgrade_proration payment {paymentId} missing userId in notes")
-                return
-            if invoiceId:
-                frozenInvoice = self._findInvoiceById(invoiceId)
-                if not frozenInvoice:
-                    raise Exception(f"Frozen invoice not found for domain proration payment: {invoiceId}")
-                self._validateFrozenInvoicePaymentMatch(frozenInvoice, paymentEntity)
-            from api.services.subscriptions.subscriptionService import subscriptionService
-            orderId = paymentEntity.get("order_id")
-            if orderId:
-                subscriptionService._activatePaidDomains(
-                    userId=userId,
-                    domains=[d.strip() for d in notes.get("domains", "").split(",") if d.strip()],
-                    targetQuantity=int(notes.get("targetQuantity", 0)),
-                    referenceId=orderId,
-                )
-            if invoiceId:
-                self._markInvoicePaid(invoiceId=invoiceId, paymentEntity=paymentEntity)
-            self._auditLog(
-                userId, "payment.captured",
-                paymentId=paymentId,
-                amount=paymentEntity.get("amount"),
-                currency=paymentEntity.get("currency", "INR"),
-                status="CAPTURED",
-                metadata={"type": "domain_upgrade_proration", "orderId": orderId, "invoiceId": invoiceId}
-            )
-            logger.info(f"Domain upgrade payment captured and activated: {paymentId}")
-        elif paymentType == "annual_renewal":
-            userId = notes.get("userId")
-            if not userId:
-                logger.error(f"annual_renewal payment {paymentId} missing userId in notes")
-                return
-            if not invoiceId:
-                logger.error(f"annual_renewal payment {paymentId} missing invoiceId in notes")
-                return
-            frozenInvoice = self._findInvoiceById(invoiceId)
-            if not frozenInvoice:
-                raise Exception(f"Frozen invoice not found for annual renewal: {invoiceId}")
-            invoiceStatus = (frozenInvoice.get("status") or "").upper()
-            if invoiceStatus == "PAID":
-                logger.info(f"Invoice {invoiceId} already paid, skipping annual_renewal webhook")
-                return
-            self._validateFrozenInvoicePaymentMatch(frozenInvoice, paymentEntity)
-            user = self._findUserById(userId)
-            if not user:
-                logger.error(f"No user found for userId {userId} during annual_renewal")
-                return
-            subscription = self._findSubscriptionByUserId(userId)
-            if not subscription:
-                logger.error(f"No subscription found for userId {userId} during annual_renewal")
-                return
-            previousExpiry = subscription.get("current_period_end")
-            if previousExpiry:
-                expiryDt = parser.isoparse(previousExpiry.replace("Z", "+00:00"))
-                if expiryDt.tzinfo is not None:
-                    expiryDt = expiryDt.replace(tzinfo=None)
-            else:
-                expiryDt = utcNow().replace(tzinfo=None)
-            newExpiry = expiryDt + relativedelta(years=1)
-            self.client.table("subscriptions").update({
-                "status": "active",
-                "plan_type": "annual",
-                "current_period_start": expiryDt.isoformat(),
-                "current_period_end": newExpiry.isoformat(),
-                "renewal_due_at": newExpiry.isoformat(),
-            }).eq("id", subscription["id"]).execute()
-            self._markInvoicePaid(invoiceId=invoiceId, paymentEntity=paymentEntity)
-            previousStatus = subscription.get("status", "")
-            if previousStatus in ("past_due", "suspended"):
-                self._sendRenewalNotification(
-                    userId=userId, invoiceId=invoiceId,
-                    template="subscription_restored",
-                    metadata={"previousStatus": previousStatus, "newExpiry": str(newExpiry)},
-                )
-            self._sendRenewalNotification(
-                userId=userId, invoiceId=invoiceId,
-                template="payment_success",
-                metadata={"amount": paymentEntity.get("amount"), "newExpiry": str(newExpiry)},
-            )
-            self._auditLog(
-                userId, "billing.annual_renewal_charged",
-                paymentId=paymentId,
-                amount=paymentEntity.get("amount"),
-                currency=paymentEntity.get("currency", "INR"),
-                status="CHARGED",
-                metadata={
-                    "invoiceId": invoiceId,
-                    "previousExpiry": str(expiryDt),
-                    "newExpiry": str(newExpiry),
-                    "flow": "webhook_payment_captured",
-                    "restoredFrom": previousStatus if previousStatus in ("past_due", "suspended") else None,
-                }
-            )
-            logger.info(f"Annual renewal charged for user {userId}, new expiry {newExpiry}")
-        elif paymentType == "credit_topup":
-            userId = notes.get("userId")
-            if not userId:
-                logger.error(f"credit_topup payment {paymentId} missing userId in notes")
-                return
-            orderId = paymentEntity.get("order_id")
-            if not orderId:
-                logger.error(f"credit_topup payment {paymentId} missing order_id")
-                return
-            from api.services.credits.creditService import creditService
-
-            result = creditService.grantTopupTokens(userId, orderId, paymentId)
-            self._auditLog(
-                userId, "credit.topup_granted",
-                paymentId=paymentId,
-                amount=paymentEntity.get("amount"),
-                currency=paymentEntity.get("currency", "INR"),
-                status="GRANTED" if result["granted"] else "ALREADY_GRANTED",
-                metadata={
-                    "packId": notes.get("packId"),
-                    "tokens": result["tokens"],
-                    "orderId": orderId,
-                    "invoiceId": invoiceId,
-                    "flow": "webhook",
-                }
-            )
-            logger.info(
-                f"Credit top-up webhook processed — payment={paymentId}, "
-                f"granted={result['granted']}, tokens={result['tokens']}"
-            )
-        else:
-            self._auditLog(
-                notes.get("userId", "unknown"), "payment.captured",
-                paymentId=paymentId,
-                amount=paymentEntity.get("amount"),
-                currency=paymentEntity.get("currency", "INR"),
-                status="CAPTURED"
-            )
-            logger.info(f"Payment captured: {paymentId}")
+        """All owned checkout captures use the same atomic financial authority."""
+        payment = event.get('payload', {}).get('payment', {}).get('entity', {}) or {}
+        from api.services.billing.manualBillingRepository import getManualBillingRepository
+        from api.services.subscriptions.subscriptionService import subscriptionService
+        repository = getManualBillingRepository()
+        try:
+            attempt = repository.attemptForOrder(payment.get('order_id'))
+        except ValueError as exc:
+            if str(exc) != 'PAYMENT_ATTEMPT_MISSING':
+                raise
+            repository.recordUnmappedPayment(payment)
+            return
+        # Signed webhook identity + local attempt establish ownership, not client notes.
+        subscriptionService._finalizeManualCheckout(str(attempt['invoice_id']),
+            payment.get('order_id'), payment.get('id'), payment)
 
     def _handlePaymentFailed(self, event: dict) -> None:
-        """
-        Handle the payment.failed webhook event.
-
-        Branches by payment source via notes.type:
-        - recurring_renewal: increments dunning counter, expires after 3 failures
-        - default: marks pending additions as failed, sends notification email
-
-        Args:
-            event (dict): The Razorpay webhook event.
-        """
-        paymentEntity = event.get("payload", {}).get("payment", {}).get("entity", {})
-        notes = paymentEntity.get("notes", {})
-        paymentType = notes.get("type", "")
-        paymentId = paymentEntity.get("id")
-        errorMeta = paymentEntity.get("error_code", "")
-        invoiceId = notes.get("invoiceId")
-
-        if paymentType == "recurring_renewal":
-            userId = notes.get("userId")
-            if not userId:
-                logger.error(f"recurring_renewal payment {paymentId} missing userId in notes")
-                return
-            user = self._findUserById(userId)
-            if not user:
-                logger.error(f"No user found for userId {userId} during payment.failed")
-                return
-            subscription = user.get("subscription") or self._findSubscriptionByUserId(userId)
-            failures = subscriptionRecurringFailures(subscription) + 1
-            if not subscription:
-                logger.error(f"No subscription found for userId {userId} during payment.failed")
-                return
-            updateData = {"recurring_failures": failures}
-            if failures >= 3:
-                updateData["status"] = "suspended"
-            self.client.table("subscriptions").update(updateData).eq("id", subscription["id"]).execute()
-            if failures >= 3:
-                subscription["status"] = "suspended"
-                normalizeChurnedSubscription(
-                    self.client, subscription, "payment_suspended",
-                    override_status="expired",
-                )
-            self._auditLog(
-                userId, "billing.renewal_failed",
-                paymentId=paymentId,
-                amount=paymentEntity.get("amount"),
-                currency=paymentEntity.get("currency", "INR"),
-                status="FAILED",
-                metadata={
-                    "invoiceId": invoiceId,
-                    "error_code": errorMeta,
-                    "error_description": paymentEntity.get("error_description", ""),
-                    "recurringFailures": failures,
-                    "suspended": failures >= 3,
-                }
-            )
-            if invoiceId:
-                self._markInvoiceFailed(
-                    invoiceId=invoiceId,
-                    errorCode=errorMeta,
-                    errorDescription=paymentEntity.get("error_description", ""),
-                )
-            if user.get("email"):
-                self._sendPaymentFailureEmail(user["email"], user.get("fullName", ""), "recurring_renewal_failed")
-            logger.info(f"Recurring renewal failed for user {userId}, failures={failures}")
-        elif paymentType == "annual_renewal":
-            userId = notes.get("userId")
-            if not userId:
-                logger.error(f"annual_renewal payment {paymentId} missing userId in notes")
-                return
-            self._auditLog(
-                userId, "billing.annual_renewal_failed",
-                paymentId=paymentId,
-                amount=paymentEntity.get("amount"),
-                currency=paymentEntity.get("currency", "INR"),
-                status="FAILED",
-                metadata={
-                    "invoiceId": invoiceId,
-                    "error_code": errorMeta,
-                    "error_description": paymentEntity.get("error_description", ""),
-                }
-            )
-            if invoiceId:
-                self._markInvoiceFailed(
-                    invoiceId=invoiceId,
-                    errorCode=errorMeta,
-                    errorDescription=paymentEntity.get("error_description", ""),
-                )
-                self._sendRenewalNotification(
-                    userId=userId, invoiceId=invoiceId,
-                    template="payment_failed_retry",
-                    metadata={
-                        "reason": "payment_failed",
-                        "errorCode": errorMeta,
-                    },
-                )
-            logger.info(f"Annual renewal payment failed for user {userId}, payment {paymentId}")
-        else:
-            userId = notes.get("userId", "unknown")
-            self._auditLog(
-                userId, "payment.failed",
-                paymentId=paymentId,
-                amount=paymentEntity.get("amount"),
-                currency=paymentEntity.get("currency", "INR"),
-                status="FAILED",
-                metadata={"invoiceId": invoiceId, "error_code": errorMeta, "error_description": paymentEntity.get("error_description", "")}
-            )
-            if invoiceId:
-                self._markInvoiceFailed(
-                    invoiceId=invoiceId,
-                    errorCode=errorMeta,
-                    errorDescription=paymentEntity.get("error_description", ""),
-                )
-            user = self._findUserById(userId) if userId != "unknown" else None
-            if user:
-                subscription = user.get("subscription") or self._findSubscriptionByUserId(userId)
-                pendingAdditions = (subscription or {}).get("pending_additions") or []
-                failedAny = False
-                for item in pendingAdditions:
-                    if item.get("state") in ("processing", "awaiting_payment"):
-                        item["state"] = "failed"
-                        failedAny = True
-                if failedAny and subscription:
-                    self.client.table("subscriptions").update({
-                        "pending_additions": pendingAdditions
-                    }).eq("id", subscription["id"]).execute()
-                self._sendPaymentFailureEmail(user["email"], user["fullName"], "payment_failed")
-            logger.info(f"Payment failed: {paymentId}")
+        payment = event.get('payload', {}).get('payment', {}).get('entity', {}) or {}
+        from api.services.billing.manualBillingRepository import getManualBillingRepository
+        repository = getManualBillingRepository()
+        try:
+            attempt = repository.attemptForOrder(payment.get('order_id'))
+        except ValueError as exc:
+            if str(exc) != 'PAYMENT_ATTEMPT_MISSING':
+                raise
+            repository.recordUnmappedPayment(payment)
+            return
+        from api.services.subscriptions.subscriptionService import subscriptionService
+        subscriptionService._finalizeManualCheckout(str(attempt['invoice_id']),
+            payment.get('order_id'), payment.get('id'), payment)
 
     def _handleOrderPaid(self, event: dict) -> None:
         """
@@ -856,51 +515,44 @@ class WebhookService:
         """
         Handle the token.confirmed webhook event.
 
-        Logs that the saved mandate (token) was confirmed by Razorpay.
+        The manual billing system no longer stores or uses recurring tokens;
+        new token confirmations are inert audit records. Historical token
+        state remains readable in billing_events.
 
         Args:
             event (dict): The Razorpay webhook event.
         """
         tokenEntity = event.get("payload", {}).get("token", {}).get("entity", {})
-        customerId = tokenEntity.get("customer_id", "")
-        user = self._findUserByCustomerId(customerId) if customerId else None
-        userId = user["userId"] if user else "unknown"
         self._auditLog(
-            userId, "token.confirmed",
-            status="CONFIRMED",
+            "system", "token.confirmed",
+            status="INERT",
             metadata={
                 "tokenId": tokenEntity.get("id"),
-                "customerId": customerId,
-                "maxAmount": tokenEntity.get("max_amount"),
+                "flow": "manual_billing_no_token_enrollment",
             }
         )
-        logger.info(f"Token confirmed for customer {customerId}")
+        logger.info(f"Token confirmed event recorded as inert: {tokenEntity.get('id')}")
 
     def _handleTokenCancelled(self, event: dict) -> None:
         """
         Handle the token.cancelled webhook event.
 
-        Clears the user's saved token to prevent future recurring charges.
+        No runtime token state exists to clear under manual billing; the
+        event is recorded as an inert audit row.
 
         Args:
             event (dict): The Razorpay webhook event.
         """
         tokenEntity = event.get("payload", {}).get("token", {}).get("entity", {})
-        customerId = tokenEntity.get("customer_id", "")
-        user = self._findUserByCustomerId(customerId) if customerId else None
-        if user:
-            subscription = user.get("subscription")
-            self.client.table("subscriptions").update({
-                "razorpay_token_id": None,
-            }).eq("id", subscription["id"]).execute()
-            self._auditLog(
-                user["userId"], "token.cancelled",
-                status="CANCELLED",
-                metadata={"tokenId": tokenEntity.get("id"), "customerId": customerId}
-            )
-            logger.info(f"Token cancelled for user {user['userId']}, cleared subscription razorpay_token_id")
-        else:
-            logger.warning(f"Token cancelled for unknown customer {customerId}")
+        self._auditLog(
+            "system", "token.cancelled",
+            status="INERT",
+            metadata={
+                "tokenId": tokenEntity.get("id"),
+                "flow": "manual_billing_no_token_enrollment",
+            }
+        )
+        logger.info(f"Token cancelled event recorded as inert: {tokenEntity.get('id')}")
 
     def _handleRefundProcessed(self, event: dict) -> None:
         """
@@ -920,6 +572,11 @@ class WebhookService:
             event (dict): The Razorpay webhook event.
         """
         refundEntity = event.get("payload", {}).get("refund", {}).get("entity", {})
+        intentId = (refundEntity.get("notes") or {}).get("refundIntentId")
+        if intentId:
+            from api.services.billing.manualBillingRepository import getManualBillingRepository
+            getManualBillingRepository().settleRefundEvidence(intentId, {"refunds": [refundEntity]})
+            return
         paymentId = refundEntity.get("payment_id", "")
         refundId = refundEntity.get("id", "")
         refundAmount = refundEntity.get("amount") or 0

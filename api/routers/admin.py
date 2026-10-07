@@ -1,8 +1,10 @@
-from fastapi import APIRouter, Depends, Header, Query, Request, status
+from fastapi import APIRouter, Depends, Header, Query, Request, Response, status
 
 from api.adminModels import (
     AdminOverviewPeriod,
     AdminAuditEventView,
+    AdminCreditResetOperationView,
+    AdminCreditResetRequest,
     AdminFreeTrialExtensionRequest,
     AdminFreeTrialExtensionResponse,
     AdminFreeTrialReductionRequest,
@@ -10,6 +12,8 @@ from api.adminModels import (
     AdminLoginRequest,
     AdminLoginResponse,
     AdminLogoutResponse,
+    AdminPaymentCaseActionRequest,
+    AdminPaymentCaseActionView,
     AdminSubscriptionPatch,
     AdminSubscriptionView,
     AdminTokenCostOverviewView,
@@ -35,6 +39,14 @@ from api.services.adminAuthService import (
     resolveAdminClientIp,
     verifyAdmin,
     verifyAdminForLogout,
+)
+from api.services.adminCreditResetService import (
+    AdminCreditResetService,
+    getAdminCreditResetService,
+)
+from api.services.adminPaymentCaseService import (
+    AdminPaymentCaseService,
+    getAdminPaymentCaseService,
 )
 from api.services.adminManagementService import (
     AdminManagementService,
@@ -169,6 +181,80 @@ async def startUserErasure(
     service: UserErasureService = Depends(getUserErasureService),
 ):
     return service.start(userId, payload, idempotencyKey, admin)
+
+
+@router.post(
+    "/users/{userId}/credits/reset",
+    response_model=AdminCreditResetOperationView,
+)
+def resetUserCredits(
+    userId: str,
+    payload: AdminCreditResetRequest,
+    idempotencyKey: str = Header(alias="Idempotency-Key"),
+    admin: AdminContext = Depends(verifyAdmin),
+    service: AdminCreditResetService = Depends(getAdminCreditResetService),
+):
+    return service.resetUser(userId, payload, idempotencyKey, admin)
+
+
+@router.post(
+    "/credits/reset-all",
+    response_model=AdminCreditResetOperationView,
+    responses={202: {"model": AdminCreditResetOperationView}},
+)
+def resetAllCredits(
+    payload: AdminCreditResetRequest,
+    response: Response,
+    idempotencyKey: str = Header(alias="Idempotency-Key"),
+    admin: AdminContext = Depends(verifyAdmin),
+    service: AdminCreditResetService = Depends(getAdminCreditResetService),
+):
+    """
+    Create or resume one all-user reset over a frozen membership snapshot.
+
+    Each call processes at most 100 unfinished targets. 202 means targets
+    remain; repeat the same request with the same Idempotency-Key to
+    continue. There is no background worker.
+    """
+    view = service.resetAll(payload, idempotencyKey, admin)
+    if view["status"] != "COMPLETED":
+        response.status_code = status.HTTP_202_ACCEPTED
+    return view
+
+
+@router.get(
+    "/credits/reset-operations/{operationId}",
+    response_model=AdminCreditResetOperationView,
+)
+def getCreditResetOperation(
+    operationId: str,
+    afterUserId: str | None = Query(default=None, max_length=128),
+    limit: int = Query(default=50, ge=1, le=100),
+    _admin: AdminContext = Depends(verifyAdmin),
+    service: AdminCreditResetService = Depends(getAdminCreditResetService),
+):
+    return service.getOperation(operationId, afterUserId, limit)
+
+
+@router.post(
+    "/billing/payment-cases/{captureEventId}/actions",
+    response_model=AdminPaymentCaseActionView,
+)
+def actOnPaymentCase(
+    captureEventId: str,
+    payload: AdminPaymentCaseActionRequest,
+    idempotencyKey: str = Header(alias="Idempotency-Key"),
+    admin: AdminContext = Depends(verifyAdmin),
+    service: AdminPaymentCaseService = Depends(getAdminPaymentCaseService),
+):
+    """
+    Record an investigation note or recheck the original payment of one capture case.
+
+    A note never resolves money. A recheck finalizes only when fresh provider
+    evidence satisfies the original purchase rules; otherwise the case stays
+    OPEN with a reason code. Refunds and overrides are not available here.
+    """
+    return service.act(captureEventId, payload, idempotencyKey, admin)
 
 
 @router.post(

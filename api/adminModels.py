@@ -1,5 +1,5 @@
 from enum import Enum
-from typing import Annotated, Literal
+from typing import Annotated, Any, Literal
 
 from pydantic import (
     BaseModel,
@@ -248,10 +248,8 @@ class AdminSubscriptionView(_StrictModel):
     pending_removals: str
     pending_additions: str
     billing_state: str
-    razorpay_customer_id: str | None = None
-    razorpay_token_id: str | None = None
-    subscription_anchor_day: int | None = None
-    recurring_failures: int
+    is_canonical: bool = False
+    renewal_opt_out: bool = False
     cancellation_reason: str | None = None
     version: int
     plan_type: str
@@ -328,3 +326,81 @@ class AdminTokenCostOverviewView(_StrictModel):
     totalCost: float = Field(ge=0, allow_inf_nan=False)
     currency: Literal["USD"]
     chart: AdminTokenCostChart
+
+
+class AdminCreditResetRequest(_StrictModel):
+    reason: str = Field(min_length=1, max_length=2000)
+
+    @field_validator("reason", mode="before")
+    @classmethod
+    def normalizeReason(cls, value):
+        return value.strip() if isinstance(value, str) else value
+
+
+class AdminCreditSnapshotView(_StrictModel):
+    planTier: str | None = None
+    domainCount: int
+    monthlyTokenQuota: int
+    usedTokens: int
+    remainingTokens: int
+    topupTokens: int
+    subscriptionId: str | None = None
+    lifecycleId: str | None = None
+    creditPeriodId: str | None = None
+    periodStart: str | None = None
+    periodEnd: str | None = None
+    balanceVersion: int
+
+
+class AdminCreditResetTargetView(_StrictModel):
+    userId: str
+    outcome: Literal["PENDING", "RESET", "SKIPPED", "RETRYABLE_FAILED"]
+    reasonCode: str | None = None
+    auditId: str | None = None
+    resetAt: str | None = None
+    before: AdminCreditSnapshotView | None = None
+    after: AdminCreditSnapshotView | None = None
+    cacheState: Literal["NOT_APPLICABLE", "PENDING", "INVALIDATED"]
+
+
+class AdminCreditResetOperationView(_StrictModel):
+    operationId: str
+    scope: Literal["individual", "all"]
+    status: Literal["RUNNING", "COMPLETED"]
+    requestedByAdminId: str
+    reason: str
+    createdAt: str
+    totalTargets: int = Field(ge=0)
+    resetCount: int = Field(ge=0)
+    skippedCount: int = Field(ge=0)
+    pendingCount: int = Field(ge=0)
+    retryableFailureCount: int = Field(ge=0)
+    cachePendingCount: int = Field(ge=0)
+    targets: list[AdminCreditResetTargetView]
+    nextAfterUserId: str | None = None
+
+
+class AdminPaymentCaseActionRequest(_StrictModel):
+    """Investigation note or original-payment recheck; never a refund or override."""
+    action: Literal["note", "recheck"]
+    caseReference: str = Field(min_length=1, max_length=128)
+    reason: str = Field(min_length=1, max_length=2000)
+
+    @field_validator("caseReference", "reason", mode="before")
+    @classmethod
+    def normalizeText(cls, value):
+        return value.strip() if isinstance(value, str) else value
+
+
+class AdminPaymentCaseActionView(_StrictModel):
+    actionId: str
+    caseId: str
+    action: Literal["note", "recheck"]
+    userId: str | None = None
+    invoiceId: str | None = None
+    financialStatus: Literal["OPEN", "FINALIZED"]
+    actionOutcome: Literal["NOTE_RECORDED", "STILL_UNRESOLVED", "FINALIZED_ORIGINAL"]
+    reasonCode: str | None = None
+    caseReference: str
+    finalization: dict[str, Any] | None = None
+    recordedAt: str

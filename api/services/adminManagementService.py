@@ -29,8 +29,7 @@ ADMIN_SUBSCRIPTION_FIELDS = (
     "current_period_end", "renewal_due_at", "auto_renew_enabled",
     "payment_collection_mode", "status", "default_currency",
     "subscribed_experts", "domain_count", "pending_removals",
-    "pending_additions", "billing_state", "razorpay_customer_id",
-    "razorpay_token_id", "subscription_anchor_day", "recurring_failures",
+    "pending_additions", "billing_state", "is_canonical", "renewal_opt_out",
     "cancellation_reason", "version", "plan_type", "created_at", "updated_at",
 )
 ADMIN_SUBSCRIPTION_SELECT = ",".join(ADMIN_SUBSCRIPTION_FIELDS)
@@ -199,7 +198,7 @@ class AdminManagementService:
                 raise AdminApiError(
                     500, "Failed to verify user erasure state"
                 ) from exc
-        if rows and rows[0].get("erasure_pending"):
+        if any(row.get("erasure_pending") for row in rows):
             return True
         try:
             requests = (

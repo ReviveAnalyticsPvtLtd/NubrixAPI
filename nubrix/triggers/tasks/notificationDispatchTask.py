@@ -55,6 +55,8 @@ class NotificationDispatchTask:
             return {"status": "disabled"}
 
         if self._service is None:
+            from api.services.billing.manualBillingRepository import getManualBillingRepository
+            getManualBillingRepository().bridgeNotificationIntents()
             from api.services.notifications.notificationDeliveryService import (
                 getNotificationDeliveryService,
             )

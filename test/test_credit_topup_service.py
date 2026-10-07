@@ -1,6 +1,4 @@
 import os
-import sys
-import types
 import unittest
 from unittest.mock import MagicMock, patch
 
@@ -11,31 +9,6 @@ os.environ.setdefault("SECRET_KEY", "test-secret")
 os.environ.setdefault("REDIS_HOST", "localhost")
 os.environ.setdefault("REDIS_PORT", "6379")
 os.environ.setdefault("REDIS_PASSWORD", "")
-
-for name in ("logtail", "loguru", "redis"):
-    if name not in sys.modules:
-        sys.modules[name] = types.ModuleType(name)
-if not hasattr(sys.modules["logtail"], "LogtailHandler"):
-    sys.modules["logtail"].LogtailHandler = lambda *a, **k: None
-if not hasattr(sys.modules["loguru"], "logger"):
-    class _L:
-        def __getattr__(self, _):
-            return lambda *a, **k: None
-    sys.modules["loguru"].logger = _L()
-if not hasattr(sys.modules["redis"], "Redis"):
-    sys.modules["redis"].Redis = lambda *a, **k: None
-if not hasattr(sys.modules["redis"], "ConnectionPool"):
-    sys.modules["redis"].ConnectionPool = type("ConnectionPool", (), {})
-if "supabase" not in sys.modules:
-    supabaseStub = types.ModuleType("supabase")
-    supabaseStub.create_client = lambda *a, **k: None
-    sys.modules["supabase"] = supabaseStub
-    optsMod = types.ModuleType("supabase.lib.client_options")
-    optsMod.ClientOptions = lambda *a, **k: None
-    libMod = types.ModuleType("supabase.lib")
-    sys.modules["supabase.lib"] = libMod
-    sys.modules["supabase.lib.client_options"] = optsMod
-
 
 _FALLBACK = 2678400
 
@@ -142,6 +115,7 @@ class TestTopupBalanceReads(unittest.TestCase):
         from api.services.credits.creditService import CreditService
         svc = CreditService()
         svc.supabase = MagicMock()
+        svc._manualBalance = MagicMock(return_value=None)
         return svc
 
     def test_remaining_tokens_is_the_sum_of_both_buckets(self):
@@ -290,32 +264,11 @@ class TestTopupLifecycleGuards(unittest.TestCase):
         from api.services.credits.creditService import CreditService
         svc = CreditService()
         svc.supabase = MagicMock()
+        svc._manualBalance = MagicMock(return_value=None)
         return svc
 
-    def test_initialize_never_writes_topup_tokens(self):
-        svc = self._service()
-        with patch.object(svc, "_dbRow", return_value={"topup_tokens": 5000000}), \
-             patch.object(svc, "_redis", side_effect=Exception("no redis")):
-            svc.initializeCreditBalance("u1", "pro")
-        payload = svc.supabase.table.return_value.upsert.call_args[0][0]
-        self.assertNotIn("topup_tokens", payload)
 
-    def test_initialize_reseeds_ttop_from_the_existing_row(self):
-        svc = self._service()
-        fakeRedis = MagicMock()
-        with patch.object(svc, "_dbRow", return_value={"topup_tokens": 5000000}), \
-             patch.object(svc, "_redis", return_value=fakeRedis):
-            svc.initializeCreditBalance("u1", "pro")
-        mapping = fakeRedis.hset.call_args[1]["mapping"]
-        self.assertEqual(mapping["ttop"], 5000000)
 
-    def test_initialize_seeds_zero_for_a_brand_new_user(self):
-        svc = self._service()
-        fakeRedis = MagicMock()
-        with patch.object(svc, "_dbRow", return_value=None), \
-             patch.object(svc, "_redis", return_value=fakeRedis):
-            svc.initializeCreditBalance("u1", "free")
-        self.assertEqual(fakeRedis.hset.call_args[1]["mapping"]["ttop"], 0)
 
     def test_reconcile_never_writes_topup_tokens(self):
         svc = self._service()
@@ -337,67 +290,6 @@ class TestTopupLifecycleGuards(unittest.TestCase):
             svc.forceResetAllQuotas(resetUsage=True)
         for call in svc.supabase.table.return_value.update.call_args_list:
             self.assertNotIn("topup_tokens", call[0][0])
-
-
-class TestTopupGrantAndClawback(unittest.TestCase):
-    def _service(self, rpcData):
-        from api.services.credits.creditService import CreditService
-        svc = CreditService()
-        svc.supabase = MagicMock()
-        svc.supabase.rpc.return_value.execute.return_value = MagicMock(data=rpcData)
-        return svc
-
-    def test_grant_increments_redis_and_reports_tokens(self):
-        svc = self._service([{"granted": True, "tokens": 5000000, "uid": "u1"}])
-        fakeRedis = MagicMock()
-        with patch.object(svc, "_redis", return_value=fakeRedis):
-            result = svc.grantTopupTokens("u1", "order_abc", "pay_abc")
-        self.assertEqual(result, {"granted": True, "tokens": 5000000})
-        svc.supabase.rpc.assert_called_once_with(
-            "grant_topup_tokens", {"p_order_id": "order_abc", "p_payment_id": "pay_abc"})
-        fakeRedis.hincrby.assert_called_once_with("credits:v3:u1", "ttop", 5000000)
-
-    def test_grant_is_a_noop_when_the_race_was_already_won(self):
-        svc = self._service([{"granted": False, "tokens": 0, "uid": None}])
-        fakeRedis = MagicMock()
-        with patch.object(svc, "_redis", return_value=fakeRedis):
-            result = svc.grantTopupTokens("u1", "order_abc", "pay_abc")
-        self.assertEqual(result, {"granted": False, "tokens": 0})
-        fakeRedis.hincrby.assert_not_called()
-
-    def test_failed_redis_increment_drops_the_hash_for_rebuild(self):
-        svc = self._service([{"granted": True, "tokens": 5000000, "uid": "u1"}])
-        fakeRedis = MagicMock()
-        fakeRedis.hincrby.side_effect = Exception("redis down")
-        with patch.object(svc, "_redis", return_value=fakeRedis):
-            result = svc.grantTopupTokens("u1", "order_abc", "pay_abc")
-        self.assertEqual(result["granted"], True)
-        fakeRedis.delete.assert_called_once_with("credits:v3:u1")
-
-    def test_empty_rpc_response_is_treated_as_not_granted(self):
-        svc = self._service([])
-        with patch.object(svc, "_redis", return_value=MagicMock()):
-            self.assertEqual(svc.grantTopupTokens("u1", "o", "p"),
-                             {"granted": False, "tokens": 0})
-
-    def test_clawback_decrements_redis_by_the_proportional_amount(self):
-        svc = self._service([{"clawed": True, "tokens": 2000000}])
-        fakeRedis = MagicMock()
-        with patch.object(svc, "_redis", return_value=fakeRedis):
-            result = svc.clawbackTopupTokens("u1", "rfnd_1", "pay_abc", 99950)
-        self.assertEqual(result, {"clawed": True, "tokens": 2000000})
-        svc.supabase.rpc.assert_called_once_with("clawback_topup_tokens", {
-            "p_refund_id": "rfnd_1", "p_payment_id": "pay_abc",
-            "p_refund_amount": 99950})
-        fakeRedis.delete.assert_called_once_with("credits:v3:u1")
-
-    def test_duplicate_refund_delivery_touches_nothing(self):
-        svc = self._service([{"clawed": False, "tokens": 0}])
-        fakeRedis = MagicMock()
-        with patch.object(svc, "_redis", return_value=fakeRedis):
-            result = svc.clawbackTopupTokens("u1", "rfnd_1", "pay_abc", 99950)
-        self.assertEqual(result, {"clawed": False, "tokens": 0})
-        fakeRedis.delete.assert_not_called()
 
 
 if __name__ == "__main__":

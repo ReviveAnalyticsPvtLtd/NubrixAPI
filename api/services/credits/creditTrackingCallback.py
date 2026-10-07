@@ -25,7 +25,12 @@ import uuid
 class CreditTrackingCallback(BaseCallbackHandler):
     """
     Post-LLM-call callback that reads ``usage_metadata`` from the
-    model response and deducts credits from the user's balance.
+    model response and settles it against the ADMITTED credit period.
+
+    The admission context (operation ID + credit period) is captured at work
+    start; a delayed ``on_llm_end`` after an expiry/refund/activation
+    boundary settles against that original period exactly once and never
+    debits a newly refilled period.
 
     Usage::
 
@@ -34,15 +39,38 @@ class CreditTrackingCallback(BaseCallbackHandler):
         response = workflow.invoke(inputs, config=config)
     """
 
-    def __init__(self, userId: str, operationType: str):
+    def __init__(self, userId: str, operationType: str, operationId: str | None = None,
+                 creditPeriodId: str | None = None, lifecycleId: str | None = None):
         super().__init__()
         self.userId = userId
         self.operationType = operationType
+        self.operationId = operationId or f"llm:{uuid.uuid4()}"
+        self.creditPeriodId = creditPeriodId
+        self.lifecycleId = lifecycleId
+        self._context = None
+        self._admit()
+
+    def _admit(self) -> None:
+        """Every eligible mode needs durable admission before counted work."""
+        from api.services.credits.creditService import creditService
+        self._context = creditService.admitCreditOperation(self.userId,self.operationType,self.operationId)
+        if ((self.creditPeriodId and self.creditPeriodId!=self._context.creditPeriodId)
+                or (self.lifecycleId and self.lifecycleId!=self._context.lifecycleId)):
+            raise ValueError('CREDIT_CONTEXT_MISMATCH')
+        self.raise_error = True
+
+    def on_llm_start(self, serialized, prompts, **kwargs):
+        if kwargs.get('run_id') is None:
+            raise ValueError('LLM_RUN_ID_REQUIRED_FOR_DURABLE_USAGE')
+        self._admit()
+
+    def on_chat_model_start(self, serialized, messages, **kwargs):
+        self.on_llm_start(serialized,messages,**kwargs)
 
     def on_llm_end(self, response: LLMResult, **kwargs: Any) -> None:
         """
-        Called after every LLM call.  Extracts token counts from the
-        response and deducts credits.
+        Called after every LLM call. Extracts token counts and settles the
+        real usage once against the originally admitted credit period.
         """
         try:
             totalTokens = 0
@@ -62,15 +90,16 @@ class CreditTrackingCallback(BaseCallbackHandler):
                         if isinstance(tokenUsage, dict):
                             totalTokens += tokenUsage.get("total_tokens", 0)
 
-            if totalTokens > 0:
+            if totalTokens > 0 and self._context is not None:
+                runId = kwargs.get("run_id")
+                if runId is None:
+                    raise ValueError("LLM_RUN_ID_REQUIRED_FOR_DURABLE_USAGE")
                 from api.services.credits.creditService import creditService
-                creditService.deductTokens(
-                    userId=self.userId,
-                    tokensUsed=totalTokens,
-                    operationType=self.operationType,
-                )
+                creditService.settleCreditOperation(self._context,totalTokens,str(runId))
         except Exception as e:
             logger.warning(
                 f"CreditTrackingCallback.on_llm_end failed — "
                 f"userId={self.userId}, op={self.operationType}: {e}"
             )
+            if self._context is not None:
+                raise

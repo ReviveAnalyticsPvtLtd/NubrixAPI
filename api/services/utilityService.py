@@ -52,7 +52,7 @@ class UtilityService:
     _STT_TOKENS_PER_SECOND = 50
     _STT_MIN_TOKENS = 2000
 
-    def getSpeechTranscript(self, speechToText: SpeechToTextModel, userId: str | None = None) -> str:
+    def getSpeechTranscript(self, speechToText: SpeechToTextModel, userId: str | None = None, operationId: str | None = None) -> str:
         """
         Converts base64-encoded audio to text using the SpeechToText module.
 
@@ -65,20 +65,22 @@ class UtilityService:
             CustomException: If transcription fails.
         """
         try:
+            context=None
+            executionId='speech:'+str(uuid.uuid4())
+            if userId:
+                from api.services.credits.creditService import creditService
+                context=creditService.admitCreditOperation(userId,'speech_to_text',
+                    (operationId+':'+executionId) if operationId else executionId)
             result = self.speechToTextModule.getTranscript(b64String = speechToText.b64String)
             transcriptText = result["text"]
             audioDuration = result.get("duration")
 
             if userId:
-                try:
-                    from api.services.credits.creditService import creditService
-                    if audioDuration is not None and audioDuration > 0:
-                        estimatedTokens = max(self._STT_MIN_TOKENS, int(audioDuration * self._STT_TOKENS_PER_SECOND))
-                    else:
-                        estimatedTokens = self._STT_MIN_TOKENS
-                    creditService.deductTokens(userId=userId, tokensUsed=estimatedTokens, operationType="speech_to_text")
-                except Exception as e:
-                    logger.warning(f"STT credit deduction failed: {e}")
+                if audioDuration is not None and audioDuration > 0:
+                    estimatedTokens = max(self._STT_MIN_TOKENS, int(audioDuration * self._STT_TOKENS_PER_SECOND))
+                else:
+                    estimatedTokens = self._STT_MIN_TOKENS
+                creditService.settleCreditOperation(context,estimatedTokens,executionId)
                 try:
                     from utils.langfuseClient import logManualGeneration
                     from nubrix.utils import getConfig
