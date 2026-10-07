@@ -25,6 +25,8 @@ class ManualCreditRepository:
             with connection.cursor(cursor_factory=RealDictCursor) as cursor:
                 self.repository._lockUser(cursor,userId)
                 subscription=self.repository._canonical(cursor,userId)
+                cursor.execute('select clock_timestamp() as current_time')
+                now=_utc(cursor.fetchone()['current_time'])
                 if not self._eligibleLocked(cursor,subscription,now):
                     return {'applied':False,'reason':'inactive_coverage'}
                 balance=self._balanceLocked(cursor,subscription,now)
@@ -119,6 +121,8 @@ class ManualCreditRepository:
             with connection.cursor(cursor_factory=RealDictCursor) as cursor:
                 self.repository._lockUser(cursor,userId)
                 subscription=self.repository._canonical(cursor,userId)
+                cursor.execute('select clock_timestamp() as current_time')
+                now=_utc(cursor.fetchone()['current_time'])
                 if self._eligibleLocked(cursor,subscription,now):
                     return self._balanceLocked(cursor,subscription,now)
                 cursor.execute('select * from public.credit_balances where user_id=%s for update',(userId,))
@@ -136,6 +140,8 @@ class ManualCreditRepository:
             with connection.cursor(cursor_factory=RealDictCursor) as cursor:
                 self.repository._lockUser(cursor,userId)
                 subscription=self.repository._canonical(cursor,userId)
+                cursor.execute('select clock_timestamp() as current_time')
+                now=_utc(cursor.fetchone()['current_time'])
                 # An old admission is a settlement identity, never authorization for a retry.
                 if not self._eligibleLocked(cursor,subscription,now):
                     raise ValueError('CREDIT_ADMISSION_REQUIRES_PAID_COVERAGE')

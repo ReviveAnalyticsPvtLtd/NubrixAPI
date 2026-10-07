@@ -129,6 +129,7 @@ class FinalizationResult:
     currentPeriod: CoveragePeriod | None
     nextPeriod: CoveragePeriod | None
     anomalyId: str | None
+    invoiceStatus: str | None = None
 
 
 @dataclass(frozen=True)

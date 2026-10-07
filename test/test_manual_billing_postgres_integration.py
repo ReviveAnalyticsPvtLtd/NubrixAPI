@@ -349,6 +349,7 @@ def test_reviewed_backfill_preserves_consumption_and_maps_current_identity(payme
     try:
         with connection.cursor() as cursor:
             cursor.execute('update public.subscriptions set billing_state=\'{}\'::jsonb where user_id=%s',(evidence.userId,))
+            cursor.execute('update public."Invoices" set metadata_json=\'{}\'::jsonb where id=%s',(evidence.invoiceId,))
             cursor.execute('update public.credit_balances set lifecycle_id=null,credit_period_id=null,used_tokens=200,remaining_tokens=monthly_token_quota-200,topup_tokens=1234 where user_id=%s',(evidence.userId,))
             cursor.execute('select version from public.subscriptions where user_id=%s',(evidence.userId,))
             version=cursor.fetchone()[0]
@@ -361,6 +362,7 @@ def test_reviewed_backfill_preserves_consumption_and_maps_current_identity(payme
         'current_invoice_id':evidence.invoiceId,'lifecycle_id':lifecycle,'credit_period_id':period}]}))
     monkeypatch.setenv('DATABASE_URL',url)
     assert applyMapping(str(mapping))['promoted']==1
+    assert repository.getCoverageSnapshot(evidence.userId).accessAllowed
     connection=psycopg2.connect(url)
     try:
         with connection.cursor() as cursor:
@@ -646,3 +648,71 @@ def test_inventory_cli_is_read_only_and_redacted_after_contraction(postgres,monk
         with connection.cursor() as cursor:
             cursor.execute('select count(*) from public.subscriptions where user_id=%s',(owner,))
             assert cursor.fetchone()[0]==2
+
+
+@pytest.mark.parametrize('operation',['coverage','admission'])
+def test_lock_wait_past_expiry_uses_wall_clock(payment,operation,monkeypatch):
+    import threading,time
+    from api.services.credits.manualCreditRepository import ManualCreditRepository
+    repository,evidence,url=payment
+    repository.finalizeCapturedPayment(evidence)
+    with psycopg2.connect(url) as connection:
+        with connection.cursor() as cursor:
+            cursor.execute("update public.\"Invoices\" set period_end=clock_timestamp()+interval '1 second' where id=%s",(evidence.invoiceId,))
+            cursor.execute("update public.subscriptions set current_period_end=clock_timestamp()+interval '1 second' where user_id=%s",(evidence.userId,))
+    blocker=repository.connectionFactory()
+    with blocker.cursor() as cursor: repository._lockUser(cursor,evidence.userId)
+    # Hold the owner lock inside the exact method being checked. Pre-activation
+    # is unnecessary for this current period and would mask admit's stale clock.
+    monkeypatch.setattr(repository,'activateDueCoverage',lambda *args:None)
+    started=threading.Event()
+    originalLock=repository._lockUser
+    def observedLock(cursor,userId):
+        started.set();originalLock(cursor,userId)
+    monkeypatch.setattr(repository,'_lockUser',observedLock)
+    def execute():
+        if operation=='coverage': return repository.getCoverageSnapshot(evidence.userId)
+        try: return ManualCreditRepository(repository).admit(evidence.userId,'reporting_query','after-lock')
+        except ValueError as exc: return str(exc)
+    try:
+        with ThreadPoolExecutor(max_workers=1) as pool:
+            result=pool.submit(execute)
+            assert started.wait(5)
+            time.sleep(1.2)
+            blocker.commit()
+            observed=result.result(timeout=5)
+        if operation=='coverage': assert not observed.accessAllowed
+        else: assert observed=='CREDIT_ADMISSION_REQUIRES_PAID_COVERAGE'
+    finally: blocker.close()
+
+
+
+def test_submission_lock_wait_past_lease_expiry_is_rejected(payment,monkeypatch):
+    import threading,time
+    from api.services.notifications.notificationDeliveryRepository import NotificationDeliveryRepository
+    repository,evidence,url=payment
+    period=repository.finalizeCapturedPayment(evidence).currentPeriod
+    deliveries=NotificationDeliveryRepository(lambda:psycopg2.connect(url))
+    row,_=deliveries.enqueueBillingNotification(evidence.userId,period.subscriptionId,'payment_receipt',
+        'waiting-lease:'+evidence.providerPaymentId,period.end.isoformat(),{'invoiceId':evidence.invoiceId})
+    with psycopg2.connect(url) as connection:
+        with connection.cursor() as cursor:
+            cursor.execute("update public.notification_deliveries set status='SENDING',lease_owner='waiting-worker',claimed_payload_version=payload_version,lease_expires_at=clock_timestamp()+interval '1 second' where id=%s",(row['id'],))
+    blocker=repository.connectionFactory()
+    with blocker.cursor() as cursor: repository._lockUser(cursor,evidence.userId)
+    started=threading.Event()
+    originalLock=ManualBillingRepository._lockUser
+    def observedLock(self,cursor,userId):
+        started.set();originalLock(self,cursor,userId)
+    monkeypatch.setattr(ManualBillingRepository,'_lockUser',observedLock)
+    try:
+        with ThreadPoolExecutor(max_workers=1) as pool:
+            result=pool.submit(deliveries.authorizeBillingSubmission,str(row['id']),'waiting-worker',1)
+            assert started.wait(5)
+            time.sleep(1.2);blocker.commit()
+            assert not result.result(timeout=5)
+        with psycopg2.connect(url) as connection:
+            with connection.cursor() as cursor:
+                cursor.execute('select submission_started_at from public.notification_deliveries where id=%s',(row['id'],))
+                assert cursor.fetchone()[0] is None
+    finally: blocker.close()

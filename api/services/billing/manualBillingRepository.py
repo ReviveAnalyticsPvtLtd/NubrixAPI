@@ -190,7 +190,7 @@ class ManualBillingRepository:
             with connection.cursor(cursor_factory=RealDictCursor) as cursor:
                 self._lockUser(cursor, userId)
                 subscription = self._canonical(cursor, userId)
-                cursor.execute('select now() as current_time')
+                cursor.execute('select clock_timestamp() as current_time')
                 now = _utc(cursor.fetchone()['current_time'])
                 state = self._json(subscription.get('billing_state'))
                 cursor.execute('select "isBanned" from public."Users" where "userId"=%s', (userId,))
@@ -272,7 +272,7 @@ class ManualBillingRepository:
             with connection.cursor(cursor_factory=RealDictCursor) as cursor:
                 self._lockUser(cursor, request.userId)
                 subscription = self._canonical(cursor, request.userId)
-                cursor.execute('select now() as current_time')
+                cursor.execute('select clock_timestamp() as current_time')
                 now = _utc(cursor.fetchone()['current_time'])
                 existing = lookup(cursor, now)
                 if existing is not None or replayOnly:
@@ -301,7 +301,7 @@ class ManualBillingRepository:
                 lifecycle = str(uuid.uuid4()) if request.purpose == 'initial_purchase' else coverage.lifecycleId
                 revision = 1
                 if request.purpose == 'renewal':
-                    if subscription.get('renewal_opt_out') or not end or end <= now:
+                    if subscription.get('renewal_opt_out') or not end or (request.billingMode == 'monthly_prepaid' and end <= now):
                         raise ValueError('RENEWAL_NOT_ELIGIBLE')
                     invoiceId = request.payload.get('invoiceId')
                     cursor.execute('select * from public."Invoices" where id=%s and "userId"=%s for update', (invoiceId, request.userId))
@@ -309,7 +309,7 @@ class ManualBillingRepository:
                     if not invoice or str(invoice['subscription_id']) != str(subscription['id']):
                         raise ValueError('OWNED_INVOICE_NOT_FOUND')
                     frozen = self._json(invoice.get('metadata_json')).get('manualBilling', {})
-                    if invoice.get('billing_reason') != 'renewal' or invoice['status'] not in ('UPCOMING', 'PAYMENT_PENDING') or _utc(invoice.get('period_start')) != end:
+                    if invoice.get('billing_reason') != 'renewal' or str(invoice['status']).upper() not in ('UPCOMING', 'PAYMENT_PENDING') or _utc(invoice.get('period_start')) != end:
                         raise ValueError('RENEWAL_INVOICE_CLOSED')
                     current = subscription.get('subscribed_experts') or []
                     current = json.loads(current) if isinstance(current, str) else current
@@ -447,7 +447,7 @@ class ManualBillingRepository:
                 if any(row['status']=='PAID' and self._json(row.get('metadata_json')).get('manualBilling',{}).get('coverageState')!='revoked' for row in invoices):
                     raise ValueError('PAID_FUTURE_SELECTION_IMMUTABLE')
                 for invoice in invoices:
-                    if invoice['status'] not in ('UPCOMING','PAYMENT_PENDING'): continue
+                    if str(invoice['status']).upper() not in ('UPCOMING','PAYMENT_PENDING'): continue
                     self._closeInvoice(cursor,invoice,'EXPERT_SELECTION_CHANGED')
                 pending.extend(domains)
                 cursor.execute('update public.subscriptions set pending_removals=%s,version=version+1 where id=%s',(Json(pending),subscription['id']))
@@ -498,7 +498,7 @@ class ManualBillingRepository:
             with connection.cursor(cursor_factory=RealDictCursor) as cursor:
                 self._lockUser(cursor, userId)
                 subscription = self._canonical(cursor, userId)
-                cursor.execute('select now() as current_time')
+                cursor.execute('select clock_timestamp() as current_time')
                 return self._reserveCheckoutIntentLocked(cursor, subscription, userId, purpose,
                     requestKey, payloadHash, snapshot, _utc(cursor.fetchone()['current_time']))
         return self._run(operation)
@@ -579,9 +579,9 @@ class ManualBillingRepository:
             namespaceKey += ':revision:'+str(revision)
             manualBilling['revision']=revision
 
-        if invoice['status'] not in ('UPCOMING','PAYMENT_PENDING') or _utc(snapshot.get('expiresAt')) <= now:
+        if str(invoice['status']).upper() not in ('UPCOMING','PAYMENT_PENDING') or _utc(snapshot.get('expiresAt')) <= now:
             raise ValueError('CHECKOUT_CLOSED')
-        if purpose == 'renewal' and (subscription.get('renewal_opt_out') or not _utc(subscription.get('current_period_end')) or _utc(subscription.get('current_period_end')) <= now):
+        if purpose == 'renewal' and (subscription.get('renewal_opt_out') or not _utc(subscription.get('current_period_end')) or (snapshot.get('billingMode') == 'monthly_prepaid' and _utc(subscription.get('current_period_end')) <= now)):
             raise ValueError('RENEWAL_NOT_ELIGIBLE')
         manualBilling['expiresAt']=(_utc(snapshot['expiresAt']) if snapshot.get('billingMode') == 'annual_prepaid'
             else min(_utc(snapshot['expiresAt']),now+timedelta(seconds=int(os.environ.get('MANUAL_CHECKOUT_TTL_SECONDS','1800'))))).isoformat()
@@ -851,7 +851,7 @@ class ManualBillingRepository:
                 captureAt = captureAt or evidence.observedAt
                 reason = None
                 if invoice['status'] == 'PAID': reason = 'EXCESS_CAPTURE'
-                elif invoice['status'] not in ('UPCOMING','PAYMENT_PENDING'): reason = 'CLOSED_INVOICE'
+                elif str(invoice['status']).upper() not in ('UPCOMING','PAYMENT_PENDING'): reason = 'CLOSED_INVOICE'
                 elif frozen.get('closedAt'): reason = 'CLOSED_ATTEMPT'
                 elif cutoff is None or captureAt >= cutoff: reason = 'CAPTURE_OUTSIDE_WINDOW'
                 elif subscription.get('erasure_pending'): reason = 'ERASURE_PENDING'
@@ -1005,7 +1005,7 @@ class ManualBillingRepository:
                 self._lockUser(cursor, userId)
                 subscription = self._canonical(cursor, userId)
                 if now is None:
-                    cursor.execute('select now() as current_time')
+                    cursor.execute('select clock_timestamp() as current_time')
                     evaluated = _utc(cursor.fetchone()['current_time'])
                 else:
                     evaluated = _utc(now)
@@ -1035,7 +1035,11 @@ class ManualBillingRepository:
                     or billing.get('coverageState') not in ('active', 'scheduled', 'elapsed')):
                 continue
             if mode == 'annual_prepaid' and billing.get('purpose') not in ('initial_purchase', 'renewal'):
-                continue
+                # Existing annual payments predate manualBilling metadata. Only
+                # owned paid service invoices with provider evidence qualify.
+                if (billing.get('purpose') is not None or invoice.get('billing_reason') not in ('initial_purchase','renewal')
+                        or not invoice.get('razorpayPaymentId')):
+                    continue
             domains = (subscription.get('subscribed_experts') if start <= now < end
                        else billing.get('domains')) or billing.get('domains') or []
             if isinstance(domains, str):
@@ -1060,6 +1064,10 @@ class ManualBillingRepository:
     def _json(value):
         return json.loads(value) if isinstance(value,str) else dict(value or {})
 
+    @staticmethod
+    def _jsonList(value):
+        return json.loads(value) if isinstance(value,str) else list(value or [])
+
     def _canonical(self,cursor,userId):
         cursor.execute('select * from public.subscriptions where user_id=%s and is_canonical=true for update',(userId,))
         row = cursor.fetchone()
@@ -1082,7 +1090,10 @@ class ManualBillingRepository:
         metadata = self._json(invoice['metadata_json'])
         billing = metadata['manualBilling']
         period = self._coverage(invoice)
-        quota = getTokenQuotaForPlan('annual', len(period.domains))
+        preserveCurrent = period.start > now and self._coverageSnapshotLocked(cursor,subscription,now,materialize=False).currentPeriod is not None
+        domains = self._jsonList(subscription.get('subscribed_experts')) if preserveCurrent else list(period.domains)
+        removals = self._jsonList(subscription.get('pending_removals')) if preserveCurrent else []
+        quota = getTokenQuotaForPlan('annual', len(domains))
         cursor.execute('''insert into public.credit_balances (user_id,subscription_id,plan_tier,domain_count,
             monthly_token_quota,used_tokens,remaining_tokens,period_start,period_end,lifecycle_id,
             credit_period_id,balance_version,last_reset_at,updated_at)
@@ -1092,7 +1103,7 @@ class ManualBillingRepository:
             remaining_tokens=excluded.remaining_tokens,period_start=excluded.period_start,period_end=excluded.period_end,
             lifecycle_id=excluded.lifecycle_id,credit_period_id=excluded.credit_period_id,
             balance_version=credit_balances.balance_version+1,last_reset_at=excluded.last_reset_at,updated_at=excluded.updated_at''',
-            (period.userId,period.subscriptionId,len(period.domains),quota,quota,now,now+relativedelta(months=1),
+            (period.userId,period.subscriptionId,len(domains),quota,quota,now,now+relativedelta(months=1),
              period.lifecycleId,period.creditPeriodId,now,now))
         billing['coverageState'] = 'scheduled' if period.start > now else 'active'
         billing['creditsAllocatedAt'] = now.isoformat()
@@ -1100,10 +1111,10 @@ class ManualBillingRepository:
         cursor.execute('''update public.subscriptions set status='active',plan_type='annual',billing_mode='annual_prepaid',
             current_period_start=%s,current_period_end=%s,renewal_due_at=%s,subscribed_experts=%s,
             domain_count=%s,pending_removals=%s,auto_renew_enabled=false,version=version+1,updated_at=%s where id=%s''',
-            (period.start,period.end,period.end,Json(list(period.domains)),len(period.domains),Json([]),now,subscription['id']))
+            (period.start,period.end,period.end,Json(domains),len(domains),Json(removals),now,subscription['id']))
         subscription.update(status='active',plan_type='annual',billing_mode='annual_prepaid',
             current_period_start=period.start,current_period_end=period.end,renewal_due_at=period.end,
-            subscribed_experts=list(period.domains),domain_count=len(period.domains))
+            subscribed_experts=domains,domain_count=len(domains),pending_removals=removals)
         invoice['metadata_json'] = metadata
         return self._result(cursor,invoice,subscription,'paid_scheduled' if period.start > now else 'activated',attemptId,refilled=True)
 
@@ -1125,7 +1136,7 @@ class ManualBillingRepository:
             'ready' if ready else 'pending_materialization',
             state in ('activated','paid_scheduled','already_finalized','elapsed','expert_activated','topup_granted'),
             refilled,snapshot.renewalOptOut,snapshot.currentPeriod if snapshot.accessAllowed else None,
-            snapshot.nextPeriod,anomalyId)
+            snapshot.nextPeriod,anomalyId,str(invoice.get('status') or '').upper() or None)
 
     def _applyCoverage(self,cursor,invoice,subscription,now,attemptId):
         metadata = self._json(invoice.get('metadata_json'))

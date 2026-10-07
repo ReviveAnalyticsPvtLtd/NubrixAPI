@@ -42,6 +42,11 @@ from api.commons import client
 from jose import jwt
 import requests
 import razorpay
+import psycopg2
+import httpx
+
+_CHECKOUT_UNAVAILABLE = (psycopg2.OperationalError, psycopg2.InterfaceError, requests.RequestException, httpx.HTTPError,
+    razorpay.errors.GatewayError, razorpay.errors.ServerError, RuntimeError, TimeoutError, ConnectionError)
 import datetime
 from dateutil import parser
 import hashlib
@@ -84,12 +89,15 @@ class SubscriptionService:
         Returns:
             dict | None: Subscription row or None.
         """
-        response = self.client.table("subscriptions") \
-            .select(CANONICAL_SUBSCRIPTION_SELECT) \
-            .eq("user_id", userId) \
-            .eq("is_canonical", True) \
-            .limit(1) \
-            .execute().data
+        try:
+            response = self.client.table("subscriptions") \
+                .select(CANONICAL_SUBSCRIPTION_SELECT) \
+                .eq("user_id", userId) \
+                .eq("is_canonical", True) \
+                .limit(1) \
+                .execute().data
+        except _CHECKOUT_UNAVAILABLE as exc:
+            raise CustomException(exc,statusCode=503,uiMessage='Subscription data is temporarily unavailable. Please try again later.') from exc
         if response:
             return response[0]
         if required:
@@ -1255,6 +1263,8 @@ class SubscriptionService:
                 {'userEmail':identity['email'],'userName':identity['name'],'userContact':identity['contact']})
         except CustomException:
             raise
+        except _CHECKOUT_UNAVAILABLE as exc:
+            raise CustomException(exc,statusCode=503,uiMessage='Checkout is temporarily unavailable. Please try again later.') from exc
         except ValueError as exc:
             marker = str(exc)
             status = 422 if marker.startswith('INVALID_') else 404 if marker == 'OWNED_INVOICE_NOT_FOUND' else 403 if marker in ('CHECKOUT_OWNER_NOT_ELIGIBLE', 'PAID_COVERAGE_REQUIRED') else 409
@@ -1303,6 +1313,8 @@ class SubscriptionService:
             return result
         except CustomException:
             raise
+        except _CHECKOUT_UNAVAILABLE as exc:
+            raise CustomException(exc,statusCode=503,uiMessage='Payment confirmation is temporarily unavailable. Please try again later.') from exc
         except ValueError as exc:
             raise CustomException(exc, statusCode=400, uiMessage='Payment verification failed.',
                 errorCode=str(exc)) from exc

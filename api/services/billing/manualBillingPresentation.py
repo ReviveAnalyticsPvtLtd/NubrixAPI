@@ -30,4 +30,4 @@ def serializeFinalizationResult(result):
         'currentPeriod':serializePeriod(result.currentPeriod), 'nextPeriod':serializePeriod(result.nextPeriod),
         'creditsRefilled':result.creditsRefilled, 'creditState':result.creditState,
         'renewalOptOut':result.renewalOptOut, 'anomalyId':result.anomalyId,
-        'invoiceStatus':'PAID' if result.finalized else 'PAYMENT_PENDING'}
+        'invoiceStatus':result.invoiceStatus}

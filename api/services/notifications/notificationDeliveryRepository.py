@@ -349,13 +349,13 @@ class NotificationDeliveryRepository:
                     cursor.execute('select * from public."Invoices" where id=%s and "userId"=%s for update',
                                    (invoiceId,identity['user_id']))
                     invoice = cursor.fetchone()
-                cursor.execute('select now() as observed_at')
+                cursor.execute('select clock_timestamp() as observed_at')
                 from api.services.subscriptions.paymentValidationService import parseUtc
                 observedAt = parseUtc(cursor.fetchone()['observed_at'])
                 if row.get('lease_expires_at') and parseUtc(row['lease_expires_at']) <= observedAt: return False
                 subscription['billing_state'] = repository._json(subscription.get('billing_state'))
                 if not isBillingNotificationEligible(row,{'subscription':subscription,'invoice':invoice},observedAt): return False
-                cursor.execute('update public.notification_deliveries set submission_started_at=now() where id=%s',(deliveryId,))
+                cursor.execute('update public.notification_deliveries set submission_started_at=clock_timestamp() where id=%s',(deliveryId,))
                 return True
         return repository._run(operation)
 

@@ -167,7 +167,7 @@ class AnnualRenewalTask:
             self.client.table("Invoices")
             .select("id, subscription_id, userId, status, due_date, period_start, period_end, "
                     "total_amount, currency, metadata_json")
-            .in_("status", ["upcoming", "payment_pending", "expired"])
+            .in_("status", ["UPCOMING", "PAYMENT_PENDING", "EXPIRED", "upcoming", "payment_pending", "expired"])
             .eq("billing_reason", "renewal")
             .not_.is_("due_date", "null")
             .lte("due_date", windowEnd)
@@ -213,7 +213,7 @@ class AnnualRenewalTask:
                     skipped += 1
                     continue
                 subscription = subscriptionRows[0]
-                if subscriptionErasurePending(subscription):
+                if subscriptionErasurePending(subscription) or subscription.get('billing_mode') != 'annual_prepaid':
                     skipped += 1
                     continue
 

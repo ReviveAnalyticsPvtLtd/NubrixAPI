@@ -221,13 +221,14 @@ def applyMapping(mappingFilePath: str) -> dict:
                     invoice=cursor.fetchone()
                     if (not invoice or invoice['userId']!=entry['user_id'] or str(invoice['subscription_id'])!=entry['promote_id']
                         or invoice['status'].upper()!='PAID' or not invoice.get('razorpayPaymentId')
+                        or invoice.get('billing_reason') not in ('initial_purchase','renewal')
                         or _utc(invoice['period_start'])!=_utc(canonical['current_period_start'])
                         or _utc(invoice['period_end'])!=_utc(canonical['current_period_end'])):
                         raise ValueError('BACKFILL_PAID_INTERVAL_EVIDENCE_REQUIRED')
                     metadata=invoice.get('metadata_json') or {}
                     metadata=json.loads(metadata) if isinstance(metadata,str) else dict(metadata)
                     metadata.setdefault('manualBilling',{}).update(lifecycleId=lifecycle,creditPeriodId=period,
-                        billingMode='monthly_prepaid',domains=canonical['subscribed_experts'],coverageState='active',
+                        billingMode='monthly_prepaid',purpose=invoice['billing_reason'],domains=canonical['subscribed_experts'],coverageState='active',
                         backfillApprovedBy=reviewed['approved_by'])
                     cursor.execute('update public."Invoices" set metadata_json=%s where id=%s',(Json(metadata),invoice['id']))
                     state=canonical.get('billing_state') or {}
@@ -254,7 +255,7 @@ def applyMapping(mappingFilePath: str) -> dict:
                         frozen=dict(paid.get('metadata_json') or {})
                         frozen.setdefault('manualBilling',{}).update(lifecycleId=lifecycle,
                             creditPeriodId=str(uuid.UUID(mapping['credit_period_id'])),billingMode='monthly_prepaid',
-                            domains=experts,coverageState='scheduled',backfillApprovedBy=reviewed['approved_by'])
+                            purpose='renewal',domains=experts,coverageState='scheduled',backfillApprovedBy=reviewed['approved_by'])
                         cursor.execute('update public."Invoices" set metadata_json=%s where id=%s',(Json(frozen),paid['id']))
                         state['manualBilling']['paidFutureEnd']=_utc(paid['period_end']).isoformat()
                     cursor.execute('update public.subscriptions set billing_state=%s where id=%s',(Json(state),canonical['id']))

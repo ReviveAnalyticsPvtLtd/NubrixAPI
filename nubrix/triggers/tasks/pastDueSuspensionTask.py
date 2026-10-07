@@ -113,7 +113,7 @@ class PastDueSuspensionTask:
                     .select("id, status")
                     .eq("subscription_id", subscriptionId)
                     .eq("billing_reason", "renewal")
-                    .in_("status", ["upcoming", "payment_pending", "expired"])
+                    .in_("status", ["UPCOMING", "PAYMENT_PENDING", "EXPIRED", "upcoming", "payment_pending", "expired"])
                     .limit(1)
                     .execute()
                     .data
@@ -174,7 +174,7 @@ class PastDueSuspensionTask:
                     .select("id, status")
                     .eq("subscription_id", subscriptionId)
                     .eq("billing_reason", "renewal")
-                    .in_("status", ["upcoming", "payment_pending", "expired"])
+                    .in_("status", ["UPCOMING", "PAYMENT_PENDING", "EXPIRED", "upcoming", "payment_pending", "expired"])
                     .limit(1)
                     .execute()
                     .data

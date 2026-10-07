@@ -137,7 +137,7 @@ def createUpcomingRenewalInvoice(subscription: dict, user: dict) -> dict | None:
             billingMode="annual_prepaid",
             billingReason="renewal",
             domainCount=domainCount,
-            customerState=subscriptionBillingState(subscription),
+            customerState=subscriptionBillingState(subscription).get('customerState'),
             periodStart=dtparser.isoparse(nextPeriodStart) if isinstance(nextPeriodStart, str) else nextPeriodStart,
             periodEnd=nextPeriodEndDt,
         )
@@ -163,7 +163,7 @@ def createUpcomingRenewalInvoice(subscription: dict, user: dict) -> dict | None:
         "total_amount": snapshot.total_amount,
         "amount": snapshot.total_amount,
         "currency": snapshot.currency,
-        "status": "upcoming",
+        "status": "UPCOMING",
         "due_date": dueDate,
         "tax_breakdown_json": snapshot.tax.to_dict(),
         "tax_rule_version": snapshot.tax.tax_rule_version,
@@ -266,7 +266,7 @@ def prepareDashboardRenewalInvoice(invoice: dict) -> dict | None:
             billingMode="annual_prepaid",
             billingReason="renewal",
             domainCount=domainCount,
-            customerState=subscriptionBillingState(subscription),
+            customerState=subscriptionBillingState(subscription).get('customerState'),
             periodStart=periodStartDt,
             periodEnd=periodEndDt,
         )
@@ -292,7 +292,7 @@ def prepareDashboardRenewalInvoice(invoice: dict) -> dict | None:
     updatePayload = {
         "payment_flow": "razorpay_order_checkout",
         "requires_customer_auth": True,
-        "status": "payment_pending",
+        "status": "PAYMENT_PENDING",
         "amount_before_tax": snapshot.amount_before_tax,
         "tax_amount": snapshot.tax.tax_amount,
         "total_amount": snapshot.total_amount,

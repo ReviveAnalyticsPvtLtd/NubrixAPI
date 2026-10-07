@@ -78,6 +78,16 @@ class SqlConnection:
         self.connection = sqlite3.connect(path)
         self.connection.row_factory = sqlite3.Row
         self.connection.create_function("now", 0, lambda: NOW.isoformat())
+        # The SQLite harness controls wall time, independently of PostgreSQL's
+        # real clock used by the lock-wait integration tests.
+        def wallClock():
+            from unittest.mock import Mock
+            import api.services.credits.manualCreditRepository as credits
+            if isinstance(credits.datetime,Mock):
+                return credits.datetime.now(timezone.utc).isoformat()
+            from api.services.billing.manualBillingRepository import _now
+            return _now().isoformat()
+        self.connection.create_function("clock_timestamp", 0, wallClock)
         self.connection.create_function("pg_advisory_xact_lock", 1, lambda _: 1)
 
     def cursor(self, **kwargs):
@@ -147,7 +157,7 @@ def database(tmp_path):
     connection.commit()
     connection.close()
     repository = ManualBillingRepository(lambda: SqlConnection(path))
-    with patch("api.services.billing.manualBillingRepository._now", return_value=NOW):
+    with patch("api.services.billing.manualBillingRepository._now", side_effect=lambda: NOW):
         yield repository, path
 
 
@@ -504,7 +514,7 @@ def test_manual_topup_cannot_fall_back_when_provider_notes_are_missing():
     repository._json.side_effect=lambda value:value
     repository.finalizeCapturedPayment.return_value=SimpleNamespace(state='requires_reconciliation',anomalyId='late-capture',
         invoiceId='invoice',attemptId='attempt',finalized=False,creditState='pending_materialization',
-        creditsRefilled=False,renewalOptOut=False,currentPeriod=None,nextPeriod=None)
+        creditsRefilled=False,renewalOptOut=False,currentPeriod=None,nextPeriod=None,invoiceStatus=None)
     provider=Mock()
     provider.order.fetch.return_value={'id':'topup-order','notes':{}}
     provider.payment.fetch.return_value={'id':'topup-payment','order_id':'topup-order',
