@@ -232,6 +232,28 @@ def _submissionStarted(case):
             return sql.fetchone()[0]
 
 
+def test_hold_predicate_can_use_the_unresolved_money_index(payment):
+    """The predicate runs under the owner lock for every solicitation; it must not scan history."""
+    class ExplainingCursor:
+        def __init__(self, sql):
+            self.sql, self.plans = sql, []
+        def execute(self, query, parameters=None):
+            self.sql.execute('explain ' + query, parameters)
+            self.plans.extend(row[0] for row in self.sql.fetchall())
+        def fetchone(self):
+            return None
+    case = _heldReady(payment)
+    holder = psycopg2.connect(case.url)
+    try:
+        with holder.cursor() as sql:
+            sql.execute('set local enable_seqscan = off')
+            cursor = ExplainingCursor(sql)
+            case.repo._unresolvedCycleCaptureLocked(cursor, canonical_row(case.url, case.user), case.end)
+    finally:
+        holder.rollback(); holder.close()
+    assert any('idx_billing_events_unresolved_cycle_money' in line for line in cursor.plans), cursor.plans
+
+
 def test_capture_committed_under_owner_lock_holds_waiting_dispatch(payment):
     import time
     case = _heldReady(payment)

@@ -7,6 +7,7 @@ def test_expansion_excludes_older_contract_and_includes_forward_notification_cha
     assert '20261005195626_contract_recurring_billing_fields.sql' not in names
     assert '20261005195635_extend_monthly_notifications.sql' in names
     assert '20261006173531_fence_billing_notification_revisions.sql' in names
+    assert '20261007154210_index_unresolved_cycle_money.sql' in names
     assert names==sorted(names)
 
 
