@@ -70,6 +70,11 @@ def _utc(value) -> datetime | None:
     return parsed.astimezone(timezone.utc)
 
 
+def _isoText(value):
+    """Stored invoice rows return datetimes; frozen JSON snapshots need ISO text."""
+    return value.isoformat() if isinstance(value, datetime) else value
+
+
 def _payloadHash(payload: dict) -> str:
     normalized = json.dumps(payload, sort_keys=True, separators=(",", ":"))
     return hashlib.sha256(normalized.encode("utf-8")).hexdigest()
@@ -467,8 +472,8 @@ class ManualBillingRepository:
                 snapshot = {'subscriptionId': str(subscription['id']), 'invoiceId': str(invoice['id']),
                     'lifecycleId': lifecycle, 'cycleId': str(invoice.get('period_start')), 'revision': revision,
                     'billingMode': request.billingMode, 'domains': selected, 'amount': int(invoice['total_amount']),
-                    'currency': invoice['currency'], 'periodStart': invoice.get('period_start'),
-                    'periodEnd': invoice.get('period_end'), 'expiresAt': deadline.isoformat(),
+                    'currency': invoice['currency'], 'periodStart': _isoText(invoice.get('period_start')),
+                    'periodEnd': _isoText(invoice.get('period_end')), 'expiresAt': deadline.isoformat(),
                     'tokens': frozen.get('tokens'), 'packId': frozen.get('packId'), 'requestKey': request.requestKey or str(uuid.uuid4())}
                 return self._reserveCheckoutIntentLocked(cursor, subscription, request.userId, request.purpose,
                     snapshot['requestKey'], payload_hash, snapshot, now)

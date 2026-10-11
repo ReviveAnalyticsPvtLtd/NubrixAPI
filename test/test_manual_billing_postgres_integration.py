@@ -263,6 +263,37 @@ def _renewal(repository,evidence,url):
     return start,end
 
 
+def test_renewal_checkout_from_stored_invoice_freezes_iso_period(payment):
+    from dateutil.relativedelta import relativedelta
+    from api.services.billing.manualBillingContracts import CheckoutRequest
+    repository,evidence,url=payment
+    first=repository.finalizeCapturedPayment(evidence)
+    start=first.currentPeriod.end
+    end=start+relativedelta(months=1)
+    invoice=str(uuid.uuid4())
+    connection=psycopg2.connect(url)
+    try:
+        with connection.cursor() as cursor:
+            cursor.execute('''insert into public."Invoices"(id,"userId",subscription_id,status,billing_reason,total_amount,currency,period_start,period_end,metadata_json)
+                values(%s,%s,%s,'PAYMENT_PENDING','renewal',3000,'INR',%s,%s,%s)''',
+                (invoice,evidence.userId,first.currentPeriod.subscriptionId,start,end,
+                    Json({'manualBilling':{'lifecycleId':first.currentPeriod.lifecycleId,'billingMode':'monthly_prepaid'}})))
+        connection.commit()
+    finally: connection.close()
+    # The stored invoice row carries datetime periods; the frozen attempt must hold ISO text.
+    intent=repository.reserveCheckout(CheckoutRequest(evidence.userId,'renewal','monthly_prepaid',
+        {'invoiceId':invoice},'renewal-'+str(uuid.uuid4())))
+    assert intent.invoiceId==invoice
+    connection=psycopg2.connect(url)
+    try:
+        with connection.cursor() as cursor:
+            cursor.execute("select metadata_json->'manualBilling' from public.billing_events where id=%s",(intent.attemptId,))
+            frozen=cursor.fetchone()[0]
+    finally: connection.close()
+    assert datetime.fromisoformat(frozen['periodStart'])==start
+    assert datetime.fromisoformat(frozen['periodEnd'])==end
+
+
 def test_boundary_race_refills_once_and_delayed_usage_keeps_new_quota(payment):
     from api.services.credits.manualCreditRepository import ManualCreditRepository
     repository,evidence,url=payment
