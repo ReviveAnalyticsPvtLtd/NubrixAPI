@@ -44,6 +44,16 @@ def test_early_renewal_replay_retains_next_period(checkout_database, monkeypatch
     assert replay['creditState'] == 'ready' and not replay['creditsRefilled']
 
 
+@pytest.mark.parametrize('mode,purpose', [('monthly_prepaid','initial_purchase'), ('monthly_prepaid','renewal'),
+    ('monthly_prepaid','topup'), ('annual_prepaid','initial_purchase')])
+def test_checkout_hides_emi_and_pay_later(checkout_database, mode, purpose):
+    from api.services.billing.manualBillingPresentation import serializeCheckoutIntent
+    manual, request = paid_then_request(checkout_database, mode, purpose)
+    result = serializeCheckoutIntent(manual.createCheckout(request), 'public-key')
+    assert result['checkoutConfig'] == {'display': {'hide': [
+        {'method': 'emi'}, {'method': 'cardless_emi'}, {'method': 'paylater'}]}}
+
+
 def test_annual_checkout_does_not_expose_internal_sentinel(checkout_database):
     from api.services.billing.manualBillingPresentation import serializeCheckoutIntent
     manual, request = paid_then_request(checkout_database,'annual_prepaid','initial_purchase')

@@ -7,6 +7,11 @@ def serializePeriod(period):
         'domains':list(period.domains), 'creditPeriodId':period.creditPeriodId}
 
 
+# Razorpay Standard Checkout `config.display.hide`: EMI and pay-later are not
+# offered for any Nubrix payment.
+HIDDEN_CHECKOUT_METHODS = ('emi', 'cardless_emi', 'paylater')
+
+
 def serializeCheckoutIntent(intent, publicKey, identity=None):
     state = {'created':'payment_pending', 'pending_provider_ack':'payment_pending',
         'authorized':'awaiting_capture', 'captured':'already_finalized',
@@ -19,7 +24,8 @@ def serializeCheckoutIntent(intent, publicKey, identity=None):
         'domains':intent.snapshot.get('domains') or [], 'quantity':len(intent.snapshot.get('domains') or []),
         'tokens':intent.snapshot.get('tokens'), 'packId':intent.snapshot.get('packId'),
         'period':{'start':intent.snapshot.get('periodStart'), 'end':intent.snapshot.get('periodEnd'),
-            'estimated':intent.purpose == 'initial_purchase'}}
+            'estimated':intent.purpose == 'initial_purchase'},
+        'checkoutConfig':{'display':{'hide':[{'method':method} for method in HIDDEN_CHECKOUT_METHODS]}}}
 
 
 def serializeFinalizationResult(result):
