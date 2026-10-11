@@ -79,6 +79,51 @@ def test_inventory_covers_required_dimensions():
         assert dimension in joined
 
 
+def test_inventory_runs_before_expansion(monkeypatch, capsys):
+    """The pre-mutation inventory must work on a pre-expansion schema (no credit identity columns)."""
+    import json
+    import types
+    from scripts.manual_billing_inventory import main
+
+    preExpansion = {'subscriptions': ['id', 'user_id', 'razorpay_token_id'],
+                    'credit_balances': ['id', 'user_id', 'period_start']}
+
+    class Cursor:
+        def __init__(self):
+            self.rows = []
+        def __enter__(self):
+            return self
+        def __exit__(self, *exc):
+            return False
+        def execute(self, sql, params=None):
+            if 'information_schema.columns' in sql and 'table_name=' in sql.replace(' ', ''):
+                table = 'credit_balances' if 'credit_balances' in sql else 'subscriptions'
+                self.rows = [{'column_name': column} for column in preExpansion[table]]
+            elif 'lifecycle_id' in sql or 'credit_period_id' in sql:
+                raise RuntimeError('column "lifecycle_id" does not exist')
+            elif 'from public.credit_balances' in sql:
+                self.rows = [{'balance_rows': 6}]
+            else:
+                self.rows = []
+        def fetchall(self):
+            return self.rows
+
+    class Connection:
+        def set_session(self, **kwargs):
+            pass
+        def cursor(self, **kwargs):
+            return Cursor()
+        def close(self):
+            pass
+
+    monkeypatch.setenv('DATABASE_URL', 'postgresql://inventory@localhost/db')
+    monkeypatch.setitem(sys.modules, 'psycopg2', types.SimpleNamespace(connect=lambda *a, **k: Connection()))
+    monkeypatch.setitem(sys.modules, 'psycopg2.extras', types.SimpleNamespace(RealDictCursor=object))
+    assert main(['--json']) == 0
+    report = json.loads(capsys.readouterr().out)
+    assert report['credits_identity_coverage'] == [{'balance_rows': 6, 'identityColumnsAbsent': True}]
+
+
 def test_redact_masks_values():
     assert redactValue("cust_123456789") == "cust_***"
     assert redactValue(None) is None

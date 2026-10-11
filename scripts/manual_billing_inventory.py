@@ -151,9 +151,17 @@ def main(argv: list[str] | None = None) -> int:
             cursor.execute("""select column_name from information_schema.columns
                 where table_schema='public' and table_name='subscriptions'""")
             subscriptionColumns={row['column_name'] for row in cursor.fetchall()}
+            cursor.execute("""select column_name from information_schema.columns
+                where table_schema='public' and table_name='credit_balances'""")
+            creditColumns={row['column_name'] for row in cursor.fetchall()}
             for name, query in queries.items():
                 if name=='token_mandate_remnants' and 'razorpay_token_id' not in subscriptionColumns:
                     report[name]={'localTokenColumnAbsent':True,'providerRetirementVerified':False}
+                    continue
+                if name=='credits_identity_coverage' and 'lifecycle_id' not in creditColumns:
+                    # Pre-expansion schema: identity columns arrive with the expand migration.
+                    cursor.execute('select count(*)::int as balance_rows from public.credit_balances')
+                    report[name]=[{**dict(row),'identityColumnsAbsent':True} for row in cursor.fetchall()]
                     continue
                 cursor.execute(query)
                 rows = [dict(row) for row in cursor.fetchall()]
