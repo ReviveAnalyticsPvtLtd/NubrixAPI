@@ -41,15 +41,17 @@ Deno.test("renewal invoice contains frozen amount experts and service dates", ()
       nextStart:"2026-11-06T12:00:00+00:00",nextEnd:"2026-12-06T12:00:00+00:00",
       renewalDeadline:base.periodEnd, checkoutSessionDeadline:"2026-10-30T12:30:00+00:00",
       reason:"private support reason",checkoutUrl:"https://evil.example/pay"}}),"https://app.example.test/account");
-  for (const fact of ["30.00", "INR", "banking", "2026-11-06", "2026-12-06", "/billing/invoices/invoice-1", "Checkout session"])
+  for (const fact of ["30.00", "INR", "banking", "6 Nov 2026, 12:00 UTC", "6 Dec 2026, 12:00 UTC",
+      "https://app.example.test/settings/manage-plan?renewalInvoiceId=invoice-1", "Pay renewal invoice", "Checkout session"])
     if (!message.htmlContent.includes(fact)) throw new Error(`missing fact ${fact}`);
+  if (message.htmlContent.includes("/billing/invoices/")) throw new Error("links to a page the app does not have");
   if (message.htmlContent.includes("private support reason") || message.htmlContent.includes("evil.example")) throw new Error("untrusted data rendered");
 });
 
 Deno.test("cancellation uses final paid end", () => {
   const message = renderBillingMessage(parseBillingRequest({...base,notificationType:"monthly_cancellation_confirmation",
     metadata:{finalPaidEnd:"2026-12-06T12:00:00+00:00"}}),"https://app.example.test");
-  if (!message.htmlContent.includes("2026-12-06")) throw new Error("final paid time omitted");
+  if (!message.htmlContent.includes("6 Dec 2026, 12:00 UTC")) throw new Error("final paid time omitted");
 });
 
 Deno.test("topup receipt never promises subscription access", () => {
@@ -70,4 +72,26 @@ Deno.test("revoked receipt describes financial history", () => {
   const message = renderBillingMessage(parseBillingRequest({...base,notificationType:"payment_receipt",
     metadata:{purpose:"renewal",serviceRevoked:true,amount:3000,currency:"INR"}}),"https://app.example.test");
   if (!message.htmlContent.includes("payment history") || !message.htmlContent.includes("does not restore")) throw new Error("revoked receipt implies active access");
+});
+
+Deno.test("each email links to the page that handles it", () => {
+  const link = (notificationType: string, metadata: Record<string, unknown> = {}) =>
+    renderBillingMessage(parseBillingRequest({...base,notificationType,metadata}),"https://app.example.test/").htmlContent;
+  if (!link("monthly_renewal_reminder",{invoiceId:"inv_2"}).includes("https://app.example.test/settings/manage-plan?renewalInvoiceId=inv_2"))
+    throw new Error("reminder does not open the renewal invoice");
+  if (!link("monthly_subscription_expired").includes("https://app.example.test/settings/manage-plan"))
+    throw new Error("expiry does not open plan selection");
+  for (const notificationType of ["payment_receipt","monthly_cancellation_confirmation","subscription_refund_processed"])
+    if (!link(notificationType,{invoiceId:"inv_3"}).includes("https://app.example.test/settings/billing-details"))
+      throw new Error(`${notificationType} does not open billing history`);
+});
+
+Deno.test("every email has a plain-text part and the support contact", () => {
+  for (const notificationType of BILLING_TYPES) {
+    const message = renderBillingMessage(parseBillingRequest({...base,notificationType,
+      metadata:{amount:3000,currency:"INR",finalPaidEnd:base.periodEnd}}),"https://app.example.test");
+    if (!message.textContent || /<(table|td|a |p |h1|html)/i.test(message.textContent)) throw new Error("missing or HTML text part");
+    if (!message.textContent.includes(message.subject)) throw new Error("text part lacks subject");
+    if (!message.htmlContent.includes("nubrixai@reviveanalytics.com")) throw new Error("support contact missing");
+  }
 });
