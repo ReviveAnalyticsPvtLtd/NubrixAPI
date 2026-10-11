@@ -139,7 +139,7 @@ def test_subscriptionExpiryTaskReturnsAndAuditsSweepSummary():
 
     assert result == summary
     assert ledger.events == [{
-        "user_id": "system",
+        "user_id": None,
         "event_type": "subscription.expiry_sweep.completed",
         "event_status": "COMPLETED",
         "category": "system",

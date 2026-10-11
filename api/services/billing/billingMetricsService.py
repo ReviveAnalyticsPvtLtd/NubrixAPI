@@ -446,7 +446,7 @@ class BillingMetricsService:
         for alert in alerts:
             try:
                 BillingEventService(self.client).log_event(
-                    user_id="system",
+                    user_id=None,
                     event_type=f"billing.alert.{alert['alertType']}",
                     event_status=alert["severity"],
                     category="system",

@@ -388,7 +388,7 @@ class WebhookService:
                 f"expected={expectedCurrency}, actual={actualCurrency}"
             )
 
-    def _auditLog(self, userId: str, eventType: str, **kwargs) -> None:
+    def _auditLog(self, userId: str | None, eventType: str, **kwargs) -> None:
         """
         Insert an audit row into the unified billing ledger.
 
@@ -524,7 +524,7 @@ class WebhookService:
         """
         tokenEntity = event.get("payload", {}).get("token", {}).get("entity", {})
         self._auditLog(
-            "system", "token.confirmed",
+            None, "token.confirmed",
             status="INERT",
             metadata={
                 "tokenId": tokenEntity.get("id"),
@@ -545,7 +545,7 @@ class WebhookService:
         """
         tokenEntity = event.get("payload", {}).get("token", {}).get("entity", {})
         self._auditLog(
-            "system", "token.cancelled",
+            None, "token.cancelled",
             status="INERT",
             metadata={
                 "tokenId": tokenEntity.get("id"),
