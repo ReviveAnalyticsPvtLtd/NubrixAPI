@@ -54,13 +54,13 @@ export function renderBillingMessage(request: BillingRequest, appUrl: string) {
   else if (refund) text += " Your affected subscription access ended at the cutoff shown below.";
   const url = new URL(appUrl);
   if ((url.protocol !== "https:" && url.protocol !== "http:") || url.username || url.password) throw new Error("FUNCTION_NOT_CONFIGURED");
-  const facts: string[] = [];
-  const fact = (label: string, value: unknown) => facts.push(`<p>${escape(label)}: ${escape(value)}</p>`);
+  const facts: [string, string][] = [];
+  const fact = (label: string, value: unknown) => facts.push([label, String(value ?? "")]);
   const dateFact = (label: string, value: unknown) => {
     if (value === undefined || value === null || value === "") return;
     const date = new Date(String(value));
     if (Number.isNaN(date.getTime())) throw new Error("INVALID_SERVICE_DATE");
-    fact(`${label} (UTC)`, date.toISOString());
+    fact(label, formatDate(date));
   };
   if (metadata.amount !== undefined) {
     const currency = String(metadata.currency ?? "");
@@ -82,12 +82,54 @@ export function renderBillingMessage(request: BillingRequest, appUrl: string) {
   dateFact("Renewal payment deadline", metadata.renewalDeadline);
   dateFact("Checkout session deadline", metadata.checkoutSessionDeadline);
   if (refund) dateFact("Service cutoff", metadata.cutoff);
-  let invoiceLink = "";
+
+  // Each email opens the app page that handles it.
+  let invoiceId = "";
   if (metadata.invoiceId) {
-    const invoiceId = String(metadata.invoiceId);
+    invoiceId = String(metadata.invoiceId);
     if (!/^[A-Za-z0-9_-]{1,128}$/.test(invoiceId)) throw new Error("INVALID_INVOICE_ID");
-    const invoiceUrl = new URL(`/billing/invoices/${encodeURIComponent(invoiceId)}`, url);
-    invoiceLink = `<p><a href="${escape(invoiceUrl.href)}">View your invoice</a></p>`;
   }
-  return { subject, htmlContent: `<html><body><h1>${escape(subject)}</h1><p>Hello ${escape(request.name)},</p><p>${escape(text)}</p>${facts.join("")}${invoiceLink}<p><a href="${escape(url.href)}">Open your account</a></p></body></html>` };
+  const renewal = request.notificationType === "monthly_renewal_ready" || request.notificationType === "monthly_renewal_reminder";
+  const action = renewal
+    ? {label:"Pay renewal invoice", path:invoiceId ? `/settings/manage-plan?renewalInvoiceId=${encodeURIComponent(invoiceId)}` : "/settings/manage-plan"}
+    : request.notificationType === "monthly_subscription_expired"
+      ? {label:"Choose a plan", path:"/settings/manage-plan"}
+      : {label:"View billing history", path:"/settings/billing-details"};
+  const actionUrl = new URL(action.path, url).href;
+
+  const rows = facts.map(([label, value]) =>
+    `<tr><td style="padding:8px 0;color:#64748b;font-size:14px;">${escape(label)}</td>` +
+    `<td style="padding:8px 0;color:#0f172a;font-size:14px;font-weight:600;text-align:right;">${escape(value)}</td></tr>`).join("");
+  const htmlContent = `<!doctype html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>${escape(subject)}</title></head>` +
+    `<body style="margin:0;padding:0;background:#f1f5f9;font-family:-apple-system,'Segoe UI',Roboto,Helvetica,Arial,sans-serif;">` +
+    `<div style="display:none;max-height:0;overflow:hidden;">${escape(text)}</div>` +
+    `<table role="presentation" width="100%" cellpadding="0" cellspacing="0" style="background:#f1f5f9;padding:32px 16px;"><tr><td align="center">` +
+    `<table role="presentation" width="100%" cellpadding="0" cellspacing="0" style="max-width:560px;background:#ffffff;border-radius:12px;overflow:hidden;">` +
+    `<tr><td style="background:#2563eb;padding:20px 32px;color:#ffffff;font-size:18px;font-weight:700;">Nubrix AI</td></tr>` +
+    `<tr><td style="padding:32px;">` +
+    `<h1 style="margin:0 0 16px;color:#0f172a;font-size:22px;line-height:1.3;">${escape(subject)}</h1>` +
+    `<p style="margin:0 0 12px;color:#334155;font-size:15px;line-height:1.6;">Hello ${escape(request.name)},</p>` +
+    `<p style="margin:0 0 24px;color:#334155;font-size:15px;line-height:1.6;">${escape(text)}</p>` +
+    (rows ? `<table role="presentation" width="100%" cellpadding="0" cellspacing="0" style="border-top:1px solid #e2e8f0;border-bottom:1px solid #e2e8f0;margin:0 0 24px;">${rows}</table>` : "") +
+    `<table role="presentation" cellpadding="0" cellspacing="0"><tr><td style="border-radius:8px;background:#2563eb;">` +
+    `<a href="${escape(actionUrl)}" style="display:inline-block;padding:12px 24px;color:#ffffff;font-size:15px;font-weight:600;text-decoration:none;">${escape(action.label)}</a>` +
+    `</td></tr></table>` +
+    `<p style="margin:24px 0 0;color:#64748b;font-size:13px;line-height:1.6;">Or open <a href="${escape(url.href)}" style="color:#2563eb;">your Nubrix account</a>.</p>` +
+    `</td></tr>` +
+    `<tr><td style="padding:20px 32px;background:#f8fafc;color:#94a3b8;font-size:12px;line-height:1.6;">` +
+    `You are receiving this email about your Nubrix AI subscription. Questions? Contact ` +
+    `<a href="mailto:${SUPPORT_EMAIL}" style="color:#64748b;">${SUPPORT_EMAIL}</a>.</td></tr>` +
+    `</table></td></tr></table></body></html>`;
+  const textContent = [subject, "", `Hello ${request.name},`, "", text, "",
+    ...facts.map(([label, value]) => `${label}: ${value}`), "", `${action.label}: ${actionUrl}`, "",
+    `Questions? Contact ${SUPPORT_EMAIL}.`].join("\n");
+  return { subject, htmlContent, textContent };
+}
+
+const SUPPORT_EMAIL = "nubrixai@reviveanalytics.com";
+
+// e.g. "6 Nov 2026, 12:00 UTC" — explicit zone, since recipients live in different time zones.
+function formatDate(date: Date): string {
+  return new Intl.DateTimeFormat("en-GB", {day:"numeric", month:"short", year:"numeric", hour:"2-digit",
+    minute:"2-digit", hour12:false, timeZone:"UTC"}).format(date).replace(/(\d{4}),? /, "$1, ") + " UTC";
 }
