@@ -610,6 +610,82 @@ class ManualBillingRepository:
                     requestKey, payloadHash, snapshot, _utc(cursor.fetchone()['current_time']))
         return self._run(operation)
 
+    def _expireCheckoutAttemptLocked(self, cursor, attempt, now):
+        metadata=self._json(attempt.get('metadata_json'))
+        metadata.setdefault('manualBilling',{}).update(closedAt=now.isoformat(),closedReason='CHECKOUT_EXPIRED')
+        cursor.execute("update public.billing_events set payment_status='expired',event_status='expired',metadata_json=%s where id=%s",
+            (Json(metadata),attempt['id']))
+
+    def _expireCheckoutInvoiceLocked(self, cursor, invoiceId, now):
+        """Close an abandoned single-use checkout invoice once nothing on it is payable or paid.
+
+        Renewal invoices stay payable until their period boundary closes them.
+        A later capture on the closed attempt still routes to reconciliation.
+        """
+        cursor.execute('select id,status,billing_reason,metadata_json from public."Invoices" where id=%s for update',(invoiceId,))
+        invoice=cursor.fetchone()
+        if (not invoice or invoice.get('billing_reason') == 'renewal'
+                or str(invoice['status']).upper() not in ('UPCOMING','PAYMENT_PENDING')):
+            return False
+        cursor.execute("""select 1 from public.billing_events where invoice_id=%s and event_category='payment_attempt'
+            and payment_status in ('created','pending_provider_ack','authorized','captured') limit 1""",(invoiceId,))
+        if cursor.fetchone():
+            return False
+        metadata=self._json(invoice.get('metadata_json'))
+        metadata.setdefault('manualBilling',{}).update(closedAt=now.isoformat(),closedReason='CHECKOUT_EXPIRED')
+        cursor.execute('update public."Invoices" set status=%s,metadata_json=%s where id=%s',('EXPIRED',Json(metadata),invoiceId))
+        return True
+
+    def _releaseExpiredAdditionsLocked(self, cursor, subscription, attemptIds, now):
+        """Expert-addition holds of lapsed attempts must not block a new selection."""
+        pending=self._jsonList(subscription.get('pending_additions'))
+        released=False
+        for item in pending:
+            if item.get('attemptId') in attemptIds and item.get('state') == 'awaiting_payment':
+                item.update(state='expired',expiredAt=now.isoformat())
+                released=True
+        if released:
+            cursor.execute('update public.subscriptions set pending_additions=%s where id=%s',(Json(pending),subscription['id']))
+            subscription['pending_additions']=pending
+
+    def expireStaleCheckouts(self, limit=200):
+        """Close checkouts whose payment window lapsed so abandoned invoices stop reading as payable.
+
+        Only attempts with a bound provider order are closed here; unknown order
+        acknowledgements and authorized money stay with provider recovery.
+        """
+        def candidates(connection):
+            with connection.cursor(cursor_factory=RealDictCursor) as cursor:
+                cursor.execute("""select distinct user_id from public.billing_events
+                    where event_category='payment_attempt' and payment_status in ('created','pending_provider_ack')
+                    and provider_order_id is not null and user_id is not null
+                    and (metadata_json->'manualBilling'->>'expiresAt')::timestamptz <= clock_timestamp()
+                    limit %s""",(limit,))
+                return [row['user_id'] for row in cursor.fetchall()]
+        summary={'attemptsExpired':0,'invoicesExpired':0}
+        for userId in self._run(candidates):
+            def operation(connection,userId=userId):
+                with connection.cursor(cursor_factory=RealDictCursor) as cursor:
+                    self._lockUser(cursor,userId)
+                    subscription=self._canonical(cursor,userId)
+                    cursor.execute('select clock_timestamp() as current_time')
+                    now=_utc(cursor.fetchone()['current_time'])
+                    cursor.execute("""select id,invoice_id,metadata_json from public.billing_events where user_id=%s
+                        and event_category='payment_attempt' and payment_status in ('created','pending_provider_ack')
+                        and provider_order_id is not null order by id for update""",(userId,))
+                    expired=[attempt for attempt in cursor.fetchall()
+                        if (_utc(self._json(attempt.get('metadata_json')).get('manualBilling',{}).get('expiresAt')) or now) < now]
+                    for attempt in expired:
+                        self._expireCheckoutAttemptLocked(cursor,attempt,now)
+                    self._releaseExpiredAdditionsLocked(cursor,subscription,{str(attempt['id']) for attempt in expired},now)
+                    closed=sum(self._expireCheckoutInvoiceLocked(cursor,str(attempt['invoice_id']),now)
+                        for attempt in expired if attempt.get('invoice_id'))
+                    return len(expired),closed
+            attempts,invoices=self._run(operation)
+            summary['attemptsExpired']+=attempts
+            summary['invoicesExpired']+=invoices
+        return summary
+
     def _reserveCheckoutIntentLocked(self, cursor, subscription, userId, purpose,
                                     requestKey, payloadHash, snapshot, now):
         manualBilling = {
@@ -698,15 +774,21 @@ class ManualBillingRepository:
         if purpose == 'topup' and (not _utc(subscription.get('current_period_end')) or _utc(subscription['current_period_end']) <= now):
             raise ValueError('TOPUP_NOT_ELIGIBLE')
         expiredAttemptIds=set()
-        cursor.execute("select id,metadata_json from public.billing_events where user_id=%s and event_category='payment_attempt' and payment_status in ('created','pending_provider_ack','authorized') order by id for update",(userId,))
+        expiredInvoiceIds=set()
+        cursor.execute("select id,invoice_id,metadata_json from public.billing_events where user_id=%s and event_category='payment_attempt' and payment_status in ('created','pending_provider_ack','authorized') order by id for update",(userId,))
         for attempt in cursor.fetchall():
-            metadata=self._json(attempt.get('metadata_json'))
-            billing=metadata.get('manualBilling',{})
-            expires=_utc(billing.get('expiresAt'))
+            expires=_utc(self._json(attempt.get('metadata_json')).get('manualBilling',{}).get('expiresAt'))
             if expires and expires <= now:
                 expiredAttemptIds.add(str(attempt['id']))
-                billing.update(closedAt=now.isoformat(),closedReason='CHECKOUT_EXPIRED')
-                cursor.execute("update public.billing_events set payment_status='expired',event_status='expired',metadata_json=%s where id=%s",(Json(metadata),attempt['id']))
+                self._expireCheckoutAttemptLocked(cursor,attempt,now)
+                if attempt.get('invoice_id'):
+                    expiredInvoiceIds.add(str(attempt['invoice_id']))
+        # The invoice this reservation is about to use stays open.
+        for expiredInvoiceId in expiredInvoiceIds-{str(snapshot.get('invoiceId'))}:
+            self._expireCheckoutInvoiceLocked(cursor,expiredInvoiceId,now)
+        if purpose != 'expert_addition':
+            # An expert_addition reservation releases these itself below.
+            self._releaseExpiredAdditionsLocked(cursor,subscription,expiredAttemptIds,now)
 
         subscriptionId = snapshot.get("subscriptionId")
         invoiceId = snapshot.get("invoiceId")

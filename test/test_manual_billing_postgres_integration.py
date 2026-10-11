@@ -294,6 +294,138 @@ def test_renewal_checkout_from_stored_invoice_freezes_iso_period(payment):
     assert datetime.fromisoformat(frozen['periodEnd'])==end
 
 
+def _abandonedCheckout(repository,first,userId,url,purpose,reason,extra,withOrder=True):
+    """Reserve a checkout, bind its order, then let its payment window lapse."""
+    invoice=str(uuid.uuid4())
+    connection=psycopg2.connect(url)
+    try:
+        with connection.cursor() as cursor:
+            cursor.execute('''insert into public."Invoices"(id,"userId",subscription_id,status,billing_reason,total_amount,currency,period_start,period_end,metadata_json)
+                values(%s,%s,%s,'PAYMENT_PENDING',%s,500,'INR',%s,%s,%s)''',
+                (invoice,userId,first.currentPeriod.subscriptionId,reason,first.currentPeriod.start,first.currentPeriod.end,
+                    Json({'manualBilling':{'lifecycleId':first.currentPeriod.lifecycleId,'billingMode':'monthly_prepaid','purpose':purpose}})))
+        connection.commit()
+    finally: connection.close()
+    attempt=repository.reserveCheckoutIntent(userId,purpose,invoice,invoice,{
+        'subscriptionId':first.currentPeriod.subscriptionId,'invoiceId':invoice,'lifecycleId':first.currentPeriod.lifecycleId,
+        'billingMode':'monthly_prepaid','amount':500,'currency':'INR',
+        'expiresAt':(datetime.now(timezone.utc)+timedelta(minutes=30)).isoformat(),**extra})
+    if withOrder:
+        repository.bindProviderOrder(attempt.attemptId,{'id':'order-'+str(uuid.uuid4())})
+    connection=psycopg2.connect(url)
+    try:
+        with connection.cursor() as cursor:
+            cursor.execute('''update public.billing_events set metadata_json=jsonb_set(metadata_json,'{manualBilling,expiresAt}',to_jsonb(%s::text))
+                where id=%s''',((datetime.now(timezone.utc)-timedelta(minutes=1)).isoformat(),attempt.attemptId))
+        connection.commit()
+    finally: connection.close()
+    return invoice,attempt.attemptId
+
+
+def _checkoutState(url,invoice,attemptId):
+    connection=psycopg2.connect(url)
+    try:
+        with connection.cursor() as cursor:
+            cursor.execute('select status from public."Invoices" where id=%s',(invoice,))
+            invoiceStatus=cursor.fetchone()[0]
+            cursor.execute("select payment_status,metadata_json->'manualBilling'->>'closedReason' from public.billing_events where id=%s",(attemptId,))
+            return (invoiceStatus,*cursor.fetchone())
+    finally: connection.close()
+
+
+def test_scheduled_expiry_closes_abandoned_topup_invoice(payment):
+    repository,evidence,url=payment
+    first=repository.finalizeCapturedPayment(evidence)
+    invoice,attemptId=_abandonedCheckout(repository,first,evidence.userId,url,'topup','add_on',
+        {'tokens':10000,'packId':'pack_small','domains':[]})
+    summary=repository.expireStaleCheckouts()
+    assert _checkoutState(url,invoice,attemptId)==('EXPIRED','expired','CHECKOUT_EXPIRED')
+    assert summary=={'attemptsExpired':1,'invoicesExpired':1}
+
+
+def test_scheduled_expiry_releases_abandoned_expert_addition(payment):
+    repository,evidence,url=payment
+    first=repository.finalizeCapturedPayment(evidence)
+    invoice,attemptId=_abandonedCheckout(repository,first,evidence.userId,url,'expert_addition','proration',
+        {'domains':['telecom']})
+    repository.expireStaleCheckouts()
+    assert _checkoutState(url,invoice,attemptId)==('EXPIRED','expired','CHECKOUT_EXPIRED')
+    connection=psycopg2.connect(url)
+    try:
+        with connection.cursor() as cursor:
+            cursor.execute('select pending_additions from public.subscriptions where user_id=%s',(evidence.userId,))
+            pending=cursor.fetchone()[0]
+    finally: connection.close()
+    assert [item['state'] for item in pending if item['attemptId']==attemptId]==['expired']
+
+
+def test_scheduled_expiry_keeps_renewal_invoice_payable(payment):
+    from dateutil.relativedelta import relativedelta
+    repository,evidence,url=payment
+    first=repository.finalizeCapturedPayment(evidence)
+    start=first.currentPeriod.end
+    invoice=str(uuid.uuid4())
+    connection=psycopg2.connect(url)
+    try:
+        with connection.cursor() as cursor:
+            cursor.execute('''insert into public."Invoices"(id,"userId",subscription_id,status,billing_reason,total_amount,currency,period_start,period_end,metadata_json)
+                values(%s,%s,%s,'PAYMENT_PENDING','renewal',3000,'INR',%s,%s,%s)''',
+                (invoice,evidence.userId,first.currentPeriod.subscriptionId,start,start+relativedelta(months=1),
+                    Json({'manualBilling':{'lifecycleId':first.currentPeriod.lifecycleId,'billingMode':'monthly_prepaid'}})))
+        connection.commit()
+    finally: connection.close()
+    attempt=repository.reserveCheckoutIntent(evidence.userId,'renewal',invoice,invoice,{
+        'subscriptionId':first.currentPeriod.subscriptionId,'invoiceId':invoice,'lifecycleId':first.currentPeriod.lifecycleId,
+        'billingMode':'monthly_prepaid','amount':3000,'currency':'INR','domains':['banking'],
+        'expiresAt':(datetime.now(timezone.utc)+timedelta(minutes=30)).isoformat()})
+    repository.bindProviderOrder(attempt.attemptId,{'id':'order-'+str(uuid.uuid4())})
+    connection=psycopg2.connect(url)
+    try:
+        with connection.cursor() as cursor:
+            cursor.execute('''update public.billing_events set metadata_json=jsonb_set(metadata_json,'{manualBilling,expiresAt}',to_jsonb(%s::text))
+                where id=%s''',((datetime.now(timezone.utc)-timedelta(minutes=1)).isoformat(),attempt.attemptId))
+        connection.commit()
+    finally: connection.close()
+    repository.expireStaleCheckouts()
+    assert _checkoutState(url,invoice,attempt.attemptId)==('PAYMENT_PENDING','expired','CHECKOUT_EXPIRED')
+
+
+def test_scheduled_expiry_leaves_unacknowledged_orders_to_recovery(payment):
+    repository,evidence,url=payment
+    first=repository.finalizeCapturedPayment(evidence)
+    invoice,attemptId=_abandonedCheckout(repository,first,evidence.userId,url,'topup','add_on',
+        {'tokens':10000,'packId':'pack_small','domains':[]},withOrder=False)
+    assert repository.expireStaleCheckouts()=={'attemptsExpired':0,'invoicesExpired':0}
+    assert _checkoutState(url,invoice,attemptId)[0]=='PAYMENT_PENDING'
+
+
+def test_new_checkout_closes_previously_abandoned_invoice(payment):
+    repository,evidence,url=payment
+    first=repository.finalizeCapturedPayment(evidence)
+    old,oldAttempt=_abandonedCheckout(repository,first,evidence.userId,url,'topup','add_on',
+        {'tokens':10000,'packId':'pack_small','domains':[]})
+    new,newAttempt=_abandonedCheckout(repository,first,evidence.userId,url,'topup','add_on',
+        {'tokens':10000,'packId':'pack_small','domains':[]})
+    assert _checkoutState(url,old,oldAttempt)==('EXPIRED','expired','CHECKOUT_EXPIRED')
+
+
+def test_new_topup_releases_abandoned_expert_addition(payment):
+    repository,evidence,url=payment
+    first=repository.finalizeCapturedPayment(evidence)
+    old,oldAttempt=_abandonedCheckout(repository,first,evidence.userId,url,'expert_addition','proration',
+        {'domains':['telecom']})
+    _abandonedCheckout(repository,first,evidence.userId,url,'topup','add_on',
+        {'tokens':10000,'packId':'pack_small','domains':[]})
+    assert _checkoutState(url,old,oldAttempt)==('EXPIRED','expired','CHECKOUT_EXPIRED')
+    connection=psycopg2.connect(url)
+    try:
+        with connection.cursor() as cursor:
+            cursor.execute('select pending_additions from public.subscriptions where user_id=%s',(evidence.userId,))
+            pending=cursor.fetchone()[0]
+    finally: connection.close()
+    assert [item['state'] for item in pending if item['attemptId']==oldAttempt]==['expired']
+
+
 def test_boundary_race_refills_once_and_delayed_usage_keeps_new_quota(payment):
     from api.services.credits.manualCreditRepository import ManualCreditRepository
     repository,evidence,url=payment
