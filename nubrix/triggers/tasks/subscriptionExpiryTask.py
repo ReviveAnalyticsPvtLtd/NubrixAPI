@@ -48,7 +48,7 @@ class SubscriptionExpiryTask:
 
         summary = sweep()
         self._eventServiceFactory(client).log_event(
-            user_id="system",
+            user_id=None,
             event_type="subscription.expiry_sweep.completed",
             event_status=(
                 "COMPLETED"

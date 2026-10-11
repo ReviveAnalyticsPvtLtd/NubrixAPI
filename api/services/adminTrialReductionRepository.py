@@ -83,8 +83,7 @@ class AdminTrialReductionRepository:
                         """
                         select erasure_pending
                         from public.subscriptions
-                        where user_id = %s
-                        order by updated_at desc, id desc
+                        where user_id = %s and is_canonical = true
                         limit 1
                         for update
                         """,
@@ -190,8 +189,7 @@ class AdminTrialReductionRepository:
                            current_period_start, current_period_end,
                            erasure_pending
                     from public.subscriptions
-                    where user_id = %s
-                    order by updated_at desc, id desc
+                    where user_id = %s and is_canonical = true
                     limit 1
                     for update
                     """,

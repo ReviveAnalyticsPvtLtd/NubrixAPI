@@ -2252,6 +2252,8 @@ dependencies = [
     { name = "scipy" },
     { name = "setuptools" },
     { name = "sqlalchemy" },
+    { name = "standard-cgi", marker = "python_full_version >= '3.13'" },
+    { name = "standard-imghdr", marker = "python_full_version >= '3.13'" },
     { name = "statsmodels" },
     { name = "supabase" },
     { name = "tqdm" },
@@ -2324,6 +2326,8 @@ requires-dist = [
     { name = "scipy", specifier = ">=1.15.3" },
     { name = "setuptools", specifier = "==80.9.0" },
     { name = "sqlalchemy", specifier = ">=2.0.41" },
+    { name = "standard-cgi", marker = "python_full_version >= '3.13'", specifier = "==3.13.0" },
+    { name = "standard-imghdr", marker = "python_full_version >= '3.13'", specifier = "==3.13.0" },
     { name = "statsmodels", specifier = ">=0.14.5" },
     { name = "supabase", specifier = ">=2.16.0" },
     { name = "tqdm", specifier = ">=4.67.1" },
@@ -3998,6 +4002,24 @@ wheels = [
     { url = "https://files.pythonhosted.org/packages/fa/2e/677c17c5d6a004c3c45334ab1dbe7b7deb834430b282b8a0f75ae220c8eb/sqlalchemy-2.0.41-cp313-cp313-win32.whl", hash = "sha256:bfc9064f6658a3d1cadeaa0ba07570b83ce6801a1314985bf98ec9b95d74e15f", size = 2082420, upload-time = "2025-05-14T17:55:52.69Z" },
     { url = "https://files.pythonhosted.org/packages/e9/61/e8c1b9b6307c57157d328dd8b8348ddc4c47ffdf1279365a13b2b98b8049/sqlalchemy-2.0.41-cp313-cp313-win_amd64.whl", hash = "sha256:82ca366a844eb551daff9d2e6e7a9e5e76d2612c8564f58db6c19a726869c1df", size = 2108329, upload-time = "2025-05-14T17:55:54.495Z" },
     { url = "https://files.pythonhosted.org/packages/1c/fc/9ba22f01b5cdacc8f5ed0d22304718d2c758fce3fd49a5372b886a86f37c/sqlalchemy-2.0.41-py3-none-any.whl", hash = "sha256:57df5dc6fdb5ed1a88a1ed2195fd31927e705cad62dedd86b46972752a80f576", size = 1911224, upload-time = "2025-05-14T17:39:42.154Z" },
+]
+
+[[package]]
+name = "standard-cgi"
+version = "3.13.0"
+source = { registry = "https://pypi.org/simple" }
+sdist = { url = "https://files.pythonhosted.org/packages/8a/ab/dad687d08c43a43979edb64ba308b596447675cb82dbc5a9e52482957b43/standard_cgi-3.13.0.tar.gz", hash = "sha256:7ba8089fdcbd7d7a46a737e24cb5e4e2892db48678ad0e5f8726699a9d4ed53a", size = 17883, upload-time = "2024-10-30T16:01:33.9Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/e0/94/f3aa44913f5fcabbbfe4ba4d8aa7b03085d8b76e7894f560a260a69be1ed/standard_cgi-3.13.0-py3-none-any.whl", hash = "sha256:3770017d2e43b4ef94b16b50206aeb3bb33b31429e7f47e9d4c2eeb0c7800902", size = 12719, upload-time = "2024-10-30T16:01:10.801Z" },
+]
+
+[[package]]
+name = "standard-imghdr"
+version = "3.13.0"
+source = { registry = "https://pypi.org/simple" }
+sdist = { url = "https://files.pythonhosted.org/packages/1a/8d/ab2620fbe2e348483c9cb776c3b7b3cc407899291a041d7fa026469b7cd1/standard_imghdr-3.13.0.tar.gz", hash = "sha256:8d9c68058d882f6fc3542a8d39ef9ff94d2187dc90bd0c851e0902776b7b7a42", size = 5511, upload-time = "2024-10-30T16:01:36.412Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/df/cb/e1da7e340586a078404c7e4328bfefc930867ace8a9a55916fd220cf9547/standard_imghdr-3.13.0-py3-none-any.whl", hash = "sha256:30a1bff5465605bb496f842a6ac3cc1f2131bf3025b0da28d4877d6d4b7cc8e9", size = 4639, upload-time = "2024-10-30T16:01:13.829Z" },
 ]
 
 [[package]]

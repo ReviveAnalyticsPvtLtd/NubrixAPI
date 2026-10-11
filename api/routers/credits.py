@@ -17,7 +17,7 @@ from api.commons import verifyUser, verifyToken, UserContext
 from api.models import CreateTopupOrderRequest, VerifyTopupPaymentRequest
 from utils.exceptionHandler import CustomException, raiseHttpException
 from fastapi.responses import ORJSONResponse
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Depends, HTTPException, Header
 from utils.logger import logger
 
 
@@ -215,7 +215,8 @@ async def getTopupPacks(token=Depends(verifyToken)):
 @router.post("/topup/order")
 async def createTopupOrder(
     request: CreateTopupOrderRequest,
-    token=Depends(verifyToken)
+    token=Depends(verifyToken),
+    requestKey: str | None = Header(default=None, alias="Idempotency-Key", min_length=1, max_length=128)
 ):
     """
     Create a Razorpay order for a credit top-up pack.
@@ -233,7 +234,7 @@ async def createTopupOrder(
     try:
         from api.services.credits.topupService import topupService
 
-        result = topupService.createTopupOrder(packId=request.packId, token=token)
+        result = topupService.createTopupOrder(packId=request.packId, token=token, requestKey=requestKey)
         return ORJSONResponse(
             status_code=200,
             content={

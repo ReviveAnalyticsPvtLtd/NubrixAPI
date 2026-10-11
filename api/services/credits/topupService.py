@@ -85,21 +85,15 @@ class TopupService:
 
     @staticmethod
     def _identity(userId: str, tokenEmail: str) -> dict:
-        """Canonical checkout identity plus a guaranteed Razorpay customer id."""
+        """Checkout identity without any Razorpay Customer dependency.
+
+        Contact details are prefill only — the same contact across separate
+        accounts is never a billing identity. No Customer create/fetch/edit.
+        """
         from api.services.subscriptions.subscriptionService import subscriptionService
-        from api.services.subscriptions.subscriptionFieldUtils import subscriptionCustomerId
 
         identity = subscriptionService._resolveCheckoutIdentity(userId, tokenEmail)
-        subscription = subscriptionService._getCanonicalSubscription(
-            userId=userId, required=True
-        )
-        customerId = subscriptionCustomerId(subscription)
-        if not customerId:
-            customerId = subscriptionService._getOrCreateRazorpayCustomer(
-                userId, identity["email"], identity["name"], identity["contact"]
-            )
-        subscriptionService._syncRazorpayCustomerIdentity(customerId, identity)
-        return {**identity, "customerId": customerId}
+        return dict(identity)
 
     @staticmethod
     def _createInvoice(userId: str, subscriptionId: str | None, snapshot,
@@ -136,10 +130,11 @@ class TopupService:
         """
         Determine whether a subscription may purchase top-ups.
 
-        Requires an active Pro or Annual plan: top-ups are an overflow valve for
-        paying customers, not a substitute for one, so free and trial users are
-        pushed to upgrade. The explicit plan_type check is what excludes trials —
-        a trial can carry an active-like status, so status alone is insufficient.
+        Requires a timestamp-valid paid Pro or Annual plan — including a
+        cancelled monthly subscription whose already-paid coverage remains.
+        Top-ups are an overflow valve for paying customers, not a substitute
+        for one: free, trial, and expired users are pushed to upgrade, and
+        stored top-ups never grant paid access.
 
         Args:
             subscription (dict | None): Canonical subscription row.
@@ -147,16 +142,18 @@ class TopupService:
         Returns:
             bool: True when top-ups may be purchased.
         """
-        if not subscription:
+        if not subscription or subscription.get('status') == 'trial' or subscription.get('billing_mode') not in ('monthly_prepaid', 'annual_prepaid'):
             return False
         from api.services.subscriptions.subscriptionService import subscriptionService
+        from api.services.subscriptions.paymentValidationService import isAccessActive
 
         return (
-            subscriptionService._isSubscriptionActive(subscription.get("status"))
+            isAccessActive(subscription)
             and (subscription.get("plan_type") or "") in _ELIGIBLE_PLAN_TYPES
         )
 
     # ---- public API ----------------------------------------------------------
+
 
     def listPacks(self, token: str) -> dict:
         """
@@ -175,7 +172,7 @@ class TopupService:
             userId, _ = self._decodeToken(token)
             subscription = self._subscription(userId)
             eligible = self._isTopupEligible(subscription)
-            billingMode = (subscription or {}).get("billing_mode") or "monthly_recurring"
+            billingMode = (subscription or {}).get("billing_mode") or "monthly_prepaid"
 
             packs = []
             for packId in getTopupPacks():
@@ -198,180 +195,34 @@ class TopupService:
             logger.error(exception)
             raise exception
 
-    def createTopupOrder(self, packId: str, token: str) -> dict:
-        """
-        Create a frozen invoice and a Razorpay Order for a top-up pack.
-
-        Tokens are granted only after payment, via verifyTopupPayment() or the
-        payment.captured webhook.
-
-        Args:
-            packId (str): Pack key from config, e.g. 'medium'.
-            token (str): Authorization token.
-
-        Returns:
-            dict: Checkout payload for Razorpay embedded checkout.
-        """
-        try:
-            userId, tokenEmail = self._decodeToken(token)
-            subscription = self._subscription(userId)
-            if not self._isTopupEligible(subscription):
-                raise Exception(
-                    "TOPUP_NOT_ELIGIBLE: credit top-ups require an active Pro or "
-                    f"Annual plan (status={(subscription or {}).get('status')}, "
-                    f"plan={(subscription or {}).get('plan_type')})"
-                )
-
-            pack = getTopupPack(packId)
-            if pack is None:
-                raise Exception(f"TOPUP_PACK_UNKNOWN: no active top-up pack '{packId}'")
-
-            billingMode = subscription.get("billing_mode") or "monthly_recurring"
-            snapshot = computeTopupSnapshot(packId, billingMode)
-            tokens = pack["tokens"]
-
-            identity = self._identity(userId, tokenEmail)
-            invoice = self._createInvoice(
-                userId, subscription.get("id"), snapshot, packId, tokens
-            )
-
-            order = self.razorpayClient.order.create({
-                "amount": snapshot.total_amount,
-                "currency": snapshot.currency,
-                "customer_id": identity["customerId"],
-                "notes": {
-                    "userId": userId,
-                    "type": "credit_topup",
-                    "packId": packId,
-                    "tokens": str(tokens),
-                    "invoiceId": invoice["id"],
-                },
-            })
-            self._attachOrder(invoice["id"], order["id"])
-
-            self._audit(
-                userId, "credit.topup_requested",
-                amount=snapshot.total_amount,
-                status="AWAITING_PAYMENT",
-                metadata={
-                    "packId": packId,
-                    "tokens": tokens,
-                    "orderId": order["id"],
-                    "invoiceId": invoice["id"],
-                },
-            )
-            logger.info(
-                f"Top-up order created — userId={userId}, pack={packId}, "
-                f"tokens={tokens}, order={order['id']}"
-            )
-
-            return {
-                "razorpayKey": os.environ["RAZORPAY_KEY_ID"],
-                "orderId": order["id"],
-                "currency": snapshot.currency,
-                "amount": snapshot.total_amount,
-                "packId": packId,
-                "tokens": tokens,
-                "credits": creditMath.tokensToCredits(tokens, TOKEN_TO_CREDIT_RATIO),
-                "invoiceId": invoice["id"],
-                "userEmail": identity["email"],
-                "userName": identity["name"],
-                "userContact": identity["contact"],
-                "customerId": identity["customerId"],
-                "pricingSnapshot": {
-                    "pricingVersion": snapshot.pricing_version,
-                    "priceSource": snapshot.pricing_reference_snapshot_json["source"],
-                },
-                "taxSnapshot": {
-                    "taxRuleVersion": snapshot.tax.tax_rule_version,
-                    "amountBeforeTax": snapshot.amount_before_tax,
-                    "taxAmount": snapshot.tax.tax_amount,
-                    "totalAmount": snapshot.total_amount,
-                    "currency": snapshot.currency,
-                },
-            }
-        except Exception as e:
-            exception = CustomException(e)
-            logger.error(exception)
-            raise exception
+    def createTopupOrder(self, packId: str, token: str, requestKey: str | None = None) -> dict:
+        from api.services.subscriptions.subscriptionService import SubscriptionService
+        userId, email = self._decodeToken(token)
+        service = SubscriptionService.__new__(SubscriptionService)
+        service.client = self.client
+        service.razorpayClient = self.razorpayClient
+        subscription = self._subscription(userId)
+        if not subscription or subscription.get('status') == 'trial' or subscription.get('billing_mode') not in ('monthly_prepaid', 'annual_prepaid'):
+            raise CustomException(ValueError('TOPUP_NOT_ELIGIBLE'), statusCode=403,
+                uiMessage='Credit top-ups require an active paid subscription.', errorCode='TOPUP_NOT_ELIGIBLE')
+        if getTopupPack(packId) is None:
+            raise CustomException(ValueError('TOPUP_PACK_UNKNOWN'), statusCode=422,
+                uiMessage='Unknown credit top-up pack.', errorCode='TOPUP_PACK_UNKNOWN')
+        result = service._reservedCheckout({'userId': userId, 'email': email}, 'topup',
+            subscription['billing_mode'], {'packId': packId}, requestKey)
+        result['credits'] = creditMath.tokensToCredits(result['tokens'], TOKEN_TO_CREDIT_RATIO)
+        return result
 
     def verifyTopupPayment(self, payload: dict, token: str) -> dict:
-        """
-        Verify the Razorpay checkout signature and grant the purchased tokens.
-
-        The grant is idempotent, so racing the payment.captured webhook is
-        expected and safe — whichever arrives first credits the tokens and the
-        other reports granted=False.
-
-        Ownership is established from the order's notes as fetched from
-        Razorpay, never from the client payload: a valid signature proves the
-        payment is genuine, not that it belongs to the caller.
-
-        Args:
-            payload (dict): Razorpay checkout response.
-            token (str): Authorization token.
-
-        Returns:
-            dict: {"granted": bool, "tokens": int, "credits": float}.
-        """
-        try:
-            from api.services.credits.creditService import creditService
-
-            userId, _ = self._decodeToken(token)
-            paymentId = payload.get("razorpayPaymentId")
-            orderId = payload.get("razorpayOrderId")
-            signature = payload.get("razorpaySignature")
-            if not all([paymentId, orderId, signature, userId]):
-                raise Exception("Missing Razorpay verification fields")
-
-            expectedSignature = hmac.new(
-                os.environ["RAZORPAY_KEY_SECRET"].encode(),
-                f"{orderId}|{paymentId}".encode(),
-                hashlib.sha256,
-            ).hexdigest()
-            if not hmac.compare_digest(expectedSignature, signature):
-                raise Exception("Invalid Razorpay signature")
-
-            order = self.razorpayClient.order.fetch(orderId)
-            notesRaw = order.get("notes") or {}
-            notes = notesRaw if isinstance(notesRaw, dict) else {}
-            if notes.get("type") != "credit_topup":
-                raise Exception(
-                    f"Order {orderId} is not a credit top-up order "
-                    f"(type={notes.get('type')})"
-                )
-            noteUserId = notes.get("userId")
-            if noteUserId and noteUserId != userId:
-                raise Exception(
-                    f"Order/user mismatch during top-up verification: "
-                    f"order.userId={noteUserId}, token.userId={userId}"
-                )
-
-            result = creditService.grantTopupTokens(userId, orderId, paymentId)
-            tokens = result["tokens"]
-
-            if result["granted"]:
-                self._audit(
-                    userId, "credit.topup_granted",
-                    paymentId=paymentId,
-                    status="GRANTED",
-                    metadata={
-                        "packId": notes.get("packId"),
-                        "tokens": tokens,
-                        "orderId": orderId,
-                        "flow": "verify",
-                    },
-                )
-
-            return {
-                "granted": result["granted"],
-                "tokens": tokens,
-                "credits": creditMath.tokensToCredits(tokens, TOKEN_TO_CREDIT_RATIO),
-            }
-        except Exception as e:
-            exception = CustomException(e)
-            logger.error(exception)
-            raise exception
+        from api.services.subscriptions.subscriptionService import SubscriptionService
+        from api.services.billing.manualBillingRepository import getManualBillingRepository
+        service = SubscriptionService.__new__(SubscriptionService)
+        service.client, service.razorpayClient = self.client, self.razorpayClient
+        result = service._verifyDurableCheckout(payload, token, 'topup')
+        attempt = getManualBillingRepository().attemptForOrder(payload['razorpayOrderId'])
+        tokens = int(getManualBillingRepository()._json(attempt['metadata_json'])['manualBilling']['tokens'])
+        return {**result, 'granted': result['finalized'] and not result['alreadyFinalized'],
+            'tokens': tokens, 'credits': creditMath.tokensToCredits(tokens, TOKEN_TO_CREDIT_RATIO)}
 
 
 topupService = TopupService()

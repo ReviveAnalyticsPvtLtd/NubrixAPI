@@ -95,6 +95,7 @@ class PastDueSuspensionTask:
             self.client.table("subscriptions")
             .select("id, user_id, current_period_end, status, billing_mode, erasure_pending")
             .eq("billing_mode", "annual_prepaid")
+            .eq("is_canonical", True)
             .in_("status", ["active", "renewal_upcoming", "payment_pending"])
             .lte("current_period_end", now.isoformat())
             .execute()
@@ -112,7 +113,7 @@ class PastDueSuspensionTask:
                     .select("id, status")
                     .eq("subscription_id", subscriptionId)
                     .eq("billing_reason", "renewal")
-                    .in_("status", ["upcoming", "payment_pending", "expired"])
+                    .in_("status", ["UPCOMING", "PAYMENT_PENDING", "EXPIRED", "upcoming", "payment_pending", "expired"])
                     .limit(1)
                     .execute()
                     .data
@@ -154,6 +155,7 @@ class PastDueSuspensionTask:
             self.client.table("subscriptions")
             .select("id, user_id, current_period_end, status, billing_mode, erasure_pending")
             .eq("billing_mode", "annual_prepaid")
+            .eq("is_canonical", True)
             .eq("status", "past_due")
             .lte("current_period_end", bufferCutoff)
             .execute()
@@ -172,7 +174,7 @@ class PastDueSuspensionTask:
                     .select("id, status")
                     .eq("subscription_id", subscriptionId)
                     .eq("billing_reason", "renewal")
-                    .in_("status", ["upcoming", "payment_pending", "expired"])
+                    .in_("status", ["UPCOMING", "PAYMENT_PENDING", "EXPIRED", "upcoming", "payment_pending", "expired"])
                     .limit(1)
                     .execute()
                     .data

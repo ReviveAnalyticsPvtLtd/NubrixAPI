@@ -79,6 +79,7 @@ def buildProfileCreditView(snapshot: dict) -> dict:
         **buildCreditView(snapshot),
         "periodEnd": snapshot.get("periodEnd"),
         "initialized": bool(snapshot.get("initialized", False)),
+        **{key:snapshot[key] for key in ('nextRefillAt','storedTopupTokens','spendableTopupTokens','spendableTokens','accessAllowed') if key in snapshot},
     }
 
 
@@ -91,4 +92,5 @@ def buildCreditBalanceView(snapshot: dict) -> dict:
         "periodEnd": snapshot.get("periodEnd"),
         "lastResetAt": snapshot.get("lastResetAt"),
         "initialized": bool(snapshot.get("initialized", False)),
+        **{key:snapshot[key] for key in ('nextRefillAt','storedTopupTokens','spendableTopupTokens','spendableTokens','accessAllowed') if key in snapshot},
     }

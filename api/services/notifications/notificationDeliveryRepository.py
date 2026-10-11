@@ -7,6 +7,8 @@ __all__ = [
 
 
 import os
+import json
+from api.services.subscriptions.paymentValidationService import parseUtc
 
 import psycopg2
 from psycopg2.extras import Json, RealDictCursor
@@ -18,6 +20,20 @@ _TERMINAL_STATUSES = {
     "BLOCKED",
     "FAILED",
     "CANCELLED",
+}
+
+# Server-selected template versions for the manual monthly billing types.
+# Template IDs/branding are deployment configuration; a missing configured
+# template surfaces an operator error at dispatch, never a trial-template
+# substitution.
+_BILLING_NOTIFICATION_TEMPLATE_VERSIONS = {
+    "monthly_renewal_ready": "1",
+    "monthly_renewal_reminder": "1",
+    "monthly_subscription_expired": "1",
+    "payment_receipt": "1",
+    "monthly_cancellation_confirmation": "1",
+    "subscription_refund_initiated": "1",
+    "subscription_refund_processed": "1",
 }
 
 
@@ -43,6 +59,55 @@ class NotificationDeliveryRepository:
         dedupeKey: str,
         metadata: dict,
     ) -> tuple[dict, bool]:
+        return self._enqueue(
+            notificationType="trial_expiry_warning",
+            templateVersion="1",
+            userId=userId,
+            subscriptionId=subscriptionId,
+            periodEnd=periodEnd,
+            dedupeKey=dedupeKey,
+            metadata=metadata,
+        )
+
+    def enqueueBillingNotification(
+        self,
+        userId: str,
+        subscriptionId: str | None,
+        notificationType: str,
+        dedupeKey: str,
+        periodEnd: str,
+        metadata: dict,
+    ) -> tuple[dict, bool]:
+        """Idempotently enqueue a committed billing notification intent.
+
+        Uses the same dedupe-key conflict guard as trial expiry; the logical
+        identity (lifecycle + cycle + milestone or payment/receipt id) is
+        the caller's dedupeKey, so replayed bridges create no duplicates.
+        """
+        if notificationType not in _BILLING_NOTIFICATION_TEMPLATE_VERSIONS:
+            raise ValueError(
+                f"Unsupported billing notification type: {notificationType}"
+            )
+        return self._enqueue(
+            notificationType=notificationType,
+            templateVersion=_BILLING_NOTIFICATION_TEMPLATE_VERSIONS[notificationType],
+            userId=userId,
+            subscriptionId=subscriptionId,
+            periodEnd=periodEnd,
+            dedupeKey=dedupeKey,
+            metadata=metadata,
+        )
+
+    def _enqueue(
+        self,
+        notificationType: str,
+        templateVersion: str,
+        userId: str,
+        subscriptionId: str | None,
+        periodEnd: str,
+        dedupeKey: str,
+        metadata: dict,
+    ) -> tuple[dict, bool]:
         connection = self.connectionFactory()
         try:
             with connection.cursor(cursor_factory=RealDictCursor) as cursor:
@@ -57,11 +122,13 @@ class NotificationDeliveryRepository:
                         period_end,
                         metadata_json
                     )
-                    values ('trial_expiry_warning', '1', %s, %s, %s, %s, %s)
+                    values (%s, %s, %s, %s, %s, %s, %s)
                     on conflict (dedupe_key) do nothing
                     returning *
                     """,
                     (
+                        notificationType,
+                        templateVersion,
                         dedupeKey,
                         userId,
                         subscriptionId,
@@ -77,11 +144,30 @@ class NotificationDeliveryRepository:
                         select *
                         from public.notification_deliveries
                         where dedupe_key = %s
-                        limit 1
+                        limit 1 for update
                         """,
                         (dedupeKey,),
                     )
                     row = cursor.fetchone()
+                    if row is not None and notificationType != 'trial_expiry_warning':
+                        old = row.get('metadata_json') or {}
+                        if isinstance(old, str):
+                            old = json.loads(old)
+                        mutable = (row.get('user_id') == userId and str(row.get('subscription_id')) == str(subscriptionId)
+                            and not row.get('submission_started_at') and not row.get('provider_message_id')
+                            and row.get('last_error_code') != 'AMBIGUOUS_SEND'
+                            and (row.get('status') in ('PENDING', 'RETRY_PENDING', 'SENDING')
+                                 or (row.get('status') == 'CANCELLED' and row.get('last_error_code')
+                                     in ('SUBSCRIPTION_NOT_ELIGIBLE', 'OBSOLETE_INVOICE', 'RENEWAL_DECLINED'))))
+                        if mutable and (old != metadata or parseUtc(row.get('period_end')) != parseUtc(periodEnd)
+                                        or row.get('status') == 'CANCELLED'):
+                            cursor.execute('''update public.notification_deliveries
+                                set metadata_json=%s, period_end=%s, payload_version=payload_version+1,
+                                    status='PENDING', next_attempt_at=now(), terminal_at=null,
+                                    lease_owner=null, lease_expires_at=null, last_error_code=null,
+                                    updated_at=now()
+                                where id=%s returning *''', (Json(metadata),periodEnd,row['id']))
+                            row = cursor.fetchone()
                 if row is None:
                     raise RuntimeError("notification enqueue returned no row")
             connection.commit()
@@ -123,6 +209,7 @@ class NotificationDeliveryRepository:
         leaseOwner: str,
         messageId: str,
         acceptedAt: str,
+        payloadVersion: int | None = None,
     ) -> bool:
         return self._write(
             """
@@ -138,8 +225,8 @@ class NotificationDeliveryRepository:
                 last_error_code = null,
                 updated_at = now()
             where id = %s and status = 'SENDING' and lease_owner = %s
-            """,
-            (messageId, acceptedAt, acceptedAt, deliveryId, leaseOwner),
+            """ + self._versionPredicate(payloadVersion),
+            (messageId, acceptedAt, acceptedAt, deliveryId, leaseOwner) + self._versionParameters(payloadVersion),
         )
 
     def scheduleRetry(
@@ -149,26 +236,34 @@ class NotificationDeliveryRepository:
         errorCode: str,
         nextAttemptAt: str,
         nextReconcileAt: str | None = None,
+        payloadVersion: int | None = None,
     ) -> bool:
         return self._write(
             """
             update public.notification_deliveries
             set status = 'RETRY_PENDING',
+                submission_started_at = case when %s = 'AMBIGUOUS_SEND'
+                    then submission_started_at else null end,
                 last_error_code = %s,
+                -- A payment hold is not a delivery attempt: return the claim's count.
+                attempt_count = case when %s = 'PAYMENT_HOLD' and attempt_count > 0
+                    then attempt_count - 1 else attempt_count end,
                 next_attempt_at = %s,
                 next_reconcile_at = %s,
                 lease_owner = null,
                 lease_expires_at = null,
                 updated_at = now()
             where id = %s and status = 'SENDING' and lease_owner = %s
-            """,
+            """ + self._versionPredicate(payloadVersion),
             (
+                errorCode,
+                errorCode,
                 errorCode,
                 nextAttemptAt,
                 nextReconcileAt,
                 deliveryId,
                 leaseOwner,
-            ),
+            ) + self._versionParameters(payloadVersion),
         )
 
     def markTerminal(
@@ -179,6 +274,7 @@ class NotificationDeliveryRepository:
         providerStatus: str | None = None,
         deliveredAt: str | None = None,
         leaseOwner: str | None = None,
+        payloadVersion: int | None = None,
     ) -> bool:
         normalizedStatus = status.upper()
         if normalizedStatus not in _TERMINAL_STATUSES:
@@ -203,7 +299,7 @@ class NotificationDeliveryRepository:
                 lease_owner = null,
                 lease_expires_at = null,
                 updated_at = now()
-            where {predicate}
+            where {predicate}{self._versionPredicate(payloadVersion)}
             """,
             (
                 normalizedStatus,
@@ -211,8 +307,74 @@ class NotificationDeliveryRepository:
                 providerStatus,
                 deliveredAt,
                 *predicateParameters,
-            ),
+            ) + self._versionParameters(payloadVersion),
         )
+
+    @staticmethod
+    def _versionPredicate(version):
+        return '' if version is None else ' and payload_version=%s and claimed_payload_version=%s'
+
+    @staticmethod
+    def _versionParameters(version):
+        return () if version is None else (version,version)
+
+    def upsertBillingRevision(self, revision) -> str:
+        row, _ = self.enqueueBillingNotification(revision.userId, revision.subscriptionId,
+            revision.notificationType, revision.dedupeKey, revision.periodEnd, revision.metadata)
+        return str(row['id'])
+
+    def authorizeBillingSubmission(self, deliveryId, leaseOwner, payloadVersion) -> bool:
+        return self.authorizeBillingSubmissionResult(deliveryId, leaseOwner, payloadVersion) == 'AUTHORIZED'
+
+    def authorizeBillingSubmissionResult(self, deliveryId, leaseOwner, payloadVersion) -> str:
+        """Fence the immutable provider submission under the financial owner lock.
+
+        Returns AUTHORIZED, HELD (otherwise eligible solicitation for a cycle
+        with unresolved received money; retry later) or REJECTED. Once
+        committed, possibly submitted payloads cannot be revised. No network
+        IO occurs inside this transaction; crashed submissions reconcile by tag.
+        """
+        from api.services.billing.manualBillingRepository import ManualBillingRepository
+        from api.services.notifications.billingNotificationService import (
+            _SOLICITATION_TYPES, isBillingNotificationEligible)
+        repository = ManualBillingRepository(self.connectionFactory)
+        def operation(connection):
+            with connection.cursor(cursor_factory=RealDictCursor) as cursor:
+                cursor.execute('select user_id from public.notification_deliveries where id=%s',(deliveryId,))
+                identity = cursor.fetchone()
+                if not identity or not identity['user_id']: return 'REJECTED'
+                repository._lockUser(cursor,identity['user_id'])
+                subscription = repository._canonical(cursor,identity['user_id'])
+                cursor.execute('select * from public.notification_deliveries where id=%s for update',(deliveryId,))
+                row = cursor.fetchone()
+                if (not row or row['status'] != 'SENDING' or row['lease_owner'] != leaseOwner
+                        or row['payload_version'] != payloadVersion
+                        or row['claimed_payload_version'] != payloadVersion
+                        or row.get('submission_started_at') or row.get('last_error_code') == 'AMBIGUOUS_SEND'
+                        or str(row.get('subscription_id')) != str(subscription['id'])): return 'REJECTED'
+                row['metadata_json'] = repository._json(row.get('metadata_json'))
+                invoiceId = row['metadata_json'].get('invoiceId')
+                invoice = None
+                if invoiceId:
+                    cursor.execute('select * from public."Invoices" where id=%s and "userId"=%s for update',
+                                   (invoiceId,identity['user_id']))
+                    invoice = cursor.fetchone()
+                cursor.execute('select clock_timestamp() as observed_at')
+                from api.services.subscriptions.paymentValidationService import parseUtc
+                observedAt = parseUtc(cursor.fetchone()['observed_at'])
+                if row.get('lease_expires_at') and parseUtc(row['lease_expires_at']) <= observedAt: return 'REJECTED'
+                subscription['billing_state'] = repository._json(subscription.get('billing_state'))
+                held = (row['notification_type'] in _SOLICITATION_TYPES
+                    and repository._unresolvedCycleCaptureLocked(cursor, subscription, parseUtc(row.get('period_end'))))
+                snapshot = {'subscription':subscription,'invoice':invoice,'unresolvedOwnedCapture':held}
+                if not isBillingNotificationEligible(row,snapshot,observedAt):
+                    # A hold never revives a message whose own window or facts have lapsed.
+                    if held and isBillingNotificationEligible(row,{**snapshot,'unresolvedOwnedCapture':False},observedAt):
+                        return 'HELD'
+                    return 'REJECTED'
+                cursor.execute('update public.notification_deliveries set submission_started_at=clock_timestamp() where id=%s',(deliveryId,))
+                return 'AUTHORIZED'
+        return repository._run(operation)
 
     def listForReconciliation(self, limit: int = 100) -> list[dict]:
         return self._readMany(

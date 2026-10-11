@@ -172,3 +172,4 @@ cython_debug/
 .pypirc
 CLAUDE.md
 claude.md
+.runtime/credit-usage/

@@ -102,6 +102,8 @@ USER_ACCESS_VIEW = {
 }
 
 SUBSCRIPTION_VIEW = {
+    "is_canonical":False,
+    "renewal_opt_out":False,
     "id": "subscription-1",
     "user_id": "user-1",
     "billing_mode": "subscription",
@@ -117,10 +119,6 @@ SUBSCRIPTION_VIEW = {
     "pending_removals": "",
     "pending_additions": "",
     "billing_state": "current",
-    "razorpay_customer_id": None,
-    "razorpay_token_id": None,
-    "subscription_anchor_day": 1,
-    "recurring_failures": 0,
     "cancellation_reason": None,
     "version": 3,
     "plan_type": "pro",
@@ -745,6 +743,14 @@ def test_admin_routes_declare_strict_response_allowlists():
         ("/admin/users/{userId}", "PATCH"): AdminUserView,
         ("/admin/users/{userId}/access", "PATCH"): accessView,
         ("/admin/users/{userId}/erasure", "POST"): AdminUserErasureAcceptedView,
+        ("/admin/users/{userId}/credits/reset", "POST"):
+            adminModels.AdminCreditResetOperationView,
+        ("/admin/credits/reset-all", "POST"):
+            adminModels.AdminCreditResetOperationView,
+        ("/admin/credits/reset-operations/{operationId}", "GET"):
+            adminModels.AdminCreditResetOperationView,
+        ("/admin/billing/payment-cases/{captureEventId}/actions", "POST"):
+            adminModels.AdminPaymentCaseActionView,
         ("/admin/free-trial/extensions", "POST"):
             AdminFreeTrialExtensionResponse,
         ("/admin/free-trial/reductions", "POST"):

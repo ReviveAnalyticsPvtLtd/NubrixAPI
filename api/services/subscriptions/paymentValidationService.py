@@ -116,11 +116,22 @@ def isPeriodExpired(subscription: dict | None, now: datetime.datetime | None = N
 
 
 def isAccessActive(subscription: dict | None, now: datetime.datetime | None = None) -> bool:
-    status = ((subscription or {}).get("status") or "").lower()
-    if status in {"active", "renewal_upcoming", "payment_pending"}:
-        return True
-    if status == "cancelled":
-        return not isPeriodExpired(subscription, now)
+    """Paid access requires timestamp-valid coverage of `now`.
+
+    Status alone is never an access grant: `payment_pending` means an unpaid
+    next-period invoice exists and grants nothing once the current window
+    has elapsed; `cancelled` keeps paid access only while its period end is
+    in the future. At the exact end instant the old period no longer grants
+    access, regardless of scheduler or JWT staleness.
+    """
+    row = subscription or {}
+    status = (row.get("status") or "").lower()
+    periodEnd = parseUtc(row.get("current_period_end"))
+    if periodEnd is None:
+        # No stored coverage window: fail closed.
+        return False
+    if status in {"active", "renewal_upcoming", "payment_pending", "cancelled"}:
+        return not isPeriodExpired(row, now)
     return False
 
 
@@ -228,20 +239,6 @@ def validateOrderPaymentAgainstInvoice(
         if paymentStatus != "captured":
             _raise(f"Payment {payment.get('id')} is not captured (status={paymentStatus})")
 
-    orderCustomerId = order.get("customer_id")
-    if expectedCustomerId and orderCustomerId and orderCustomerId != expectedCustomerId:
-        _raise(
-            f"Order/customer mismatch: order.customer_id={orderCustomerId}, "
-            f"expected={expectedCustomerId}"
-        )
-
-    paymentCustomerId = payment.get("customer_id")
-    if expectedCustomerId and paymentCustomerId and paymentCustomerId != expectedCustomerId:
-        _raise(
-            f"Payment/customer mismatch: payment.customer_id={paymentCustomerId}, "
-            f"expected={expectedCustomerId}"
-        )
-
     expectedAmount = invoice.get("total_amount")
     if expectedAmount is None:
         expectedAmount = invoice.get("amount")
@@ -274,7 +271,7 @@ def normalizeChurnedSubscription(
     Apply a partial churn reset to a terminal subscription row.
 
     Clears period dates, entitlements, pending changes, and stale payment
-    tokens while preserving ``billing_mode`` and ``razorpay_customer_id``.
+    provider handles while preserving ``billing_mode`` and historical evidence.
     Archives previous values in ``billing_state.churn_snapshot``.
 
     Returns ``True`` if the DB was updated, ``False`` if already reset (no-op).

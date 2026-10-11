@@ -37,7 +37,8 @@ class EntitlementBoundaryTask:
         subscriptions = (
             self.client.table("subscriptions")
             .select(CANONICAL_SUBSCRIPTION_SELECT)
-            .in_("status", ["active", "renewal_upcoming", "payment_pending", "past_due", "suspended"])
+            .eq("is_canonical", True)
+            .in_("status", ["active", "cancelled", "renewal_upcoming", "payment_pending", "past_due", "suspended"])
             .execute()
             .data
         )
@@ -51,6 +52,12 @@ class EntitlementBoundaryTask:
             try:
                 if subscriptionErasurePending(subscription):
                     skipped += 1
+                    continue
+                if subscription.get("billing_mode") == "monthly_prepaid":
+                    from api.services.billing.manualBillingRepository import getManualBillingRepository
+                    result = getManualBillingRepository().activateDueCoverage(subscription["user_id"], now)
+                    applied += int(result.state in ("activated", "expired"))
+                    skipped += int(result.state not in ("activated", "expired"))
                     continue
                 pendingRemovals = subscriptionPendingRemovals(subscription)
                 if not pendingRemovals:

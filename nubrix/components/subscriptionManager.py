@@ -55,6 +55,38 @@ def _auditSubscriptionIntegrityIssue(client, userId: str, reason: str, metadata:
         logger.error(f"Failed to write subscription integrity audit log for user {userId}: {e}")
 
 
+def _hasValidPaidFutureCoverage(client, subscription: dict, now) -> bool:
+    """Whether a valid (non-revoked) PAID renewal covers `now` or later.
+
+    A paid upcoming month must not be destroyed by the daily expiry sweep:
+    it either already covers `now` (its start elapsed) or begins at the
+    expired row's stored end. Revoked (refunded) coverage never continues.
+    """
+    userId = subscription.get("user_id")
+    if not userId:
+        return False
+    rows = client.table("Invoices") \
+        .select("id, status, period_start, period_end, metadata_json") \
+        .eq("userId", userId) \
+        .eq("billing_reason", "renewal") \
+        .eq("status", "PAID") \
+        .execute().data or []
+    for row in rows:
+        metadata = row.get("metadata_json")
+        manualBilling = (
+            metadata.get("manualBilling") if isinstance(metadata, dict) else None
+        ) or {}
+        if manualBilling.get("coverageState") == "revoked":
+            continue
+        start = parseUtc(row.get("period_start"))
+        end = parseUtc(row.get("period_end"))
+        if start is None or end is None:
+            continue
+        if start <= now < end or start >= now:
+            return True
+    return False
+
+
 def recalculateSubscriptionDays() -> dict:
     """
     Recalculates subscription lifecycle status from canonical subscriptions rows.
@@ -86,6 +118,7 @@ def recalculateSubscriptionDays() -> dict:
     )
     subscriptions = client.table("subscriptions") \
         .select("id, user_id, current_period_start, current_period_end, status, billing_mode, billing_state, erasure_pending") \
+        .eq("is_canonical", True) \
         .not_.is_("current_period_end", "null") \
         .execute().data
     summary = {
@@ -120,8 +153,13 @@ def recalculateSubscriptionDays() -> dict:
         if subscription.get("erasure_pending"):
             continue
         try:
-            billingMode = subscription.get("billing_mode", "monthly_recurring")
+            billingMode = subscription.get("billing_mode", "monthly_prepaid")
             currentStatus = (subscription.get("status") or "").lower()
+            if billingMode == "monthly_prepaid":
+                from api.services.billing.manualBillingRepository import getManualBillingRepository
+                getManualBillingRepository().activateDueCoverage(subscription["user_id"], now)
+                continue
+
 
             expiryRaw = subscription["current_period_end"]
             expiry = parseUtc(expiryRaw)
@@ -129,6 +167,21 @@ def recalculateSubscriptionDays() -> dict:
                 continue
 
             deltaDays = (expiry.date() - now.date()).days
+
+            # A paid upcoming month must survive the daily expiry sweep:
+            # check for a valid (non-revoked) PAID renewal covering the next
+            # cycle BEFORE expiring the row. Cancellation does not defeat
+            # paid continuation.
+            paidFutureContinues = False
+            if (
+                deltaDays < 0
+                and billingMode == "monthly_prepaid"
+                and currentStatus != "expired"
+            ):
+                paidFutureContinues = _hasValidPaidFutureCoverage(
+                    client, subscription, now
+                )
+
             snapshotStatus = "expired" if deltaDays < 0 else currentStatus
             billingState = mergeSubscriptionLifecycleSnapshot(
                 subscription.get("billing_state"),
@@ -138,7 +191,7 @@ def recalculateSubscriptionDays() -> dict:
             )
             updatePayload = {"billing_state": billingState}
 
-            if deltaDays < 0:
+            if deltaDays < 0 and not paidFutureContinues:
                 if currentStatus not in ("expired", "suspended"):
                     updatePayload["status"] = "expired"
                     updatePayload["plan_type"] = mapBillingModeToPlanType(billingMode, "expired")
@@ -146,7 +199,7 @@ def recalculateSubscriptionDays() -> dict:
 
             client.table("subscriptions").update(updatePayload).eq("id", subscription["id"]).execute()
 
-            if deltaDays < 0 and currentStatus not in ("expired", "suspended"):
+            if deltaDays < 0 and not paidFutureContinues and currentStatus not in ("expired", "suspended"):
                 churnReason = (
                     "cancelled_period_ended"
                     if currentStatus == "cancelled"

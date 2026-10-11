@@ -414,23 +414,13 @@ class UserErasureRepository:
                     (userId,),
                 )
                 workspaceIds = [str(row[0]) for row in cursor.fetchall()]
-                cursor.execute(
-                    """
-                    select razorpay_customer_id, razorpay_token_id
-                    from public.subscriptions
-                    where user_id = %s
-                    """,
-                    (userId,),
-                )
-                billingCredentials = [
-                    {"customerId": row[0], "tokenId": row[1]}
-                    for row in cursor.fetchall()
-                    if row[0] and row[1]
-                ]
+                # Recurring provider credentials no longer exist in the
+                # runtime schema: manual billing stores no customer/token
+                # state to inventory or clean up.
                 return {
                     "projectIds": projectIds,
                     "workspaceIds": workspaceIds,
-                    "billingCredentials": billingCredentials,
+                    "billingCredentials": [],
                 }
         finally:
             connection.close()
@@ -440,7 +430,7 @@ class UserErasureRepository:
             """
             update public.subscriptions
             set erasure_pending = true, auto_renew_enabled = false,
-                razorpay_token_id = null, renewal_due_at = null,
+                renewal_opt_out = true, renewal_due_at = null,
                 updated_at = now()
             where user_id = %s
             """,
@@ -477,6 +467,12 @@ class UserErasureRepository:
                     "select pg_advisory_xact_lock(hashtextextended(%s, 0))",
                     (userId,),
                 )
+                from api.services.billing.manualBillingRepository import _advisoryKey
+                cursor.execute('select pg_advisory_xact_lock(%s)',(_advisoryKey(userId),))
+                if self._tableExists(cursor,'billing_events'):
+                    cursor.execute("select id from public.billing_events where user_id=%s and event_type='refund.intent' and event_status <> 'processed' limit 1",(userId,))
+                    if cursor.fetchone() is not None:
+                        raise AdminApiError(409,'Approved refund must be reconciled before financial records are anonymised')
                 self._scrubNotificationDeliveries(cursor, userId)
                 if self._tableExists(cursor, "Invoices"):
                     cursor.execute(

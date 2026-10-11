@@ -84,7 +84,7 @@ class RenewalLifecycleTask:
         invoices = (
             self.client.table("Invoices")
             .select("id, userId, subscription_id, due_date, total_amount, currency")
-            .eq("status", "payment_pending")
+            .in_("status", ["PAYMENT_PENDING", "payment_pending"])
             .eq("billing_reason", "renewal")
             .not_.is_("due_date", "null")
             .execute()
@@ -110,13 +110,14 @@ class RenewalLifecycleTask:
 
             subscriptionRows = (
                 self.client.table("subscriptions")
-                .select("erasure_pending")
+                .select("erasure_pending, billing_mode, is_canonical")
+                .eq("is_canonical", True)
                 .eq("id", invoice.get("subscription_id"))
                 .limit(1)
                 .execute()
                 .data
             ) or []
-            if not subscriptionRows or subscriptionErasurePending(subscriptionRows[0]):
+            if not subscriptionRows or subscriptionErasurePending(subscriptionRows[0]) or subscriptionRows[0].get('billing_mode') != 'annual_prepaid':
                 skipped += 1
                 continue
 

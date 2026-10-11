@@ -10,10 +10,10 @@ __all__ = ["router"]
 
 
 from utils.exceptionHandler import CustomException, raiseHttpException
-from api.models import VerifySubscriptionRequest, CreateSubscriptionRequest, AddDomainsRequest, VerifyDomainUpgradeRequest, RemoveDomainRequest, CancelPendingAdditionRequest, CancelSubscriptionRequest, RefundRequest, CreateAnnualRenewalSessionRequest, VerifyAnnualRenewalPaymentRequest
+from api.models import VerifySubscriptionRequest, CreateSubscriptionRequest, AddDomainsRequest, VerifyDomainUpgradeRequest, RemoveDomainRequest, CancelPendingAdditionRequest, CancelSubscriptionRequest, RefundRequest, CreateAnnualRenewalSessionRequest, VerifyAnnualRenewalPaymentRequest, PrepareRenewalInvoiceRequest, CreateRenewalSessionRequest, VerifyRenewalPaymentRequest, ResumeRenewalRequest
 from api.services.subscriptions.subscriptionService import subscriptionService
 from fastapi.responses import ORJSONResponse
-from fastapi import APIRouter, Depends
+from fastapi import APIRouter, Depends, Header
 from api.commons import verifyToken
 
 router = APIRouter()
@@ -48,9 +48,11 @@ async def activateFreeTrial(token=Depends(verifyToken)):
 
 
 @router.post("/createSubscription")
-async def createSubscription(request: CreateSubscriptionRequest, token=Depends(verifyToken)):
+async def createSubscription(request: CreateSubscriptionRequest, token=Depends(verifyToken),
+    requestKey: str | None = Header(default=None, alias="Idempotency-Key", min_length=1, max_length=128)
+):
     """
-    Create a Razorpay order with tokenization for the given domains.
+    Create an ordinary Razorpay order for the selected experts.
 
     Args:
         request (CreateSubscriptionRequest): Domains to subscribe.
@@ -64,8 +66,7 @@ async def createSubscription(request: CreateSubscriptionRequest, token=Depends(v
             domains=request.domains,
             contact=request.contact,
             billingMode=request.billingMode,
-            token=token
-        )
+            token=token, requestKey=requestKey)
         return ORJSONResponse(status_code=200, content=result)
     except CustomException as e:
         raiseHttpException(e)
@@ -101,7 +102,9 @@ async def verifySubscription(
 
 
 @router.post("/addDomains")
-async def addDomains(payload: AddDomainsRequest, token=Depends(verifyToken)):
+async def addDomains(payload: AddDomainsRequest, token=Depends(verifyToken),
+    requestKey: str | None = Header(default=None, alias="Idempotency-Key", min_length=1, max_length=128)
+):
     """
     Add one or more domains to the authenticated user's subscription
     via a Razorpay Order for prorated billing.
@@ -114,7 +117,7 @@ async def addDomains(payload: AddDomainsRequest, token=Depends(verifyToken)):
         ORJSONResponse: Order details required for embedded checkout.
     """
     try:
-        result = subscriptionService.addDomains(domains=payload.domains, token=token)
+        result = subscriptionService.addDomains(domains=payload.domains, token=token, requestKey=requestKey)
         return ORJSONResponse(
             status_code=200,
             content={
@@ -143,12 +146,13 @@ async def verifyDomainUpgrade(
         ORJSONResponse: Verification result.
     """
     try:
-        subscriptionService.verifyDomainUpgrade(payload=payload.dict(), token=token)
+        result = subscriptionService.verifyDomainUpgrade(payload=payload.dict(), token=token)
         return ORJSONResponse(
             status_code=200,
             content={
                 "status": "SUCCESS",
-                "message": "Domain upgrade verified and activated."
+                "message": "Domain upgrade payment checked.",
+                "data": result,
             }
         )
     except CustomException as e:
@@ -288,10 +292,121 @@ async def getInvoices(token=Depends(verifyToken)):
         raiseHttpException(e)
 
 
+@router.post("/prepareRenewalInvoice")
+async def prepareRenewalInvoice(
+    _request: PrepareRenewalInvoiceRequest | None = None,
+    token=Depends(verifyToken),
+):
+    """
+    Prepare (or read) the next renewal invoice on explicit dashboard request.
+
+    Monthly: prepares the next calendar-month renewal invoice on demand,
+    including earlier than T-7, while access is valid and renewal is not
+    declined. Annual: existing preparation policy.
+    """
+    try:
+        result = subscriptionService.prepareRenewalInvoice(token=token)
+        return ORJSONResponse(
+            status_code=200,
+            content={
+                "status": "SUCCESS",
+                "message": "Renewal invoice prepared.",
+                "data": result,
+            }
+        )
+    except CustomException as e:
+        raiseHttpException(e)
+
+
+@router.post("/createRenewalPaymentSession")
+async def createRenewalPaymentSession(
+    request: CreateRenewalSessionRequest,
+    token=Depends(verifyToken),
+    requestKey: str | None = Header(default=None, alias="Idempotency-Key", min_length=1, max_length=128)
+):
+    """
+    Create a customer-free Razorpay checkout session for an owned renewal
+    invoice. Monthly renewals pay before the current period end.
+    """
+    try:
+        result = subscriptionService.createRenewalPaymentSession(
+            invoiceId=request.invoiceId,
+            token=token, requestKey=requestKey)
+        return ORJSONResponse(
+            status_code=200,
+            content={
+                "status": "SUCCESS",
+                "message": "Renewal payment session created.",
+                "data": result,
+            }
+        )
+    except CustomException as e:
+        raiseHttpException(e)
+
+
+@router.post("/verifyRenewalPayment")
+async def verifyRenewalPayment(
+    payload: VerifyRenewalPaymentRequest,
+    token=Depends(verifyToken),
+):
+    """
+    Verify a renewal checkout signature and finalize the captured payment.
+
+    Monthly early payment schedules the frozen future month; credits refill
+    only at its start. Annual keeps its own lifecycle policy.
+    """
+    try:
+        result = subscriptionService.verifyRenewalPayment(
+            payload=payload.dict(),
+            token=token,
+        )
+        message = (
+            "Renewal payment verified and finalized."
+            if result.get("finalized")
+            else "Renewal payment verified. Awaiting capture/finalization."
+        )
+        return ORJSONResponse(
+            status_code=200,
+            content={
+                "status": "SUCCESS",
+                "message": message,
+                "data": result,
+            }
+        )
+    except CustomException as e:
+        raiseHttpException(e)
+
+
+@router.post("/resumeRenewal")
+async def resumeRenewal(
+    _request: ResumeRenewalRequest | None = None,
+    token=Depends(verifyToken),
+):
+    """
+    Clear the monthly renewal opt-out before the final paid end.
+
+    Restores eligibility for manual renewal invoices/reminders. Never
+    charges or reactivates a void order.
+    """
+    try:
+        result = subscriptionService.resumeRenewal(token=token)
+        return ORJSONResponse(
+            status_code=200,
+            content={
+                "status": "SUCCESS",
+                "message": "Renewal resumed.",
+                "data": result,
+            }
+        )
+    except CustomException as e:
+        raiseHttpException(e)
+
+
 @router.post("/createAnnualRenewalPaymentSession")
 async def createAnnualRenewalPaymentSession(
     request: CreateAnnualRenewalSessionRequest,
-    token=Depends(verifyToken)
+    token=Depends(verifyToken),
+    requestKey: str | None = Header(default=None, alias="Idempotency-Key", min_length=1, max_length=128)
 ):
     """
     Create or reuse a Razorpay Order for an annual renewal invoice.
@@ -306,8 +421,7 @@ async def createAnnualRenewalPaymentSession(
     try:
         result = subscriptionService.createAnnualRenewalPaymentSession(
             invoiceId=request.invoiceId,
-            token=token
-        )
+            token=token, requestKey=requestKey)
         return ORJSONResponse(
             status_code=200,
             content={

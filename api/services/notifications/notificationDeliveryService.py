@@ -148,25 +148,41 @@ class NotificationDeliveryService:
             )
             summary["failed"] += 1
             return
+        if (delivery.get('notification_type') != 'trial_expiry_warning'
+                and delivery.get('last_error_code') == 'AMBIGUOUS_SEND'):
+            self._scheduleRetry(delivery,workerId,'AMBIGUOUS_SEND',
+                now + datetime.timedelta(minutes=30),now + datetime.timedelta(minutes=5))
+            summary['ambiguous'] += 1
+            return
         subscription = self._findOne(
             "subscriptions",
             "id",
             delivery.get("subscription_id"),
             (
                 "id, user_id, current_period_start, current_period_end, "
-                "status, billing_mode, erasure_pending"
+                "status, billing_mode, erasure_pending, renewal_opt_out, billing_state, is_canonical"
             ),
         )
         if subscription is None:
             self._cancel(delivery, workerId, "SUBSCRIPTION_NOT_FOUND", summary)
             return
 
-        intent = buildTrialExpiryIntent(subscription, now)
-        if intent is None or not self._samePeriod(
-            intent["periodEnd"], delivery.get("period_end")
-        ):
-            self._cancel(delivery, workerId, "SUBSCRIPTION_NOT_ELIGIBLE", summary)
-            return
+        billingDelivery = delivery.get("notification_type") != "trial_expiry_warning"
+        if billingDelivery:
+            from api.services.notifications.billingNotificationService import isBillingNotificationEligible
+            metadata = dict(delivery.get("metadata_json") or {})
+            invoice = self._findOne("Invoices", "id", metadata.get("invoiceId"), "id, status, period_start, period_end, metadata_json") if metadata.get("invoiceId") else None
+            if invoice and delivery.get('notification_type') == 'payment_receipt':
+                metadata['serviceRevoked'] = bool((invoice.get('metadata_json') or {}).get('manualBilling',{}).get('revokedAt'))
+            snapshot = {"subscription":subscription, "invoice":invoice}
+            if not isBillingNotificationEligible(delivery, snapshot, now):
+                self._cancel(delivery, workerId, "SUBSCRIPTION_NOT_ELIGIBLE", summary)
+                return
+        else:
+            intent = buildTrialExpiryIntent(subscription, now)
+            if intent is None or not self._samePeriod(intent["periodEnd"], delivery.get("period_end")):
+                self._cancel(delivery, workerId, "SUBSCRIPTION_NOT_ELIGIBLE", summary)
+                return
 
         user = self._findOne(
             "Users",
@@ -181,6 +197,27 @@ class NotificationDeliveryService:
         name = str(user.get("fullName") or "").strip()
         if not email or not name:
             self._cancel(delivery, workerId, "USER_PROFILE_INCOMPLETE", summary)
+            return
+
+        if billingDelivery:
+            authorization = self.repository.authorizeBillingSubmissionResult(
+                str(delivery['id']),workerId,delivery['payload_version'])
+            if authorization == 'HELD':
+                # Unresolved received money for this cycle: keep the original
+                # milestone and re-check after the hold, never discard it.
+                self._scheduleRetry(delivery,workerId,'PAYMENT_HOLD',now + datetime.timedelta(hours=1),None)
+                summary['retryScheduled'] += 1
+                return
+            if authorization != 'AUTHORIZED':
+                self._cancel(delivery,workerId,'SUBSCRIPTION_NOT_ELIGIBLE',summary)
+                return
+            delivery['submission_started_at'] = now.isoformat()
+            payload = {"mode":"send", "deliveryId":str(delivery["id"]),
+                "notificationType":delivery["notification_type"], "templateVersion":delivery["template_version"],
+                "email":email, "name":name, "periodEnd":str(delivery.get("period_end") or ""),
+                "metadata":metadata, "trackingTag":f"nubrix_delivery:{delivery['id']}"}
+            result = self.edgeClient.sendBilling(payload)
+            self._applySendResult(delivery,workerId,result,now,summary)
             return
 
         payload = {
@@ -375,6 +412,7 @@ class NotificationDeliveryService:
                 workerId,
                 str(result.messageId),
                 now.isoformat(),
+                **self._versionArguments(delivery),
             ):
                 raise RuntimeError("DELIVERY_LEASE_LOST")
             summary["accepted"] += 1
@@ -430,6 +468,10 @@ class NotificationDeliveryService:
         summary["retryScheduled"] += 1
         self._audit(delivery, "RETRY_PENDING", result.errorCode)
 
+    @staticmethod
+    def _versionArguments(delivery):
+        return {'payloadVersion':delivery['payload_version']} if delivery.get('notification_type') != 'trial_expiry_warning' else {}
+
     def _scheduleUnexpectedFailure(
         self,
         delivery: dict,
@@ -443,7 +485,7 @@ class NotificationDeliveryService:
                     delivery,
                     workerId,
                     "FAILED",
-                    "INTERNAL_DISPATCH_ERROR",
+                    "AMBIGUOUS_SEND" if delivery.get("submission_started_at") else "INTERNAL_DISPATCH_ERROR",
                 )
                 summary["failed"] += 1
             except Exception:
@@ -459,9 +501,9 @@ class NotificationDeliveryService:
             self._scheduleRetry(
                 delivery,
                 workerId,
-                "INTERNAL_DISPATCH_ERROR",
+                "AMBIGUOUS_SEND" if delivery.get("submission_started_at") else "INTERNAL_DISPATCH_ERROR",
                 nextAttempt,
-                None,
+                self.now() + datetime.timedelta(minutes=5) if delivery.get("submission_started_at") else None,
             )
             summary["retryScheduled"] += 1
         except Exception:
@@ -484,6 +526,7 @@ class NotificationDeliveryService:
             errorCode,
             nextAttemptAt.isoformat(),
             nextReconcileAt.isoformat() if nextReconcileAt else None,
+            **self._versionArguments(delivery),
         )
         if not changed:
             raise RuntimeError("DELIVERY_LEASE_LOST")
@@ -510,6 +553,7 @@ class NotificationDeliveryService:
             status,
             errorCode=errorCode,
             leaseOwner=workerId,
+            **self._versionArguments(delivery),
         )
         if not changed:
             raise RuntimeError("DELIVERY_LEASE_LOST")

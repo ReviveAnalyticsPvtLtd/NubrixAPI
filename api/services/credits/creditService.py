@@ -265,6 +265,20 @@ class CreditService:
     def _redisKey(userId: str) -> str:
         return f"credits:v3:{userId}"
 
+    def invalidateCreditProjection(self, userId: str) -> bool:
+        """Delete one user's Redis projection after a committed SQL change.
+
+        Only eviction: a delayed call can drop a newer projection, which then
+        rebuilds from SQL, but it never publishes a historical snapshot.
+        Returns False on failure without touching the committed SQL result.
+        """
+        try:
+            self._redis().delete(self._redisKey(userId))
+            return True
+        except Exception as e:
+            logger.warning(f"Credit projection invalidation failed: {type(e).__name__}")
+            return False
+
     # ---- durable read helpers -------------------------------------------------
 
     def _dbRow(self, userId: str) -> dict | None:
@@ -272,7 +286,8 @@ class CreditService:
             self.supabase.table("credit_balances")
             .select(
                 "plan_tier, monthly_token_quota, used_tokens, remaining_tokens, "
-                "topup_tokens, domain_count, period_start, period_end, last_reset_at"
+                "topup_tokens, domain_count, period_start, period_end, last_reset_at, "
+                "subscription_id, lifecycle_id, credit_period_id, balance_version"
             )
             .eq("user_id", userId)
             .limit(1)
@@ -310,6 +325,11 @@ class CreditService:
             return []
 
     # ---- Redis hash lifecycle -------------------------------------------------
+
+    def _manualBalance(self,userId):
+        # One PostgreSQL authority for all modes; Redis never owns shared top-ups.
+        from api.services.credits.manualCreditRepository import ManualCreditRepository
+        return ManualCreditRepository().balanceSnapshot(userId)
 
     def _ensureHash(self, userId: str) -> dict | None:
         """
@@ -512,6 +532,23 @@ class CreditService:
 
     # ---- public API -----------------------------------------------------------
 
+    def admitCreditOperation(self,userId,operationType,operationId):
+        from api.services.credits.manualCreditRepository import ManualCreditRepository
+        return ManualCreditRepository().admit(userId,operationType,operationId)
+
+    def settleCreditOperation(self,context,tokensUsed,runId):
+        from api.services.credits.manualCreditRepository import ManualCreditRepository
+        repository=ManualCreditRepository()
+        try:
+            repository.reportUsage(context,tokensUsed,str(runId))
+        except ValueError:
+            raise
+        except Exception:
+            from api.services.credits.creditUsageSpool import retainUsage
+            retainUsage(context,tokensUsed,str(runId))
+            raise
+        return repository.settle(context,tokensUsed,str(runId))
+
     def refreshTrialCreditsCache(
         self, userId: str, quota: int, topupTokens: int, periodEnd,
         generation: int,
@@ -538,66 +575,13 @@ class CreditService:
             logger.warning(f"Admin trial credit cache refresh failed for {userId}: {e}")
             return "FAILED"
 
-    def initializeCreditBalance(self, userId, planTier, subscriptionId=None,
-                                domainCount=1) -> dict:
-        """
-        Create or reset a user's balance on activation / trial start / renewal.
-
-        The purchased bucket survives: the upsert payload omits topup_tokens so
-        PostgREST leaves the column untouched on conflict, and the Redis mapping
-        reseeds it from the existing row.
-
-        The allowance scales with domainCount for paid tiers; free and none
-        ignore it.
-        """
-        quota = getTokenQuotaForPlan(planTier, domainCount)
-        now = datetime.now(timezone.utc)
-        periodEnd = now + relativedelta(months=1)
-
-        existingRow = self._dbRow(userId)
-        topup = (existingRow or {}).get("topup_tokens", 0) or 0
-
-        payload = {
-            "user_id": userId,
-            "subscription_id": str(subscriptionId) if subscriptionId else None,
-            "plan_tier": planTier,
-            "domain_count": domainCount,
-            "monthly_token_quota": quota,
-            "used_tokens": 0,
-            "remaining_tokens": quota,
-            "period_start": now.isoformat(),
-            "period_end": periodEnd.isoformat(),
-            "last_reset_at": now.isoformat(),
-            "updated_at": now.isoformat(),
-        }
-        result = (
-            self.supabase.table("credit_balances")
-            .upsert(payload, on_conflict="user_id")
-            .execute()
-        )
-        try:
-            r = self._redis()
-            r.hset(self._redisKey(userId), mapping={
-                "trem": quota,
-                "ttop": topup,
-                "tquota": quota,
-                "pend": int(periodEnd.timestamp()),
-                "pnext": int(creditMath.nextPeriodEnd(periodEnd).timestamp()),
-            })
-            logger.info(
-                f"Credit balance initialized — userId={userId}, plan={planTier}, "
-                f"monthlyTokens={quota}, topupTokens={topup}"
-            )
-        except Exception as e:
-            logger.warning(
-                f"Redis credit init failed for {userId}, dropping hash so the "
-                f"next read rebuilds from Supabase: {e}"
-            )
-            try:
-                self._redis().delete(self._redisKey(userId))
-            except Exception:
-                pass
-        return result.data[0] if result.data else payload
+    def initializeCreditBalance(self,userId,planTier,subscriptionId=None,domainCount=1):
+        from api.services.credits.manualCreditRepository import ManualCreditRepository
+        balance=ManualCreditRepository().balanceSnapshot(userId)
+        if balance.get('plan_tier')!=planTier or (subscriptionId and str(balance.get('subscription_id'))!=str(subscriptionId)):
+            raise ValueError('CREDIT_INITIALIZER_MODE_OR_OWNER_MISMATCH')
+        # Reading a committed allocation never resets usage or purchased credits.
+        return balance
 
     def applyDomainCountChange(self, userId: str, domainCount: int,
                                grantImmediately: bool) -> dict:
@@ -638,6 +622,9 @@ class CreditService:
         Returns:
             dict: {"applied": bool, "quota": int, "delta": int, "remaining": int}.
         """
+        if self._manualBalance(userId) is not None:
+            from api.services.credits.manualCreditRepository import ManualCreditRepository
+            return ManualCreditRepository().resizeQuota(userId,domainCount,grantImmediately)
         try:
             domainCount = max(1, int(domainCount))
         except (TypeError, ValueError):
@@ -700,7 +687,7 @@ class CreditService:
         return {"applied": True, "quota": newQuota, "delta": delta,
                 "remaining": newRemaining}
 
-    def deductTokens(self, userId, tokensUsed, operationType) -> int:
+    def deductTokens(self, userId, tokensUsed, operationType, context=None, runId=None) -> int:
         """
         Subtract the exact token count from the user's balance.
 
@@ -717,6 +704,12 @@ class CreditService:
         balance is unreachable (the call is then not charged).
         """
         if tokensUsed <= 0:
+            return self.getRemainingTokens(userId)
+
+        if self._manualBalance(userId) is not None:
+            if context is None or runId is None or context.userId!=userId or context.operationType!=operationType:
+                raise ValueError('CREDIT_PREWORK_ADMISSION_REQUIRED')
+            self.settleCreditOperation(context,tokensUsed,runId)
             return self.getRemainingTokens(userId)
 
         self._ensureHash(userId)
@@ -772,9 +765,13 @@ class CreditService:
         roll in Python. That fallback includes the purchased balance, so a Redis
         outage cannot lock out the users who paid not to be locked out.
 
-        `monthly` is -1 when the balance is unreadable (Redis and Supabase both
-        unavailable), which callers treat as "allow".
+        `monthly` is -1 when the balance is unreadable. Protected work treats
+        that state as a retryable failure and cannot use the cache to authorize it.
         """
+        manual = self._manualBalance(userId)
+        if manual is not None:
+            return {"monthly": int(manual.get("remaining_tokens") or 0),
+                    "topup": int(manual.get("topup_tokens") or 0), "rolled": False}
         self._ensureHash(userId)
         state = self._peek(userId)
         if state is not None:
@@ -812,128 +809,36 @@ class CreditService:
         """
         Total spendable tokens: monthly remainder plus purchased balance.
 
-        Returns -1 when the balance is unreadable, which requireCredits treats
-        as "allow" rather than blocking users on an infrastructure fault.
+        Returns -1 when the authoritative balance is unreadable, which
+        requireCredits translates to a retryable HTTP 503.
         """
-        parts = self.getRemainingParts(userId)
+        try:
+            parts = self.getRemainingParts(userId)
+        except Exception:
+            logger.warning('Authoritative credit balance unavailable')
+            return -1
         if parts["monthly"] == -1:
             return -1
         return parts["monthly"] + parts["topup"]
 
-    def resetMonthlyTokens(self, userId: str) -> None:
-        """Event-driven monthly reset (e.g. annual renewal). Restores the full quota."""
-        try:
-            row = self._dbRow(userId)
-            if not row:
-                logger.warning(f"No credit_balances row for userId={userId}, skipping reset")
-                return
-            quota = row.get("monthly_token_quota", 0)
-            now = datetime.now(timezone.utc)
-            oldEnd = row.get("period_end")
-            periodStart = dateparser.parse(oldEnd) if oldEnd else now
-            periodEnd = creditMath.nextPeriodEnd(periodStart)
-
-            self._writePeriod(userId, periodStart, periodEnd, quota, now)
-
-            try:
-                r = self._redis()
-                r.hset(self._redisKey(userId), mapping={
-                    "trem": quota,
-                    "tquota": quota,
-                    "pend": int(periodEnd.timestamp()),
-                    "pnext": int(creditMath.nextPeriodEnd(periodEnd).timestamp()),
-                })
-            except Exception:
-                pass
-            logger.info(f"Monthly token reset for userId={userId}, quota={quota}")
-        except Exception as e:
-            logger.error(f"Token reset failed for userId={userId}: {e}")
-
     def grantTopupTokens(self, userId: str, orderId: str, paymentId: str) -> dict:
-        """
-        Credit a purchased token pack, exactly once.
+        """Recovery alias; the owned durable attempt is the only grant authority."""
+        from api.services.billing.manualBillingRepository import getManualBillingRepository
+        from api.services.subscriptions.subscriptionService import subscriptionService
+        repository = getManualBillingRepository()
+        attempt = repository.attemptForOrder(orderId)
+        frozen = repository._json(attempt['metadata_json'])['manualBilling']
+        if attempt['user_id'] != userId or frozen['purpose'] != 'topup':
+            raise ValueError('TOPUP_OWNER_OR_PURPOSE_MISMATCH')
+        payment = subscriptionService.razorpayClient.payment.fetch(paymentId)
+        result = subscriptionService._finalizeManualCheckout(str(attempt['invoice_id']), orderId, paymentId, payment)
+        return {'granted': result['finalized'] and not result['alreadyFinalized'],
+            'tokens': int(frozen['tokens']) if result['finalized'] else 0,
+            'disposition': result['state'], 'anomalyId': result['anomalyId']}
 
-        The RPC flips the add_on invoice to PAID and increments topup_tokens in
-        a single transaction, so the verify endpoint and the payment.captured
-        webhook can both call this safely — whichever arrives first claims the
-        grant and the other returns granted=False. A failed Redis increment
-        drops the hash rather than retrying: Supabase already holds the grant,
-        so a rebuild is safer than serving a silently low balance.
-
-        Args:
-            userId (str): The purchasing user.
-            orderId (str): Razorpay order ID the invoice was created against.
-            paymentId (str): Razorpay payment ID that settled the order.
-
-        Returns:
-            dict: {"granted": bool, "tokens": int}.
-        """
-        res = self.supabase.rpc("grant_topup_tokens", {
-            "p_order_id": orderId,
-            "p_payment_id": paymentId,
-        }).execute()
-
-        row = (res.data or [None])[0] or {}
-        if not row.get("granted"):
-            logger.info(f"Top-up grant already applied for order {orderId}, skipping")
-            return {"granted": False, "tokens": 0}
-
-        tokens = int(row.get("tokens", 0))
-        try:
-            self._redis().hincrby(self._redisKey(userId), "ttop", tokens)
-        except Exception as e:
-            logger.warning(f"Redis ttop increment failed for {userId}, dropping hash: {e}")
-            try:
-                self._redis().delete(self._redisKey(userId))
-            except Exception:
-                pass
-
-        logger.info(
-            f"Top-up granted — userId={userId}, tokens={tokens}, order={orderId}"
-        )
-        return {"granted": True, "tokens": tokens}
-
-    def clawbackTopupTokens(self, userId: str, refundId: str,
-                            paymentId: str, refundAmount: int) -> dict:
-        """
-        Remove purchased tokens in proportion to a refund, exactly once.
-
-        The RPC is guarded twice: the invoice must be billing_reason='add_on',
-        and the billing_events insert must actually happen (idempotency_key is
-        UNIQUE, so a redelivered refund.processed no-ops). A subscription
-        refund matches neither and moves nothing. The Redis hash is dropped
-        rather than decremented, since Supabase is authoritative.
-
-        Args:
-            userId (str): The refunded user.
-            refundId (str): Razorpay refund ID, the idempotency key.
-            paymentId (str): Razorpay payment ID being refunded.
-            refundAmount (int): Refunded amount in paise.
-
-        Returns:
-            dict: {"clawed": bool, "tokens": int}.
-        """
-        res = self.supabase.rpc("clawback_topup_tokens", {
-            "p_refund_id": refundId,
-            "p_payment_id": paymentId,
-            "p_refund_amount": refundAmount,
-        }).execute()
-
-        row = (res.data or [None])[0] or {}
-        if not row.get("clawed"):
-            return {"clawed": False, "tokens": 0}
-
-        tokens = int(row.get("tokens", 0))
-        try:
-            self._redis().delete(self._redisKey(userId))
-        except Exception as e:
-            logger.warning(f"Redis hash drop after clawback failed for {userId}: {e}")
-
-        logger.info(
-            f"Top-up clawed back — userId={userId}, tokens={tokens}, "
-            f"refund={refundId}, amount={refundAmount}"
-        )
-        return {"clawed": True, "tokens": tokens}
+    def clawbackTopupTokens(self,userId,refundId,paymentId,refundAmount):
+        from api.services.credits.manualCreditRepository import ManualCreditRepository
+        return ManualCreditRepository().clawbackTopup(userId,refundId,paymentId,int(refundAmount))
 
     def reconcile(self, userId: str) -> None:
         """
@@ -943,6 +848,8 @@ class CreditService:
         writes on both sides, so an absolute sync here would race with an
         in-flight grant and lose a purchase.
         """
+        if self._manualBalance(userId) is not None:
+            return
         try:
             self.syncQuotaFromConfig(userId)
 
@@ -1013,9 +920,12 @@ class CreditService:
             "topupCredits": 0.0, "remainingCredits": 0.0, "usagePercentage": 0.0,
             "periodStart": None, "periodEnd": None, "lastResetAt": None,
             "initialized": False,
+            "nextRefillAt":None,"storedTopupTokens":None,"spendableTopupTokens":None,
+            "spendableTokens":None,"accessAllowed":None,
         }
         try:
-            row = self._dbRow(userId)
+            authoritative = self._manualBalance(userId)
+            row = authoritative if authoritative is not None else self._dbRow(userId)
             if not row:
                 return defaults
 
@@ -1061,6 +971,11 @@ class CreditService:
                 "periodEnd": row.get("period_end"),
                 "lastResetAt": row.get("last_reset_at"),
                 "initialized": True,
+                "nextRefillAt":authoritative.get('next_refill_at') if authoritative else None,
+                "storedTopupTokens":topup,
+                "spendableTopupTokens":authoritative.get('spendable_topup_tokens') if authoritative else None,
+                "spendableTokens":monthlyRemaining + int(authoritative.get('spendable_topup_tokens') or 0) if authoritative else None,
+                "accessAllowed":authoritative.get('access_allowed') if authoritative else None,
             }
         except Exception as e:
             logger.warning(f"getBalanceSnapshot failed for userId={userId}: {e}")
@@ -1096,6 +1011,11 @@ class CreditService:
             updatedCount = 0
             for row in rows.data:
                 userId = row["user_id"]
+                if self._manualBalance(userId) is not None:
+                    from api.services.credits.manualCreditRepository import ManualCreditRepository
+                    result=ManualCreditRepository().resizeQuota(userId,row.get('domain_count') or 1,False,resetUsage)
+                    updatedCount += int(result['applied'])
+                    continue
                 planTier = row.get("plan_tier", "none")
                 domainCount = row.get("domain_count", 1) or 1
                 newQuota = getTokenQuotaForPlan(planTier, domainCount)
@@ -1165,6 +1085,10 @@ class CreditService:
 
         Called during reconcile to prevent long-term drift.
         """
+        if self._manualBalance(userId) is not None:
+            from api.services.credits.manualCreditRepository import ManualCreditRepository
+            ManualCreditRepository().resizeQuota(userId,None,False)
+            return
         try:
             row = self._dbRow(userId)
             if not row:
@@ -1178,8 +1102,8 @@ class CreditService:
                     self.supabase.table("subscriptions")
                     .select("domain_count")
                     .eq("user_id", userId)
+                    .eq("is_canonical", True)
                     .in_("status", _ACTIVE_LIKE_SUBSCRIPTION_STATUSES)
-                    .order("updated_at", desc=True)
                     .limit(1)
                     .execute()
                 )

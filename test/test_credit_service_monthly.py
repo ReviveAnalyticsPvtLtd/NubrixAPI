@@ -85,6 +85,7 @@ class TestCreditServiceMonthly(unittest.TestCase):
         from api.services.credits.creditService import CreditService
         svc = CreditService()
         svc.supabase = MagicMock()
+        svc._manualBalance = MagicMock(return_value=None)
         return svc
 
     def test_deduct_subtracts_exact_tokens_without_rounding(self):

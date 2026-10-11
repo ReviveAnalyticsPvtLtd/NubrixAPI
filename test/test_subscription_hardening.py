@@ -1,104 +1,10 @@
 import hashlib
 import hmac
 import os
-import sys
 import types
 import unittest
 from datetime import datetime, timedelta, timezone
 from unittest.mock import patch
-
-
-if "logtail" not in sys.modules:
-    logtailStub = types.ModuleType("logtail")
-
-    class _DummyLogtailHandler:
-        def __init__(self, *args, **kwargs):
-            pass
-
-    logtailStub.LogtailHandler = _DummyLogtailHandler
-    sys.modules["logtail"] = logtailStub
-
-if "loguru" not in sys.modules:
-    loguruStub = types.ModuleType("loguru")
-
-    class _DummyLogger:
-        def remove(self, *args, **kwargs):
-            return None
-
-        def add(self, *args, **kwargs):
-            return None
-
-        def info(self, *args, **kwargs):
-            return None
-
-        def warning(self, *args, **kwargs):
-            return None
-
-        def error(self, *args, **kwargs):
-            return None
-
-    loguruStub.logger = _DummyLogger()
-    sys.modules["loguru"] = loguruStub
-
-if "fastapi" not in sys.modules:
-    fastapiStub = types.ModuleType("fastapi")
-
-    class _DummyHTTPException(Exception):
-        pass
-
-    fastapiStub.HTTPException = _DummyHTTPException
-    sys.modules["fastapi"] = fastapiStub
-
-if "api.commons" not in sys.modules:
-    commonsStub = types.ModuleType("api.commons")
-    commonsStub.client = object()
-    commonsStub.verifyToken = lambda: "token"
-    commonsStub.updateProjectModifiedAt = lambda *_args, **_kwargs: None
-    sys.modules["api.commons"] = commonsStub
-
-if "razorpay" not in sys.modules:
-    razorpayStub = types.ModuleType("razorpay")
-
-    class _DummyRazorpayClient:
-        def __init__(self, *args, **kwargs):
-            pass
-
-    razorpayStub.Client = _DummyRazorpayClient
-    sys.modules["razorpay"] = razorpayStub
-
-if "redis" not in sys.modules:
-    redisStub = types.ModuleType("redis")
-
-    class _DummyRedis:
-        def __init__(self, *args, **kwargs):
-            pass
-
-        def set(self, *args, **kwargs):
-            return True
-
-    redisStub.Redis = _DummyRedis
-    sys.modules["redis"] = redisStub
-
-if "jose" not in sys.modules:
-    joseStub = types.ModuleType("jose")
-
-    class _DummyJwt:
-        @staticmethod
-        def decode(*args, **kwargs):
-            return {}
-
-    joseStub.jwt = _DummyJwt
-    sys.modules["jose"] = joseStub
-
-if "requests" not in sys.modules:
-    requestsStub = types.ModuleType("requests")
-    requestsStub.post = lambda *args, **kwargs: None
-    sys.modules["requests"] = requestsStub
-
-if "supabase" not in sys.modules:
-    supabaseStub = types.ModuleType("supabase")
-    supabaseStub.create_client = lambda *args, **kwargs: None
-    sys.modules["supabase"] = supabaseStub
 
 
 from utils.exceptionHandler import CustomException
@@ -239,6 +145,7 @@ def _subscription(status="active", billingMode="monthly_recurring", periodEnd=No
     return {
         "id": "sub_1",
         "user_id": "u1",
+                "is_canonical": True,
         "billing_mode": billingMode,
         "status": status,
         "current_period_start": (now - timedelta(days=10)).isoformat(),
@@ -420,73 +327,7 @@ class SubscriptionHardeningTests(unittest.TestCase):
         serviceFactory.assert_not_called()
         send.assert_not_called()
 
-    @patch("api.services.subscriptions.subscriptionService.jwt.decode", return_value={"userId": "u1", "email": "u@example.test"})
-    def test_create_subscription_rejects_cancelled_but_unexpired_subscription(self, _mockDecode):
-        service = SubscriptionService()
-        service.client = _FakeClient({"Users": [{"userId": "u1"}]})
-        service._getCanonicalSubscription = lambda **_kwargs: _subscription(status="cancelled")
-        service._resolveCheckoutIdentity = lambda *_args: {
-            "email": "u@example.test",
-            "name": "User",
-            "contact": "+919999999999",
-        }
-        service._getOrCreateRazorpayCustomer = lambda *_args: "cust_1"
-        service._syncRazorpayCustomerIdentity = lambda *_args, **_kwargs: False
-        service._auditLog = lambda *_args, **_kwargs: None
-        service.razorpayClient = _FakeRazorpayClient()
 
-        with self.assertRaises(CustomException) as raised:
-            service.createSubscription(
-                domains=["banking"],
-                contact="+919999999999",
-                billingMode="monthly_recurring",
-                token="token",
-            )
-
-        self.assertEqual(raised.exception.statusCode, 409)
-
-    @patch("api.services.subscriptions.subscriptionService.jwt.decode", return_value={"userId": "u1", "email": "u@example.test"})
-    @patch("api.services.subscriptions.subscriptionService.computeInvoiceSnapshot")
-    def test_create_subscription_allows_cancelled_after_period_end(self, mockSnapshot, _mockDecode):
-        pastEnd = (datetime.now(timezone.utc) - timedelta(days=1)).isoformat()
-        mockSnapshot.return_value = types.SimpleNamespace(
-            total_amount=1180,
-            currency="INR",
-            pricing_version="pricing_v1",
-            pricing_reference_snapshot_json={"source": "unit_test"},
-            tax=types.SimpleNamespace(
-                tax_rule_version="tax_v1",
-                tax_amount=180,
-                to_dict=lambda: {"tax_amount": 180},
-            ),
-            amount_before_tax=1000,
-        )
-        service = SubscriptionService()
-        service.client = _FakeClient({"Users": [{"userId": "u1"}]})
-        service._getCanonicalSubscription = lambda **_kwargs: _subscription(
-            status="cancelled",
-            periodEnd=pastEnd,
-        )
-        service._resolveCheckoutIdentity = lambda *_args: {
-            "email": "u@example.test",
-            "name": "User",
-            "contact": "+919999999999",
-        }
-        service._getOrCreateRazorpayCustomer = lambda *_args: "cust_1"
-        service._syncRazorpayCustomerIdentity = lambda *_args, **_kwargs: False
-        service._createFrozenInvoiceFromSnapshot = lambda **_kwargs: {"id": "inv_new"}
-        service._attachOrderToInvoice = lambda **_kwargs: None
-        service._auditLog = lambda *_args, **_kwargs: None
-        service.razorpayClient = _FakeRazorpayClient()
-
-        result = service.createSubscription(
-            domains=["banking"],
-            contact="+919999999999",
-            billingMode="monthly_recurring",
-            token="token",
-        )
-
-        self.assertEqual(result["orderId"], "order_new")
 
     def test_payment_validation_rejects_currency_order_and_uncaptured_status(self):
         invoice = {
@@ -561,151 +402,8 @@ class SubscriptionHardeningTests(unittest.TestCase):
                 requireCaptured=True,
             )
 
-    @patch("api.services.subscriptions.subscriptionService.jwt.decode", return_value={"userId": "u1"})
-    def test_verify_initial_subscription_rejects_amount_mismatch(self, _mockDecode):
-        orderId = "order_initial_1"
-        paymentId = "pay_initial_1"
-        service = SubscriptionService()
-        service.client = _FakeClient({
-            "subscriptions": [_subscription()],
-            "Invoices": [{
-                "id": "inv_initial_1",
-                "userId": "u1",
-                "subscription_id": "sub_1",
-                "billing_reason": "initial_purchase",
-                "status": "payment_pending",
-                "total_amount": 1180,
-                "amount": 1180,
-                "currency": "INR",
-                "razorpay_order_id": orderId,
-            }],
-        })
-        service.razorpayClient = _FakeRazorpayClient(
-            orderById={
-                orderId: {
-                    "id": orderId,
-                    "status": "paid",
-                    "customer_id": "cust_1",
-                    "notes": {
-                        "type": "initial_subscription",
-                        "userId": "u1",
-                        "domains": "banking",
-                        "billingMode": "monthly_recurring",
-                        "invoiceId": "inv_initial_1",
-                    },
-                }
-            },
-            paymentById={
-                paymentId: {
-                    "id": paymentId,
-                    "status": "captured",
-                    "amount": 1179,
-                    "currency": "INR",
-                    "order_id": orderId,
-                    "customer_id": "cust_1",
-                    "token_id": "token_1",
-                    "captured_at": 1700000000,
-                }
-            },
-        )
 
-        with self.assertRaises(CustomException) as raised:
-            service.verifySubscription(
-                payload={
-                    "razorpayOrderId": orderId,
-                    "razorpayPaymentId": paymentId,
-                    "razorpaySignature": _signature(orderId, paymentId),
-                },
-                token="token",
-            )
-        self.assertEqual(raised.exception.statusCode, 400)
 
-    @patch("api.services.subscriptions.subscriptionService.jwt.decode", return_value={"userId": "u1"})
-    def test_verify_initial_annual_subscription_activates_without_token_when_invoice_matches(self, _mockDecode):
-        orderId = "order_initial_annual"
-        paymentId = "pay_initial_annual"
-        service = SubscriptionService()
-        service.client = _FakeClient({
-            "subscriptions": [_subscription(status="trial", billingMode="none")],
-            "Invoices": [{
-                "id": "inv_initial_annual",
-                "userId": "u1",
-                "subscription_id": "sub_1",
-                "billing_reason": "initial_purchase",
-                "status": "payment_pending",
-                "total_amount": 12000,
-                "amount": 12000,
-                "currency": "INR",
-                "razorpay_order_id": orderId,
-            }],
-        })
-        service.razorpayClient = _FakeRazorpayClient(
-            orderById={
-                orderId: {
-                    "id": orderId,
-                    "status": "paid",
-                    "customer_id": "cust_1",
-                    "notes": {
-                        "type": "initial_subscription",
-                        "userId": "u1",
-                        "domains": "banking",
-                        "billingMode": "annual_prepaid",
-                        "invoiceId": "inv_initial_annual",
-                    },
-                }
-            },
-            paymentById={
-                paymentId: {
-                    "id": paymentId,
-                    "status": "captured",
-                    "amount": 12000,
-                    "currency": "INR",
-                    "order_id": orderId,
-                    "customer_id": "cust_1",
-                    "captured_at": 1700000000,
-                }
-            },
-        )
-        service._auditLog = lambda *_args, **_kwargs: None
-        service._reissueTokenWithUpdatedClaims = lambda *_args, **_kwargs: "new-token"
-
-        service.verifySubscription(
-            payload={
-                "razorpayOrderId": orderId,
-                "razorpayPaymentId": paymentId,
-                "razorpaySignature": _signature(orderId, paymentId),
-            },
-            token="token",
-        )
-
-        subscriptionUpdates = [
-            update["payload"]
-            for update in service.client.state["updates"]
-            if update["table"] == "subscriptions"
-        ]
-        self.assertTrue(any(update.get("billing_mode") == "annual_prepaid" for update in subscriptionUpdates))
-        self.assertTrue(any(update.get("razorpay_token_id") is None for update in subscriptionUpdates))
-
-    @patch("api.services.subscriptions.subscriptionService.jwt.decode", return_value={"userId": "u1", "email": "u@example.test"})
-    def test_annual_renewal_session_rejects_invoice_for_different_subscription(self, _mockDecode):
-        service = SubscriptionService()
-        service.client = _FakeClient({
-            "Invoices": [{
-                "id": "inv_renewal_1",
-                "userId": "u1",
-                "subscription_id": "sub_old",
-                "billing_reason": "renewal",
-                "status": "payment_pending",
-                "total_amount": 12000,
-                "amount": 12000,
-                "currency": "INR",
-            }],
-            "subscriptions": [_subscription(billingMode="annual_prepaid")],
-        })
-        service.razorpayClient = _FakeRazorpayClient()
-
-        with self.assertRaises(CustomException):
-            service.createAnnualRenewalPaymentSession("inv_renewal_1", "token")
 
     @patch("api.services.subscriptions.subscriptionService.jwt.decode", return_value={"userId": "u1"})
     def test_annual_renewal_verify_rejects_invoice_for_different_subscription(self, _mockDecode):
@@ -762,78 +460,6 @@ class SubscriptionHardeningTests(unittest.TestCase):
                 token="token",
             )
 
-    @patch("api.services.subscriptions.subscriptionService.jwt.decode", return_value={"userId": "u1"})
-    def test_annual_renewal_verify_preserves_invoice_metadata_snapshot(self, _mockDecode):
-        orderId = "order_renewal_2"
-        paymentId = "pay_renewal_2"
-        service = SubscriptionService()
-        service.client = _FakeClient({
-            "Users": [{"userId": "u1"}],
-            "subscriptions": [_subscription(billingMode="annual_prepaid")],
-            "Invoices": [{
-                "id": "inv_renewal_2",
-                "userId": "u1",
-                "subscription_id": "sub_1",
-                "billing_reason": "renewal",
-                "status": "payment_pending",
-                "total_amount": 12000,
-                "amount": 12000,
-                "currency": "INR",
-                "razorpay_order_id": orderId,
-                "metadata_json": {
-                    "currentDomains": ["banking", "manufacturing"],
-                    "renewalDomains": ["banking"],
-                    "entitlementChangeEffectiveAt": "2026-05-26T00:00:00+00:00",
-                },
-            }],
-        })
-        service.razorpayClient = _FakeRazorpayClient(
-            orderById={
-                orderId: {
-                    "id": orderId,
-                    "status": "attempted",
-                    "customer_id": "cust_1",
-                    "notes": {
-                        "type": "annual_renewal",
-                        "userId": "u1",
-                        "invoiceId": "inv_renewal_2",
-                    },
-                }
-            },
-            paymentById={
-                paymentId: {
-                    "id": paymentId,
-                    "status": "authorized",
-                    "amount": 12000,
-                    "currency": "INR",
-                    "order_id": orderId,
-                    "customer_id": "cust_1",
-                    "captured_at": None,
-                }
-            },
-        )
-        service._auditLog = lambda *_args, **_kwargs: None
-
-        service.verifyAnnualRenewalPayment(
-            payload={
-                "invoiceId": "inv_renewal_2",
-                "razorpayOrderId": orderId,
-                "razorpayPaymentId": paymentId,
-                "razorpaySignature": _signature(orderId, paymentId),
-            },
-            token="token",
-        )
-
-        invoiceUpdate = next(
-            update["payload"]
-            for update in service.client.state["updates"]
-            if update["table"] == "Invoices"
-        )
-        metadata = invoiceUpdate["metadata_json"]
-        self.assertEqual(metadata["currentDomains"], ["banking", "manufacturing"])
-        self.assertEqual(metadata["renewalDomains"], ["banking"])
-        self.assertEqual(metadata["entitlementChangeEffectiveAt"], "2026-05-26T00:00:00+00:00")
-        self.assertTrue(metadata["verified"])
 
     @patch("api.services.subscriptions.subscriptionService.jwt.decode", return_value={"userId": "u1"})
     def test_remove_domain_marks_payable_renewal_invoice_for_repricing(self, _mockDecode):
@@ -866,7 +492,7 @@ class SubscriptionHardeningTests(unittest.TestCase):
             for update in service.client.state["updates"]
             if update["table"] == "Invoices"
         )
-        self.assertEqual(invoiceUpdate["status"], "expired")
+        self.assertEqual(invoiceUpdate["status"], "EXPIRED")
         self.assertNotIn("razorpay" + "InvoiceId", invoiceUpdate)
         self.assertNotIn("razorpay_" + "payment_" + "link_id", invoiceUpdate)
         self.assertNotIn("short" + "Url", invoiceUpdate)

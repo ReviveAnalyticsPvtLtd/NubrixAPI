@@ -18,7 +18,7 @@ from nubrix.triggers.tasks.entitlementBoundaryTask import EntitlementBoundaryTas
 from nubrix.triggers.tasks.subscriptionExpiryTask import SubscriptionExpiryTask
 from nubrix.triggers.tasks.creditReconciliationTask import CreditReconciliationTask
 from nubrix.triggers.tasks.adminSessionCleanupTask import AdminSessionCleanupTask
-from nubrix.triggers.tasks.billingTask import DailyBillingTask
+from nubrix.triggers.tasks.monthlyRenewalTask import MonthlyRenewalTask
 from nubrix.triggers.tasks.userErasureTask import UserErasureTask
 from nubrix.triggers.tasks.adminTrialCreditSyncTask import AdminTrialCreditSyncTask
 from nubrix.triggers.tasks.notificationDispatchTask import (
@@ -41,9 +41,9 @@ celeryApp = Celery(APP_NAME, broker=_redisUrl, backend=_redisUrl)
 def sendForecasts():
     return GenerateForecasts().generateAndSendForecasts()
 
-@celeryApp.task(name=f"{APP_NAME}.dailyBilling")
-def runDailyBilling():
-    return DailyBillingTask().execute()
+@celeryApp.task(name=f"{APP_NAME}.monthlyRenewal")
+def runMonthlyRenewal():
+    return MonthlyRenewalTask().execute()
 
 @celeryApp.task(name=f"{APP_NAME}.annualRenewal")
 def runAnnualRenewal():
@@ -112,7 +112,7 @@ def runNotificationCleanup():
 
 
 celeryApp.conf.beat_schedule = {
-    "daily-billing-midnight": {"task": f"{APP_NAME}.dailyBilling", "schedule": crontab(minute=0, hour=0)},
+    "monthly-renewal-hourly": {"task": f"{APP_NAME}.monthlyRenewal", "schedule": crontab(minute=0)},
     "annual-renewal-daily": {"task": f"{APP_NAME}.annualRenewal", "schedule": crontab(minute=30, hour=0)},
     "renewal-reminders-daily": {"task": f"{APP_NAME}.renewalLifecycle", "schedule": crontab(minute=0, hour=2)},
     "past-due-suspension-every-30min": {"task": f"{APP_NAME}.pastDueSuspension", "schedule": crontab(minute="*/30")},

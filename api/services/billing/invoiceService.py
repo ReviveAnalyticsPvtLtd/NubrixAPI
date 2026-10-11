@@ -108,6 +108,7 @@ def createUpcomingRenewalInvoice(subscription: dict, user: dict) -> dict | None:
         .eq("billing_reason", "renewal")
         .eq("period_start", nextPeriodStart)
         .eq("period_end", nextPeriodEnd)
+        .in_("status", ["UPCOMING", "PAYMENT_PENDING", "PAID", "EXPIRED", "upcoming", "payment_pending", "paid", "expired"])
         .limit(1)
         .execute()
         .data
@@ -137,7 +138,7 @@ def createUpcomingRenewalInvoice(subscription: dict, user: dict) -> dict | None:
             billingMode="annual_prepaid",
             billingReason="renewal",
             domainCount=domainCount,
-            customerState=subscriptionBillingState(subscription),
+            customerState=subscriptionBillingState(subscription).get('customerState'),
             periodStart=dtparser.isoparse(nextPeriodStart) if isinstance(nextPeriodStart, str) else nextPeriodStart,
             periodEnd=nextPeriodEndDt,
         )
@@ -163,7 +164,7 @@ def createUpcomingRenewalInvoice(subscription: dict, user: dict) -> dict | None:
         "total_amount": snapshot.total_amount,
         "amount": snapshot.total_amount,
         "currency": snapshot.currency,
-        "status": "upcoming",
+        "status": "UPCOMING",
         "due_date": dueDate,
         "tax_breakdown_json": snapshot.tax.to_dict(),
         "tax_rule_version": snapshot.tax.tax_rule_version,
@@ -199,6 +200,7 @@ def createUpcomingRenewalInvoice(subscription: dict, user: dict) -> dict | None:
                 .eq("billing_reason", "renewal")
                 .eq("period_start", nextPeriodStart)
                 .eq("period_end", nextPeriodEnd)
+                .in_("status", ["UPCOMING", "PAYMENT_PENDING", "PAID", "EXPIRED", "upcoming", "payment_pending", "paid", "expired"])
                 .limit(1)
                 .execute()
                 .data or [None]
@@ -266,7 +268,7 @@ def prepareDashboardRenewalInvoice(invoice: dict) -> dict | None:
             billingMode="annual_prepaid",
             billingReason="renewal",
             domainCount=domainCount,
-            customerState=subscriptionBillingState(subscription),
+            customerState=subscriptionBillingState(subscription).get('customerState'),
             periodStart=periodStartDt,
             periodEnd=periodEndDt,
         )
@@ -289,10 +291,16 @@ def prepareDashboardRenewalInvoice(invoice: dict) -> dict | None:
         "paymentFlow": "razorpay_order_checkout",
         "dashboardRenewalUrl": dashboardRenewalUrl,
     }
+    if existingMetadata.get('repricingRequired'):
+        manual = dict(existingMetadata.get('manualBilling') or {})
+        for key in ('closedAt', 'closedReason'):
+            manual.pop(key, None)
+        manual.update(domains=renewalMetadata['renewalDomains'], revision=int(manual.get('revision') or 1) + 1)
+        metadata.update(manualBilling=manual, repricingRequired=False)
     updatePayload = {
         "payment_flow": "razorpay_order_checkout",
         "requires_customer_auth": True,
-        "status": "payment_pending",
+        "status": "PAYMENT_PENDING",
         "amount_before_tax": snapshot.amount_before_tax,
         "tax_amount": snapshot.tax.tax_amount,
         "total_amount": snapshot.total_amount,
