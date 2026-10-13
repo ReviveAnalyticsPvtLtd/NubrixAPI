@@ -116,11 +116,11 @@ def test_expired_key_replays_frozen_intent(checkout_database):
     assert counts(path) == (1, 1)
 
 
-def test_monthly_ttl_does_not_change_annual_session_policy(checkout_database, monkeypatch):
+def test_new_annual_session_uses_configured_checkout_ttl(checkout_database, monkeypatch):
     repository, _ = checkout_database
     monkeypatch.setenv('MANUAL_CHECKOUT_TTL_SECONDS', '600')
     annual = repository.reserveCheckout(request('annual', mode='annual_prepaid'))
-    assert annual.expiresAt.year == 9999
+    assert annual.expiresAt == NOW + timedelta(seconds=600)
 
 
 def test_topup_route_passes_request_key(monkeypatch):

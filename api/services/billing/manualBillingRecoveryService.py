@@ -2,7 +2,8 @@
 from datetime import datetime, timezone
 import json
 
-from api.services.billing.manualBillingContracts import VerifiedPaymentEvidence
+from api.services.billing.manualBillingContracts import CheckoutProviderSnapshot, VerifiedPaymentEvidence
+from api.services.billing.checkoutRecoveryPolicy import classifyCheckoutProviderOutcome
 
 
 class ManualBillingRecoveryService:
@@ -24,6 +25,31 @@ class ManualBillingRecoveryService:
             if len(items) < 100:
                 return
             skip += len(items)
+
+    def inspectAttempt(self, attempt):
+        from api.services.billing.manualBillingRepository import _now
+        orderId = attempt['provider_order_id']
+        payments = ()
+        complete = False
+        outcome = 'unknown'
+        try:
+            order = self.provider.order.fetch(orderId)
+            if (not isinstance(order, dict) or order.get('id') != orderId
+                    or int(order.get('amount', -1)) != int(attempt['amount'])
+                    or order.get('currency') != attempt['currency']):
+                raise ValueError('RECOVERY_ORDER_EVIDENCE_MISMATCH')
+            payments = tuple(self._pages(lambda params: self.provider.order.payments(orderId, params)))
+            if any(not payment.get('id') or payment.get('order_id') != orderId
+                    or int(payment.get('amount', -1)) != int(attempt['amount'])
+                    or payment.get('currency') != attempt['currency'] for payment in payments):
+                raise ValueError('RECOVERY_PAYMENT_EVIDENCE_MISMATCH')
+            complete = True
+            outcome = classifyCheckoutProviderOutcome(order, payments, complete)
+        except Exception:
+            # Incomplete evidence also invalidates a previous unpaid observation.
+            complete = False
+        return CheckoutProviderSnapshot(str(attempt['id']), orderId, outcome, _now(),
+            complete, int(attempt['amount']), attempt['currency'], payments)
 
     def recoverAttempt(self, attempt):
         orderId = attempt.get('provider_order_id')
@@ -47,23 +73,28 @@ class ManualBillingRecoveryService:
             order = matches[0]
             self.repository.bindProviderOrder(str(attempt['id']),order)
             orderId = order['id']
+            attempt = {**attempt, 'provider_order_id': orderId}
+        snapshot = self.inspectAttempt(attempt)
+        self.repository.recordProviderObservation(str(attempt['id']), snapshot)
+        if snapshot.outcome == 'unknown':
+            raise RuntimeError('PROVIDER_STATUS_UNKNOWN')
         metadata = attempt.get('metadata_json') or {}
         metadata = json.loads(metadata) if isinstance(metadata,str) else metadata
         frozen = metadata.get('manualBilling',{})
         # No timestamp on a payment entity is treated as proof of capture time.
         resolved = 0
-        for payment in self._pages(lambda params:self.provider.order.payments(orderId,params)):
+        for payment in snapshot.payments:
             if payment.get('status') != 'captured':
                 continue
             if payment.get('order_id') != orderId:
                 raise ValueError('RECOVERY_PAYMENT_ORDER_MISMATCH')
             evidence = VerifiedPaymentEvidence(str(attempt['id']),str(attempt['invoice_id']),
                 attempt['user_id'],orderId,payment['id'],frozen.get('purpose','erased_checkout'),payment['currency'],
-                'captured','server_observation',int(payment['amount']),datetime.now(timezone.utc),
+                'captured','server_observation',int(payment['amount']),snapshot.observedAt,
                 None,None,False)
             result = self.repository.finalizeCapturedPayment(evidence)
             resolved += int(result.state != 'awaiting_capture')
-        if frozen.get('closedAt'):
+        if frozen.get('closedAt') and snapshot.outcome == 'unpaid' and not snapshot.payments:
             # A successful complete provider listing settles cancellation wording;
             # a later capture is still audited against the original cutoff.
             self.repository.markClosedAttemptReconciled(str(attempt['id']))

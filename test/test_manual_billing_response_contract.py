@@ -54,11 +54,11 @@ def test_checkout_hides_emi_and_pay_later(checkout_database, mode, purpose):
         {'method': 'emi'}, {'method': 'cardless_emi'}, {'method': 'paylater'}]}}
 
 
-def test_annual_checkout_does_not_expose_internal_sentinel(checkout_database):
+def test_new_annual_checkout_exposes_finite_deadline(checkout_database):
     from api.services.billing.manualBillingPresentation import serializeCheckoutIntent
     manual, request = paid_then_request(checkout_database,'annual_prepaid','initial_purchase')
     result = serializeCheckoutIntent(manual.createCheckout(request),'public-key')
-    assert result['expiresAt'] is None
+    assert result['expiresAt'] == (NOW + timedelta(minutes=30)).isoformat()
 
 
 def test_monthly_cancellation_trims_reason_and_limits_length(checkout_database):

@@ -32,7 +32,8 @@ def test_annual_remove_finalizes_observed_expert_money_once(checkout_client, che
     manual.finalizeCapturedPayment(evidence(manual.createCheckout(request('initial', mode='annual_prepaid'))))
     added = manual.createCheckout(request('add', mode='annual_prepaid', purpose='expert_addition', domains=('telecom',)))
     payment = {'id':'captured-addition','order_id':added.razorpayOrderId,'amount':added.amount,'currency':added.currency,'status':'captured'}
-    provider.order.fetch = Mock(return_value={'status':'paid','notes':{'domains':'telecom','targetQuantity':'2'}})
+    provider.order.fetch = Mock(return_value={'id':added.razorpayOrderId,'amount':added.amount,
+        'currency':added.currency,'status':'paid','notes':{'domains':'telecom','targetQuantity':'2'}})
     provider.order.payments = lambda *a, **kw: {'items':[payment]}
     monkeypatch.setattr('api.services.subscriptions.subscriptionService.utcNow', lambda:NOW)
     with patch('api.services.billing.manualBillingRecoveryService.datetime', Mock(now=lambda _:NOW)):

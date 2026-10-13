@@ -26,6 +26,7 @@ from psycopg2.extras import Json, RealDictCursor
 
 from api.services.billing.manualBillingContracts import (
     CheckoutIntent,
+    CheckoutProviderSnapshot,
     CheckoutRequest,
     CoveragePeriod,
     CoverageSnapshot,
@@ -156,6 +157,55 @@ class ManualBillingRepository:
                 return [row for row in cursor.fetchall()
                         if self._json(row.get('metadata_json')).get('manualBilling', {}).get('purpose') == purpose
                         and self._json(row.get('metadata_json')).get('manualBilling', {}).get('billingMode') == mode]
+        return self._run(operation)
+
+    def renewalRecoveryRows(self, userId, mode, invoiceId):
+        def operation(connection):
+            with connection.cursor(cursor_factory=RealDictCursor) as cursor:
+                cursor.execute('''select e.* from public.billing_events e
+                    join public."Invoices" i on i.id=e.invoice_id
+                    where e.user_id=%s and i."userId"=%s and e.invoice_id=%s
+                    and e.event_category='payment_attempt' order by e.id''',
+                    (userId, userId, invoiceId))
+                return [row for row in cursor.fetchall()
+                    if self._json(row.get('metadata_json')).get('manualBilling', {}).get('purpose') == 'renewal'
+                    and self._json(row.get('metadata_json')).get('manualBilling', {}).get('billingMode') == mode
+                    and (row.get('payment_status') != 'created' or row.get('provider_order_id'))
+                    and row.get('payment_status') != 'captured']
+        return self._run(operation)
+
+    def recordProviderObservation(self, attemptId, snapshot):
+        def operation(connection):
+            with connection.cursor(cursor_factory=RealDictCursor) as cursor:
+                cursor.execute('select user_id,invoice_id from public.billing_events where id=%s', (attemptId,))
+                owner = cursor.fetchone()
+                if not owner:
+                    raise ValueError('ATTEMPT_MISSING')
+                self._lockUser(cursor, owner['user_id'])
+                if owner['user_id'] is not None:
+                    self._canonical(cursor, owner['user_id'])
+                cursor.execute('select id from public."Invoices" where id=%s for update', (owner['invoice_id'],))
+                cursor.fetchone()
+                cursor.execute('select * from public.billing_events where id=%s for update', (attemptId,))
+                attempt = cursor.fetchone()
+                if (snapshot.attemptId != str(attemptId) or snapshot.providerOrderId != attempt['provider_order_id']
+                        or snapshot.amount != int(attempt['amount']) or snapshot.currency != attempt['currency']):
+                    raise ValueError('RECOVERY_ORDER_EVIDENCE_MISMATCH')
+                metadata = self._json(attempt.get('metadata_json'))
+                billing = metadata.setdefault('manualBilling', {})
+                previous = billing.get('providerObservation', {})
+                if previous.get('checkedAt') and _utc(previous['checkedAt']) > snapshot.observedAt:
+                    return
+                if previous.get('hasPayments') and not snapshot.payments and snapshot.outcome == 'unpaid':
+                    return
+                billing['providerObservation'] = {'orderId': snapshot.providerOrderId,
+                    'outcome': snapshot.outcome, 'checkedAt': snapshot.observedAt.isoformat(),
+                    'complete': snapshot.complete, 'hasPayments': bool(snapshot.payments)}
+                status = attempt['payment_status']
+                if snapshot.outcome == 'authorized' and not billing.get('closedAt') and status in ('created', 'pending_provider_ack'):
+                    status = 'authorized'
+                cursor.execute('update public.billing_events set metadata_json=%s,payment_status=%s where id=%s',
+                    (Json(metadata), status, attemptId))
         return self._run(operation)
 
     def closeUncreatedOrder(self, attemptId):
@@ -427,7 +477,12 @@ class ManualBillingRepository:
                 expiry = _utc(frozen.get('expiresAt'))
                 live = (row.get('payment_status') in ('created', 'pending_provider_ack', 'authorized')
                         and (expiry is not None and expiry > now or
-                             row.get('payment_status') == 'pending_provider_ack' and not row.get('provider_order_id')))
+                             row.get('payment_status') == 'pending_provider_ack' and not row.get('provider_order_id')
+                             or request.purpose == 'renewal' and self._renewalMoneyPending(row, frozen, now)))
+                if (request.purpose == 'renewal' and str(row.get('invoice_id')) == str(request.payload.get('invoiceId'))
+                        and row.get('payment_status') == 'captured' and frozen.get('payloadHash') == payload_hash):
+                    self._bindCheckoutRequestLocked(cursor, request, payload_hash, row)
+                    return self._intentFromAttemptRow(row, metadata, request.userId, request.purpose), []
                 if request.requestKey is None and live and frozen.get('payloadHash') == payload_hash:
                     if request.purpose == 'renewal':
                         self._validateRenewalAttemptLocked(cursor, request, subscription, row, now)
@@ -515,11 +570,8 @@ class ManualBillingRepository:
                     raise ValueError('INVALID_CHECKOUT_TTL')
                 deadline = now + timedelta(seconds=ttl)
                 if request.billingMode == 'annual_prepaid':
-                    # The existing annual adapter has no finite session TTL.
-                    # Keep it independent of the new monthly TTL policy.
-                    deadline = datetime.max.replace(tzinfo=timezone.utc)
                     if request.purpose == 'expert_addition':
-                        deadline = end
+                        deadline = min(deadline, end)
                 if request.billingMode == 'monthly_prepaid' and request.purpose in ('renewal', 'expert_addition'):
                     deadline = min(deadline, end)
                 if invoice is None:
@@ -709,6 +761,27 @@ class ManualBillingRepository:
         cursor.execute("update public.billing_events set payment_status='expired',event_status='expired',metadata_json=%s where id=%s",
             (Json(metadata),attempt['id']))
 
+    def _renewalMoneyPending(self, attempt, billing, now):
+        observation = billing.get('providerObservation', {})
+        if attempt.get('payment_status') == 'authorized' or observation.get('outcome') in ('processing', 'authorized', 'unknown', 'captured'):
+            return True
+        expiry = _utc(billing.get('expiresAt'))
+        return bool(expiry and expiry <= now and observation.get('hasPayments'))
+
+    def _mayExpireCheckoutAttempt(self, attempt, now):
+        from api.services.billing.checkoutRecoveryPolicy import mayExpireCheckout
+        billing = self._json(attempt.get('metadata_json')).get('manualBilling', {})
+        if attempt.get('payment_status') not in ('created', 'pending_provider_ack'):
+            return False
+        observation = billing.get('providerObservation', {})
+        checked = _utc(observation.get('checkedAt'))
+        if not checked or not attempt.get('provider_order_id') or observation.get('orderId') != attempt['provider_order_id']:
+            return False
+        snapshot = CheckoutProviderSnapshot(str(attempt['id']), attempt['provider_order_id'],
+            observation.get('outcome'), checked, bool(observation.get('complete')),
+            0, '', ({},) if observation.get('hasPayments') else ())
+        return mayExpireCheckout(snapshot, now)
+
     def _expireCheckoutInvoiceLocked(self, cursor, invoiceId, now):
         """Close an abandoned single-use checkout invoice once nothing on it is payable or paid.
 
@@ -763,11 +836,12 @@ class ManualBillingRepository:
                     subscription=self._canonical(cursor,userId)
                     cursor.execute('select clock_timestamp() as current_time')
                     now=_utc(cursor.fetchone()['current_time'])
-                    cursor.execute("""select id,invoice_id,metadata_json from public.billing_events where user_id=%s
+                    cursor.execute("""select id,invoice_id,metadata_json,payment_status,provider_order_id from public.billing_events where user_id=%s
                         and event_category='payment_attempt' and payment_status in ('created','pending_provider_ack')
                         and provider_order_id is not null order by id for update""",(userId,))
                     expired=[attempt for attempt in cursor.fetchall()
-                        if (_utc(self._json(attempt.get('metadata_json')).get('manualBilling',{}).get('expiresAt')) or now) < now]
+                        if (_utc(self._json(attempt.get('metadata_json')).get('manualBilling',{}).get('expiresAt')) or now) <= now
+                        and self._mayExpireCheckoutAttempt(attempt, now)]
                     for attempt in expired:
                         self._expireCheckoutAttemptLocked(cursor,attempt,now)
                     self._releaseExpiredAdditionsLocked(cursor,subscription,{str(attempt['id']) for attempt in expired},now)
@@ -868,10 +942,10 @@ class ManualBillingRepository:
             raise ValueError('TOPUP_NOT_ELIGIBLE')
         expiredAttemptIds=set()
         expiredInvoiceIds=set()
-        cursor.execute("select id,invoice_id,metadata_json from public.billing_events where user_id=%s and event_category='payment_attempt' and payment_status in ('created','pending_provider_ack','authorized') order by id for update",(userId,))
+        cursor.execute("select id,invoice_id,metadata_json,payment_status,provider_order_id from public.billing_events where user_id=%s and event_category='payment_attempt' and payment_status in ('created','pending_provider_ack','authorized') order by id for update",(userId,))
         for attempt in cursor.fetchall():
             expires=_utc(self._json(attempt.get('metadata_json')).get('manualBilling',{}).get('expiresAt'))
-            if expires and expires <= now:
+            if expires and expires <= now and self._mayExpireCheckoutAttempt(attempt, now):
                 expiredAttemptIds.add(str(attempt['id']))
                 self._expireCheckoutAttemptLocked(cursor,attempt,now)
                 if attempt.get('invoice_id'):
@@ -956,6 +1030,14 @@ class ManualBillingRepository:
     ) -> CheckoutIntent:
         billing = (metadata or {}).get("manualBilling") or {}
         expiresAt = _utc(billing.get("expiresAt")) or _now()
+        state = str(row.get('payment_status') or 'created')
+        observation = billing.get('providerObservation', {})
+        if state in ('created', 'pending_provider_ack'):
+            if observation.get('outcome') == 'processing':
+                state = 'provider_processing'
+            elif observation.get('outcome') == 'captured' or (
+                    observation.get('hasPayments') and expiresAt <= _now()):
+                state = 'requires_reconciliation'
         return CheckoutIntent(
             attemptId=str(row["id"]),
             invoiceId=str(row.get("invoice_id") or "") or "",
@@ -965,7 +1047,7 @@ class ManualBillingRepository:
             billingMode=str(billing.get("billingMode") or ""),
             payloadHash=str(billing.get("payloadHash") or ""),
             currency=str(billing.get("currency") or "INR"),
-            state=str(row.get("payment_status") or "created"),
+            state=state,
             revision=int(billing.get("revision") or 1),
             amount=int(billing.get("frozenAmount") or 0),
             expiresAt=expiresAt,

@@ -45,7 +45,7 @@ def test_monthly_policy_errors_are_flat_domain_errors(checkout_client,checkout_d
 
 
 @pytest.mark.parametrize('mode',['monthly_prepaid','annual_prepaid'])
-def test_second_renewal_key_returns_conflict_without_duplicate(checkout_client,checkout_database,mode):
+def test_second_renewal_key_recovers_without_duplicate(checkout_client,checkout_database,mode):
     client,provider,path=checkout_client
     manual,checkout=paid_then_request(checkout_database,mode,'renewal')
     import api.routers.subscriptions as routes
@@ -60,7 +60,9 @@ def test_second_renewal_key_returns_conflict_without_duplicate(checkout_client,c
     first=client.post('/createRenewalPaymentSession',json={'invoiceId':'renewal'},headers={'Idempotency-Key':'first'})
     second=client.post('/createRenewalPaymentSession',json={'invoiceId':'renewal'},headers={'Idempotency-Key':'second'})
     assert first.status_code==200,first.text
-    assert second.status_code==409,second.text
+    assert second.status_code==200,second.text
+    assert second.json()['data']['attemptId']==first.json()['data']['attemptId']
+    assert second.json()['data']['orderId']==first.json()['data']['orderId']
     assert len(provider.order.createdPayloads)==before+1
 
 
