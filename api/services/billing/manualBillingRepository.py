@@ -382,6 +382,9 @@ class ManualBillingRepository:
             return
         if frozen.get('closedAt'):
             raise ValueError('CHECKOUT_CLOSED')
+        if (request.billingMode == 'annual_prepaid'
+                and self._coverageSnapshotLocked(cursor, subscription, now, materialize=False).nextPeriod):
+            raise ValueError('RENEWAL_ALREADY_PAID')
         end = _utc(subscription.get('current_period_end'))
         lifecycle = self._json(subscription.get('billing_state')).get('manualBilling', {}).get('lifecycleId')
         if (subscription.get('renewal_opt_out') or subscription.get('erasure_pending') or not end
@@ -523,6 +526,8 @@ class ManualBillingRepository:
                 coverage = self._coverageSnapshotLocked(cursor, subscription, now, materialize=True)
                 if subscription.get('erasure_pending') or coverage.denialReason == 'account_banned':
                     raise ValueError('CHECKOUT_OWNER_NOT_ELIGIBLE')
+                if request.purpose == 'renewal' and request.billingMode == 'annual_prepaid' and coverage.nextPeriod:
+                    raise ValueError('RENEWAL_ALREADY_PAID')
                 if request.purpose == 'initial_purchase':
                     if coverage.currentPeriod or coverage.nextPeriod or (
                             subscription.get('billing_mode') == 'annual_prepaid'
@@ -1269,6 +1274,9 @@ class ManualBillingRepository:
                 and not subscription.get('erasure_pending') and not billing.get('revokedAt')):
             reason = None
         if evidence.purpose == 'renewal':
+            if (reason is None and frozen.get('billingMode') == 'annual_prepaid'
+                    and self._coverageSnapshotLocked(cursor, subscription, evidence.observedAt, materialize=False).nextPeriod):
+                reason = 'FUTURE_PERIOD_ALREADY_PAID'
             lifecycle = self._json(subscription.get('billing_state')).get('manualBilling', {}).get('lifecycleId')
             if frozen.get('lifecycleId') != lifecycle: reason = 'STALE_LIFECYCLE'
             if _utc(invoice.get('period_start')) != _utc(subscription.get('current_period_end')): reason = 'STALE_CYCLE'
