@@ -255,3 +255,34 @@ def test_authorized_renewal_captured_after_deadline_returns_reconciliation(check
         assert tuple(capture) == ('REQUIRES_RECONCILIATION', 'CAPTURE_OUTSIDE_WINDOW')
         assert connection.execute("SELECT status FROM \"Invoices\" WHERE id='renewal'").fetchone()[0] == 'UPCOMING'
     assert len(provider.order.createdPayloads) == 2
+
+
+@pytest.mark.parametrize('mode', ['monthly_prepaid', 'annual_prepaid'])
+def test_adopted_key_releases_review_after_confirmed_order_absence(checkout_database, mode):
+    from api.services.billing.manualBillingPresentation import serializeCheckoutIntent
+    service, request = paid_then_request(checkout_database, mode, 'renewal')
+    adopted = replace(request, requestKey='second-browser')
+    with patch.object(service.razorpayClient.order, 'create', side_effect=TimeoutError('not submitted')):
+        with pytest.raises(RuntimeError, match='ORDER_ACK_UNKNOWN'):
+            service.createCheckout(request)
+        with pytest.raises(RuntimeError, match='ORDER_ACK_UNKNOWN'):
+            service.createCheckout(adopted)
+    with patch('api.services.billing.manualBillingRepository._now', return_value=NOW + timedelta(minutes=33)):
+        closed = service.createCheckout(adopted)
+        assert serializeCheckoutIntent(closed, 'test-public-key')['state'] == 'expired'
+        replay = service.createCheckout(adopted)
+        assert replay.attemptId == closed.attemptId and replay.state == 'expired'
+        with pytest.raises(ValueError, match='IDEMPOTENCY_CONFLICT'):
+            service.createCheckout(replace(adopted, payload={**adopted.payload, 'revision': 99}))
+        replacement = service.createCheckout(replace(request, requestKey='fresh-review'))
+    assert replacement.attemptId != closed.attemptId and replacement.razorpayOrderId
+    assert replacement.invoiceId == closed.invoiceId
+    original = service.repository.attemptById(request.userId, closed.attemptId)
+    assert original['payment_status'] == 'failed' and not original['provider_order_id']
+    assert original['idempotency_key'] == f'renewal:{request.userId}:{request.requestKey}'
+    assert service.repository._json(original['metadata_json'])['manualBilling']['closedReason'] == 'ORDER_NOT_CREATED'
+    with sqlTransaction(checkout_database[1]) as connection:
+        assert connection.execute("SELECT count(*) FROM billing_events WHERE event_type='checkout.request.bound' AND invoice_id='renewal'").fetchone()[0] == 1
+        assert connection.execute("SELECT count(*) FROM billing_events WHERE event_category='payment_attempt' AND invoice_id='renewal'").fetchone()[0] == 2
+        assert connection.execute("SELECT status FROM \"Invoices\" WHERE id='renewal'").fetchone()[0] == 'UPCOMING'
+    assert len(service.razorpayClient.order.createdPayloads) == 2

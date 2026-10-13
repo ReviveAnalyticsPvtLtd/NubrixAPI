@@ -1038,7 +1038,10 @@ class ManualBillingRepository:
         expiresAt = _utc(billing.get("expiresAt")) or _now()
         state = str(row.get('payment_status') or 'created')
         observation = billing.get('providerObservation', {})
-        if state in ('created', 'pending_provider_ack', 'authorized') and observation.get('outcome') == 'captured':
+        if state == 'failed' and billing.get('closedReason') == 'ORDER_NOT_CREATED' and not row.get('provider_order_id'):
+            # Release the review key while retaining the failed financial history.
+            state = 'expired'
+        elif state in ('created', 'pending_provider_ack', 'authorized') and observation.get('outcome') == 'captured':
             state = 'requires_reconciliation'
         elif state in ('created', 'pending_provider_ack'):
             if observation.get('outcome') == 'processing':
