@@ -283,6 +283,85 @@ class ManualBillingRepository:
 
     # -- checkout intents -----------------------------------------------------
 
+    def _checkoutRequestReplayLocked(self, cursor, request, payloadHash):
+        if request.requestKey is None:
+            return None
+        cursor.execute('''select * from public.billing_events where user_id=%s
+            and idempotency_key=%s''',
+            (request.userId, f'{request.purpose}:{request.userId}:{request.requestKey}'))
+        binding = cursor.fetchone()
+        if not binding:
+            return None
+        if binding.get('event_category') == 'payment_attempt':
+            frozen = self._json(binding.get('metadata_json')).get('manualBilling', {})
+            if frozen.get('payloadHash') != payloadHash:
+                raise ValueError('IDEMPOTENCY_CONFLICT')
+            return None if frozen.get('closedReason') == 'ORDER_NOT_CREATED' else binding
+        if binding.get('event_type') != 'checkout.request.bound':
+            raise ValueError('IDEMPOTENCY_CONFLICT')
+        identity = self._json(binding.get('metadata_json')).get('checkoutRequest', {})
+        if identity.get('payloadHash') != payloadHash:
+            raise ValueError('IDEMPOTENCY_CONFLICT')
+        cursor.execute('''select * from public.billing_events where id=%s and user_id=%s
+            and event_category='payment_attempt' ''', (identity.get('attemptId'), request.userId))
+        attempt = cursor.fetchone()
+        if not attempt or str(attempt.get('invoice_id')) != str(binding.get('invoice_id')):
+            raise ValueError('CHECKOUT_REQUEST_BINDING_MISMATCH')
+        return attempt
+
+    def _bindCheckoutRequestLocked(self, cursor, request, payloadHash, attempt):
+        if request.requestKey is None:
+            return
+        namespace = f'{request.purpose}:{request.userId}:{request.requestKey}'
+        if attempt.get('idempotency_key') == namespace:
+            return
+        cursor.execute('select id from public.billing_events where idempotency_key=%s', (namespace,))
+        if cursor.fetchone():
+            raise ValueError('IDEMPOTENCY_CONFLICT')
+        cursor.execute('''insert into public.billing_events
+            (id,user_id,subscription_id,invoice_id,event_category,event_type,event_status,
+             idempotency_key,metadata_json,occurred_at)
+            values(%s,%s,%s,%s,'audit','checkout.request.bound','processed',%s,%s,%s)''',
+            (str(uuid.uuid4()), request.userId, attempt['subscription_id'], attempt['invoice_id'],
+             namespace, Json({'checkoutRequest': {'attemptId': str(attempt['id']),
+                 'payloadHash': payloadHash}}), _now()))
+
+    def _validateRenewalAttemptLocked(self, cursor, request, subscription, attempt, now):
+        frozen = self._json(attempt.get('metadata_json')).get('manualBilling', {})
+        if attempt.get('payment_status') not in ('created', 'pending_provider_ack', 'authorized'):
+            return
+        if frozen.get('closedAt'):
+            raise ValueError('CHECKOUT_CLOSED')
+        end = _utc(subscription.get('current_period_end'))
+        lifecycle = self._json(subscription.get('billing_state')).get('manualBilling', {}).get('lifecycleId')
+        if (subscription.get('renewal_opt_out') or subscription.get('erasure_pending') or not end
+                or request.billingMode != subscription.get('billing_mode')
+                or frozen.get('lifecycleId') != lifecycle
+                or (request.billingMode == 'monthly_prepaid' and end <= now)):
+            raise ValueError('RENEWAL_NOT_ELIGIBLE')
+        cursor.execute('select "isBanned" from public."Users" where "userId"=%s', (request.userId,))
+        owner = cursor.fetchone()
+        if not owner or owner.get('isBanned'):
+            raise ValueError('CHECKOUT_OWNER_NOT_ELIGIBLE')
+        cursor.execute('select * from public."Invoices" where id=%s and "userId"=%s for update',
+            (attempt['invoice_id'], request.userId))
+        invoice = cursor.fetchone()
+        if (not invoice or str(invoice.get('subscription_id')) != str(subscription['id'])
+                or str(invoice['status']).upper() not in ('UPCOMING', 'PAYMENT_PENDING')
+                or invoice.get('billing_reason') != 'renewal' or _utc(invoice.get('period_start')) != end):
+            raise ValueError('RENEWAL_INVOICE_CLOSED')
+        quote = self._json(invoice.get('metadata_json')).get('manualBilling', {})
+        quotedDomains = quote.get('domains') or self._json(invoice.get('metadata_json')).get('renewalDomains')
+        selected = set(self._jsonList(subscription.get('subscribed_experts'))) - set(
+            self._jsonList(subscription.get('pending_removals')))
+        if (int(invoice.get('total_amount') or invoice.get('amount') or 0) != int(frozen.get('frozenAmount') or 0)
+                or invoice.get('currency') != frozen.get('currency')
+                or _utc(invoice.get('period_end')) != _utc(frozen.get('periodEnd'))
+                or set(frozen.get('domains') or []) != selected
+                or (quotedDomains is not None and set(quotedDomains) != selected)
+                or int(quote.get('revision') or 1) != int(frozen.get('revision') or 1)):
+            raise ValueError('INVOICE_REVISION_CONFLICT')
+
     def reserveCheckout(self, request: CheckoutRequest, *, replayOnly=False) -> CheckoutIntent | None:
         """Freeze server pricing, invoice and attempt in one owner transaction.
 
@@ -313,7 +392,13 @@ class ManualBillingRepository:
             identity['domains'] = list(domains)
         payload_hash = _payloadHash(identity)
 
-        def lookup(cursor, now, matchOnly=False):
+        def lookup(cursor, now, subscription, matchOnly=False):
+            if request.purpose == 'renewal':
+                bound = self._checkoutRequestReplayLocked(cursor, request, payload_hash)
+                if bound:
+                    self._validateRenewalAttemptLocked(cursor, request, subscription, bound, now)
+                    return self._intentFromAttemptRow(bound, self._json(bound.get('metadata_json')),
+                        request.userId, request.purpose), []
             cursor.execute('''select * from public.billing_events where user_id=%s
                 and event_category='payment_attempt' order by id''', (request.userId,))
             rows = []
@@ -334,6 +419,8 @@ class ManualBillingRepository:
                         raise ValueError('IDEMPOTENCY_CONFLICT')
                     if frozen.get('closedReason') == 'ORDER_NOT_CREATED':
                         continue
+                    if request.purpose == 'renewal':
+                        self._validateRenewalAttemptLocked(cursor, request, subscription, row, now)
                     return self._intentFromAttemptRow(row, metadata, request.userId, request.purpose), []
             replacements = []
             for row, metadata, frozen in rows:
@@ -342,6 +429,8 @@ class ManualBillingRepository:
                         and (expiry is not None and expiry > now or
                              row.get('payment_status') == 'pending_provider_ack' and not row.get('provider_order_id')))
                 if request.requestKey is None and live and frozen.get('payloadHash') == payload_hash:
+                    if request.purpose == 'renewal':
+                        self._validateRenewalAttemptLocked(cursor, request, subscription, row, now)
                     return self._intentFromAttemptRow(row, metadata, request.userId, request.purpose), []
                 if matchOnly:
                     continue
@@ -354,7 +443,11 @@ class ManualBillingRepository:
                     replacements.append(row)
                 if (request.purpose == 'renewal' and live
                         and str(row.get('invoice_id')) == str(request.payload.get('invoiceId'))):
-                    raise ValueError('LIVE_RENEWAL_CHECKOUT_CONFLICT')
+                    if frozen.get('payloadHash') != payload_hash:
+                        raise ValueError('LIVE_RENEWAL_CHECKOUT_CONFLICT')
+                    self._validateRenewalAttemptLocked(cursor, request, subscription, row, now)
+                    self._bindCheckoutRequestLocked(cursor, request, payload_hash, row)
+                    return self._intentFromAttemptRow(row, metadata, request.userId, request.purpose), []
             return None, replacements
 
         def transaction(connection, reference=None, lookupOnly=False):
@@ -363,7 +456,7 @@ class ManualBillingRepository:
                 subscription = self._canonical(cursor, request.userId)
                 cursor.execute('select clock_timestamp() as current_time')
                 now = _utc(cursor.fetchone()['current_time'])
-                existing, replacements = lookup(cursor, now, matchOnly=replayOnly)
+                existing, replacements = lookup(cursor, now, subscription, matchOnly=replayOnly)
                 if existing is not None or lookupOnly:
                     return existing
                 coverage = self._coverageSnapshotLocked(cursor, subscription, now, materialize=True)
