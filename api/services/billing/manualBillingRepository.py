@@ -489,6 +489,12 @@ class ManualBillingRepository:
                     return self._intentFromAttemptRow(row, metadata, request.userId, request.purpose), []
                 if matchOnly:
                     continue
+                if (request.purpose == 'renewal' and not live
+                        and str(row.get('invoice_id')) == str(request.payload.get('invoiceId'))
+                        and row.get('payment_status') in ('created', 'pending_provider_ack', 'authorized')
+                        and not self._mayExpireCheckoutAttempt(row, now)):
+                    # Recheck evidence under the owner lock before replacement.
+                    raise RuntimeError('PROVIDER_STATUS_UNKNOWN')
                 if request.purpose == 'initial_purchase' and live:
                     if frozen.get('payloadHash') == payload_hash or (
                             row.get('payment_status') == 'pending_provider_ack' and not row.get('provider_order_id')):
@@ -1032,11 +1038,12 @@ class ManualBillingRepository:
         expiresAt = _utc(billing.get("expiresAt")) or _now()
         state = str(row.get('payment_status') or 'created')
         observation = billing.get('providerObservation', {})
-        if state in ('created', 'pending_provider_ack'):
+        if state in ('created', 'pending_provider_ack', 'authorized') and observation.get('outcome') == 'captured':
+            state = 'requires_reconciliation'
+        elif state in ('created', 'pending_provider_ack'):
             if observation.get('outcome') == 'processing':
                 state = 'provider_processing'
-            elif observation.get('outcome') == 'captured' or (
-                    observation.get('hasPayments') and expiresAt <= _now()):
+            elif observation.get('hasPayments') and expiresAt <= _now():
                 state = 'requires_reconciliation'
         return CheckoutIntent(
             attemptId=str(row["id"]),

@@ -214,3 +214,44 @@ def test_fresh_key_cannot_reuse_changed_renewal(checkout_database, change):
     with pytest.raises(ValueError):
         service.createCheckout(replace(request, requestKey='second-browser'))
     assert len(service.razorpayClient.order.createdPayloads) == 2
+
+
+def test_stale_provider_observation_cannot_reserve_another_renewal(checkout_database):
+    from api.services.billing.manualBillingRecoveryService import ManualBillingRecoveryService
+    service, request = paid_then_request(checkout_database, 'monthly_prepaid', 'renewal')
+    first = service.createCheckout(request)
+    later = NOW + timedelta(hours=1)
+    with patch('api.services.billing.manualBillingRepository._now', return_value=later):
+        ManualBillingRecoveryService(service.repository, service.razorpayClient).recoverAttempt(
+            service.repository.attemptById(request.userId, first.attemptId))
+    # Provider evidence can age while reservation waits for the owner lock.
+    with patch('api.services.billing.manualBillingRepository._now', return_value=later + timedelta(seconds=61)):
+        with pytest.raises(RuntimeError, match='PROVIDER_STATUS_UNKNOWN'):
+            service.repository.reserveCheckout(replace(request, requestKey='second-browser'))
+    assert service.repository.attemptById(request.userId, first.attemptId)['payment_status'] == 'pending_provider_ack'
+    with sqlTransaction(checkout_database[1]) as connection:
+        assert connection.execute("SELECT count(*) FROM billing_events WHERE event_category='payment_attempt' AND invoice_id='renewal'").fetchone()[0] == 1
+
+
+def test_authorized_renewal_captured_after_deadline_returns_reconciliation(checkout_database):
+    from api.services.billing.manualBillingPresentation import serializeCheckoutIntent
+    service, request = paid_then_request(checkout_database, 'monthly_prepaid', 'renewal')
+    first = service.createCheckout(request)
+    provider = service.razorpayClient
+    provider.order.orders[first.razorpayOrderId]['status'] = 'attempted'
+    payment = {'id': 'pay_late_authorized', 'order_id': first.razorpayOrderId,
+        'status': 'authorized', 'amount': first.amount, 'currency': first.currency}
+    provider.paymentsByOrder[first.razorpayOrderId] = [payment]
+    assert service.createCheckout(request).state == 'authorized'
+    provider.order.orders[first.razorpayOrderId]['status'] = 'paid'
+    payment['status'] = 'captured'
+    with patch('api.services.billing.manualBillingRepository._now', return_value=NOW + timedelta(hours=1)):
+        recovered = service.createCheckout(request)
+        assert service.createCheckout(request).state == 'requires_reconciliation'
+    assert recovered.state == 'requires_reconciliation' and recovered.attemptId == first.attemptId
+    assert serializeCheckoutIntent(recovered, 'test-public-key')['state'] == 'requires_reconciliation'
+    with sqlTransaction(checkout_database[1]) as connection:
+        capture = connection.execute("SELECT event_status,failure_reason FROM billing_events WHERE event_type='payment.capture' AND provider_payment_id='pay_late_authorized'").fetchone()
+        assert tuple(capture) == ('REQUIRES_RECONCILIATION', 'CAPTURE_OUTSIDE_WINDOW')
+        assert connection.execute("SELECT status FROM \"Invoices\" WHERE id='renewal'").fetchone()[0] == 'UPCOMING'
+    assert len(provider.order.createdPayloads) == 2
