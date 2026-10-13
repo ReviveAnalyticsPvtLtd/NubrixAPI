@@ -478,7 +478,7 @@ class ManualBillingRepository:
                 live = (row.get('payment_status') in ('created', 'pending_provider_ack', 'authorized')
                         and (expiry is not None and expiry > now or
                              row.get('payment_status') == 'pending_provider_ack' and not row.get('provider_order_id')
-                             or request.purpose == 'renewal' and self._renewalMoneyPending(row, frozen, now)))
+                             or request.purpose in ('initial_purchase', 'renewal') and self._checkoutMoneyPending(row, frozen, now)))
                 if (request.purpose == 'renewal' and str(row.get('invoice_id')) == str(request.payload.get('invoiceId'))
                         and row.get('payment_status') == 'captured' and frozen.get('payloadHash') == payload_hash):
                     self._bindCheckoutRequestLocked(cursor, request, payload_hash, row)
@@ -489,17 +489,17 @@ class ManualBillingRepository:
                     return self._intentFromAttemptRow(row, metadata, request.userId, request.purpose), []
                 if matchOnly:
                     continue
-                if (request.purpose == 'renewal' and not live
-                        and str(row.get('invoice_id')) == str(request.payload.get('invoiceId'))
+                if (not live and (request.purpose == 'initial_purchase' or request.purpose == 'renewal'
+                        and str(row.get('invoice_id')) == str(request.payload.get('invoiceId')))
                         and row.get('payment_status') in ('created', 'pending_provider_ack', 'authorized')
                         and not self._mayExpireCheckoutAttempt(row, now)):
                     # Recheck evidence under the owner lock before replacement.
                     raise RuntimeError('PROVIDER_STATUS_UNKNOWN')
                 if request.purpose == 'initial_purchase' and live:
-                    if frozen.get('payloadHash') == payload_hash or (
+                    if frozen.get('payloadHash') == payload_hash or self._checkoutMoneyPending(row, frozen, now) or (
                             row.get('payment_status') == 'pending_provider_ack' and not row.get('provider_order_id')):
-                        # An unknown order acknowledgement must be recovered
-                        # before opening a second payment opportunity.
+                        # Unsettled money and unknown creation must be recovered
+                        # before opening another payment opportunity.
                         raise ValueError('LIVE_INITIAL_CHECKOUT_CONFLICT')
                     replacements.append(row)
                 if (request.purpose == 'renewal' and live
@@ -767,7 +767,7 @@ class ManualBillingRepository:
         cursor.execute("update public.billing_events set payment_status='expired',event_status='expired',metadata_json=%s where id=%s",
             (Json(metadata),attempt['id']))
 
-    def _renewalMoneyPending(self, attempt, billing, now):
+    def _checkoutMoneyPending(self, attempt, billing, now):
         observation = billing.get('providerObservation', {})
         if attempt.get('payment_status') == 'authorized' or observation.get('outcome') in ('processing', 'authorized', 'unknown', 'captured'):
             return True
