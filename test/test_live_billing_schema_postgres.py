@@ -5,6 +5,7 @@ task-owned localhost manual_billing_test_* database may be recreated.
 """
 import os
 import uuid
+from concurrent.futures import ThreadPoolExecutor
 from contextlib import closing
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -107,6 +108,44 @@ def seedPaid(url, *, ended=False):
         period_start,period_end) values(%s,%s,'pro',1,%s,%s,10000,7000,3000,2500,%s,%s)''',
         (user,subscription,lifecycle,period,start,end))
     return user, subscription, now
+
+
+def test_two_browser_keys_reserve_one_renewal_and_recover_one_order(actualSchema):
+    from dataclasses import replace
+    from dateutil.relativedelta import relativedelta
+    from api.services.billing.manualBillingContracts import CheckoutRequest
+    from api.services.billing.manualPaymentService import ManualPaymentService
+    from test.test_customer_free_payments import StrictFakeRazorpayClient
+    user, subscriptionId, _ = seedPaid(actualSchema)
+    [subscription] = query(actualSchema, 'select * from public.subscriptions where id=%s', (subscriptionId,))
+    invoiceId = str(uuid.uuid4())
+    start = subscription['current_period_end']
+    query(actualSchema, '''insert into public."Invoices"(id,"userId",subscription_id,status,billing_reason,
+        total_amount,currency,period_start,period_end,metadata_json)
+        values(%s,%s,%s,'UPCOMING','renewal',3000,'INR',%s,%s,%s)''',
+        (invoiceId,user,subscriptionId,start,start+relativedelta(months=1),
+         Json({'manualBilling':{'domains':['banking'],'revision':1}})))
+    repository = ManualBillingRepository(lambda: psycopg2.connect(actualSchema))
+    original = CheckoutRequest(user,'renewal','monthly_prepaid',{'invoiceId':invoiceId},'browser_a')
+    adopted = replace(original,requestKey='browser_b')
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        results = list(pool.map(repository.reserveCheckout,[original,adopted]))
+    assert len({result.attemptId for result in results}) == 1
+    provider = StrictFakeRazorpayClient()
+    service = ManualPaymentService.forProduction(provider,repository)
+    first = service.createCheckout(original)
+    provider.order.payments = lambda order,params=None: {'items':[]}
+    second = service.createCheckout(adopted)
+    assert first.razorpayOrderId == second.razorpayOrderId
+    assert len(provider.order.createdPayloads) == 1
+    [counts] = query(actualSchema, '''select count(*) filter(where event_category='payment_attempt') as attempts,
+        count(*) filter(where event_type='checkout.request.bound') as bindings
+        from public.billing_events where invoice_id=%s''',(invoiceId,))
+    assert counts == {'attempts':1,'bindings':1}
+    replay = service.createCheckout(adopted)
+    assert replay.attemptId == first.attemptId
+    with pytest.raises(ValueError,match='IDEMPOTENCY_CONFLICT'):
+        service.createCheckout(replace(adopted,payload={'invoiceId':invoiceId,'revision':99}))
 
 
 def test_runtime_expiry_accepts_inactive_zero_domains_without_losing_usage_or_topups(actualSchema):

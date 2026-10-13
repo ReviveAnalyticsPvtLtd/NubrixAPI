@@ -312,6 +312,7 @@ def _abandonedCheckout(repository,first,userId,url,purpose,reason,extra,withOrde
         'expiresAt':(datetime.now(timezone.utc)+timedelta(minutes=30)).isoformat(),**extra})
     if withOrder:
         repository.bindProviderOrder(attempt.attemptId,{'id':'order-'+str(uuid.uuid4())})
+        _observeUnpaidCheckout(repository,userId,attempt.attemptId)
     connection=psycopg2.connect(url)
     try:
         with connection.cursor() as cursor:
@@ -320,6 +321,14 @@ def _abandonedCheckout(repository,first,userId,url,purpose,reason,extra,withOrde
         connection.commit()
     finally: connection.close()
     return invoice,attempt.attemptId
+
+
+def _observeUnpaidCheckout(repository,userId,attemptId):
+    from api.services.billing.manualBillingContracts import CheckoutProviderSnapshot
+    attempt=repository.attemptById(userId,attemptId)
+    repository.recordProviderObservation(str(attemptId),CheckoutProviderSnapshot(
+        str(attemptId),attempt['provider_order_id'],'unpaid',datetime.now(timezone.utc),
+        True,int(attempt['amount']),attempt['currency'],()))
 
 
 def _checkoutState(url,invoice,attemptId):
@@ -379,6 +388,7 @@ def test_scheduled_expiry_keeps_renewal_invoice_payable(payment):
         'billingMode':'monthly_prepaid','amount':3000,'currency':'INR','domains':['banking'],
         'expiresAt':(datetime.now(timezone.utc)+timedelta(minutes=30)).isoformat()})
     repository.bindProviderOrder(attempt.attemptId,{'id':'order-'+str(uuid.uuid4())})
+    _observeUnpaidCheckout(repository,evidence.userId,attempt.attemptId)
     connection=psycopg2.connect(url)
     try:
         with connection.cursor() as cursor:
