@@ -207,6 +207,9 @@ class TopupService:
             raise CustomException(ValueError('TOPUP_NOT_ELIGIBLE'), statusCode=403,
                 uiMessage='Credit top-ups require an active paid subscription.', errorCode='TOPUP_NOT_ELIGIBLE')
         currency = subscription.get('default_currency') or 'INR'
+        if getTopupPack(packId) is None:
+            raise CustomException(ValueError('TOPUP_PACK_UNKNOWN'), statusCode=422,
+                uiMessage='Unknown credit top-up pack.', errorCode='TOPUP_PACK_UNKNOWN')
         if getTopupPack(packId, currency) is None:
             raise CustomException(ValueError('TOPUP_PRICE_UNAVAILABLE'), statusCode=422,
                 uiMessage='This credit pack is unavailable in your billing currency.', errorCode='TOPUP_PRICE_UNAVAILABLE')
