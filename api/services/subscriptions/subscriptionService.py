@@ -739,12 +739,20 @@ class SubscriptionService:
         decoded = jwt.decode(token, os.environ["SECRET_KEY"], algorithms=["HS256"])
         from api.services.billing.pricingContext import verifyPricingContext
         from api.services.billing.manualBillingRepository import getManualBillingRepository
+        def replayCurrency():
+            try:
+                return getManualBillingRepository().initialReplayCurrency(decoded['userId'], requestKey, normalized, mode)
+            except _CHECKOUT_UNAVAILABLE as exc:
+                raise CustomException(exc, statusCode=503,
+                    uiMessage='Checkout is temporarily unavailable. Please try again later.') from exc
         try:
             currency = verifyPricingContext(pricingContext, decoded['userId'])['currency']
+            # An owned attempt remains priced in its frozen currency after travel.
+            currency = replayCurrency() or currency
         except ValueError as exc:
             currency = None
             if str(exc) in ('PRICING_CONTEXT_REQUIRED', 'PRICING_CONTEXT_EXPIRED'):
-                currency = getManualBillingRepository().initialReplayCurrency(decoded['userId'], requestKey, normalized, mode)
+                currency = replayCurrency()
             if currency is None:
                 raise CustomException(exc, statusCode=409, uiMessage='Please refresh pricing and review your selection again.',
                                       errorCode=str(exc)) from exc

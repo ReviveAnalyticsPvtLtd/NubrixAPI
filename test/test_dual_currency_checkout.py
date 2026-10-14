@@ -73,3 +73,53 @@ def test_expired_context_can_resume_only_owned_frozen_selection(checkout_client)
                           headers={'Idempotency-Key': 'existing'})
     assert changed.status_code == 409
     assert counts(path) == (1, 1)
+
+
+def test_fresh_travel_context_resumes_original_owned_currency(checkout_client):
+    from api.services.billing.pricingContext import issuePricingContext
+    from test.test_manual_billing_runtime import USER
+    client, provider, path = checkout_client
+    first = client.post('/createSubscription', json={'domains': ['banking'], 'contact': ''},
+                        headers={'Idempotency-Key': 'travel'}).json()
+    resumed = client.post('/createSubscription', json={'domains': ['banking'], 'contact': '',
+        'pricingContext': issuePricingContext(USER, 'USD', 'hosting')}, headers={'Idempotency-Key': 'travel'})
+    assert resumed.status_code == 200
+    assert (resumed.json()['orderId'], resumed.json()['currency']) == (first['orderId'], 'INR')
+    assert counts(path) == (1, 1)
+    assert len(provider.order.createdPayloads) == 1
+
+
+def test_foreign_currency_new_key_cannot_supersede_live_initial_order(checkout_client, monkeypatch):
+    from api.services.billing.pricingContext import issuePricingContext
+    from test.test_manual_billing_runtime import USER
+    client, provider, path = checkout_client
+    monkeypatch.setattr('api.services.billing.billingEngine._getMonthlyBasePrice',
+                        lambda currency='INR': {'amount': 1739, 'currency': currency, 'plan_id': 'unit_plan'})
+    client.post('/createSubscription', json={'domains': ['banking'], 'contact': ''},
+                headers={'Idempotency-Key': 'india'})
+    changed = client.post('/createSubscription', json={'domains': ['banking'], 'contact': '',
+        'pricingContext': issuePricingContext(USER, 'USD', 'hosting')}, headers={'Idempotency-Key': 'travel-new'})
+    assert changed.status_code == 409
+    body = changed.json()
+    assert (body.get('detail') or body)['errorCode'] == 'LIVE_INITIAL_CHECKOUT_CONFLICT'
+    assert counts(path) == (1, 1)
+    assert len(provider.order.createdPayloads) == 1
+
+
+@pytest.mark.parametrize('context', ['fresh', 'expired', 'missing'])
+def test_replay_lookup_database_outage_is_retryable(checkout_client, checkout_database, monkeypatch, context):
+    import psycopg2
+    from api.services.billing.pricingContext import issuePricingContext
+    from test.test_manual_billing_runtime import USER, NOW
+    client, provider, path = checkout_client
+    repository, _ = checkout_database
+    def unavailable(*args, **kwargs):
+        raise psycopg2.OperationalError('local test database unavailable')
+    monkeypatch.setattr(repository, 'initialReplayCurrency', unavailable)
+    payload = {'domains': ['banking'], 'contact': ''}
+    if context != 'fresh':
+        payload['pricingContext'] = None if context == 'missing' else issuePricingContext(USER, 'INR', 'hosting', now=NOW)
+    response = client.post('/createSubscription', json=payload, headers={'Idempotency-Key': 'existing'})
+    assert response.status_code == 503
+    assert counts(path) == (0, 0)
+    assert provider.order.createdPayloads == []

@@ -509,8 +509,9 @@ class ManualBillingRepository:
                     # Recheck evidence under the owner lock before replacement.
                     raise RuntimeError('PROVIDER_STATUS_UNKNOWN')
                 if request.purpose == 'initial_purchase' and live:
-                    if hashMatches(frozen) or self._checkoutMoneyPending(row, frozen, now) or (
-                            row.get('payment_status') == 'pending_provider_ack' and not row.get('provider_order_id')):
+                    if (hashMatches(frozen) or (frozen.get('currency') or 'INR') != request.currency
+                            or self._checkoutMoneyPending(row, frozen, now) or (
+                            row.get('payment_status') == 'pending_provider_ack' and not row.get('provider_order_id'))):
                         # Unsettled money and unknown creation must be recovered
                         # before opening another payment opportunity.
                         raise ValueError('LIVE_INITIAL_CHECKOUT_CONFLICT')
