@@ -168,25 +168,26 @@ def _fetchPlanAmount(planId: str, cacheKey: str) -> dict:
     )
 
 
-def _getMonthlyBasePrice() -> dict:
+def _getMonthlyBasePrice(currency: str = "INR") -> dict:
     """
     Fetch the monthly per-domain price from the Razorpay reference plan.
 
     Returns:
         dict: Monthly plan metadata snapshot.
     """
-    planId = os.environ.get("RAZORPAY_PRO_PLAN_ID", "")
-    return _fetchPlanAmount(planId, "billing:monthly_base_price")
+    from api.services.billing.priceCatalog import getPlanPrice
+    return getPlanPrice(currency, "monthly_prepaid")
 
 
-def _getAnnualBasePrice() -> dict:
+def _getAnnualBasePrice(currency: str = "INR") -> dict:
     """
     Fetch the annual per-domain price from the Razorpay reference plan.
 
     Returns:
         dict: Annual plan metadata snapshot.
     """
-    return _fetchPlanAmount(RAZORPAY_ANNUAL_PLAN_ID, "billing:annual_base_price")
+    from api.services.billing.priceCatalog import getPlanPrice
+    return getPlanPrice(currency, "annual_prepaid")
 
 
 def computeInvoiceSnapshot(billingMode: str, billingReason: str,
