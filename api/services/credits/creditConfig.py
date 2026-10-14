@@ -137,7 +137,7 @@ def getOperationMinimum(operationType: str) -> int:
     return minimums.get(operationType, _DEFAULT_OPERATION_MINIMUM)
 
 
-def getTopupPacks() -> dict:
+def getTopupPacks(currency: str = "INR") -> dict:
     """
     Return the purchasable top-up packs, keyed by pack id.
 
@@ -148,10 +148,17 @@ def getTopupPacks() -> dict:
         dict: Active packs, each with 'tokens' and 'amount' (paise).
     """
     packs = _getCreditConfig().get("topup_packs", {})
-    return {packId: pack for packId, pack in packs.items() if pack.get("active", False)}
+    if currency not in ('INR', 'USD'):
+        return {}
+    selected = {}
+    for packId, pack in packs.items():
+        amount = pack.get('amounts', {}).get(currency, pack.get('amount') if currency == 'INR' else None)
+        if pack.get('active', False) and type(amount) is int and 0 < amount <= 9007199254740991:
+            selected[packId] = {**pack, 'amount': amount, 'currency': currency}
+    return selected
 
 
-def getTopupPack(packId: str) -> dict | None:
+def getTopupPack(packId: str, currency: str = "INR") -> dict | None:
     """
     Return a single active top-up pack.
 
@@ -161,4 +168,4 @@ def getTopupPack(packId: str) -> dict | None:
     Returns:
         dict | None: The pack, or None if it is unknown or retired.
     """
-    return getTopupPacks().get(packId)
+    return getTopupPacks(currency).get(packId)

@@ -1,0 +1,35 @@
+"""USD credit packs require explicit independent backend prices."""
+import pytest
+
+
+def test_missing_usd_pack_does_not_become_inr(monkeypatch):
+    from api.services.credits import creditConfig
+    monkeypatch.setattr(creditConfig, '_getCreditConfig', lambda: {'topup_packs': {
+        'small': {'tokens': 1000000, 'amount': 49900, 'active': True}}})
+    assert creditConfig.getTopupPack('small', 'INR')['amount'] == 49900
+    assert creditConfig.getTopupPack('small', 'USD') is None
+
+
+def test_independent_usd_pack_amount(monkeypatch):
+    from api.services.credits import creditConfig
+    monkeypatch.setattr(creditConfig, '_getCreditConfig', lambda: {'topup_packs': {
+        'small': {'tokens': 1000000, 'amount': 49900, 'amounts': {'USD': 619}, 'active': True}}})
+    pack = creditConfig.getTopupPack('small', 'USD')
+    assert (pack['amount'], pack['currency'], pack['tokens']) == (619, 'USD', 1000000)
+
+
+def test_usd_topup_snapshot_uses_usd_tax_base(monkeypatch):
+    from api.services.credits import creditConfig
+    from api.services.billing.billingEngine import computeTopupSnapshot
+    monkeypatch.setattr(creditConfig, '_getCreditConfig', lambda: {'topup_packs': {
+        'small': {'tokens': 1000000, 'amount': 49900, 'amounts': {'USD': 619}, 'active': True}}})
+    snapshot = computeTopupSnapshot('small', 'monthly_prepaid', currency='USD')
+    assert (snapshot.amount_before_tax, snapshot.tax.tax_amount, snapshot.total_amount, snapshot.currency) == (619, 112, 731, 'USD')
+
+
+@pytest.mark.parametrize('amount', [True, 0, -1, '619', 6.19])
+def test_bad_usd_pack_unavailable(monkeypatch, amount):
+    from api.services.credits import creditConfig
+    monkeypatch.setattr(creditConfig, '_getCreditConfig', lambda: {'topup_packs': {
+        'small': {'tokens': 1000000, 'amount': 49900, 'amounts': {'USD': amount}, 'active': True}}})
+    assert creditConfig.getTopupPack('small', 'USD') is None

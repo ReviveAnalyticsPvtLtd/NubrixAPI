@@ -175,8 +175,9 @@ class TopupService:
             billingMode = (subscription or {}).get("billing_mode") or "monthly_prepaid"
 
             packs = []
-            for packId in getTopupPacks():
-                snapshot = computeTopupSnapshot(packId, billingMode)
+            currency = (subscription or {}).get('default_currency') or 'INR'
+            for packId in getTopupPacks(currency):
+                snapshot = computeTopupSnapshot(packId, billingMode, currency=currency)
                 tokens = snapshot.pricing_reference_snapshot_json["tokens"]
                 packs.append({
                     "packId": packId,
@@ -205,9 +206,10 @@ class TopupService:
         if not subscription or subscription.get('status') == 'trial' or subscription.get('billing_mode') not in ('monthly_prepaid', 'annual_prepaid'):
             raise CustomException(ValueError('TOPUP_NOT_ELIGIBLE'), statusCode=403,
                 uiMessage='Credit top-ups require an active paid subscription.', errorCode='TOPUP_NOT_ELIGIBLE')
-        if getTopupPack(packId) is None:
-            raise CustomException(ValueError('TOPUP_PACK_UNKNOWN'), statusCode=422,
-                uiMessage='Unknown credit top-up pack.', errorCode='TOPUP_PACK_UNKNOWN')
+        currency = subscription.get('default_currency') or 'INR'
+        if getTopupPack(packId, currency) is None:
+            raise CustomException(ValueError('TOPUP_PRICE_UNAVAILABLE'), statusCode=422,
+                uiMessage='This credit pack is unavailable in your billing currency.', errorCode='TOPUP_PRICE_UNAVAILABLE')
         result = service._reservedCheckout({'userId': userId, 'email': email}, 'topup',
             subscription['billing_mode'], {'packId': packId}, requestKey)
         result['credits'] = creditMath.tokensToCredits(result['tokens'], TOKEN_TO_CREDIT_RATIO)
