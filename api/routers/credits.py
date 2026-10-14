@@ -27,6 +27,7 @@ _TOPUP_ERROR_STATUS = {
     "TOPUP_NOT_ELIGIBLE": 403,
     "TOPUP_PACK_UNKNOWN": 400,
     "TOPUP_PACK_INACTIVE": 400,
+    "TOPUP_PRICE_UNAVAILABLE": 422,
 }
 
 
@@ -174,6 +175,11 @@ def _raiseTopupException(e: Exception) -> None:
     Raises:
         HTTPException: Always.
     """
+    if isinstance(e, CustomException) and e.errorCode:
+        raise HTTPException(
+            status_code=_TOPUP_ERROR_STATUS.get(e.errorCode, e.statusCode),
+            detail={"status": "FAILURE", "message": e.uiMessage, "errorCode": e.errorCode},
+        )
     message = str(e)
     raise HTTPException(
         status_code=_topupStatusCode(message),

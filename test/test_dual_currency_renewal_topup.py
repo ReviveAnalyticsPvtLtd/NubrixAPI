@@ -33,3 +33,29 @@ def test_bad_usd_pack_unavailable(monkeypatch, amount):
     monkeypatch.setattr(creditConfig, '_getCreditConfig', lambda: {'topup_packs': {
         'small': {'tokens': 1000000, 'amount': 49900, 'amounts': {'USD': amount}, 'active': True}}})
     assert creditConfig.getTopupPack('small', 'USD') is None
+
+
+@pytest.mark.parametrize('marker,service_status,http_status', [
+    ('TOPUP_PRICE_UNAVAILABLE', 422, 422),
+    ('TOPUP_PACK_UNKNOWN', 422, 400),
+    ('TOPUP_NOT_ELIGIBLE', 403, 403),
+])
+def test_topup_route_preserves_typed_service_errors(monkeypatch, marker, service_status, http_status):
+    import asyncio
+    from fastapi import HTTPException
+    from api.models import CreateTopupOrderRequest
+    from api.routers.credits import createTopupOrder
+    from api.services.credits.topupService import topupService
+    from utils.exceptionHandler import CustomException
+    calls = []
+    def unavailable(**kwargs):
+        calls.append(kwargs)
+        raise CustomException(ValueError(marker), statusCode=service_status,
+                              uiMessage='Pack cannot be purchased.', errorCode=marker)
+    monkeypatch.setattr(topupService, 'createTopupOrder', unavailable)
+    with pytest.raises(HTTPException) as result:
+        asyncio.run(createTopupOrder(CreateTopupOrderRequest(packId='small'), token='local-token', requestKey='local-key'))
+    assert result.value.status_code == http_status
+    assert result.value.detail['errorCode'] == marker
+    assert result.value.detail['message'] == 'Pack cannot be purchased.'
+    assert len(calls) == 1
