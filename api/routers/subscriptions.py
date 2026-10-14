@@ -13,13 +13,40 @@ from utils.exceptionHandler import CustomException, raiseHttpException
 from api.models import VerifySubscriptionRequest, CreateSubscriptionRequest, AddDomainsRequest, VerifyDomainUpgradeRequest, RemoveDomainRequest, CancelPendingAdditionRequest, CancelSubscriptionRequest, RefundRequest, CreateAnnualRenewalSessionRequest, VerifyAnnualRenewalPaymentRequest, PrepareRenewalInvoiceRequest, CreateRenewalSessionRequest, VerifyRenewalPaymentRequest, ResumeRenewalRequest
 from api.services.subscriptions.subscriptionService import subscriptionService
 from fastapi.responses import ORJSONResponse
-from fastapi import APIRouter, Depends, Header
+from fastapi import APIRouter, Depends, Header, Request, HTTPException
+from fastapi.security import HTTPAuthorizationCredentials
 from api.commons import verifyToken
 
 router = APIRouter()
 """
 Router for subscription-related endpoints.
 """
+
+
+@router.get("/pricing")
+def getPricing(request: Request, scope: str = "visitor"):
+    from api.services.billing.pricingContext import verifyProxyAssertion
+    from api.services.billing.pricingService import PricingService
+    try:
+        if set(request.query_params) - {"scope"}:
+            raise ValueError("PRICING_SCOPE_INVALID")
+        authorization = request.headers.get("authorization", "")
+        token = authorization[7:] if authorization.startswith("Bearer ") else ""
+        country = verifyProxyAssertion(request.headers, scope, token if scope == "account" else "")
+        if scope == "account":
+            if not token:
+                raise HTTPException(401, detail="Authentication required")
+            verifyToken(HTTPAuthorizationCredentials(scheme="Bearer", credentials=token))
+        return ORJSONResponse(PricingService().getCatalog(scope, country, token or None),
+                              headers={"Cache-Control": "private, no-store"})
+    except ValueError as exc:
+        code = str(exc)
+        return ORJSONResponse({"message": "Pricing is unavailable. Please refresh and try again.",
+                              "errorCode": code}, status_code=403 if code == "PRICING_PROXY_INVALID" else 422,
+                              headers={"Cache-Control": "private, no-store"})
+    except RuntimeError:
+        return ORJSONResponse({"message": "Pricing is temporarily unavailable.", "errorCode": "PRICING_UNAVAILABLE"},
+                              status_code=503, headers={"Cache-Control": "private, no-store"})
 
 
 @router.get("/activateFreeTrial")
