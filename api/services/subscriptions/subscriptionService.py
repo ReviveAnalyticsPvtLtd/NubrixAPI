@@ -1255,6 +1255,14 @@ class SubscriptionService:
             userId = decodedToken.get("userId")
             subscription = self._getCanonicalSubscription(userId=userId, required=True)
             billingMode = (subscription.get("billing_mode") or "").lower()
+            if billingMode == "annual_prepaid":
+                from api.services.billing.manualBillingRepository import getManualBillingRepository
+                from api.services.billing.manualBillingPresentation import serializePeriod
+                coverage = getManualBillingRepository().getCoverageSnapshot(userId)
+                if coverage.nextPeriod:
+                    return {"invoiceId":coverage.nextPeriod.invoiceId,"state":"paid_scheduled",
+                        "invoiceStatus":"PAID","billingMode":billingMode,"creditsRefilled":False,
+                        "nextPeriod":serializePeriod(coverage.nextPeriod)}
             if billingMode == "monthly_prepaid":
                 rows=self.client.table("Invoices").select("id,period_start,period_end,metadata_json").eq("userId",userId).eq("subscription_id",subscription["id"]).eq("billing_reason","renewal").eq("status","PAID").eq("period_start",subscription["current_period_end"]).execute().data or []
                 for paid in rows:

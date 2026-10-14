@@ -292,13 +292,24 @@ class AdminCliEnvironmentTests(unittest.TestCase):
         self.assertIn("override=False", source)
 
     def test_cli_reads_supabase_url_from_dotenv_in_a_clean_process(self):
+        import tempfile
+        import shutil
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / 'scripts').mkdir()
+            source = Path(__file__).resolve().parents[1] / 'scripts/manage_admin.py'
+            shutil.copyfile(source, root / 'scripts/manage_admin.py')
+            (root / '.env').write_text('SUPABASE_URL=http://localhost:1\nSUPABASE_KEY=test-only\n')
+            self._assert_cli_loads_dotenv(root)
+
+    def _assert_cli_loads_dotenv(self, root):
         script = (
             "import os, sys;"
             "sys.argv = ['manage_admin.py', '--help'];"
             "sys.path.insert(0, r'"
             + str(Path(__file__).resolve().parents[1])
             + "');"
-            "import scripts.manage_admin;"
+            "import runpy;runpy.run_path(r'" + str(root / 'scripts/manage_admin.py') + "');"
             "print('SUPABASE_URL' in os.environ)"
         )
         result = subprocess.run(

@@ -16,6 +16,7 @@ __all__ = ["ManualPaymentService", "manualPaymentService"]
 import hashlib
 import json
 import os
+from dataclasses import replace
 from datetime import datetime, timedelta, timezone
 
 from api.services.billing.manualBillingContracts import (
@@ -91,18 +92,30 @@ class ManualPaymentService:
 
     def _createDurableCheckout(self, request):
         self.repository.ensureCanonicalSubscription(request.userId)
-        if request.purpose == 'initial_purchase':
+        if request.purpose in ('initial_purchase', 'renewal'):
             replay = self.repository.reserveCheckout(request, replayOnly=True)
-            if replay is not None and (replay.razorpayOrderId or
-                    replay.state not in ('created', 'pending_provider_ack', 'authorized')):
+            if replay is not None and (replay.state in ('captured', 'expired', 'cancelled', 'superseded', 'failed')
+                    or request.purpose == 'initial_purchase' and replay.razorpayOrderId):
                 return replay
         from api.services.billing.manualBillingRecoveryService import ManualBillingRecoveryService
         recovery = ManualBillingRecoveryService(self.repository, self.razorpayClient)
-        for pending in self.repository.orderlessRecoveryRows(request.userId, request.purpose, request.billingMode):
+        pendingRows = self.repository.orderlessRecoveryRows(request.userId, request.purpose, request.billingMode)
+        if request.purpose == 'renewal':
+            pendingRows = self.repository.renewalRecoveryRows(request.userId, request.billingMode,
+                request.payload.get('invoiceId'))
+        for pending in pendingRows:
             try:
                 recovery.recoverAttempt(pending)
             except Exception as exc:
-                raise RuntimeError('ORDER_ACK_UNKNOWN') from exc
+                raise RuntimeError('PROVIDER_STATUS_UNKNOWN' if pending.get('provider_order_id') else 'ORDER_ACK_UNKNOWN') from exc
+            if request.purpose == 'renewal':
+                updated = self.repository.attemptById(request.userId, str(pending['id']))
+                metadata = self.repository._json(updated.get('metadata_json'))
+                frozen = metadata.get('manualBilling', {})
+                observation = frozen.get('providerObservation', {})
+                if frozen.get('closedAt') and observation.get('hasPayments') and updated.get('payment_status') != 'captured':
+                    original = self.repository._intentFromAttemptRow(updated, metadata, request.userId, request.purpose)
+                    return replace(original, state='requires_reconciliation')
         intent = self.repository.reserveCheckout(request)
         if intent.razorpayOrderId or intent.state not in ('created', 'pending_provider_ack', 'authorized'):
             # Historical-key replays retain closed intent identity. They

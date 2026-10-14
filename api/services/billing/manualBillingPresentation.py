@@ -14,7 +14,7 @@ HIDDEN_CHECKOUT_METHODS = ('emi', 'cardless_emi', 'paylater')
 
 def serializeCheckoutIntent(intent, publicKey, identity=None):
     state = {'created':'payment_pending', 'pending_provider_ack':'payment_pending',
-        'authorized':'awaiting_capture', 'captured':'already_finalized',
+        'authorized':'awaiting_capture', 'provider_processing':'awaiting_capture', 'captured':'already_finalized',
         'expired':'expired', 'cancelled':'cancelled', 'superseded':'superseded'}.get(intent.state,'requires_reconciliation')
     deadline = None if intent.billingMode == 'annual_prepaid' and intent.expiresAt.year == 9999 else intent.expiresAt.isoformat()
     return {**(identity or {}), 'userId':intent.userId, 'invoiceId':intent.invoiceId,

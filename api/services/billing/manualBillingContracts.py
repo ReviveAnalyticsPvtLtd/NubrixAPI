@@ -11,6 +11,7 @@ __all__ = [
     "CoverageSnapshot",
     "CheckoutIntent",
     "CheckoutRequest",
+    "CheckoutProviderSnapshot",
     "VerifiedPaymentEvidence",
     "FinalizationResult",
     "RefundQuote",
@@ -97,6 +98,18 @@ class CheckoutIntent:
     expiresAt: datetime
     razorpayOrderId: str | None
     snapshot: dict
+
+
+@dataclass(frozen=True)
+class CheckoutProviderSnapshot:
+    attemptId: str
+    providerOrderId: str
+    outcome: str
+    observedAt: datetime
+    complete: bool
+    amount: int
+    currency: str
+    payments: tuple[dict, ...]
 
 
 @dataclass(frozen=True)

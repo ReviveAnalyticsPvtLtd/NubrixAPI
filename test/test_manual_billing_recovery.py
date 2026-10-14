@@ -11,9 +11,10 @@ def test_lost_order_ack_is_bound_before_shared_capture_finalization():
     provider = Mock()
     attempt = {'id':'attempt','invoice_id':'invoice','user_id':'user','amount':100,
         'currency':'INR','metadata_json':{'manualBilling':{'purpose':'renewal'}}}
-    order = {'id':'order','receipt':'attempt','amount':100,'currency':'INR',
+    order = {'id':'order','status':'paid','receipt':'attempt','amount':100,'currency':'INR',
         'notes':{'attemptId':'attempt','invoiceId':'invoice','userId':'user'}}
     provider.order.all.return_value = {'items':[order]}
+    provider.order.fetch.return_value = order
     provider.order.payments.return_value = {'items':[{'id':'payment','order_id':'order',
         'amount':100,'currency':'INR','status':'captured','created_at':1}]}
     repository.finalizeCapturedPayment.return_value = SimpleNamespace(state='paid_scheduled')
