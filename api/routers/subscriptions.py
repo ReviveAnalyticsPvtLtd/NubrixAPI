@@ -93,6 +93,7 @@ async def createSubscription(request: CreateSubscriptionRequest, token=Depends(v
             domains=request.domains,
             contact=request.contact,
             billingMode=request.billingMode,
+            pricingContext=request.pricingContext,
             token=token, requestKey=requestKey)
         return ORJSONResponse(status_code=200, content=result)
     except CustomException as e:

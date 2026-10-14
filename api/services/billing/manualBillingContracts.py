@@ -80,6 +80,7 @@ class CheckoutRequest:
     billingMode: str
     payload: dict
     requestKey: str | None = None
+    currency: str = "INR"
 
 
 @dataclass(frozen=True)

@@ -166,6 +166,7 @@ class CreateSubscriptionRequest(BaseModel):
     domains: list[str]
     contact: str
     billingMode: str | None = "monthly_prepaid"
+    pricingContext: str | None = None
 
 class AddDomainsRequest(BaseModel):
     domains: list[str]
