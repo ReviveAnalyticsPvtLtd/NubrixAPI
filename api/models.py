@@ -162,6 +162,19 @@ class VerifySubscriptionRequest(BaseModel):
     class Config:
         extra = "forbid"
 
+class SubscriptionPricingPreviewRequest(BaseModel):
+    model_config = {"extra": "forbid"}
+    domains: list[Literal["banking", "manufacturing", "supplychain", "telecom"]] = Field(min_length=1, max_length=4)
+    billingMode: Literal["monthly_prepaid", "annual_prepaid"]
+    pricingContext: str = Field(min_length=1, max_length=4096)
+
+    @model_validator(mode="after")
+    def uniqueDomains(self):
+        if len(set(self.domains)) != len(self.domains):
+            raise ValueError("Domains must be unique")
+        return self
+
+
 class CreateSubscriptionRequest(BaseModel):
     domains: list[str]
     contact: str

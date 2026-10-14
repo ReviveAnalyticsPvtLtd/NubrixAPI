@@ -5,7 +5,7 @@ import os
 from jose import jwt
 
 from api.services.billing.priceCatalog import getPlanPrice, PriceUnavailable
-from api.services.billing.pricingContext import resolveCurrency, issuePricingContext
+from api.services.billing.pricingContext import resolveCurrency, issuePricingContext, verifyPricingContext
 
 
 class PricingService:
@@ -58,3 +58,23 @@ class PricingService:
         result["pricingContext"] = issuePricingContext(subject, currency, source, now=now) if subject else None
         result["expiresAt"] = (now + timedelta(seconds=600)).isoformat() if subject else None
         return result
+
+    def preview(self, token, domains, billingMode, pricingContext):
+        """Calculate a display total; never reserve an invoice or provider order."""
+        from api.services.billing.billingEngine import computeInvoiceSnapshot
+        identity = jwt.decode(token, os.environ["SECRET_KEY"], algorithms=["HS256"])
+        userId = str(identity["userId"])
+        claims = verifyPricingContext(pricingContext, userId)
+        now = datetime.now(timezone.utc)
+        currency = claims["currency"]
+        snapshot = computeInvoiceSnapshot(
+            billingMode=billingMode, billingReason="initial_purchase", domainCount=len(domains),
+            priceReference=self.priceLoader(currency, billingMode), evaluatedAt=now, currency=currency)
+        taxes = [{"label": label, "amount": getattr(snapshot.tax, key)}
+                 for key, label in (("cgst", "CGST"), ("sgst", "SGST"), ("igst", "IGST"), ("cess", "Cess"))
+                 if getattr(snapshot.tax, key)]
+        return {"schemaVersion": 1, "subject": userId, "domains": sorted(domains), "billingMode": billingMode,
+                "expiresAt": min(datetime.fromtimestamp(claims["exp"], timezone.utc),
+                                 now + timedelta(minutes=5)).isoformat(),
+                "breakdown": {"currency": currency, "subtotal": snapshot.amount_before_tax,
+                              "tax": snapshot.tax.tax_amount, "total": snapshot.total_amount, "taxes": taxes}}

@@ -16,6 +16,7 @@ from fastapi.responses import ORJSONResponse
 from fastapi import APIRouter, Depends, Header, Request, HTTPException
 from fastapi.security import HTTPAuthorizationCredentials
 from api.commons import verifyToken
+from api.models import SubscriptionPricingPreviewRequest
 
 router = APIRouter()
 """
@@ -47,6 +48,21 @@ def getPricing(request: Request, scope: str = "visitor"):
     except RuntimeError:
         return ORJSONResponse({"message": "Pricing is temporarily unavailable.", "errorCode": "PRICING_UNAVAILABLE"},
                               status_code=503, headers={"Cache-Control": "private, no-store"})
+
+
+@router.post("/pricing-preview")
+def previewPricing(request: SubscriptionPricingPreviewRequest, token=Depends(verifyToken)):
+    from api.services.billing.pricingService import PricingService
+    headers = {"Cache-Control": "private, no-store"}
+    try:
+        return ORJSONResponse(PricingService().preview(token, request.domains, request.billingMode,
+                                                     request.pricingContext), headers=headers)
+    except ValueError as exc:
+        return ORJSONResponse({"message": "Please refresh pricing and review your selection again.",
+                              "errorCode": str(exc)}, status_code=422, headers=headers)
+    except RuntimeError:
+        return ORJSONResponse({"message": "Pricing is temporarily unavailable.", "errorCode": "PRICING_UNAVAILABLE"},
+                              status_code=503, headers=headers)
 
 
 @router.get("/activateFreeTrial")
