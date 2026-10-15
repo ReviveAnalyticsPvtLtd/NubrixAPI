@@ -19,7 +19,7 @@ def service(monkeypatch, paid=False, currency="INR", missing=False):
     repo = Mock()
     repo.loadCurrent.return_value = CatalogSnapshot(1,BASELINE,datetime.now(timezone.utc),None,'fixture','Catalog HTTP fixture')
     if missing: repo.loadCurrent.side_effect = CatalogUnavailable()
-    instance = PricingService(client=Mock(), priceLoader=prices, catalogRepository=repo)
+    instance = PricingService(priceLoader=prices, catalogRepository=repo)
     instance.accountFacts = lambda token: ("user-a", "India", currency if paid else None)
     return instance
 

@@ -1,44 +1,33 @@
 """Read-only price catalogue. Public amounts never authorize client totals."""
 from datetime import datetime, timezone, timedelta
 import os
+import psycopg2
 
 from jose import jwt
 
 from api.services.billing.priceCatalog import getPlanPrice, PriceUnavailable
 from api.services.billing.pricingContext import resolveCurrency, issuePricingContext, verifyPricingContext
 from api.services.billing.pricingCatalogRepository import getPricingCatalogRepository
+from api.services.billing.pricingCatalogContracts import CatalogUnavailable
 
 
 class PricingService:
-    def __init__(self, client=None, priceLoader=None, catalogRepository=None):
-        self._client = client
+    def __init__(self, priceLoader=None, catalogRepository=None, accountRepository=None):
+        from api.services.billing.manualBillingRepository import getManualBillingRepository
         self.priceLoader = priceLoader or getPlanPrice
         self.catalogRepository = catalogRepository or getPricingCatalogRepository()
-
-    @property
-    def client(self):
-        if self._client is None:
-            from api.commons import client
-            self._client = client
-        return self._client
+        self.accountRepository = accountRepository or getManualBillingRepository()
 
     def accountFacts(self, token):
         # Caller has verified the session through verifyToken before this read.
         identity = jwt.decode(token, os.environ["SECRET_KEY"], algorithms=["HS256"])
         userId = str(identity["userId"])
-        users = self.client.table("Users").select("country").eq("userId", userId).limit(1).execute().data
-        subscriptions = self.client.table("subscriptions").select("id, default_currency").eq(
-            "user_id", userId).eq("is_canonical", True).limit(1).execute().data
-        paidCurrency = None
-        if subscriptions:
-            paid = self.client.table("Invoices").select("currency").eq("userId", userId).eq(
-                "subscription_id", subscriptions[0]["id"]).eq("status", "PAID").execute().data
-            currencies = {row.get("currency") or "INR" for row in paid}
-            if len(currencies) > 1:
-                raise ValueError("BILLING_CURRENCY_CONFLICT")
-            if currencies:
-                paidCurrency = currencies.pop()
-        return userId, users[0].get("country") if users else None, paidCurrency
+        try:
+            paidCurrency = self.accountRepository.paidSubscriptionCurrency(userId)
+        except (psycopg2.Error, OSError, RuntimeError) as exc:
+            raise CatalogUnavailable('Account pricing is temporarily unavailable') from exc
+        # Self-reported country is not an input to regional price authorization.
+        return userId, None, paidCurrency
 
     def getCatalog(self, scope, hostCountry, token=None):
         if scope not in {"visitor", "account"}:

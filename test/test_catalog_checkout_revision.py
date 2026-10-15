@@ -79,3 +79,10 @@ def test_unsafe_computed_total_is_rejected_before_invoice_persistence():
     with pytest.raises(ValueError,match='INVALID_INVOICE_AMOUNT'):
         computeInvoiceSnapshot('monthly_prepaid','initial_purchase',4,currency='USD',
             priceReference={'amount':9007199254740991,'currency':'USD','plan_id':'catalog:7:monthly:USD'})
+
+
+def test_account_currency_uses_authoritative_financial_read_without_profile_transport(monkeypatch):
+    monkeypatch.setenv('PRICING_PROXY_SECRET','catalog-test-secret')
+    token = jwt.encode({'userId':'user-a'},__import__('os').environ['SECRET_KEY'],algorithm='HS256')
+    service = PricingService(accountRepository=SimpleNamespace(paidSubscriptionCurrency=lambda userId:'USD'))
+    assert service.accountFacts(token) == ('user-a',None,'USD')

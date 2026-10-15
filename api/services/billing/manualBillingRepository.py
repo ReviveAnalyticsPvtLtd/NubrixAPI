@@ -677,6 +677,19 @@ class ManualBillingRepository:
                 return currency
         return self._run(operation)
 
+    def paidSubscriptionCurrency(self, userId):
+        """Read paid currency in one query, without trusting unpaid defaults."""
+        def operation(connection):
+            with connection.cursor(cursor_factory=RealDictCursor) as cursor:
+                cursor.execute('''SELECT DISTINCT coalesce(i.currency,'INR') AS currency
+                    FROM public."Invoices" i JOIN public.subscriptions s ON s.id=i.subscription_id
+                    WHERE s.user_id=%s AND s.is_canonical=true AND i."userId"=%s AND i.status='PAID' ''',
+                    (userId,userId))
+                currencies = {row['currency'] for row in cursor.fetchall()}
+                if len(currencies) > 1: raise ValueError('BILLING_CURRENCY_CONFLICT')
+                return next(iter(currencies), None)
+        return self._run(operation)
+
     def getPaidPeriodPrice(self, userId):
         """Actual before-tax payments backing current coverage; never catalog prices."""
         def operation(connection):

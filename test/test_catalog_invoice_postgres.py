@@ -39,6 +39,7 @@ def test_invoice_holds_one_revision_then_replays_after_publication(invoice_db,cu
     with psycopg2.connect(invoice_db) as connection, connection.cursor() as cursor:
         cursor.execute('INSERT INTO public."Users"("userId") VALUES(%s)',(user,))
     repo.ensureCanonicalSubscription(user)
+    assert repo.paidSubscriptionCurrency(user) is None
     current = catalog_repo.loadCurrent()
     request = CheckoutRequest(user,'initial_purchase','monthly_prepaid',{'domains':['banking']},'original',
                               currency=currency,expectedCatalogRevision=current.revision)
@@ -95,6 +96,7 @@ def test_paid_additions_and_topups_freeze_current_revision(invoice_db,mode,curre
     evidence = VerifiedPaymentEvidence(initial.attemptId,initial.invoiceId,user,order,'pay-'+str(uuid.uuid4()),
         'initial_purchase',currency,'captured','server_observation',initial.amount,datetime.now(timezone.utc),None,None,False)
     repo.finalizeCapturedPayment(evidence)
+    assert repo.paidSubscriptionCurrency(user) == currency
     paid_price = repo.getPaidPeriodPrice(user)
     sku = 'monthly' if mode == 'monthly_prepaid' else 'annual'
     assert paid_price['amountBeforeTax'] == current.prices[currency][sku]

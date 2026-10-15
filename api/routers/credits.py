@@ -192,7 +192,7 @@ def _raiseTopupException(e: Exception) -> None:
 
 
 @router.get("/topup/packs")
-async def getTopupPacks(token=Depends(verifyToken)):
+def getTopupPacks(token=Depends(verifyToken)):
     """
     List the purchasable credit top-up packs.
 
