@@ -27,6 +27,17 @@ def validateReference(reference, currency, planId=None):
 
 def getPlanPrice(currency: str, billingMode: str, *, provider=None, cache=None, now=None) -> dict:
     mode = "monthly_prepaid" if billingMode == "monthly_recurring" else billingMode
+    # Manual USD orders do not require Razorpay Subscriptions to support USD
+    # plans. These independently configured amounts are cents, never INR/FX.
+    amountName = {('USD', 'monthly_prepaid'): 'BILLING_USD_MONTHLY_AMOUNT',
+                  ('USD', 'annual_prepaid'): 'BILLING_USD_ANNUAL_AMOUNT'}.get((currency, mode))
+    configured = os.environ.get(amountName) if amountName else None
+    if configured is not None:
+        if not configured.isascii() or not configured.isdecimal():
+            raise PriceUnavailable()
+        return validateReference({'amount': int(configured), 'currency': currency,
+            'plan_id': f'configured_{currency}_{mode}', 'source': 'backend_configuration',
+            'config_key': amountName, 'fetched_at': (now or datetime.now(timezone.utc)).isoformat()}, currency)
     envName = PLAN_ENV.get((currency, mode))
     planId = os.environ.get(envName, "") if envName else ""
     if not planId:
