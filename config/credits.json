@@ -1,5 +1,5 @@
 {
-  "version": "4.0.1",
+  "version": "4.0.2",
   "token_to_credit_ratio": 10000,
   "quotas": {
     "free": {
@@ -38,18 +38,21 @@
     "small": {
       "tokens": 1000000,
       "amount": 50000,
+      "amounts": {"USD": 500},
       "active": true,
       "description": "100 credits"
     },
     "medium": {
       "tokens": 5000000,
       "amount": 200000,
+      "amounts": {"USD": 2000},
       "active": true,
       "description": "500 credits"
     },
     "large": {
       "tokens": 10000000,
       "amount": 350000,
+      "amounts": {"USD": 3500},
       "active": true,
       "description": "1,000 credits"
     }

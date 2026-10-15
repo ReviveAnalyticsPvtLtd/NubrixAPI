@@ -76,7 +76,7 @@ class TestTopupPricingSnapshot(unittest.TestCase):
         self.assertEqual(snap.pricing_reference_snapshot_json["tokens"], 5000000)
         self.assertEqual(snap.pricing_reference_snapshot_json["source"],
                          "config_credits_json")
-        self.assertTrue(snap.pricing_version.startswith("topup_v4.0.1_medium_"))
+        self.assertTrue(snap.pricing_version.startswith("topup_v4.0.2_medium_"))
 
     def test_total_includes_tax(self):
         from api.services.billing.billingEngine import computeTopupSnapshot
