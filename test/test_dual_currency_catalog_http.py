@@ -30,6 +30,11 @@ def test_paid_currency_overrides_travel(monkeypatch):
     assert (result["currency"], result["countrySource"]) == ("INR", "subscription")
 
 
+def test_self_reported_india_does_not_select_inr_without_verified_location(monkeypatch):
+    result = service(monkeypatch).getCatalog("account", None, token="verified")
+    assert (result["currency"], result["countrySource"]) == ("USD", "default")
+
+
 def test_visitors_have_no_account_context(monkeypatch):
     result = service(monkeypatch).getCatalog("visitor", "IN")
     assert result["currency"] == "INR"

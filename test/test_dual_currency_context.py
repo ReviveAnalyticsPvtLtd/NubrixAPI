@@ -20,10 +20,11 @@ def secret(monkeypatch):
 @pytest.mark.parametrize("host,profile,paid,expected", [
     ("IN", "United States", None, ("INR", "hosting")),
     ("GB", "India", None, ("USD", "hosting")),
-    (None, "India", None, ("INR", "profile")),
-    ("XX", "IN", None, ("INR", "profile")),
+    (None, "India", None, ("USD", "default")),
+    ("XX", "IN", None, ("USD", "default")),
     (None, None, None, ("USD", "default")),
     ("IN", None, "USD", ("USD", "subscription")),
+    (None, "United States", "INR", ("INR", "subscription")),
 ])
 def test_currency_resolution(host, profile, paid, expected):
     assert resolveCurrency(host, profile, paid) == expected
