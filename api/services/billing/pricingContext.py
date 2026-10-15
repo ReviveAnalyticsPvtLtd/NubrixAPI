@@ -22,9 +22,8 @@ def resolveCurrency(hostCountry, profileCountry, paidCurrency=None):
     host = str(hostCountry or "").strip().upper()
     if len(host) == 2 and host.isascii() and host.isalpha() and host not in {"XX", "ZZ"}:
         return ("INR" if host == "IN" else "USD"), "hosting"
-    profile = str(profileCountry or "").strip().casefold()
-    if profile and profile not in {"unknown", "xx", "zz"}:
-        return ("INR" if profile in {"in", "india"} else "USD"), "profile"
+    # Self-reported onboarding country cannot authorize regional prices.
+    # Keep the argument for callers; only trusted location or paid currency wins.
     return "USD", "default"
 
 
