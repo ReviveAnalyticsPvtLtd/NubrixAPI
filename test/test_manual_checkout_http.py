@@ -64,7 +64,15 @@ def checkout_client(checkout_database, monkeypatch):
     app = FastAPI()
     app.include_router(routes.router)
     app.dependency_overrides[verifyToken] = lambda: token
-    return TestClient(app), service.razorpayClient, path
+    monkeypatch.setenv('PRICING_PROXY_SECRET', 'local-http-pricing-secret')
+    class PricingTestClient(TestClient):
+        def post(self, url, **kwargs):
+            if str(url) == '/createSubscription' and 'json' in kwargs:
+                from api.services.billing.pricingContext import issuePricingContext
+                kwargs['json'] = dict(kwargs['json'])
+                kwargs['json'].setdefault('pricingContext', issuePricingContext(USER, 'INR', 'hosting'))
+            return super().post(url, **kwargs)
+    return PricingTestClient(app), service.razorpayClient, path
 
 
 def test_http_same_key_returns_original_attempt(checkout_client):

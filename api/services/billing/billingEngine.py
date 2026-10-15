@@ -168,25 +168,26 @@ def _fetchPlanAmount(planId: str, cacheKey: str) -> dict:
     )
 
 
-def _getMonthlyBasePrice() -> dict:
+def _getMonthlyBasePrice(currency: str = "INR") -> dict:
     """
     Fetch the monthly per-domain price from the Razorpay reference plan.
 
     Returns:
         dict: Monthly plan metadata snapshot.
     """
-    planId = os.environ.get("RAZORPAY_PRO_PLAN_ID", "")
-    return _fetchPlanAmount(planId, "billing:monthly_base_price")
+    from api.services.billing.priceCatalog import getPlanPrice
+    return getPlanPrice(currency, "monthly_prepaid")
 
 
-def _getAnnualBasePrice() -> dict:
+def _getAnnualBasePrice(currency: str = "INR") -> dict:
     """
     Fetch the annual per-domain price from the Razorpay reference plan.
 
     Returns:
         dict: Annual plan metadata snapshot.
     """
-    return _fetchPlanAmount(RAZORPAY_ANNUAL_PLAN_ID, "billing:annual_base_price")
+    from api.services.billing.priceCatalog import getPlanPrice
+    return getPlanPrice(currency, "annual_prepaid")
 
 
 def computeInvoiceSnapshot(billingMode: str, billingReason: str,
@@ -196,7 +197,8 @@ def computeInvoiceSnapshot(billingMode: str, billingReason: str,
                            prorationAnchorStart: datetime = None,
                            prorationAnchorEnd: datetime = None,
                            priceReference: dict = None,
-                           evaluatedAt: datetime = None) -> PricingSnapshot:
+                           evaluatedAt: datetime = None,
+                           currency: str = "INR") -> PricingSnapshot:
     """
     Compute an immutable invoice-ready pricing snapshot.
 
@@ -227,7 +229,7 @@ def computeInvoiceSnapshot(billingMode: str, billingReason: str,
     now = evaluatedAt or datetime.now(timezone.utc)
 
     if billingMode in ("monthly_prepaid", "monthly_recurring"):
-        priceRef = priceReference or _getMonthlyBasePrice()
+        priceRef = priceReference or (_getMonthlyBasePrice() if currency == "INR" else _getMonthlyBasePrice(currency))
         basePrice = priceRef["amount"]
         planId = os.environ.get("RAZORPAY_PRO_PLAN_ID", "")
         if periodStart is None:
@@ -235,7 +237,7 @@ def computeInvoiceSnapshot(billingMode: str, billingReason: str,
         if periodEnd is None:
             periodEnd = periodStart + relativedelta(months=1)
     elif billingMode == "annual_prepaid":
-        priceRef = priceReference or _getAnnualBasePrice()
+        priceRef = priceReference or (_getAnnualBasePrice() if currency == "INR" else _getAnnualBasePrice(currency))
         basePrice = priceRef["amount"]
         planId = RAZORPAY_ANNUAL_PLAN_ID
         if periodStart is None:
@@ -245,6 +247,9 @@ def computeInvoiceSnapshot(billingMode: str, billingReason: str,
     else:
         raise ValueError(f"Unsupported billing mode: {billingMode}")
 
+    from api.services.billing.priceCatalog import validateReference
+    validateReference(priceRef, currency)
+    planId = priceRef.get("plan_id") or planId
     if billingReason in ("initial_purchase", "renewal"):
         amountBeforeTax = domainCount * basePrice
     elif billingReason == "proration":
@@ -282,7 +287,7 @@ def computeInvoiceSnapshot(billingMode: str, billingReason: str,
         amount_before_tax=amountBeforeTax,
         tax=taxBreakdown,
         total_amount=taxBreakdown.total_amount,
-        currency="INR",
+        currency=currency,
         pricing_version=pricingVersion,
         plan_id=planId,
         pricing_reference_snapshot_json=priceRef,
@@ -300,7 +305,7 @@ def computeInvoiceSnapshot(billingMode: str, billingReason: str,
 
 
 def computeTopupSnapshot(packId: str, billingMode: str,
-                         customerState: str = None) -> PricingSnapshot:
+                         customerState: str = None, *, currency: str = "INR") -> PricingSnapshot:
     """
     Compute an invoice-ready pricing snapshot for a credit top-up pack.
 
@@ -326,7 +331,7 @@ def computeTopupSnapshot(packId: str, billingMode: str,
     """
     from api.services.credits.creditConfig import getTopupPack, CREDIT_CONFIG
 
-    pack = getTopupPack(packId)
+    pack = getTopupPack(packId, currency)
     if pack is None:
         raise ValueError(f"Unknown or inactive top-up pack: {packId}")
 
@@ -357,7 +362,7 @@ def computeTopupSnapshot(packId: str, billingMode: str,
         amount_before_tax=amountBeforeTax,
         tax=taxBreakdown,
         total_amount=taxBreakdown.total_amount,
-        currency="INR",
+        currency=currency,
         pricing_version=pricingVersion,
         plan_id=f"topup_{packId}",
         pricing_reference_snapshot_json=priceRef,

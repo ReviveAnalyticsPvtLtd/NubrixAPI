@@ -1,5 +1,5 @@
 {
-  "version": "4.0.0",
+  "version": "4.0.2",
   "token_to_credit_ratio": 10000,
   "quotas": {
     "free": {
@@ -37,21 +37,24 @@
   "topup_packs": {
     "small": {
       "tokens": 1000000,
-      "amount": 49900,
+      "amount": 50000,
+      "amounts": {"USD": 500},
       "active": true,
-      "description": "100 credits — placeholder pricing, pending sign-off"
+      "description": "100 credits"
     },
     "medium": {
       "tokens": 5000000,
-      "amount": 199900,
+      "amount": 200000,
+      "amounts": {"USD": 2000},
       "active": true,
-      "description": "500 credits — placeholder pricing, pending sign-off"
+      "description": "500 credits"
     },
     "large": {
       "tokens": 10000000,
-      "amount": 349900,
+      "amount": 350000,
+      "amounts": {"USD": 3500},
       "active": true,
-      "description": "1,000 credits — placeholder pricing, pending sign-off"
+      "description": "1,000 credits"
     }
   }
 }

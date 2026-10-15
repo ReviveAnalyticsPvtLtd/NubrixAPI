@@ -443,7 +443,17 @@ class ManualBillingRepository:
             **{key: value for key, value in request.payload.items() if key in ('packId', 'invoiceId', 'revision')}}
         if domains:
             identity['domains'] = list(domains)
+        legacy_hash = _payloadHash(identity)
+        if request.currency not in ('INR', 'USD'):
+            raise ValueError('BILLING_CURRENCY_UNSUPPORTED')
+        if request.purpose == 'initial_purchase':
+            identity['currency'] = request.currency
         payload_hash = _payloadHash(identity)
+
+        def hashMatches(frozen):
+            return (frozen.get('payloadHash') == payload_hash or
+                    frozen.get('payloadHash') == legacy_hash and
+                    (frozen.get('currency') or 'INR') == request.currency)
 
         def lookup(cursor, now, subscription, matchOnly=False):
             if request.purpose == 'renewal':
@@ -468,7 +478,7 @@ class ManualBillingRepository:
                 exact = (request.requestKey is not None and row.get('idempotency_key') ==
                     f'{request.purpose}:{request.userId}:{request.requestKey}')
                 if exact:
-                    if frozen.get('payloadHash') != payload_hash:
+                    if not hashMatches(frozen):
                         raise ValueError('IDEMPOTENCY_CONFLICT')
                     if frozen.get('closedReason') == 'ORDER_NOT_CREATED':
                         continue
@@ -486,7 +496,7 @@ class ManualBillingRepository:
                         and row.get('payment_status') == 'captured' and frozen.get('payloadHash') == payload_hash):
                     self._bindCheckoutRequestLocked(cursor, request, payload_hash, row)
                     return self._intentFromAttemptRow(row, metadata, request.userId, request.purpose), []
-                if request.requestKey is None and live and frozen.get('payloadHash') == payload_hash:
+                if request.requestKey is None and live and hashMatches(frozen):
                     if request.purpose == 'renewal':
                         self._validateRenewalAttemptLocked(cursor, request, subscription, row, now)
                     return self._intentFromAttemptRow(row, metadata, request.userId, request.purpose), []
@@ -499,8 +509,9 @@ class ManualBillingRepository:
                     # Recheck evidence under the owner lock before replacement.
                     raise RuntimeError('PROVIDER_STATUS_UNKNOWN')
                 if request.purpose == 'initial_purchase' and live:
-                    if frozen.get('payloadHash') == payload_hash or self._checkoutMoneyPending(row, frozen, now) or (
-                            row.get('payment_status') == 'pending_provider_ack' and not row.get('provider_order_id')):
+                    if (hashMatches(frozen) or (frozen.get('currency') or 'INR') != request.currency
+                            or self._checkoutMoneyPending(row, frozen, now) or (
+                            row.get('payment_status') == 'pending_provider_ack' and not row.get('provider_order_id'))):
                         # Unsettled money and unknown creation must be recovered
                         # before opening another payment opportunity.
                         raise ValueError('LIVE_INITIAL_CHECKOUT_CONFLICT')
@@ -518,11 +529,16 @@ class ManualBillingRepository:
             with connection.cursor(cursor_factory=RealDictCursor) as cursor:
                 self._lockUser(cursor, request.userId)
                 subscription = self._canonical(cursor, request.userId)
+                resolvedCurrency = request.currency if request.purpose == 'initial_purchase' else (subscription.get('default_currency') or 'INR')
+                if reference is not None and reference.get('currency') != resolvedCurrency:
+                    raise ValueError('BILLING_CURRENCY_CONFLICT')
                 cursor.execute('select clock_timestamp() as current_time')
                 now = _utc(cursor.fetchone()['current_time'])
                 existing, replacements = lookup(cursor, now, subscription, matchOnly=replayOnly)
                 if existing is not None or lookupOnly:
                     return existing
+                if request.requiresExistingAttempt:
+                    raise ValueError('PRICING_CONTEXT_REQUIRED')
                 coverage = self._coverageSnapshotLocked(cursor, subscription, now, materialize=True)
                 if subscription.get('erasure_pending') or coverage.denialReason == 'account_banned':
                     raise ValueError('CHECKOUT_OWNER_NOT_ELIGIBLE')
@@ -587,11 +603,12 @@ class ManualBillingRepository:
                     deadline = min(deadline, end)
                 if invoice is None:
                     if request.purpose == 'topup':
-                        pricing = billingEngine.computeTopupSnapshot(request.payload.get('packId'), request.billingMode)
+                        pricing = billingEngine.computeTopupSnapshot(request.payload.get('packId'), request.billingMode,
+                                                                   currency=resolvedCurrency)
                     else:
                         reason = 'proration' if request.purpose == 'expert_addition' else request.purpose
                         pricing = billingEngine.computeInvoiceSnapshot(request.billingMode, reason, len(selected),
-                            periodStart=start, priceReference=reference, evaluatedAt=now,
+                            periodStart=start, priceReference=reference, evaluatedAt=now, currency=resolvedCurrency,
                             prorationAnchorStart=_utc(subscription.get('current_period_start')), prorationAnchorEnd=end)
                     billing = {'schemaVersion': 1, 'lifecycleId': lifecycle, 'purpose': request.purpose,
                         'billingMode': request.billingMode, 'domains': selected, 'revision': revision,
@@ -636,10 +653,43 @@ class ManualBillingRepository:
         existing = self._run(lambda connection: transaction(connection, lookupOnly=True))
         if existing is not None or replayOnly:
             return existing
+        if request.requiresExistingAttempt:
+            raise ValueError('PRICING_CONTEXT_REQUIRED')
         reference = None
         if request.purpose in ('initial_purchase', 'expert_addition'):
-            reference = billingEngine._getMonthlyBasePrice() if request.billingMode == 'monthly_prepaid' else billingEngine._getAnnualBasePrice()
+            currency = request.currency
+            if request.purpose != 'initial_purchase':
+                currency = self.subscriptionCurrency(request.userId)
+            fetch = billingEngine._getMonthlyBasePrice if request.billingMode == 'monthly_prepaid' else billingEngine._getAnnualBasePrice
+            reference = fetch() if currency == 'INR' else fetch(currency)
         return self._run(lambda connection: transaction(connection, reference))
+
+    def subscriptionCurrency(self, userId):
+        def operation(connection):
+            with connection.cursor(cursor_factory=RealDictCursor) as cursor:
+                currency = self._canonical(cursor, userId).get('default_currency') or 'INR'
+                if currency not in ('INR', 'USD'):
+                    raise ValueError('BILLING_CURRENCY_UNSUPPORTED')
+                return currency
+        return self._run(operation)
+
+    def initialReplayCurrency(self, userId, requestKey, domains, mode):
+        if not requestKey:
+            return None
+        def operation(connection):
+            with connection.cursor(cursor_factory=RealDictCursor) as cursor:
+                cursor.execute('''select * from public.billing_events where user_id=%s
+                    and event_category='payment_attempt' and idempotency_key=%s''',
+                    (userId, f'initial_purchase:{userId}:{requestKey}'))
+                for row in cursor.fetchall():
+                    frozen = self._json(row.get('metadata_json')).get('manualBilling', {})
+                    if (frozen.get('purpose') == 'initial_purchase' and frozen.get('billingMode') == mode
+                            and frozen.get('closedReason') != 'ORDER_NOT_CREATED'
+                            and set(frozen.get('domains') or []) == set(domains)
+                            and row.get('currency') in ('INR', 'USD')):
+                        return row['currency']
+                return None
+        return self._run(operation)
 
     def createFrozenRenewalInvoice(self, payload, expectedVersion):
         """Pricing is fetched outside locks; its selection version is checked here."""
@@ -1591,6 +1641,9 @@ class ManualBillingRepository:
         """Annual service duration and monthly credit allocation have separate clocks."""
         from api.services.credits.creditConfig import getTokenQuotaForPlan
         from dateutil.relativedelta import relativedelta
+        cursor.execute('update public.subscriptions set default_currency=%s where id=%s',
+                       (invoice['currency'], subscription['id']))
+        subscription['default_currency'] = invoice['currency']
         metadata = self._json(invoice['metadata_json'])
         billing = metadata['manualBilling']
         period = self._coverage(invoice)
@@ -1643,6 +1696,9 @@ class ManualBillingRepository:
             snapshot.nextPeriod,anomalyId,str(invoice.get('status') or '').upper() or None)
 
     def _applyCoverage(self,cursor,invoice,subscription,now,attemptId):
+        cursor.execute('update public.subscriptions set default_currency=%s where id=%s',
+                       (invoice['currency'], subscription['id']))
+        subscription['default_currency'] = invoice['currency']
         metadata = self._json(invoice.get('metadata_json'))
         billing = metadata['manualBilling']
         period = self._coverage(invoice)

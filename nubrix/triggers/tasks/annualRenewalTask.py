@@ -287,7 +287,7 @@ class AnnualRenewalTask:
             "template": template,
             "templateVersion": "1",
             "amount": invoice.get("total_amount", 0),
-            "currency": "INR",
+            "currency": invoice.get("currency") or "INR",
             "domainCount": subscriptionRenewalDomainCount(subscription),
             "renewalDate": subscription.get("current_period_end", ""),
             "estimateNote": True,

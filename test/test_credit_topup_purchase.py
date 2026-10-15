@@ -51,18 +51,32 @@ if not hasattr(razorpayStub, "Client"):
 
 
 class TestTopupPricingSnapshot(unittest.TestCase):
+    def test_rounded_pack_costs_flow_into_tax_totals_without_changing_credits(self):
+        from api.services.billing.billingEngine import computeTopupSnapshot
+        for pack_id, base, tax, total, tokens in (
+            ("small", 50000, 9000, 59000, 1000000),
+            ("medium", 200000, 36000, 236000, 5000000),
+            ("large", 350000, 63000, 413000, 10000000),
+        ):
+            with self.subTest(pack=pack_id):
+                snapshot = computeTopupSnapshot(pack_id, "monthly_prepaid")
+                self.assertEqual(snapshot.amount_before_tax, base)
+                self.assertEqual(snapshot.tax.tax_amount, tax)
+                self.assertEqual(snapshot.total_amount, total)
+                self.assertEqual(snapshot.pricing_reference_snapshot_json["tokens"], tokens)
+
     def test_snapshot_prices_the_pack_and_freezes_its_tokens(self):
         from api.services.billing.billingEngine import computeTopupSnapshot
         snap = computeTopupSnapshot("medium", "monthly_recurring")
         self.assertEqual(snap.billing_reason, "add_on")
-        self.assertEqual(snap.amount_before_tax, 199900)
+        self.assertEqual(snap.amount_before_tax, 200000)
         self.assertEqual(snap.domain_count, 1)
         self.assertEqual(snap.currency, "INR")
         self.assertEqual(snap.pricing_reference_snapshot_json["packId"], "medium")
         self.assertEqual(snap.pricing_reference_snapshot_json["tokens"], 5000000)
         self.assertEqual(snap.pricing_reference_snapshot_json["source"],
                          "config_credits_json")
-        self.assertTrue(snap.pricing_version.startswith("topup_v4.0.0_medium_"))
+        self.assertTrue(snap.pricing_version.startswith("topup_v4.0.2_medium_"))
 
     def test_total_includes_tax(self):
         from api.services.billing.billingEngine import computeTopupSnapshot
@@ -157,8 +171,8 @@ class TestTopupEligibilityAndOrder(unittest.TestCase):
         medium = next(p for p in result["packs"] if p["packId"] == "medium")
         self.assertEqual(medium["tokens"], 5000000)
         self.assertEqual(medium["credits"], 500.0)
-        self.assertEqual(medium["amountBeforeTax"], 199900)
-        self.assertGreaterEqual(medium["totalAmount"], 199900)
+        self.assertEqual(medium["amountBeforeTax"], 200000)
+        self.assertGreaterEqual(medium["totalAmount"], 200000)
 
     def test_list_packs_reports_ineligible_without_raising(self):
         svc = self._service()
@@ -190,7 +204,7 @@ class TestTopupEligibilityAndOrder(unittest.TestCase):
     def test_order_creates_a_frozen_invoice_and_razorpay_order(self):
         svc = self._service()
         svc.razorpayClient.order.create.return_value = {
-            "id": "order_abc", "currency": "INR", "amount": 235882}
+            "id": "order_abc", "currency": "INR", "amount": 236000}
         with patch.object(svc, "_decodeToken", return_value=("u1", "a@b.c")), \
              patch.object(svc, "_subscription", return_value=self._sub()), \
              patch.object(svc, "_identity", return_value={
@@ -218,7 +232,7 @@ class TestTopupEligibilityAndOrder(unittest.TestCase):
     def test_order_amount_is_the_tax_inclusive_total(self):
         svc = self._service()
         svc.razorpayClient.order.create.return_value = {
-            "id": "order_abc", "currency": "INR", "amount": 235882}
+            "id": "order_abc", "currency": "INR", "amount": 236000}
         with patch.object(svc, "_decodeToken", return_value=("u1", "a@b.c")), \
              patch.object(svc, "_subscription", return_value=self._sub()), \
              patch.object(svc, "_identity", return_value={
@@ -227,7 +241,7 @@ class TestTopupEligibilityAndOrder(unittest.TestCase):
              patch.object(svc, "_attachOrder"), patch.object(svc, "_audit"):
             svc.createTopupOrder("medium", token="t")
         sent = svc.razorpayClient.order.create.call_args[0][0]
-        self.assertGreaterEqual(sent["amount"], 199900)
+        self.assertEqual(sent["amount"], 236000)
 
 
 class TestTopupErrorCodeMapping(unittest.TestCase):

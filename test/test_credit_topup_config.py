@@ -37,9 +37,9 @@ if "supabase" not in sys.modules:
 
 
 class TestTopupPackConfig(unittest.TestCase):
-    def test_config_version_is_4_0_0(self):
+    def test_config_version_is_4_0_2(self):
         from api.services.credits.creditConfig import CREDIT_CONFIG
-        self.assertEqual(CREDIT_CONFIG["version"], "4.0.0")
+        self.assertEqual(CREDIT_CONFIG["version"], "4.0.2")
 
     def test_returns_the_three_active_packs(self):
         from api.services.credits.creditConfig import getTopupPacks
@@ -50,7 +50,7 @@ class TestTopupPackConfig(unittest.TestCase):
         from api.services.credits.creditConfig import getTopupPack
         pack = getTopupPack("medium")
         self.assertEqual(pack["tokens"], 5000000)
-        self.assertEqual(pack["amount"], 199900)
+        self.assertEqual(pack["amount"], 200000)
 
     def test_unknown_pack_returns_none(self):
         from api.services.credits.creditConfig import getTopupPack

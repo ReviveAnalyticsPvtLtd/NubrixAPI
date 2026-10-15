@@ -103,7 +103,7 @@ def createUpcomingRenewalInvoice(subscription: dict, user: dict) -> dict | None:
 
     existing = (
         client.table("Invoices")
-        .select("id, status, total_amount")
+        .select("id, status, total_amount, currency")
         .eq("subscription_id", subscriptionId)
         .eq("billing_reason", "renewal")
         .eq("period_start", nextPeriodStart)
@@ -136,6 +136,7 @@ def createUpcomingRenewalInvoice(subscription: dict, user: dict) -> dict | None:
     try:
         snapshot = computeInvoiceSnapshot(
             billingMode="annual_prepaid",
+            currency=subscription.get('default_currency') or 'INR',
             billingReason="renewal",
             domainCount=domainCount,
             customerState=subscriptionBillingState(subscription).get('customerState'),
@@ -195,7 +196,7 @@ def createUpcomingRenewalInvoice(subscription: dict, user: dict) -> dict | None:
             )
             return (
                 client.table("Invoices")
-                .select("id, status, total_amount")
+                .select("id, status, total_amount, currency")
                 .eq("subscription_id", subscriptionId)
                 .eq("billing_reason", "renewal")
                 .eq("period_start", nextPeriodStart)
@@ -266,6 +267,7 @@ def prepareDashboardRenewalInvoice(invoice: dict) -> dict | None:
         periodEndDt = dtparser.isoparse(invoice["period_end"])
         snapshot = computeInvoiceSnapshot(
             billingMode="annual_prepaid",
+            currency=invoice.get('currency') or subscription.get('default_currency') or 'INR',
             billingReason="renewal",
             domainCount=domainCount,
             customerState=subscriptionBillingState(subscription).get('customerState'),

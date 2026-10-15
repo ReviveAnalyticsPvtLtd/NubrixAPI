@@ -732,12 +732,35 @@ class SubscriptionService:
             raise exception
 
     def createSubscription(self, domains: list[str], contact: str, token: str,
-                           billingMode: str = "monthly_prepaid", requestKey: str | None = None) -> dict:
+                           billingMode: str = "monthly_prepaid", requestKey: str | None = None,
+                           pricingContext: str | None = None) -> dict:
         normalized = self._normalizeAndValidateDomains(domains)
         mode = self._normalizeBillingMode(billingMode)
         decoded = jwt.decode(token, os.environ["SECRET_KEY"], algorithms=["HS256"])
+        from api.services.billing.pricingContext import verifyPricingContext
+        from api.services.billing.manualBillingRepository import getManualBillingRepository
+        requiresExistingAttempt = False
+        def replayCurrency():
+            try:
+                return getManualBillingRepository().initialReplayCurrency(decoded['userId'], requestKey, normalized, mode)
+            except _CHECKOUT_UNAVAILABLE as exc:
+                raise CustomException(exc, statusCode=503,
+                    uiMessage='Checkout is temporarily unavailable. Please try again later.') from exc
+        try:
+            currency = verifyPricingContext(pricingContext, decoded['userId'])['currency']
+            # An owned attempt remains priced in its frozen currency after travel.
+            currency = replayCurrency() or currency
+        except ValueError as exc:
+            currency = None
+            if str(exc) in ('PRICING_CONTEXT_REQUIRED', 'PRICING_CONTEXT_EXPIRED'):
+                currency = replayCurrency()
+            if currency is None:
+                raise CustomException(exc, statusCode=409, uiMessage='Please refresh pricing and review your selection again.',
+                                      errorCode=str(exc)) from exc
+            requiresExistingAttempt = True
         return self._reservedCheckout(decoded, 'initial_purchase', mode,
-            {'domains': normalized}, requestKey, contact)
+            {'domains': normalized}, requestKey, contact, currency=currency,
+            requiresExistingAttempt=requiresExistingAttempt)
 
     def verifySubscription(self, payload: dict, token: str) -> dict:
         return self._verifyDurableCheckout(payload, token, 'initial_purchase')
@@ -1141,7 +1164,8 @@ class SubscriptionService:
             logger.error(exception)
             raise exception
 
-    def _reservedCheckout(self, decoded, purpose, mode, payload, requestKey=None, contact=None):
+    def _reservedCheckout(self, decoded, purpose, mode, payload, requestKey=None, contact=None, currency='INR',
+                          requiresExistingAttempt=False):
         from api.services.billing.manualBillingContracts import CheckoutRequest
         from api.services.billing.manualBillingRepository import getManualBillingRepository
         repository = getManualBillingRepository()
@@ -1151,7 +1175,8 @@ class SubscriptionService:
             from api.services.billing.manualPaymentService import ManualPaymentService
             try:
                 intent = ManualPaymentService.forProduction(self.razorpayClient, repository).createCheckout(
-                    CheckoutRequest(userId, purpose, mode, payload, requestKey))
+                    CheckoutRequest(userId, purpose, mode, payload, requestKey, currency=currency,
+                                    requiresExistingAttempt=requiresExistingAttempt))
             except (RuntimeError, TimeoutError, ConnectionError) as exc:
                 raise CustomException(exc, statusCode=503,
                     uiMessage='Checkout creation is being reconciled. Please try again later.') from exc
@@ -1330,6 +1355,7 @@ class SubscriptionService:
         domainCount = max(len(renewalDomains), 1)
         snapshot = computeInvoiceSnapshot(
             billingMode="monthly_prepaid",
+            currency=subscription.get('default_currency') or 'INR',
             billingReason="renewal",
             domainCount=domainCount,
             customerState=None,
