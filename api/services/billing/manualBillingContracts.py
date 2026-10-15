@@ -82,6 +82,7 @@ class CheckoutRequest:
     requestKey: str | None = None
     currency: str = "INR"
     requiresExistingAttempt: bool = False
+    expectedCatalogRevision: int | None = None
 
 
 @dataclass(frozen=True)

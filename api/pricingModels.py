@@ -38,3 +38,27 @@ class PublishPricingBody(_StrictModel):
         if not 5 <= len(value) <= 500:
             raise ValueError('Reason must contain 5 to 500 characters')
         return value
+
+
+class PricingPublisher(_StrictModel):
+    id: str | None
+    email: str
+
+
+class CatalogRevisionView(_StrictModel):
+    revision: StrictInt
+    prices: RegionalPrices
+    publishedAt: str
+    publishedBy: PricingPublisher
+    reason: str
+
+
+class AdminPricingPageView(_StrictModel):
+    current: CatalogRevisionView
+    history: list[CatalogRevisionView]
+    nextCursor: StrictInt | None
+
+
+class PublishPricingResultView(_StrictModel):
+    catalog: CatalogRevisionView
+    noOp: bool

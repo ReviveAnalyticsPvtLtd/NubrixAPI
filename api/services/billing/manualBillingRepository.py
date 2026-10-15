@@ -418,8 +418,8 @@ class ManualBillingRepository:
     def reserveCheckout(self, request: CheckoutRequest, *, replayOnly=False) -> CheckoutIntent | None:
         """Freeze server pricing, invoice and attempt in one owner transaction.
 
-        Reference-plan transport runs outside locks. A replay lookup precedes
-        that fetch, so retries remain possible during a provider outage.
+        Existing attempts replay before any catalog read. New invoice prices
+        are read under a shared catalog lock in this same owner transaction.
         A changed initial selection with a fresh/no key supersedes unpaid
         invoices in the reservation transaction; old money stays auditable.
         replayOnly resolves request identity without reserving or pricing;
@@ -602,16 +602,26 @@ class ManualBillingRepository:
                 if request.billingMode == 'monthly_prepaid' and request.purpose in ('renewal', 'expert_addition'):
                     deadline = min(deadline, end)
                 if invoice is None:
+                    from api.services.billing.pricingCatalogRepository import getPricingCatalogRepository
+                    from api.services.billing.priceCatalog import getPlanPrice
+                    from api.services.credits.creditConfig import getTopupPack
+                    catalog = getPricingCatalogRepository().loadCurrent(connection=connection, forShare=True)
+                    if type(request.expectedCatalogRevision) is not int or request.expectedCatalogRevision != catalog.revision:
+                        raise ValueError('PRICING_CHANGED')
                     if request.purpose == 'topup':
+                        reference = getTopupPack(request.payload.get('packId'), resolvedCurrency, catalog=catalog)
+                        if reference is None: raise ValueError('INVALID_TOPUP_PACK')
                         pricing = billingEngine.computeTopupSnapshot(request.payload.get('packId'), request.billingMode,
-                                                                   currency=resolvedCurrency)
+                                                                   currency=resolvedCurrency, priceReference=reference)
                     else:
+                        reference = getPlanPrice(resolvedCurrency, request.billingMode, catalog=catalog)
                         reason = 'proration' if request.purpose == 'expert_addition' else request.purpose
                         pricing = billingEngine.computeInvoiceSnapshot(request.billingMode, reason, len(selected),
                             periodStart=start, priceReference=reference, evaluatedAt=now, currency=resolvedCurrency,
                             prorationAnchorStart=_utc(subscription.get('current_period_start')), prorationAnchorEnd=end)
                     billing = {'schemaVersion': 1, 'lifecycleId': lifecycle, 'purpose': request.purpose,
                         'billingMode': request.billingMode, 'domains': selected, 'revision': revision,
+                        'catalogRevision': catalog.revision,
                         'coverageState': 'estimated', 'expiresAt': deadline.isoformat()}
                     if request.purpose == 'topup':
                         billing.update(tokens=pricing.pricing_reference_snapshot_json['tokens'], packId=request.payload['packId'])
@@ -648,6 +658,7 @@ class ManualBillingRepository:
                     'currency': invoice['currency'], 'periodStart': _isoText(invoice.get('period_start')),
                     'periodEnd': _isoText(invoice.get('period_end')), 'expiresAt': deadline.isoformat(),
                     'tokens': frozen.get('tokens'), 'packId': frozen.get('packId'), 'requestKey': request.requestKey or str(uuid.uuid4())}
+                snapshot['catalogRevision'] = self._json(invoice.get('pricing_reference_snapshot_json')).get('catalogRevision')
                 return self._reserveCheckoutIntentLocked(cursor, subscription, request.userId, request.purpose,
                     snapshot['requestKey'], payload_hash, snapshot, now)
         existing = self._run(lambda connection: transaction(connection, lookupOnly=True))
@@ -655,14 +666,7 @@ class ManualBillingRepository:
             return existing
         if request.requiresExistingAttempt:
             raise ValueError('PRICING_CONTEXT_REQUIRED')
-        reference = None
-        if request.purpose in ('initial_purchase', 'expert_addition'):
-            currency = request.currency
-            if request.purpose != 'initial_purchase':
-                currency = self.subscriptionCurrency(request.userId)
-            fetch = billingEngine._getMonthlyBasePrice if request.billingMode == 'monthly_prepaid' else billingEngine._getAnnualBasePrice
-            reference = fetch() if currency == 'INR' else fetch(currency)
-        return self._run(lambda connection: transaction(connection, reference))
+        return self._run(lambda connection: transaction(connection))
 
     def subscriptionCurrency(self, userId):
         def operation(connection):
@@ -671,6 +675,40 @@ class ManualBillingRepository:
                 if currency not in ('INR', 'USD'):
                     raise ValueError('BILLING_CURRENCY_UNSUPPORTED')
                 return currency
+        return self._run(operation)
+
+    def getPaidPeriodPrice(self, userId):
+        """Actual before-tax payments backing current coverage; never catalog prices."""
+        def operation(connection):
+            with connection.cursor(cursor_factory=RealDictCursor) as cursor:
+                self._lockUser(cursor, userId)
+                subscription = self._canonical(cursor, userId)
+                now = _now()
+                coverage = self._coverageSnapshotLocked(cursor, subscription, now, materialize=False)
+                period = coverage.currentPeriod
+                if period is None: return None
+                cursor.execute('SELECT * FROM public."Invoices" WHERE "userId"=%s AND subscription_id=%s AND status=\'PAID\' ORDER BY id',
+                               (userId, subscription['id']))
+                rows = []
+                for invoice in cursor.fetchall():
+                    billing = self._json(invoice.get('metadata_json')).get('manualBilling', {})
+                    if billing.get('revokedAt') or billing.get('coverageState') == 'revoked': continue
+                    base = str(invoice['id']) == period.invoiceId
+                    addition = (billing.get('purpose') == 'expert_addition' and billing.get('coverageState') == 'active'
+                        and billing.get('lifecycleId') == period.lifecycleId
+                        and _utc(invoice.get('period_end')) == period.end
+                        and period.start <= (_utc(invoice.get('period_start')) or now) <= now)
+                    if base or addition: rows.append(invoice)
+                if not rows or period.invoiceId not in {str(row['id']) for row in rows}: return None
+                amounts = [row.get('amount_before_tax') for row in rows]
+                currencies = {row.get('currency') for row in rows}
+                if len(currencies) != 1 or not currencies <= {'INR', 'USD'}: return None
+                if any(type(value) is not int or value < 0 for value in amounts): return None
+                amount = sum(amounts)
+                if not 0 < amount <= 9007199254740991: return None
+                return {'currency':currencies.pop(), 'amountBeforeTax':amount, 'billingMode':coverage.billingMode,
+                    'periodStart':period.start.isoformat(), 'periodEnd':period.end.isoformat(),
+                    'invoiceIds':sorted(str(row['id']) for row in rows)}
         return self._run(operation)
 
     def initialReplayCurrency(self, userId, requestKey, domains, mode):
@@ -691,8 +729,8 @@ class ManualBillingRepository:
                 return None
         return self._run(operation)
 
-    def createFrozenRenewalInvoice(self, payload, expectedVersion):
-        """Pricing is fetched outside locks; its selection version is checked here."""
+    def createFrozenRenewalInvoice(self, payload, expectedVersion, expectedCatalogRevision=None):
+        """Freeze current catalog prices inside the renewal issuance transaction."""
         def operation(connection):
             with connection.cursor(cursor_factory=RealDictCursor) as cursor:
                 self._lockUser(cursor,payload['userId'])
@@ -721,12 +759,27 @@ class ManualBillingRepository:
                 for invoice in cursor.fetchall():
                     billing=self._json(invoice.get('metadata_json')).get('manualBilling',{})
                     if billing.get('coverageState') != 'revoked': return invoice
+                from api.services.billing.pricingCatalogRepository import getPricingCatalogRepository
+                from api.services.billing.priceCatalog import getPlanPrice
+                from api.services.billing.billingEngine import computeInvoiceSnapshot
+                catalog = getPricingCatalogRepository().loadCurrent(connection=connection, forShare=True)
+                if expectedCatalogRevision is not None and expectedCatalogRevision != catalog.revision:
+                    raise ValueError('PRICING_CHANGED')
+                currency = subscription.get('default_currency') or 'INR'
+                pricing = computeInvoiceSnapshot('monthly_prepaid', 'renewal', len(domains),
+                    periodStart=_utc(payload['period_start']), periodEnd=_utc(payload['period_end']), currency=currency,
+                    priceReference=getPlanPrice(currency, 'monthly_prepaid', catalog=catalog))
+                renewalPayload = {**payload, 'amount':pricing.total_amount, 'total_amount':pricing.total_amount,
+                    'amount_before_tax':pricing.amount_before_tax, 'tax_amount':pricing.tax.tax_amount,
+                    'currency':pricing.currency, 'tax_breakdown_json':pricing.tax.to_dict(),
+                    'tax_rule_version':pricing.tax.tax_rule_version, 'place_of_supply_snapshot':pricing.tax.place_of_supply_snapshot,
+                    'pricing_version':pricing.pricing_version, 'pricing_reference_snapshot_json':pricing.pricing_reference_snapshot_json}
                 allowed={'userId','subscription_id','billing_reason','payment_flow','requires_customer_auth',
                     'period_start','period_end','amount_before_tax','tax_amount','total_amount','amount','currency','status',
                     'tax_breakdown_json','tax_rule_version','place_of_supply_snapshot','pricing_version',
                     'pricing_reference_snapshot_json','metadata_json'}
                 if set(payload)-allowed: raise ValueError('UNSUPPORTED_INVOICE_FIELDS')
-                row={'id':str(uuid.uuid4()),**payload}
+                row={'id':str(uuid.uuid4()),**renewalPayload}
                 columns=list(row)
                 values=[Json(value) if isinstance(value,(dict,list)) else value for value in row.values()]
                 cursor.execute('insert into public."Invoices" ('+','.join('"'+column+'"' for column in columns)+') values ('+','.join('%s' for _ in columns)+') returning *',values)
@@ -921,6 +974,7 @@ class ManualBillingRepository:
             "lifecycleId": snapshot.get("lifecycleId"),
             "cycleId": snapshot.get("cycleId"),
             "revision": snapshot.get("revision", 1),
+            "catalogRevision": snapshot.get("catalogRevision"),
             "purpose": purpose,
             "billingMode": snapshot.get("billingMode"),
             "domains": snapshot.get("domains", []),

@@ -122,7 +122,7 @@ def test_fresh_travel_context_resumes_original_owned_currency(checkout_client):
     first = client.post('/createSubscription', json={'domains': ['banking'], 'contact': ''},
                         headers={'Idempotency-Key': 'travel'}).json()
     resumed = client.post('/createSubscription', json={'domains': ['banking'], 'contact': '',
-        'pricingContext': issuePricingContext(USER, 'USD', 'hosting')}, headers={'Idempotency-Key': 'travel'})
+        'pricingContext': issuePricingContext(USER, 'USD', 'hosting', catalogRevision=1)}, headers={'Idempotency-Key': 'travel'})
     assert resumed.status_code == 200
     assert (resumed.json()['orderId'], resumed.json()['currency']) == (first['orderId'], 'INR')
     assert counts(path) == (1, 1)
@@ -138,7 +138,7 @@ def test_foreign_currency_new_key_cannot_supersede_live_initial_order(checkout_c
     client.post('/createSubscription', json={'domains': ['banking'], 'contact': ''},
                 headers={'Idempotency-Key': 'india'})
     changed = client.post('/createSubscription', json={'domains': ['banking'], 'contact': '',
-        'pricingContext': issuePricingContext(USER, 'USD', 'hosting')}, headers={'Idempotency-Key': 'travel-new'})
+        'pricingContext': issuePricingContext(USER, 'USD', 'hosting', catalogRevision=1)}, headers={'Idempotency-Key': 'travel-new'})
     assert changed.status_code == 409
     body = changed.json()
     assert (body.get('detail') or body)['errorCode'] == 'LIVE_INITIAL_CHECKOUT_CONFLICT'

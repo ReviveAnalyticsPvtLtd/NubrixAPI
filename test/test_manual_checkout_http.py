@@ -28,14 +28,25 @@ def checkout_database(database):
         migration = Path('supabase/migrations/20261006131717_enforce_manual_checkout_order_identity.sql').read_text()
         connection.executescript(migration.replace('public.', ''))
     reference = {'amount': 10000, 'currency': 'INR', 'source': 'razorpay_plan_fetch', 'plan_id': 'plan_test'}
-    with patch('api.services.billing.billingEngine._getMonthlyBasePrice', return_value=reference), \
+    from api.services.billing.pricingCatalogContracts import CatalogSnapshot
+    from test.test_pricing_catalog_contracts import BASELINE
+    from copy import deepcopy
+    prices = deepcopy(BASELINE)
+    for currency in prices: prices[currency].update(monthly=10000, annual=10000)
+    catalog = CatalogSnapshot(1, prices, NOW, None, 'fixture', 'Checkout test catalog')
+    # SQLite verifies invoice/attempt SQL only; catalog locking is exercised by
+    # test_catalog_invoice_postgres against actual PostgreSQL.
+    loader = SimpleNamespace(loadCurrent=lambda **kwargs: catalog)
+    with patch('api.services.billing.pricingCatalogRepository.getPricingCatalogRepository', return_value=loader), \
+         patch('api.services.billing.pricingService.getPricingCatalogRepository', return_value=loader), \
+         patch('api.services.billing.billingEngine._getMonthlyBasePrice', return_value=reference), \
          patch('api.services.billing.billingEngine._getAnnualBasePrice', return_value=reference):
         yield database
 
 
 def request(key=None, domains=('banking',), mode='monthly_prepaid', purpose='initial_purchase', **payload):
     from api.services.billing.manualBillingContracts import CheckoutRequest
-    return CheckoutRequest(USER, purpose, mode, {'domains': list(domains), **payload}, key)
+    return CheckoutRequest(USER, purpose, mode, {'domains': list(domains), **payload}, key, expectedCatalogRevision=1)
 
 
 def counts(path):
@@ -70,7 +81,9 @@ def checkout_client(checkout_database, monkeypatch):
             if str(url) == '/createSubscription' and 'json' in kwargs:
                 from api.services.billing.pricingContext import issuePricingContext
                 kwargs['json'] = dict(kwargs['json'])
-                kwargs['json'].setdefault('pricingContext', issuePricingContext(USER, 'INR', 'hosting'))
+                kwargs['json'].setdefault('pricingContext', issuePricingContext(USER, 'INR', 'hosting',catalogRevision=1))
+            if str(url) in ('/createSubscription','/addDomains','/topup/order') and 'json' in kwargs:
+                kwargs['json'] = {**kwargs['json'], 'expectedCatalogRevision':kwargs['json'].get('expectedCatalogRevision',1)}
             return super().post(url, **kwargs)
     return PricingTestClient(app), service.razorpayClient, path
 

@@ -78,10 +78,12 @@ def test_simultaneous_admins_cannot_overwrite_each_other(repo):
     assert repo.loadCurrent().prices['USD']['monthly'] == 2500
 
 
-def test_failed_durable_audit_rolls_back_prices_pointer_and_replay_ledger(repo, database):
+@pytest.mark.parametrize('table', ['public.admin_audit_log','private.pricing_catalog_prices'])
+def test_failed_write_rolls_back_prices_pointer_and_replay_ledger(repo, database, table):
     with psycopg2.connect(database) as conn, conn.cursor() as cursor:
-        cursor.execute("CREATE OR REPLACE FUNCTION public.reject_pricing_audit() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN RAISE EXCEPTION 'audit unavailable'; END $$")
-        cursor.execute('CREATE TRIGGER reject_pricing_audit BEFORE INSERT ON public.admin_audit_log FOR EACH ROW EXECUTE FUNCTION public.reject_pricing_audit()')
+        cursor.execute("CREATE OR REPLACE FUNCTION public.reject_pricing_audit() RETURNS trigger LANGUAGE plpgsql SET search_path=pg_catalog AS $$ BEGIN RAISE EXCEPTION 'write unavailable'; END $$")
+        condition = " WHEN (NEW.sku='large' AND NEW.currency='USD')" if table.endswith('pricing_catalog_prices') else ''
+        cursor.execute(f'CREATE TRIGGER reject_pricing_audit BEFORE INSERT ON {table} FOR EACH ROW{condition} EXECUTE FUNCTION public.reject_pricing_audit()')
     try:
         with pytest.raises(CatalogUnavailable): publish(repo)
         assert repo.loadCurrent().revision == 1
@@ -92,7 +94,8 @@ def test_failed_durable_audit_rolls_back_prices_pointer_and_replay_ledger(repo, 
             assert cursor.fetchone()[0] == 10
     finally:
         with psycopg2.connect(database) as conn, conn.cursor() as cursor:
-            cursor.execute('DROP TRIGGER reject_pricing_audit ON public.admin_audit_log')
+            cursor.execute(f'DROP TRIGGER reject_pricing_audit ON {table}')
+            cursor.execute('DROP FUNCTION public.reject_pricing_audit()')
 
 
 def test_history_has_bounded_cursor_pages_without_duplicates(repo):

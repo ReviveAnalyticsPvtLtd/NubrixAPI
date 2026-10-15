@@ -1,34 +1,19 @@
-"""Manual USD orders must not require USD subscription-plan support."""
-from unittest.mock import MagicMock
-
+"""Old deployment price values cannot override or replace the database catalog."""
+from datetime import datetime, timezone
+from types import SimpleNamespace
 import pytest
+from api.services.billing.priceCatalog import getPlanPrice
+from api.services.billing.pricingCatalogContracts import CatalogSnapshot,CatalogUnavailable
+from test.test_pricing_catalog_contracts import BASELINE
 
+@pytest.mark.parametrize('value',['9999','invalid','0'])
+def test_env_cannot_override_catalog(monkeypatch,value):
+    monkeypatch.setenv('BILLING_USD_MONTHLY_AMOUNT',value)
+    catalog=CatalogSnapshot(1,BASELINE,datetime.now(timezone.utc),None,'fixture','Configured price regression')
+    assert getPlanPrice('USD','monthly_prepaid',catalog=catalog)['amount']==2000
 
-@pytest.mark.parametrize('mode,name,amount', [
-    ('monthly_prepaid', 'BILLING_USD_MONTHLY_AMOUNT', 2000),
-    ('annual_prepaid', 'BILLING_USD_ANNUAL_AMOUNT', 20000),
-])
-def test_explicit_usd_amount_prices_manual_orders_without_provider_plans(monkeypatch, mode, name, amount):
-    from api.services.billing.priceCatalog import getPlanPrice
-    from api.services.billing.billingEngine import computeInvoiceSnapshot
-    monkeypatch.setenv(name, str(amount))
-    monkeypatch.delenv('RAZORPAY_PRO_PLAN_ID_USD', raising=False)
-    monkeypatch.delenv('RAZORPAY_ANNUAL_PLAN_ID_USD', raising=False)
-    provider, cache = MagicMock(), MagicMock()
-    reference = getPlanPrice('USD', mode, provider=provider, cache=cache)
-    snapshot = computeInvoiceSnapshot(mode, 'initial_purchase', 2, priceReference=reference, currency='USD')
-    assert reference['amount'] == amount and reference['currency'] == 'USD'
-    assert reference['source'] == 'backend_configuration'
-    assert snapshot.amount_before_tax == amount * 2 and snapshot.currency == 'USD'
-    provider.plan.fetch.assert_not_called()
-
-
-@pytest.mark.parametrize('value', ['', '0', '-1', '20.00', 'not-a-price', '9007199254740992'])
-def test_invalid_explicit_usd_price_cannot_fall_back_to_another_price(monkeypatch, value):
-    from api.services.billing.priceCatalog import getPlanPrice, PriceUnavailable
-    monkeypatch.setenv('BILLING_USD_MONTHLY_AMOUNT', value)
-    monkeypatch.setenv('RAZORPAY_PRO_PLAN_ID_USD', 'plan_other_price')
-    provider = MagicMock()
-    with pytest.raises(PriceUnavailable):
-        getPlanPrice('USD', 'monthly_prepaid', provider=provider, cache=MagicMock())
-    provider.plan.fetch.assert_not_called()
+def test_env_cannot_fallback_during_catalog_outage(monkeypatch):
+    monkeypatch.setenv('BILLING_USD_MONTHLY_AMOUNT','2000')
+    def unavailable(**kwargs): raise CatalogUnavailable()
+    monkeypatch.setattr('api.services.billing.priceCatalog.getPricingCatalogRepository',lambda:SimpleNamespace(loadCurrent=unavailable))
+    with pytest.raises(CatalogUnavailable): getPlanPrice('USD','monthly_prepaid')

@@ -228,7 +228,8 @@ async def createTopupOrder(
     Create a Razorpay order for a credit top-up pack.
 
     The client sends only a packId — token counts and prices are resolved
-    server-side from config/credits.json. Tokens are granted after payment.
+    server-side from the published catalog and quantity configuration.
+    Tokens are granted after payment.
 
     Args:
         request (CreateTopupOrderRequest): The pack to buy.
@@ -240,7 +241,8 @@ async def createTopupOrder(
     try:
         from api.services.credits.topupService import topupService
 
-        result = topupService.createTopupOrder(packId=request.packId, token=token, requestKey=requestKey)
+        result = topupService.createTopupOrder(packId=request.packId, token=token, requestKey=requestKey,
+                                               expectedCatalogRevision=request.expectedCatalogRevision)
         return ORJSONResponse(
             status_code=200,
             content={

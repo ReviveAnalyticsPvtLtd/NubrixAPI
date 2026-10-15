@@ -1,5 +1,5 @@
 from fastapi import APIRouter, Depends, Header, Query, Request, Response, status
-from api.pricingModels import PublishPricingBody
+from api.pricingModels import PublishPricingBody, AdminPricingPageView, PublishPricingResultView
 from api.services.adminPricingService import AdminPricingService, getAdminPricingService
 
 from api.adminModels import (
@@ -75,7 +75,7 @@ from api.services.userErasureService import (
 router = APIRouter()
 
 
-@router.get('/pricing')
+@router.get('/pricing', response_model=AdminPricingPageView)
 def getPricing(
     response: Response,
     beforeRevision: int | None = Query(default=None, ge=1, le=9007199254740991),
@@ -86,7 +86,7 @@ def getPricing(
     return service.read(beforeRevision=beforeRevision)
 
 
-@router.put('/pricing')
+@router.put('/pricing', response_model=PublishPricingResultView)
 def publishPricing(
     body: PublishPricingBody,
     response: Response,

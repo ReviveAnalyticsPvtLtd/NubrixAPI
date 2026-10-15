@@ -359,8 +359,20 @@ def test_removal_changes_only_unpaid_next_selection_and_closes_checkout(database
         assert connection.execute('SELECT status FROM "Invoices" WHERE id=\'renewal-unpaid\'').fetchone()[0]=='VOID'
 
 
-def test_renewal_snapshot_creation_rejects_stale_selection_version(database):
+def test_renewal_snapshot_creation_rejects_stale_selection_version(database, monkeypatch):
+    from types import SimpleNamespace
+    from api.services.billing.pricingCatalogContracts import CatalogSnapshot
+    from test.test_pricing_catalog_contracts import BASELINE
+    catalog = CatalogSnapshot(1, BASELINE, NOW, None, 'fixture', 'Renewal unit catalog')
+    monkeypatch.setattr('api.services.billing.pricingCatalogRepository.getPricingCatalogRepository',
+                        lambda: SimpleNamespace(loadCurrent=lambda **kwargs:catalog))
     repository,path=database
+    with sqlTransaction(path) as connection:
+        columns = {row[1] for row in connection.execute('PRAGMA table_info("Invoices")')}
+        for name, kind in {'amount_before_tax':'INTEGER','tax_amount':'INTEGER','tax_breakdown_json':'TEXT',
+                           'tax_rule_version':'TEXT','place_of_supply_snapshot':'TEXT','pricing_version':'TEXT',
+                           'pricing_reference_snapshot_json':'TEXT'}.items():
+            if name not in columns: connection.execute(f'ALTER TABLE "Invoices" ADD COLUMN {name} {kind}')
     first=repository.finalizeCapturedPayment(seed_payment(database))
     row=read_row(path,'subscriptions')
     payload={'userId':USER,'subscription_id':SUB,'billing_reason':'renewal','status':'PAYMENT_PENDING',
