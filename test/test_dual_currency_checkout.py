@@ -75,6 +75,46 @@ def test_expired_context_can_resume_only_owned_frozen_selection(checkout_client)
     assert counts(path) == (1, 1)
 
 
+@pytest.mark.parametrize('context', ['expired', 'missing'])
+@pytest.mark.parametrize('closure', ['before_lookup', 'during_lookup'])
+def test_uncreated_order_replacement_requires_fresh_pricing(checkout_client, checkout_database, monkeypatch, context, closure):
+    from datetime import timedelta
+    from unittest.mock import patch
+    from api.services.billing.pricingContext import issuePricingContext
+    from test.test_manual_billing_runtime import USER, NOW
+    client, provider, path = checkout_client
+    repository, _ = checkout_database
+    payload = {'domains': ['banking'], 'contact': ''}
+    headers = {'Idempotency-Key': 'uncreated-order'}
+    with patch.object(provider.order, 'create', side_effect=TimeoutError('not submitted')):
+        assert client.post('/createSubscription', json=payload, headers=headers).status_code == 503
+    with sqlTransaction(path) as db:
+        attemptId = db.execute("SELECT id FROM billing_events WHERE event_category='payment_attempt'").fetchone()[0]
+
+    def close():
+        with patch('api.services.billing.manualBillingRepository._now', return_value=NOW + timedelta(minutes=33)):
+            assert repository.closeUncreatedOrder(attemptId)
+
+    if closure == 'before_lookup':
+        close()
+    else:
+        original = repository.initialReplayCurrency
+        def lookup(*args):
+            currency = original(*args)
+            close()
+            return currency
+        monkeypatch.setattr(repository, 'initialReplayCurrency', lookup)
+    stale = None if context == 'missing' else issuePricingContext(USER, 'INR', 'hosting', now=NOW)
+    response = client.post('/createSubscription', json={**payload, 'pricingContext': stale}, headers=headers)
+    assert response.status_code == 409
+    assert counts(path) == (1, 1)
+    assert provider.order.createdPayloads == []
+    fresh = client.post('/createSubscription', json=payload, headers=headers)
+    assert fresh.status_code == 200
+    assert counts(path) == (2, 2)
+    assert len(provider.order.createdPayloads) == 1
+
+
 def test_fresh_travel_context_resumes_original_owned_currency(checkout_client):
     from api.services.billing.pricingContext import issuePricingContext
     from test.test_manual_billing_runtime import USER

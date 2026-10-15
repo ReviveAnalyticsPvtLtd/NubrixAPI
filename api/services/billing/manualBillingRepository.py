@@ -537,6 +537,8 @@ class ManualBillingRepository:
                 existing, replacements = lookup(cursor, now, subscription, matchOnly=replayOnly)
                 if existing is not None or lookupOnly:
                     return existing
+                if request.requiresExistingAttempt:
+                    raise ValueError('PRICING_CONTEXT_REQUIRED')
                 coverage = self._coverageSnapshotLocked(cursor, subscription, now, materialize=True)
                 if subscription.get('erasure_pending') or coverage.denialReason == 'account_banned':
                     raise ValueError('CHECKOUT_OWNER_NOT_ELIGIBLE')
@@ -651,6 +653,8 @@ class ManualBillingRepository:
         existing = self._run(lambda connection: transaction(connection, lookupOnly=True))
         if existing is not None or replayOnly:
             return existing
+        if request.requiresExistingAttempt:
+            raise ValueError('PRICING_CONTEXT_REQUIRED')
         reference = None
         if request.purpose in ('initial_purchase', 'expert_addition'):
             currency = request.currency
@@ -680,6 +684,7 @@ class ManualBillingRepository:
                 for row in cursor.fetchall():
                     frozen = self._json(row.get('metadata_json')).get('manualBilling', {})
                     if (frozen.get('purpose') == 'initial_purchase' and frozen.get('billingMode') == mode
+                            and frozen.get('closedReason') != 'ORDER_NOT_CREATED'
                             and set(frozen.get('domains') or []) == set(domains)
                             and row.get('currency') in ('INR', 'USD')):
                         return row['currency']

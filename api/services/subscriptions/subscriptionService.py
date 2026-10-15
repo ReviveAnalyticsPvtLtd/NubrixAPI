@@ -739,6 +739,7 @@ class SubscriptionService:
         decoded = jwt.decode(token, os.environ["SECRET_KEY"], algorithms=["HS256"])
         from api.services.billing.pricingContext import verifyPricingContext
         from api.services.billing.manualBillingRepository import getManualBillingRepository
+        requiresExistingAttempt = False
         def replayCurrency():
             try:
                 return getManualBillingRepository().initialReplayCurrency(decoded['userId'], requestKey, normalized, mode)
@@ -756,8 +757,10 @@ class SubscriptionService:
             if currency is None:
                 raise CustomException(exc, statusCode=409, uiMessage='Please refresh pricing and review your selection again.',
                                       errorCode=str(exc)) from exc
+            requiresExistingAttempt = True
         return self._reservedCheckout(decoded, 'initial_purchase', mode,
-            {'domains': normalized}, requestKey, contact, currency=currency)
+            {'domains': normalized}, requestKey, contact, currency=currency,
+            requiresExistingAttempt=requiresExistingAttempt)
 
     def verifySubscription(self, payload: dict, token: str) -> dict:
         return self._verifyDurableCheckout(payload, token, 'initial_purchase')
@@ -1161,7 +1164,8 @@ class SubscriptionService:
             logger.error(exception)
             raise exception
 
-    def _reservedCheckout(self, decoded, purpose, mode, payload, requestKey=None, contact=None, currency='INR'):
+    def _reservedCheckout(self, decoded, purpose, mode, payload, requestKey=None, contact=None, currency='INR',
+                          requiresExistingAttempt=False):
         from api.services.billing.manualBillingContracts import CheckoutRequest
         from api.services.billing.manualBillingRepository import getManualBillingRepository
         repository = getManualBillingRepository()
@@ -1171,7 +1175,8 @@ class SubscriptionService:
             from api.services.billing.manualPaymentService import ManualPaymentService
             try:
                 intent = ManualPaymentService.forProduction(self.razorpayClient, repository).createCheckout(
-                    CheckoutRequest(userId, purpose, mode, payload, requestKey, currency=currency))
+                    CheckoutRequest(userId, purpose, mode, payload, requestKey, currency=currency,
+                                    requiresExistingAttempt=requiresExistingAttempt))
             except (RuntimeError, TimeoutError, ConnectionError) as exc:
                 raise CustomException(exc, statusCode=503,
                     uiMessage='Checkout creation is being reconciled. Please try again later.') from exc

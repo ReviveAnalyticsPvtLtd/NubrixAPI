@@ -103,6 +103,65 @@ class _RenewalTaskClient:
 
 
 class RenewalEmailFlowTests(unittest.TestCase):
+    def test_existing_t30_invoice_retains_currency_for_email_retry(self):
+        from api.services.billing.invoiceService import createUpcomingRenewalInvoice
+
+        invoice = {"id": "inv_t30", "status": "UPCOMING", "total_amount": 23600, "currency": "USD"}
+
+        class ProjectedInvoiceTable(_FakeTable):
+            def in_(self, *_args):
+                return self
+
+            def limit(self, _count):
+                return self
+
+            def select(self, fields):
+                self._data = [] if self.state.get("awaitingInsert") else [
+                    {key: invoice[key] for key in fields.replace(" ", "").split(",")}
+                ]
+                return self
+
+            def insert(self, _payload):
+                self.state["awaitingInsert"] = False
+                raise ValueError("23505 duplicate invoice")
+
+        for duplicate in (False, True):
+            with self.subTest(duplicate=duplicate):
+                client = _FakeClient()
+                client.state["awaitingInsert"] = duplicate
+                client.table = lambda _name: ProjectedInvoiceTable(client.state)
+                with patch("api.services.billing.invoiceService.client", client), patch(
+                    "api.services.billing.invoiceService.getBillingRedisClient", return_value=_FakeRedis()
+                ), patch("api.services.billing.billingEngine._getAnnualBasePrice", return_value={
+                    "amount": 20000, "currency": "USD", "plan_id": "test-usd-annual"
+                }):
+                    result = createUpcomingRenewalInvoice(
+                        {"id": "sub", "user_id": "u1", "default_currency": "USD",
+                         "subscribed_experts": ["banking"], "current_period_end": "2026-12-01T00:00:00+00:00"},
+                        {"userId": "u1"},
+                    )
+                self.assertEqual(result.get("currency"), "USD")
+
+    @patch.dict("os.environ", {"RENEWAL_REMINDER_EMAIL_URL": "https://email.example.test"})
+    def test_t30_email_preserves_frozen_invoice_currency(self):
+        for currency, expected in (("USD", "USD"), ("INR", "INR"), (None, "INR")):
+            with self.subTest(currency=currency):
+                task = AnnualRenewalTask.__new__(AnnualRenewalTask)
+                task.redisClient = _FakeRedis()
+                task.client = _FakeClient()
+                invoice = {"id": "inv_t30", "total_amount": 23600}
+                if currency is not None:
+                    invoice["currency"] = currency
+                with patch("nubrix.triggers.tasks.annualRenewalTask.requests.post") as send:
+                    send.return_value.status_code = 200
+                    task._sendT30Email(
+                        {"userId": "u1", "email": "user@example.test"},
+                        invoice, {"subscribed_experts": ["banking"]},
+                    )
+                payload = send.call_args.kwargs["json"]
+                self.assertEqual(payload["currency"], expected)
+                self.assertEqual(payload["amount"], 23600)
+
     def _serviceWithInvoice(self, invoice):
         service = WebhookService()
         service.client = _FakeClient()

@@ -103,7 +103,7 @@ def createUpcomingRenewalInvoice(subscription: dict, user: dict) -> dict | None:
 
     existing = (
         client.table("Invoices")
-        .select("id, status, total_amount")
+        .select("id, status, total_amount, currency")
         .eq("subscription_id", subscriptionId)
         .eq("billing_reason", "renewal")
         .eq("period_start", nextPeriodStart)
@@ -196,7 +196,7 @@ def createUpcomingRenewalInvoice(subscription: dict, user: dict) -> dict | None:
             )
             return (
                 client.table("Invoices")
-                .select("id, status, total_amount")
+                .select("id, status, total_amount, currency")
                 .eq("subscription_id", subscriptionId)
                 .eq("billing_reason", "renewal")
                 .eq("period_start", nextPeriodStart)

@@ -81,6 +81,7 @@ class CheckoutRequest:
     payload: dict
     requestKey: str | None = None
     currency: str = "INR"
+    requiresExistingAttempt: bool = False
 
 
 @dataclass(frozen=True)
