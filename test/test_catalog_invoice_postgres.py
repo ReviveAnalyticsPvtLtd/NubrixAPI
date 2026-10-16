@@ -1,8 +1,6 @@
 """Actual invoice/publication serialization in a separate financial test DB."""
 import os
 from concurrent.futures import ThreadPoolExecutor
-from copy import deepcopy
-from pathlib import Path
 from threading import Event
 import uuid
 from datetime import datetime, timezone
@@ -15,7 +13,6 @@ from api.services.billing.manualBillingContracts import CheckoutRequest
 from api.services.billing.manualBillingRepository import ManualBillingRepository
 from api.services.billing.pricingCatalogRepository import PricingCatalogRepository
 from test.test_manual_billing_postgres_integration import postgres
-from test.test_pricing_catalog_contracts import BASELINE
 from test.test_pricing_catalog_repository import ADMIN
 
 pytestmark = pytest.mark.skipif(os.environ.get('RUN_MANUAL_BILLING_INTEGRATION') != '1', reason='Disposable local DB required')
@@ -23,11 +20,6 @@ pytestmark = pytest.mark.skipif(os.environ.get('RUN_MANUAL_BILLING_INTEGRATION')
 
 @pytest.fixture(scope='module')
 def invoice_db(postgres):
-    with psycopg2.connect(postgres) as connection, connection.cursor() as cursor:
-        cursor.execute('DROP SCHEMA IF EXISTS private CASCADE')
-        cursor.execute("DO $$ BEGIN IF NOT EXISTS (SELECT 1 FROM pg_publication WHERE pubname='supabase_realtime') THEN CREATE PUBLICATION supabase_realtime; END IF; END $$")
-        migration = next(Path('supabase/migrations').glob('*_create_pricing_catalog.sql'))
-        cursor.execute(migration.read_text())
     return postgres
 
 
