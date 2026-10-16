@@ -141,8 +141,9 @@ class AnnualSqlClient:
     def table(self,name): return AnnualSqlQuery(self.path,name)
 
 @pytest.fixture
-def annual_task_database(checkout_database):
+def annual_task_database(checkout_database,monkeypatch):
     repo,path=checkout_database
+    monkeypatch.setattr('api.services.billing.manualBillingRepository.getManualBillingRepository',lambda:repo)
     with sqlTransaction(path) as db:
         for key in ('fullName','phoneNumber'): db.execute('alter table "Users" add column '+key+' text')
         for key in ('webhook_event_id',): db.execute('alter table billing_events add column '+key+' text')

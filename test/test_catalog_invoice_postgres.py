@@ -80,6 +80,59 @@ def test_shared_catalog_lock_blocks_publication_until_invoice_transaction_finish
     finally: connection.close()
 
 
+def test_annual_issuance_holds_catalog_lock_and_replays_frozen_invoice(invoice_db, monkeypatch):
+    from api.services.billing.manualBillingContracts import VerifiedPaymentEvidence
+    import api.services.billing.pricingCatalogRepository as catalog_module
+    repo = ManualBillingRepository(lambda: psycopg2.connect(invoice_db))
+    catalog_repo = PricingCatalogRepository(lambda: psycopg2.connect(invoice_db))
+    user = 'annual-scheduler-' + str(uuid.uuid4())
+    with psycopg2.connect(invoice_db) as connection, connection.cursor() as cursor:
+        cursor.execute('INSERT INTO public."Users"("userId") VALUES(%s)', (user,))
+    repo.ensureCanonicalSubscription(user)
+    current = catalog_repo.loadCurrent()
+    initial = repo.reserveCheckout(CheckoutRequest(user, 'initial_purchase', 'annual_prepaid',
+        {'domains': ['banking']}, 'initial', currency='USD', expectedCatalogRevision=current.revision))
+    order = 'order-' + str(uuid.uuid4())
+    repo.bindProviderOrder(initial.attemptId, {'id': order})
+    repo.finalizeCapturedPayment(VerifiedPaymentEvidence(initial.attemptId, initial.invoiceId, user, order,
+        'pay-' + str(uuid.uuid4()), 'initial_purchase', 'USD', 'captured', 'server_observation', initial.amount,
+        datetime.now(timezone.utc), None, None, False))
+    loaded, release, published = Event(), Event(), Event()
+    original_load = catalog_repo.loadCurrent
+    def hold(**kwargs):
+        assert kwargs.get('forShare') is True and kwargs.get('connection') is not None
+        snapshot = original_load(**kwargs)
+        loaded.set()
+        assert release.wait(5)
+        return snapshot
+    monkeypatch.setattr(catalog_repo, 'loadCurrent', hold)
+    monkeypatch.setattr(catalog_module, 'getPricingCatalogRepository', lambda: catalog_repo)
+    prices = {c: dict(v) for c, v in current.prices.items()}
+    prices['USD']['annual'] += 100
+    def publish():
+        result = catalog_repo.publish(admin=ADMIN, expectedRevision=current.revision,
+            reason='Annual issuance race', prices=prices, idempotencyKey=str(uuid.uuid4()))
+        published.set()
+        return result
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        issuance = pool.submit(repo.createAnnualRenewalInvoice, user)
+        assert loaded.wait(5)
+        publication = pool.submit(publish)
+        try:
+            assert not published.wait(.15)
+        finally:
+            release.set()
+        invoice = issuance.result(timeout=5)
+        assert publication.result(timeout=5).catalog.revision > current.revision
+    assert invoice['amount_before_tax'] == current.prices['USD']['annual']
+    assert invoice['pricing_reference_snapshot_json']['catalogRevision'] == current.revision
+    # Replays never read the current catalog, even after another publication.
+    monkeypatch.setattr(catalog_repo, 'loadCurrent', lambda **kwargs: pytest.fail('Issued invoice repriced'))
+    assert repo.createAnnualRenewalInvoice(user)['id'] == invoice['id']
+    prepared = repo.prepareAnnualRenewalInvoice(str(invoice['id']))
+    assert prepared['total_amount'] == invoice['total_amount']
+
+
 @pytest.mark.parametrize('mode,currency', [('monthly_prepaid','INR'),('monthly_prepaid','USD'),('annual_prepaid','INR'),('annual_prepaid','USD')])
 def test_paid_additions_and_topups_freeze_current_revision(invoice_db,mode,currency):
     from api.services.billing.manualBillingContracts import VerifiedPaymentEvidence
