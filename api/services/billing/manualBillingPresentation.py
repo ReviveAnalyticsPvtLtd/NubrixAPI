@@ -21,6 +21,7 @@ def serializeCheckoutIntent(intent, publicKey, identity=None):
         'attemptId':intent.attemptId, 'razorpayOrderId':intent.razorpayOrderId, 'orderId':intent.razorpayOrderId,
         'razorpayKeyId':publicKey, 'razorpayKey':publicKey, 'amount':intent.amount,
         'currency':intent.currency, 'expiresAt':deadline, 'state':state, 'billingMode':intent.billingMode,
+        'catalogRevision':intent.snapshot.get('catalogRevision'),
         'domains':intent.snapshot.get('domains') or [], 'quantity':len(intent.snapshot.get('domains') or []),
         'tokens':intent.snapshot.get('tokens'), 'packId':intent.snapshot.get('packId'),
         'period':{'start':intent.snapshot.get('periodStart'), 'end':intent.snapshot.get('periodEnd'),
@@ -59,11 +60,18 @@ def subscriptionDisplayFacts(subscription):
     """Display real paid periods; unavailable reads expose an unknown state."""
     from api.services.billing.manualBillingRepository import getManualBillingRepository
     facts = {'billingStateAvailable':False,'renewalOptOut':subscription.get('renewal_opt_out'),
-        'cancellationEffectiveEnd':None,'currentPeriod':None,'nextPeriod':None}
+        'cancellationEffectiveEnd':None,'currentPeriod':None,'nextPeriod':None,'paidPeriodPrice':None}
     try:
         coverage = getManualBillingRepository().getCoverageSnapshot(subscription['user_id'])
+        try:
+            paid = getManualBillingRepository().getPaidPeriodPrice(subscription['user_id'])
+            if paid and (not coverage.currentPeriod or paid['periodStart'] != coverage.currentPeriod.start.isoformat()
+                         or paid['periodEnd'] != coverage.currentPeriod.end.isoformat()): paid = None
+        except Exception:
+            paid = None
         return {'billingStateAvailable':True,'renewalOptOut':coverage.renewalOptOut,
             'cancellationEffectiveEnd':coverage.finalPaidEnd.isoformat() if coverage.renewalOptOut and coverage.finalPaidEnd else None,
-            'currentPeriod':serializePeriod(coverage.currentPeriod),'nextPeriod':serializePeriod(coverage.nextPeriod)}
+            'currentPeriod':serializePeriod(coverage.currentPeriod),'nextPeriod':serializePeriod(coverage.nextPeriod),
+            'paidPeriodPrice':paid}
     except Exception:
         return facts

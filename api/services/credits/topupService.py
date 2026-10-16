@@ -22,6 +22,7 @@ from api.services.credits.creditConfig import (
     TOKEN_TO_CREDIT_RATIO,
     getTopupPack,
     getTopupPacks,
+    CREDIT_CONFIG,
 )
 from api.services.billing.billingEngine import computeTopupSnapshot
 from api.services.credits import creditMath
@@ -176,8 +177,10 @@ class TopupService:
 
             packs = []
             currency = (subscription or {}).get('default_currency') or 'INR'
-            for packId in getTopupPacks(currency):
-                snapshot = computeTopupSnapshot(packId, billingMode, currency=currency)
+            from api.services.billing.pricingCatalogRepository import getPricingCatalogRepository
+            catalog = getPricingCatalogRepository().loadCurrent()
+            for packId, reference in getTopupPacks(currency, catalog=catalog).items():
+                snapshot = computeTopupSnapshot(packId, billingMode, currency=currency, priceReference=reference)
                 tokens = snapshot.pricing_reference_snapshot_json["tokens"]
                 packs.append({
                     "packId": packId,
@@ -190,13 +193,14 @@ class TopupService:
                 })
             packs.sort(key=lambda pack: pack["tokens"])
 
-            return {"packs": packs, "eligible": eligible}
+            return {"packs": packs, "eligible": eligible, 'currency':currency, 'catalogRevision':catalog.revision}
         except Exception as e:
-            exception = CustomException(e)
+            from api.services.billing.pricingCatalogContracts import CatalogUnavailable
+            exception = CustomException(e, statusCode=503, uiMessage='Prices are temporarily unavailable.', errorCode='PRICE_UNAVAILABLE') if isinstance(e, CatalogUnavailable) else CustomException(e)
             logger.error(exception)
             raise exception
 
-    def createTopupOrder(self, packId: str, token: str, requestKey: str | None = None) -> dict:
+    def createTopupOrder(self, packId: str, token: str, requestKey: str | None = None, expectedCatalogRevision: int | None = None) -> dict:
         from api.services.subscriptions.subscriptionService import SubscriptionService
         userId, email = self._decodeToken(token)
         service = SubscriptionService.__new__(SubscriptionService)
@@ -207,14 +211,11 @@ class TopupService:
             raise CustomException(ValueError('TOPUP_NOT_ELIGIBLE'), statusCode=403,
                 uiMessage='Credit top-ups require an active paid subscription.', errorCode='TOPUP_NOT_ELIGIBLE')
         currency = subscription.get('default_currency') or 'INR'
-        if getTopupPack(packId) is None:
+        if not CREDIT_CONFIG.get('topup_packs', {}).get(packId, {}).get('active'):
             raise CustomException(ValueError('TOPUP_PACK_UNKNOWN'), statusCode=422,
                 uiMessage='Unknown credit top-up pack.', errorCode='TOPUP_PACK_UNKNOWN')
-        if getTopupPack(packId, currency) is None:
-            raise CustomException(ValueError('TOPUP_PRICE_UNAVAILABLE'), statusCode=422,
-                uiMessage='This credit pack is unavailable in your billing currency.', errorCode='TOPUP_PRICE_UNAVAILABLE')
         result = service._reservedCheckout({'userId': userId, 'email': email}, 'topup',
-            subscription['billing_mode'], {'packId': packId}, requestKey)
+            subscription['billing_mode'], {'packId': packId}, requestKey, expectedCatalogRevision=expectedCatalogRevision)
         result['credits'] = creditMath.tokensToCredits(result['tokens'], TOKEN_TO_CREDIT_RATIO)
         return result
 

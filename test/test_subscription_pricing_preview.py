@@ -15,11 +15,11 @@ from api.services.billing.pricingContext import issuePricingContext
 def test_preview_returns_selection_total_without_financial_writes(checkout_client, monkeypatch, currency, mode, base):
     client, provider, path = checkout_client
     monkeypatch.setattr('api.services.billing.pricingService.getPlanPrice',
-                        lambda cur, cycle: {'amount': base, 'currency': cur, 'plan_id': 'plan_preview'})
+                        lambda cur, cycle, **kwargs: {'amount': base, 'currency': cur, 'plan_id': 'plan_preview'})
     before = counts(path)
     response = client.post('/pricing-preview', json={
         'domains': ['manufacturing', 'banking'], 'billingMode': mode,
-        'pricingContext': issuePricingContext(USER, currency, 'hosting')})
+        'pricingContext': issuePricingContext(USER, currency, 'hosting',catalogRevision=1)})
     assert response.status_code == 200
     result = response.json()
     assert result['subject'] == USER

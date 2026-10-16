@@ -1,3 +1,4 @@
+from test.pricingFixtures import catalog_source
 import os
 import sys
 import types
@@ -65,10 +66,10 @@ class TestTopupPackConfig(unittest.TestCase):
                 "quotas": {}, "operation_minimums": {},
                 "topup_packs": {
                     "legacy": {"tokens": 1, "amount": 1, "active": False},
-                    "live":   {"tokens": 2, "amount": 2, "active": True},
+                    "small":   {"tokens": 2, "amount": 2, "active": True},
                 },
             }
-            self.assertEqual(list(creditConfig.getTopupPacks().keys()), ["live"])
+            self.assertEqual(list(creditConfig.getTopupPacks().keys()), ["small"])
             self.assertIsNone(creditConfig.getTopupPack("legacy"))
         finally:
             creditConfig._cachedCreditConfig = original

@@ -370,6 +370,9 @@ class AnnualRenewalTask:
         dashboardRenewalUrl = metadata.get("dashboardRenewalUrl") or buildDashboardRenewalUrl(
             str(invoiceId)
         )
+        dueDate = artifact.get("due_date")
+        if isinstance(dueDate, datetime.date):
+            dueDate = dueDate.isoformat()
 
         payload = {
             "email": user.get("email", ""),
@@ -380,7 +383,7 @@ class AnnualRenewalTask:
             "currency": artifact.get("currency", "INR"),
             "paymentUrl": dashboardRenewalUrl,
             "dashboardFallbackUrl": dashboardRenewalUrl,
-            "dueDate": artifact.get("due_date", ""),
+            "dueDate": dueDate or "",
             "domainCount": subscriptionRenewalDomainCount(subscription),
         }
 

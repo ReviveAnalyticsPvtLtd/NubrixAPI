@@ -1,3 +1,4 @@
+from test.pricingFixtures import catalog_source
 """Configured currency prices must reach the customer catalogue and invoice calculator."""
 from datetime import datetime, timedelta, timezone
 

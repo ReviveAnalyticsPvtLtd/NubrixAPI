@@ -56,10 +56,10 @@ def previewPricing(request: SubscriptionPricingPreviewRequest, token=Depends(ver
     headers = {"Cache-Control": "private, no-store"}
     try:
         return ORJSONResponse(PricingService().preview(token, request.domains, request.billingMode,
-                                                     request.pricingContext), headers=headers)
+                                                     request.pricingContext, request.expectedCatalogRevision), headers=headers)
     except ValueError as exc:
         return ORJSONResponse({"message": "Please refresh pricing and review your selection again.",
-                              "errorCode": str(exc)}, status_code=422, headers=headers)
+                              "errorCode": str(exc), 'errors':{'code':str(exc)}}, status_code=409 if str(exc) == 'PRICING_CHANGED' else 422, headers=headers)
     except RuntimeError:
         return ORJSONResponse({"message": "Pricing is temporarily unavailable.", "errorCode": "PRICING_UNAVAILABLE"},
                               status_code=503, headers=headers)
@@ -110,6 +110,7 @@ async def createSubscription(request: CreateSubscriptionRequest, token=Depends(v
             contact=request.contact,
             billingMode=request.billingMode,
             pricingContext=request.pricingContext,
+            expectedCatalogRevision=request.expectedCatalogRevision,
             token=token, requestKey=requestKey)
         return ORJSONResponse(status_code=200, content=result)
     except CustomException as e:
@@ -161,7 +162,8 @@ async def addDomains(payload: AddDomainsRequest, token=Depends(verifyToken),
         ORJSONResponse: Order details required for embedded checkout.
     """
     try:
-        result = subscriptionService.addDomains(domains=payload.domains, token=token, requestKey=requestKey)
+        result = subscriptionService.addDomains(domains=payload.domains, token=token, requestKey=requestKey,
+                                                expectedCatalogRevision=payload.expectedCatalogRevision)
         return ORJSONResponse(
             status_code=200,
             content={

@@ -49,12 +49,13 @@ def verifyProxyAssertion(headers, scope, accessToken, now=None):
     return country or None
 
 
-def issuePricingContext(userId, currency, source, now=None):
+def issuePricingContext(userId, currency, source, now=None, *, catalogRevision=None):
     if currency not in {"INR", "USD"} or not userId:
         raise ValueError("PRICING_CONTEXT_INVALID")
     epoch = int((now or datetime.now(timezone.utc)).timestamp())
     return jwt.encode({"iss": "nubrix-pricing", "aud": "initial-purchase", "v": 1,
         "sub": str(userId), "currency": currency, "countrySource": source,
+        **({'catalogRevision':catalogRevision} if catalogRevision is not None else {}),
         "iat": epoch, "exp": epoch + 600}, _secret(), algorithm="HS256")
 
 
@@ -74,6 +75,8 @@ def verifyPricingContext(context, userId, now=None):
             raise ValueError("PRICING_CONTEXT_INVALID")
         if claims["exp"] <= epoch:
             raise ValueError("PRICING_CONTEXT_EXPIRED")
+        if 'catalogRevision' in claims and (type(claims['catalogRevision']) is not int or not 1 <= claims['catalogRevision'] <= 9007199254740991):
+            raise ValueError('PRICING_CONTEXT_INVALID')
         return claims
     except JWTError:
         raise ValueError("PRICING_CONTEXT_INVALID") from None

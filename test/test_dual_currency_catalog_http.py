@@ -1,5 +1,8 @@
 """Catalogue assembly uses account facts without locking an unpaid INR default."""
 from unittest.mock import Mock
+from datetime import datetime, timezone
+from api.services.billing.pricingCatalogContracts import CatalogSnapshot, CatalogUnavailable
+from test.test_pricing_catalog_contracts import BASELINE
 
 import pytest
 
@@ -9,11 +12,14 @@ from api.services.billing.priceCatalog import PriceUnavailable
 
 def service(monkeypatch, paid=False, currency="INR", missing=False):
     monkeypatch.setenv("PRICING_PROXY_SECRET", "catalog-unit-secret")
-    def prices(code, mode):
+    def prices(code, mode, **kwargs):
         if missing:
             raise PriceUnavailable()
         return {"amount": 1739 if mode == "monthly_prepaid" else 18117, "currency": code}
-    instance = PricingService(client=Mock(), priceLoader=prices)
+    repo = Mock()
+    repo.loadCurrent.return_value = CatalogSnapshot(1,BASELINE,datetime.now(timezone.utc),None,'fixture','Catalog HTTP fixture')
+    if missing: repo.loadCurrent.side_effect = CatalogUnavailable()
+    instance = PricingService(priceLoader=prices, catalogRepository=repo)
     instance.accountFacts = lambda token: ("user-a", "India", currency if paid else None)
     return instance
 
@@ -41,10 +47,9 @@ def test_visitors_have_no_account_context(monkeypatch):
     assert result["subject"] is None and result["pricingContext"] is None
 
 
-def test_missing_price_returns_availability_not_invented_amount(monkeypatch):
-    result = service(monkeypatch, missing=True).getCatalog("visitor", "US")
-    assert result["monthly"] == {"available": False, "reason": "PRICE_UNAVAILABLE"}
-    assert result["annual"] == {"available": False, "reason": "PRICE_UNAVAILABLE"}
+def test_missing_catalog_fails_closed_without_inventing_prices(monkeypatch):
+    with pytest.raises(CatalogUnavailable):
+        service(monkeypatch, missing=True).getCatalog("visitor", "US")
 
 
 def test_account_scope_requires_authentication(monkeypatch):

@@ -729,8 +729,11 @@ def test_unknown_admin_path_uses_admin_error_shape(client, path):
 
 
 def test_admin_routes_declare_strict_response_allowlists():
+    from api.pricingModels import AdminPricingPageView, PublishPricingResultView
     accessView = getattr(adminModels, "AdminUserAccessView")
     expectedModels = {
+        ('/admin/pricing', 'GET'): AdminPricingPageView,
+        ('/admin/pricing', 'PUT'): PublishPricingResultView,
         ("/admin/auth/login", "POST"): AdminLoginResponse,
         ("/admin/auth/logout", "POST"): AdminLogoutResponse,
         ("/admin/audit", "GET"): list[AdminAuditEventView],

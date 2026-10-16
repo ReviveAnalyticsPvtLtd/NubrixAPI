@@ -1,4 +1,6 @@
 from fastapi import APIRouter, Depends, Header, Query, Request, Response, status
+from api.pricingModels import PublishPricingBody, AdminPricingPageView, PublishPricingResultView
+from api.services.adminPricingService import AdminPricingService, getAdminPricingService
 
 from api.adminModels import (
     AdminOverviewPeriod,
@@ -71,6 +73,29 @@ from api.services.userErasureService import (
 
 
 router = APIRouter()
+
+
+@router.get('/pricing', response_model=AdminPricingPageView)
+def getPricing(
+    response: Response,
+    beforeRevision: int | None = Query(default=None, ge=1, le=9007199254740991),
+    _admin: AdminContext = Depends(verifyAdmin),
+    service: AdminPricingService = Depends(getAdminPricingService),
+):
+    response.headers['Cache-Control'] = 'private, no-store'
+    return service.read(beforeRevision=beforeRevision)
+
+
+@router.put('/pricing', response_model=PublishPricingResultView)
+def publishPricing(
+    body: PublishPricingBody,
+    response: Response,
+    idempotencyKey: str = Header(alias='Idempotency-Key', min_length=1, max_length=128),
+    admin: AdminContext = Depends(verifyAdmin),
+    service: AdminPricingService = Depends(getAdminPricingService),
+):
+    response.headers['Cache-Control'] = 'private, no-store'
+    return service.publish(admin, body, idempotencyKey)
 
 
 @router.post("/auth/login", response_model=AdminLoginResponse)

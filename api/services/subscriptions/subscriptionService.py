@@ -85,7 +85,6 @@ class SubscriptionService:
                 os.environ.get("RAZORPAY_KEY_SECRET", "")
             )
         )
-        self.BASE_PLAN_ID = os.environ.get("RAZORPAY_PRO_PLAN_ID", "")
         self.VALID_DOMAINS = {"banking", "manufacturing", "supplychain", "telecom"}
 
     def _getCanonicalSubscription(self, userId: str, required: bool = False) -> dict | None:
@@ -733,7 +732,7 @@ class SubscriptionService:
 
     def createSubscription(self, domains: list[str], contact: str, token: str,
                            billingMode: str = "monthly_prepaid", requestKey: str | None = None,
-                           pricingContext: str | None = None) -> dict:
+                           pricingContext: str | None = None, expectedCatalogRevision: int | None = None) -> dict:
         normalized = self._normalizeAndValidateDomains(domains)
         mode = self._normalizeBillingMode(billingMode)
         decoded = jwt.decode(token, os.environ["SECRET_KEY"], algorithms=["HS256"])
@@ -747,7 +746,12 @@ class SubscriptionService:
                 raise CustomException(exc, statusCode=503,
                     uiMessage='Checkout is temporarily unavailable. Please try again later.') from exc
         try:
-            currency = verifyPricingContext(pricingContext, decoded['userId'])['currency']
+            claims = verifyPricingContext(pricingContext, decoded['userId'])
+            currency = claims['currency']
+            if expectedCatalogRevision is not None and expectedCatalogRevision != claims.get('catalogRevision'):
+                raise ValueError('PRICING_CHANGED')
+            expectedCatalogRevision = claims.get('catalogRevision')
+            requiresExistingAttempt = expectedCatalogRevision is None
             # An owned attempt remains priced in its frozen currency after travel.
             currency = replayCurrency() or currency
         except ValueError as exc:
@@ -760,17 +764,17 @@ class SubscriptionService:
             requiresExistingAttempt = True
         return self._reservedCheckout(decoded, 'initial_purchase', mode,
             {'domains': normalized}, requestKey, contact, currency=currency,
-            requiresExistingAttempt=requiresExistingAttempt)
+            requiresExistingAttempt=requiresExistingAttempt, expectedCatalogRevision=expectedCatalogRevision)
 
     def verifySubscription(self, payload: dict, token: str) -> dict:
         return self._verifyDurableCheckout(payload, token, 'initial_purchase')
 
-    def addDomains(self, domains: list[str], token: str, requestKey: str | None = None) -> dict:
+    def addDomains(self, domains: list[str], token: str, requestKey: str | None = None, expectedCatalogRevision: int | None = None) -> dict:
         normalized = self._normalizeAndValidateDomains(domains)
         decoded = jwt.decode(token, os.environ["SECRET_KEY"], algorithms=["HS256"])
         subscription = self._getCanonicalSubscription(decoded['userId'], required=True)
         return self._reservedCheckout(decoded, 'expert_addition', subscription['billing_mode'],
-            {'domains': normalized}, requestKey)
+            {'domains': normalized}, requestKey, expectedCatalogRevision=expectedCatalogRevision)
 
     def verifyDomainUpgrade(self, payload: dict, token: str) -> dict:
         return self._verifyDurableCheckout(payload, token, 'expert_addition')
@@ -1165,7 +1169,7 @@ class SubscriptionService:
             raise exception
 
     def _reservedCheckout(self, decoded, purpose, mode, payload, requestKey=None, contact=None, currency='INR',
-                          requiresExistingAttempt=False):
+                          requiresExistingAttempt=False, expectedCatalogRevision=None):
         from api.services.billing.manualBillingContracts import CheckoutRequest
         from api.services.billing.manualBillingRepository import getManualBillingRepository
         repository = getManualBillingRepository()
@@ -1176,7 +1180,7 @@ class SubscriptionService:
             try:
                 intent = ManualPaymentService.forProduction(self.razorpayClient, repository).createCheckout(
                     CheckoutRequest(userId, purpose, mode, payload, requestKey, currency=currency,
-                                    requiresExistingAttempt=requiresExistingAttempt))
+                                    requiresExistingAttempt=requiresExistingAttempt, expectedCatalogRevision=expectedCatalogRevision))
             except (RuntimeError, TimeoutError, ConnectionError) as exc:
                 raise CustomException(exc, statusCode=503,
                     uiMessage='Checkout creation is being reconciled. Please try again later.') from exc

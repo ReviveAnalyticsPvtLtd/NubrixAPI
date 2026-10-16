@@ -1,6 +1,6 @@
 from datetime import datetime
 from typing import Literal
-from pydantic import BaseModel, Field, model_validator
+from pydantic import BaseModel, Field, StrictInt, model_validator
 from enum import Enum
 
 class SignUp(BaseModel):
@@ -167,6 +167,7 @@ class SubscriptionPricingPreviewRequest(BaseModel):
     domains: list[Literal["banking", "manufacturing", "supplychain", "telecom"]] = Field(min_length=1, max_length=4)
     billingMode: Literal["monthly_prepaid", "annual_prepaid"]
     pricingContext: str = Field(min_length=1, max_length=4096)
+    expectedCatalogRevision: StrictInt | None = Field(default=None, ge=1, le=9007199254740991)
 
     @model_validator(mode="after")
     def uniqueDomains(self):
@@ -180,9 +181,11 @@ class CreateSubscriptionRequest(BaseModel):
     contact: str
     billingMode: str | None = "monthly_prepaid"
     pricingContext: str | None = None
+    expectedCatalogRevision: StrictInt | None = Field(default=None, ge=1, le=9007199254740991)
 
 class AddDomainsRequest(BaseModel):
     domains: list[str]
+    expectedCatalogRevision: StrictInt | None = Field(default=None, ge=1, le=9007199254740991)
 
 class VerifyDomainUpgradeRequest(BaseModel):
     domains: list[str] | None = None
@@ -256,6 +259,7 @@ class RefundRequest(BaseModel):
 
 class CreateTopupOrderRequest(BaseModel):
     packId: str
+    expectedCatalogRevision: StrictInt | None = Field(default=None, ge=1, le=9007199254740991)
 
 class VerifyTopupPaymentRequest(BaseModel):
     razorpayOrderId: str

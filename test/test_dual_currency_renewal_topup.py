@@ -1,39 +1,32 @@
-"""USD credit packs require explicit independent backend prices."""
+"""USD pack amounts come only from the published catalog."""
+from copy import deepcopy
+from datetime import datetime, timezone
+from types import SimpleNamespace
 import pytest
+from api.services.billing.pricingCatalogContracts import CatalogSnapshot
+from test.test_pricing_catalog_contracts import BASELINE
 
-
-def test_missing_usd_pack_does_not_become_inr(monkeypatch):
+@pytest.fixture
+def configured(monkeypatch):
     from api.services.credits import creditConfig
-    monkeypatch.setattr(creditConfig, '_getCreditConfig', lambda: {'topup_packs': {
-        'small': {'tokens': 1000000, 'amount': 49900, 'active': True}}})
-    assert creditConfig.getTopupPack('small', 'INR')['amount'] == 49900
-    assert creditConfig.getTopupPack('small', 'USD') is None
+    prices=deepcopy(BASELINE); prices['USD']['small']=619
+    catalog=CatalogSnapshot(1,prices,datetime.now(timezone.utc),None,'fixture','Pack price fixture')
+    monkeypatch.setattr('api.services.billing.pricingCatalogRepository.getPricingCatalogRepository',lambda:SimpleNamespace(loadCurrent=lambda **kwargs:catalog))
+    monkeypatch.setattr(creditConfig,'_getCreditConfig',lambda:{'topup_packs':{'small':{'tokens':1000000,'amount':999999,'amounts':{'USD':99999},'active':True}}})
+    return creditConfig
 
+def test_legacy_config_amount_does_not_override_catalog(configured):
+    assert configured.getTopupPack('small','INR')['amount'] == 50000
+    assert configured.getTopupPack('small','USD')['amount'] == 619
 
-def test_independent_usd_pack_amount(monkeypatch):
-    from api.services.credits import creditConfig
-    monkeypatch.setattr(creditConfig, '_getCreditConfig', lambda: {'topup_packs': {
-        'small': {'tokens': 1000000, 'amount': 49900, 'amounts': {'USD': 619}, 'active': True}}})
-    pack = creditConfig.getTopupPack('small', 'USD')
-    assert (pack['amount'], pack['currency'], pack['tokens']) == (619, 'USD', 1000000)
-
-
-def test_usd_topup_snapshot_uses_usd_tax_base(monkeypatch):
-    from api.services.credits import creditConfig
+def test_usd_topup_snapshot_uses_usd_tax_base(configured):
     from api.services.billing.billingEngine import computeTopupSnapshot
-    monkeypatch.setattr(creditConfig, '_getCreditConfig', lambda: {'topup_packs': {
-        'small': {'tokens': 1000000, 'amount': 49900, 'amounts': {'USD': 619}, 'active': True}}})
-    snapshot = computeTopupSnapshot('small', 'monthly_prepaid', currency='USD')
-    assert (snapshot.amount_before_tax, snapshot.tax.tax_amount, snapshot.total_amount, snapshot.currency) == (619, 112, 731, 'USD')
+    snapshot=computeTopupSnapshot('small','monthly_prepaid',currency='USD')
+    assert (snapshot.amount_before_tax,snapshot.tax.tax_amount,snapshot.total_amount,snapshot.currency)==(619,112,731,'USD')
 
-
-@pytest.mark.parametrize('amount', [True, 0, -1, '619', 6.19])
-def test_bad_usd_pack_unavailable(monkeypatch, amount):
-    from api.services.credits import creditConfig
-    monkeypatch.setattr(creditConfig, '_getCreditConfig', lambda: {'topup_packs': {
-        'small': {'tokens': 1000000, 'amount': 49900, 'amounts': {'USD': amount}, 'active': True}}})
-    assert creditConfig.getTopupPack('small', 'USD') is None
-
+def test_retired_pack_is_unavailable(configured,monkeypatch):
+    monkeypatch.setattr(configured,'_getCreditConfig',lambda:{'topup_packs':{'small':{'tokens':1000000,'active':False}}})
+    assert configured.getTopupPack('small','USD') is None
 
 @pytest.mark.parametrize('marker,service_status,http_status', [
     ('TOPUP_PRICE_UNAVAILABLE', 422, 422),

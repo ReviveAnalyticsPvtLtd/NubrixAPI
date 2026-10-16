@@ -127,7 +127,8 @@ def test_replacement_price_outage_preserves_original(checkout_database):
     repo, path = checkout_database
     first = repo.reserveCheckout(request('first'))
     repo.bindProviderOrder(first.attemptId, {'id': 'original-order'})
-    with patch('api.services.billing.billingEngine._getMonthlyBasePrice', side_effect=RuntimeError('price unavailable')):
+    with patch('api.services.billing.pricingCatalogRepository.getPricingCatalogRepository') as catalog_factory:
+        catalog_factory.return_value.loadCurrent.side_effect = RuntimeError('price unavailable')
         with pytest.raises(RuntimeError, match='price unavailable'):
             repo.reserveCheckout(request('replacement', ('telecom',)))
     assert invoice(path, first.invoiceId)['status'] == 'PAYMENT_PENDING'

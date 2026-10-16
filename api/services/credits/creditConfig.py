@@ -137,7 +137,7 @@ def getOperationMinimum(operationType: str) -> int:
     return minimums.get(operationType, _DEFAULT_OPERATION_MINIMUM)
 
 
-def getTopupPacks(currency: str = "INR") -> dict:
+def getTopupPacks(currency: str = "INR", *, catalog=None) -> dict:
     """
     Return the purchasable top-up packs, keyed by pack id.
 
@@ -150,15 +150,19 @@ def getTopupPacks(currency: str = "INR") -> dict:
     packs = _getCreditConfig().get("topup_packs", {})
     if currency not in ('INR', 'USD'):
         return {}
+    if not any(pack.get('active', False) for pack in packs.values()):
+        return {}
+    from api.services.billing.pricingCatalogRepository import getPricingCatalogRepository
+    catalog = catalog or getPricingCatalogRepository().loadCurrent()
     selected = {}
     for packId, pack in packs.items():
-        amount = pack.get('amounts', {}).get(currency, pack.get('amount') if currency == 'INR' else None)
-        if pack.get('active', False) and type(amount) is int and 0 < amount <= 9007199254740991:
-            selected[packId] = {**pack, 'amount': amount, 'currency': currency}
+        if pack.get('active', False) and packId in catalog.prices[currency]:
+            selected[packId] = {**pack, 'amount': catalog.prices[currency][packId],
+                'currency': currency, 'catalogRevision':catalog.revision, 'source':'pricing_catalog'}
     return selected
 
 
-def getTopupPack(packId: str, currency: str = "INR") -> dict | None:
+def getTopupPack(packId: str, currency: str = "INR", *, catalog=None) -> dict | None:
     """
     Return a single active top-up pack.
 
@@ -168,4 +172,6 @@ def getTopupPack(packId: str, currency: str = "INR") -> dict | None:
     Returns:
         dict | None: The pack, or None if it is unknown or retired.
     """
-    return getTopupPacks(currency).get(packId)
+    if not _getCreditConfig().get('topup_packs', {}).get(packId, {}).get('active', False):
+        return None
+    return getTopupPacks(currency, catalog=catalog).get(packId)

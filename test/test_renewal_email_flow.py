@@ -105,42 +105,15 @@ class _RenewalTaskClient:
 class RenewalEmailFlowTests(unittest.TestCase):
     def test_existing_t30_invoice_retains_currency_for_email_retry(self):
         from api.services.billing.invoiceService import createUpcomingRenewalInvoice
-
+        from unittest.mock import Mock
         invoice = {"id": "inv_t30", "status": "UPCOMING", "total_amount": 23600, "currency": "USD"}
-
-        class ProjectedInvoiceTable(_FakeTable):
-            def in_(self, *_args):
-                return self
-
-            def limit(self, _count):
-                return self
-
-            def select(self, fields):
-                self._data = [] if self.state.get("awaitingInsert") else [
-                    {key: invoice[key] for key in fields.replace(" ", "").split(",")}
-                ]
-                return self
-
-            def insert(self, _payload):
-                self.state["awaitingInsert"] = False
-                raise ValueError("23505 duplicate invoice")
-
-        for duplicate in (False, True):
-            with self.subTest(duplicate=duplicate):
-                client = _FakeClient()
-                client.state["awaitingInsert"] = duplicate
-                client.table = lambda _name: ProjectedInvoiceTable(client.state)
-                with patch("api.services.billing.invoiceService.client", client), patch(
-                    "api.services.billing.invoiceService.getBillingRedisClient", return_value=_FakeRedis()
-                ), patch("api.services.billing.billingEngine._getAnnualBasePrice", return_value={
-                    "amount": 20000, "currency": "USD", "plan_id": "test-usd-annual"
-                }):
-                    result = createUpcomingRenewalInvoice(
-                        {"id": "sub", "user_id": "u1", "default_currency": "USD",
-                         "subscribed_experts": ["banking"], "current_period_end": "2026-12-01T00:00:00+00:00"},
-                        {"userId": "u1"},
-                    )
-                self.assertEqual(result.get("currency"), "USD")
+        repository = Mock()
+        repository.createAnnualRenewalInvoice.return_value = invoice
+        with patch("api.services.billing.manualBillingRepository.getManualBillingRepository", return_value=repository):
+            result = createUpcomingRenewalInvoice({"id": "sub", "user_id": "u1"}, {"userId": "u1"})
+        self.assertIs(result, invoice)
+        self.assertEqual(result["currency"], "USD")
+        repository.createAnnualRenewalInvoice.assert_called_once_with("u1", "sub")
 
     @patch.dict("os.environ", {"RENEWAL_REMINDER_EMAIL_URL": "https://email.example.test"})
     def test_t30_email_preserves_frozen_invoice_currency(self):

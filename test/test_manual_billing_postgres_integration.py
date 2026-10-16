@@ -70,7 +70,7 @@ def postgres():
     connection = psycopg2.connect(url)
     try:
         with connection.cursor() as cursor:
-            cursor.execute("drop schema public cascade; create schema public")
+            cursor.execute("drop schema public cascade; create schema public; drop schema if exists private cascade")
             cursor.execute(BASELINE)
             cursor.execute("""DO $$ BEGIN CREATE ROLE anon; EXCEPTION WHEN duplicate_object THEN NULL; END $$;
                 DO $$ BEGIN CREATE ROLE authenticated; EXCEPTION WHEN duplicate_object THEN NULL; END $$;
@@ -85,6 +85,9 @@ def postgres():
             from scripts.manual_billing_migration_plan import buildMigrationPlan
             for migration in buildMigrationPlan(set(),'expand'):
                 cursor.execute(migration.read_text())
+            cursor.execute("DO $$ BEGIN IF NOT EXISTS (SELECT 1 FROM pg_publication WHERE pubname='supabase_realtime') THEN CREATE PUBLICATION supabase_realtime; END IF; END $$")
+            catalogMigration = next((ROOT/'supabase/migrations').glob('*_create_pricing_catalog.sql'))
+            cursor.execute(catalogMigration.read_text(encoding='utf-8'))
         connection.commit()
     finally: connection.close()
     return url
@@ -99,11 +102,10 @@ def test_two_sessions_initial_reservation_creates_one_invoice_and_attempt(postgr
             cursor.execute('insert into public."Users"("userId") values(%s)', (user,))
     repository = ManualBillingRepository(lambda: psycopg2.connect(postgres))
     repository.ensureCanonicalSubscription(user)
-    request = CheckoutRequest(user, 'initial_purchase', 'monthly_prepaid', {'domains': ['banking']}, request_key)
-    reference = {'amount': 10000, 'currency': 'INR', 'source': 'razorpay_plan_fetch'}
-    with patch('api.services.billing.billingEngine._getMonthlyBasePrice', return_value=reference):
-        with ThreadPoolExecutor(max_workers=2) as pool:
-            results = list(pool.map(repository.reserveCheckout, [request, request]))
+    request = CheckoutRequest(user, 'initial_purchase', 'monthly_prepaid', {'domains': ['banking']}, request_key,
+        expectedCatalogRevision=1)
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        results = list(pool.map(repository.reserveCheckout, [request, request]))
     assert results[0].attemptId == results[1].attemptId
     assert results[0].expiresAt == results[1].expiresAt
     with psycopg2.connect(postgres) as connection:
@@ -761,12 +763,11 @@ def test_distinct_expert_captures_respect_the_catalogue_limit(payment):
     from api.services.billing.manualBillingContracts import CheckoutRequest
     repository,evidence,url=payment
     repository.finalizeCapturedPayment(evidence)
-    reference={'amount':10000,'currency':'INR','source':'razorpay_plan_fetch'}
     def reserve(domain):
-        return repository.reserveCheckout(CheckoutRequest(evidence.userId,'expert_addition','monthly_prepaid',{'domains':[domain]},'add-'+domain))
-    with patch('api.services.billing.billingEngine._getMonthlyBasePrice',return_value=reference):
-        with ThreadPoolExecutor(max_workers=2) as pool:
-            attempts=list(pool.map(reserve,['telecom','manufacturing','supplychain']))
+        return repository.reserveCheckout(CheckoutRequest(evidence.userId,'expert_addition','monthly_prepaid',
+            {'domains':[domain]},'add-'+domain,expectedCatalogRevision=1))
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        attempts=list(pool.map(reserve,['telecom','manufacturing','supplychain']))
     captures=[]
     for attempt in attempts:
         order='expert-order-'+str(uuid.uuid4())
@@ -779,8 +780,8 @@ def test_distinct_expert_captures_respect_the_catalogue_limit(payment):
     assert all(result.finalized for result in results)
     assert set(repository.getCoverageSnapshot(evidence.userId).currentPeriod.domains)=={'banking','telecom','manufacturing','supplychain'}
     with pytest.raises(ValueError,match='EXPERT_SELECTION_CONFLICT'):
-        with patch('api.services.billing.billingEngine._getMonthlyBasePrice',return_value=reference):
-            repository.reserveCheckout(CheckoutRequest(evidence.userId,'expert_addition','monthly_prepaid',{'domains':['telecom']},'duplicate-new-key'))
+        repository.reserveCheckout(CheckoutRequest(evidence.userId,'expert_addition','monthly_prepaid',
+            {'domains':['telecom']},'duplicate-new-key',expectedCatalogRevision=1))
 
 
 def test_erasure_races_capture_and_dispatch_without_new_access_or_repeat_send(payment):
