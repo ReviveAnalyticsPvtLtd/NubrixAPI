@@ -1891,8 +1891,9 @@ class ManualBillingRepository:
     def _activateDueCoverageLocked(self, cursor, subscription, now, invoices=None):
         if self._usesPurchaseAuthority():
             coverage = self._coverageSnapshotLocked(cursor, subscription, now, materialize=False)
-            # Exact access is a projection; allocation activation is a separate
-            # operation. A delayed legacy worker must not rewrite paid facts.
+            if coverage.accessAllowed and coverage.currentPeriod:
+                from api.services.credits.manualCreditRepository import ManualCreditRepository
+                ManualCreditRepository(self).ensureCurrentAllocation(cursor, coverage.currentPeriod, now)
             return self._result(cursor, {}, subscription, 'unchanged' if coverage.currentPeriod else 'expired', None, now=now)
         invoices = self._paidInvoicesLocked(cursor, subscription) if invoices is None else invoices
         result = self._result(cursor,{}, subscription, 'unchanged', None)
@@ -2021,6 +2022,8 @@ class ManualBillingRepository:
 
     def _applyAnnualPayment(self, cursor, invoice, subscription, now, attemptId):
         """Annual service duration and monthly credit allocation have separate clocks."""
+        if self._usesPurchaseAuthority():
+            return self._applyPurchasedCoverage(cursor, invoice, subscription, now, attemptId)
         from api.services.credits.creditConfig import getTokenQuotaForPlan
         from dateutil.relativedelta import relativedelta
         cursor.execute('update public.subscriptions set default_currency=%s where id=%s',
@@ -2071,6 +2074,12 @@ class ManualBillingRepository:
             and balance.get('plan_tier')==('annual' if snapshot.billingMode=='annual_prepaid' else 'pro')
             and snapshot.accessAllowed and _utc(balance.get('period_start')) is not None
             and _utc(balance['period_start'])<=evaluated<_utc(balance['period_end']))
+        if self._usesPurchaseAuthority():
+            from api.services.credits.paidAllowancePolicy import paidCreditWindow, matchesPaidAllocation
+            window = paidCreditWindow(snapshot.currentPeriod, evaluated) if snapshot.accessAllowed and snapshot.currentPeriod else None
+            ready = bool(matchesPaidAllocation(balance, window) and balance.get('plan_tier') == 'pro'
+                and int(balance.get('monthly_token_quota') or 0) > 0
+                and int(balance.get('domain_count') or 0) == len(window.domains))
         if invoice.get('billing_reason')=='add_on' and balance is not None:
             ready=True  # Stored purchased credits do not imply subscription access.
         return FinalizationResult(str(invoice.get('id') or ''),attemptId,state,
@@ -2079,7 +2088,37 @@ class ManualBillingRepository:
             refilled,snapshot.renewalOptOut,snapshot.currentPeriod if snapshot.accessAllowed else None,
             snapshot.nextPeriod,anomalyId,str(invoice.get('status') or '').upper() or None)
 
+    def _applyPurchasedCoverage(self, cursor, invoice, subscription, now, attemptId):
+        """Payment schedules purchased time; only its current window can allocate."""
+        period = self._coverage(invoice)
+        if period.start > now:
+            return self._result(cursor, invoice, subscription, 'paid_scheduled', attemptId, now=now)
+        if period.end <= now:
+            return self._result(cursor, invoice, subscription, 'elapsed', attemptId, now=now)
+        from api.services.credits.manualCreditRepository import ManualCreditRepository
+        coverage = self._coverageSnapshotLocked(cursor, subscription, now, materialize=False)
+        cursor.execute('select credit_period_id from public.credit_balances where user_id=%s for update', (period.userId,))
+        before = cursor.fetchone()
+        allocated = None
+        if coverage.accessAllowed and coverage.currentPeriod:
+            allocated = ManualCreditRepository(self).ensureCurrentAllocation(cursor, coverage.currentPeriod, now)
+        metadata = self._json(invoice['metadata_json'])
+        metadata['manualBilling']['coverageState'] = 'active'
+        cursor.execute('update public."Invoices" set metadata_json=%s where id=%s', (Json(metadata), invoice['id']))
+        # V1 projection only; future payments leave current dates/experts intact.
+        plan = 'annual' if period.billingMode == 'annual_prepaid' else 'pro'
+        cursor.execute('''update public.subscriptions set status='active',plan_type=%s,billing_mode=%s,
+            current_period_start=%s,current_period_end=%s,renewal_due_at=%s,subscribed_experts=%s,domain_count=%s,
+            pending_removals=%s,auto_renew_enabled=false,default_currency=%s,version=version+1,updated_at=%s where id=%s''',
+            (plan, period.billingMode, period.start, period.end, period.end, Json(list(period.domains)),
+             len(period.domains), Json([]), invoice['currency'], now, subscription['id']))
+        invoice['metadata_json'] = metadata
+        refilled = bool(allocated and (not before or str(before['credit_period_id']) != allocated))
+        return self._result(cursor, invoice, subscription, 'activated', attemptId, refilled=refilled, now=now)
+
     def _applyCoverage(self,cursor,invoice,subscription,now,attemptId):
+        if self._usesPurchaseAuthority():
+            return self._applyPurchasedCoverage(cursor, invoice, subscription, now, attemptId)
         cursor.execute('update public.subscriptions set default_currency=%s where id=%s',
                        (invoice['currency'], subscription['id']))
         subscription['default_currency'] = invoice['currency']
@@ -2148,6 +2187,8 @@ class ManualBillingRepository:
         if self._usesPurchaseAuthority():
             coverage = self._coverageSnapshotLocked(cursor, subscription, evidence.observedAt, materialize=False)
             current = list(coverage.currentPeriod.domains)
+            from api.services.credits.manualCreditRepository import ManualCreditRepository
+            ManualCreditRepository(self).ensureCurrentAllocation(cursor, coverage.currentPeriod, evidence.observedAt)
         added=self._json(attempt.get('metadata_json'))['manualBilling']['domains']
         combined=list(dict.fromkeys(current+added))
         if len(combined)>4 or len(combined)!=len(current)+len(added):
@@ -2164,8 +2205,14 @@ class ManualBillingRepository:
         pending=json.loads(pending) if isinstance(pending,str) else list(pending)
         for item in pending:
             if item.get('orderId') == evidence.providerOrderId: item['state']='activated'
-        quota=getTokenQuotaForPlan('annual' if subscription.get('billing_mode') == 'annual_prepaid' else 'pro',len(combined))
-        remaining=max(0,int(credit['remaining_tokens'])+quota-int(credit['monthly_token_quota']))
+        if self._usesPurchaseAuthority():
+            from api.services.credits.creditConfig import getAllowanceQuota
+            quota = getAllowanceQuota('paid', len(combined))
+            delta = quota - getAllowanceQuota('paid', len(current))
+        else:
+            quota=getTokenQuotaForPlan('annual' if subscription.get('billing_mode') == 'annual_prepaid' else 'pro',len(combined))
+            delta = quota-int(credit['monthly_token_quota'])
+        remaining=max(0,int(credit['remaining_tokens'])+delta)
         cursor.execute('''update public.credit_balances set monthly_token_quota=%s,remaining_tokens=%s,
             domain_count=%s,balance_version=balance_version+1,updated_at=%s where user_id=%s''',
             (quota,remaining,len(combined),evidence.observedAt,evidence.userId))

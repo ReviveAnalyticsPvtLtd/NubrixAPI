@@ -11,6 +11,137 @@ pytestmark = pytest.mark.skipif(os.environ.get('RUN_MANUAL_BILLING_INTEGRATION')
     reason='Guarded disposable PostgreSQL opt-in; skip is UNVERIFIED')
 
 
+@pytest.mark.parametrize('account', ['monthly_prepaid', 'annual_prepaid'], indirect=True)
+def test_future_purchase_preserves_current_allocation_until_exact_boundary(account):
+    repo, _, initial, url = account
+    # Adopt a reviewed existing allocation without resetting already spent tokens.
+    repo.activateDueCoverage(initial.userId, NOW)
+    query(url, 'UPDATE credit_balances SET used_tokens=700,remaining_tokens=monthly_token_quota-700,topup_tokens=500 WHERE user_id=%s', (initial.userId,))
+    before = query(url, 'SELECT * FROM credit_balances WHERE user_id=%s', (initial.userId,), one=True)
+    mode = repo.getCoverageSnapshot(initial.userId, NOW).billingMode
+    invoice = repo.createAnnualRenewalInvoice(initial.userId) if mode == 'annual_prepaid' else renewal(account)
+    attempt = repo.reserveCheckout(CheckoutRequest(initial.userId, 'renewal', mode,
+        {'invoiceId': str(invoice['id'])}, expectedCatalogRevision=1))
+    result, evidence = capture(repo, attempt)
+    assert result.state == 'paid_scheduled' and not result.creditsRefilled
+    assert query(url, 'SELECT * FROM credit_balances WHERE user_id=%s', (initial.userId,), one=True) == before
+    boundary = repo.getCoverageSnapshot(initial.userId, NOW).nextPeriod.start
+    activated = repo.activateDueCoverage(initial.userId, boundary)
+    after = query(url, 'SELECT * FROM credit_balances WHERE user_id=%s', (initial.userId,), one=True)
+    assert activated.creditState == 'ready'
+    assert after['credit_period_id'] != before['credit_period_id']
+    assert (after['used_tokens'], after['remaining_tokens'], after['topup_tokens'], after['plan_tier']) == (0, 20_000_000, 500, 'pro')
+    repo.activateDueCoverage(initial.userId, boundary)
+    repo.finalizeCapturedPayment(evidence)
+    assert query(url, 'SELECT * FROM credit_balances WHERE user_id=%s', (initial.userId,), one=True) == after
+
+
+@pytest.mark.parametrize('account', ['annual_prepaid'], indirect=True)
+def test_annual_runtime_uses_original_anchor_not_chained_february_end(account):
+    from datetime import datetime, timezone
+    repo, _, initial, url = account
+    start = datetime(2027, 1, 31, 10, tzinfo=timezone.utc)
+    query(url, 'UPDATE "Invoices" SET period_start=%s,period_end=%s WHERE id=%s',
+          (start, start.replace(year=2028), initial.invoiceId))
+    for day, expectedEnd in [(datetime(2027, 2, 28, 10, tzinfo=timezone.utc), datetime(2027, 3, 31, 10, tzinfo=timezone.utc)),
+                             (datetime(2027, 3, 31, 10, tzinfo=timezone.utc), datetime(2027, 4, 30, 10, tzinfo=timezone.utc))]:
+        repo.activateDueCoverage(initial.userId, day)
+        balance = query(url, 'SELECT * FROM credit_balances WHERE user_id=%s', (initial.userId,), one=True)
+        assert (balance['period_start'], balance['period_end']) == (day, expectedEnd)
+    before = balance
+    assert repo.activateDueCoverage(initial.userId, start.replace(year=2028)).creditState != 'ready'
+    assert query(url, 'SELECT * FROM credit_balances WHERE user_id=%s', (initial.userId,), one=True) == before
+
+
+@pytest.mark.parametrize('account', ['monthly_prepaid', 'annual_prepaid'], indirect=True)
+def test_credit_admission_uses_owned_interval_and_exact_expiry(account):
+    from api.services.credits.manualCreditRepository import ManualCreditRepository
+    repo, _, initial, url = account
+    credits = ManualCreditRepository(repo)
+    mode = repo.getCoverageSnapshot(initial.userId, NOW).billingMode
+    query(url, "UPDATE subscriptions SET billing_mode='none',domain_count=0,plan_type='none',status='expired' WHERE user_id=%s", (initial.userId,))
+    admitted = credits.admit(initial.userId, 'reporting_query', 'owned-mode')
+    assert admitted.billingMode == mode
+    assert credits.balanceSnapshot(initial.userId)['plan_tier'] == 'pro'
+    expirePurchasedCoverage(account)
+    before = query(url, 'SELECT * FROM credit_balances WHERE user_id=%s', (initial.userId,), one=True)
+    with pytest.raises(ValueError, match='CREDIT_ADMISSION_REQUIRES_PAID_COVERAGE'):
+        credits.admit(initial.userId, 'reporting_query', 'expired')
+    assert credits.balanceSnapshot(initial.userId)['remaining_tokens'] == 0
+    assert query(url, 'SELECT * FROM credit_balances WHERE user_id=%s', (initial.userId,), one=True) == before
+
+
+@pytest.mark.parametrize('account', ['annual_prepaid'], indirect=True)
+def test_annual_expert_delta_and_next_credit_month_preserve_frozen_future(account):
+    from dateutil.relativedelta import relativedelta
+    repo, _, initial, url = account
+    repo.activateDueCoverage(initial.userId, NOW)
+    query(url, 'UPDATE credit_balances SET used_tokens=700,remaining_tokens=monthly_token_quota-700,topup_tokens=500 WHERE user_id=%s', (initial.userId,))
+    nextInvoice = repo.createAnnualRenewalInvoice(initial.userId)
+    nextAttempt = repo.reserveCheckout(CheckoutRequest(initial.userId, 'renewal', 'annual_prepaid', {'invoiceId': str(nextInvoice['id'])}, expectedCatalogRevision=1))
+    capture(repo, nextAttempt)
+    addition = repo.reserveCheckout(CheckoutRequest(initial.userId, 'expert_addition', 'annual_prepaid', {'domains': ['telecom']}, expectedCatalogRevision=1))
+    _, evidence = capture(repo, addition)
+    balance = query(url, 'SELECT * FROM credit_balances WHERE user_id=%s', (initial.userId,), one=True)
+    assert (balance['used_tokens'], balance['remaining_tokens'], balance['topup_tokens']) == (700, 30_000_000 - 700, 500)
+    repo.finalizeCapturedPayment(evidence)
+    assert query(url, 'SELECT * FROM credit_balances WHERE user_id=%s', (initial.userId,), one=True) == balance
+    coverage = repo.getCoverageSnapshot(initial.userId, NOW)
+    repo.activateDueCoverage(initial.userId, coverage.currentPeriod.start + relativedelta(months=1))
+    balance = query(url, 'SELECT * FROM credit_balances WHERE user_id=%s', (initial.userId,), one=True)
+    assert (balance['domain_count'], balance['remaining_tokens'], balance['topup_tokens']) == (3, 30_000_000, 500)
+    repo.activateDueCoverage(initial.userId, coverage.nextPeriod.start)
+    balance = query(url, 'SELECT * FROM credit_balances WHERE user_id=%s', (initial.userId,), one=True)
+    assert (balance['domain_count'], balance['remaining_tokens'], balance['topup_tokens']) == (2, 20_000_000, 500)
+
+
+@pytest.mark.parametrize('account', ['monthly_prepaid', 'annual_prepaid'], indirect=True)
+def test_admin_generation_survives_late_settlement_and_worker_replay(account):
+    import psycopg2
+    from psycopg2.extras import RealDictCursor
+    from api.services.credits.manualCreditRepository import ManualCreditRepository
+    repo, _, initial, url = account
+    credits = ManualCreditRepository(repo)
+    context = credits.admit(initial.userId, 'reporting_query', 'before-admin')
+    with psycopg2.connect(url) as db, db.cursor(cursor_factory=RealDictCursor) as cursor:
+        repo._lockUser(cursor, initial.userId)
+        result = credits.resetQuotaLocked(cursor, repo._canonical(cursor, initial.userId), NOW)
+    assert result['after']['creditPeriodId'] != context.creditPeriodId
+    assert credits.settle(context, 700, 'late')['historicalPeriod']
+    after = query(url, 'SELECT * FROM credit_balances WHERE user_id=%s', (initial.userId,), one=True)
+    repo.activateDueCoverage(initial.userId, NOW)
+    credits.balanceSnapshot(initial.userId)
+    assert query(url, 'SELECT * FROM credit_balances WHERE user_id=%s', (initial.userId,), one=True) == after
+    assert (after['used_tokens'], after['remaining_tokens']) == (0, 20_000_000)
+
+
+@pytest.mark.parametrize('account', ['annual_prepaid'], indirect=True)
+def test_misaligned_existing_annual_window_requires_review_instead_of_new_grant(account):
+    from datetime import timedelta
+    repo, _, initial, url = account
+    # A legacy chained end may straddle the proper anchored window. Treat it
+    # as unresolved rather than secretly refill during an authority cutover.
+    query(url, 'UPDATE credit_balances SET period_end=period_end-interval \'1 day\',used_tokens=700,remaining_tokens=monthly_token_quota-700 WHERE user_id=%s', (initial.userId,))
+    before = query(url, 'SELECT * FROM credit_balances WHERE user_id=%s', (initial.userId,), one=True)
+    with pytest.raises(ValueError, match='CREDIT_WINDOW_REQUIRES_RECONCILIATION'):
+        repo.activateDueCoverage(initial.userId, NOW + timedelta(seconds=1))
+    assert query(url, 'SELECT * FROM credit_balances WHERE user_id=%s', (initial.userId,), one=True) == before
+
+
+@pytest.mark.parametrize('field,value', [('monthly_token_quota', 0), ('domain_count', 1)])
+def test_finalization_cannot_report_corrupt_allocation_as_ready(account, field, value):
+    repo, _, initial, url = account
+    repo.activateDueCoverage(initial.userId, NOW)
+    # Pick only the two literal test columns; no user input enters this SQL.
+    query(url, f'UPDATE credit_balances SET {field}=%s WHERE user_id=%s', (value, initial.userId))
+    def transaction(connection):
+        from psycopg2.extras import RealDictCursor
+        with connection.cursor(cursor_factory=RealDictCursor) as cursor:
+            repo._lockUser(cursor, initial.userId)
+            return repo._result(cursor, {}, repo._canonical(cursor, initial.userId), 'unchanged', None, now=NOW)
+    assert repo._run(transaction).creditState == 'pending_materialization'
+
+
 def test_captured_addition_uses_owned_attempt_and_original_period_preserving_usage(account):
     from api.services.credits.creditConfig import getTokenQuotaForPlan
     repo, model, intent, url = account

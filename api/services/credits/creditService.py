@@ -578,6 +578,9 @@ class CreditService:
     def initializeCreditBalance(self,userId,planTier,subscriptionId=None,domainCount=1):
         from api.services.credits.manualCreditRepository import ManualCreditRepository
         balance=ManualCreditRepository().balanceSnapshot(userId)
+        from api.services.subscriptions.subscriptionCompatibility import getSubscriptionModelPhase
+        if getSubscriptionModelPhase() in ('dual','v2','contracted') and planTier == 'annual':
+            planTier = 'pro'
         if balance.get('plan_tier')!=planTier or (subscriptionId and str(balance.get('subscription_id'))!=str(subscriptionId)):
             raise ValueError('CREDIT_INITIALIZER_MODE_OR_OWNER_MISMATCH')
         # Reading a committed allocation never resets usage or purchased credits.

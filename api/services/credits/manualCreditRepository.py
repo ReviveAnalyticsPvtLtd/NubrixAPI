@@ -23,6 +23,80 @@ class ManualCreditRepository:
         records = [self.repository._json(row['metadata_json']) for row in cursor.fetchall()]
         return sum(int(row.get('monthlyCharged', 0)) for row in records if row.get('creditPeriodId') == periodId)
 
+    def ensureCurrentAllocation(self, cursor, period, now) -> str | None:
+        """Materialize an owned current purchase under the caller's owner lock.
+
+        The natural window marker prevents a worker/lazy read from regranting
+        a window. The allocation event separately identifies an admin-reset
+        generation, so late settlements cannot consume that fresh generation.
+        Top-ups are intentionally absent from the upsert's update columns.
+        """
+        from api.services.credits.creditConfig import getAllowanceQuota
+        from api.services.credits.paidAllowancePolicy import paidCreditWindow, matchesPaidAllocation
+        window = paidCreditWindow(period, now)
+        if window is None:
+            return None
+        userId = period.userId
+        key = f'credit-window:{userId}:{period.invoiceId}:{window.start.isoformat()}'
+        cursor.execute('select metadata_json from public.billing_events where idempotency_key=%s for update', (key,))
+        recorded = cursor.fetchone()
+        cursor.execute('select * from public.credit_balances where user_id=%s for update', (userId,))
+        balance = cursor.fetchone()
+        matches = matchesPaidAllocation(balance, window)
+        overlaps = bool(balance and str(balance.get('subscription_id')) == period.subscriptionId
+            and str(balance.get('lifecycle_id')) == period.lifecycleId
+            and _utc(balance.get('period_start')) and _utc(balance.get('period_end'))
+            and _utc(balance['period_start']) < window.end and window.start < _utc(balance['period_end']))
+        if not matches and (recorded or overlaps):
+            raise ValueError('CREDIT_WINDOW_REQUIRES_RECONCILIATION')
+        if matches:
+            if (balance['plan_tier'] not in ('pro', 'annual') or int(balance['monthly_token_quota']) <= 0
+                    or int(balance['domain_count']) != len(period.domains)):
+                raise ValueError('CREDIT_ALLOCATION_MODE_OR_OWNER_MISMATCH')
+            # Reviewed legacy annual rows keep usage and generation on adoption.
+            if balance['plan_tier'] == 'annual':
+                cursor.execute("update public.credit_balances set plan_tier='pro',balance_version=balance_version+1,updated_at=%s where user_id=%s", (now, userId))
+            periodId = str(balance['credit_period_id'])
+            if recorded:
+                return periodId
+            watermark = int(balance['remaining_tokens']) + self._monthlySettled(cursor, userId, periodId)
+        else:
+            quota = getAllowanceQuota('paid', len(period.domains))
+            periodId, watermark = window.creditPeriodId, quota
+            cursor.execute('''insert into public.credit_balances(user_id,subscription_id,plan_tier,domain_count,
+                monthly_token_quota,used_tokens,remaining_tokens,period_start,period_end,lifecycle_id,
+                credit_period_id,balance_version,last_reset_at,updated_at)
+                values(%s,%s,'pro',%s,%s,0,%s,%s,%s,%s,%s,1,%s,%s)
+                on conflict(user_id) do update set subscription_id=excluded.subscription_id,plan_tier='pro',
+                domain_count=excluded.domain_count,monthly_token_quota=excluded.monthly_token_quota,used_tokens=0,
+                remaining_tokens=excluded.remaining_tokens,period_start=excluded.period_start,period_end=excluded.period_end,
+                lifecycle_id=excluded.lifecycle_id,credit_period_id=excluded.credit_period_id,
+                balance_version=credit_balances.balance_version+1,last_reset_at=excluded.last_reset_at,updated_at=excluded.updated_at''',
+                (userId, period.subscriptionId, len(period.domains), quota, quota, window.start, window.end,
+                 period.lifecycleId, periodId, now, now))
+        metadata = {'userId':userId, 'subscriptionId':period.subscriptionId, 'lifecycleId':period.lifecycleId,
+            'billingMode':period.billingMode, 'servicePeriodId':period.invoiceId, 'creditPeriodId':periodId,
+            'periodStart':window.start.isoformat(), 'periodEnd':window.end.isoformat(), 'quotaWatermark':watermark}
+        for eventKey, eventType in ((key, 'credit.window_materialized'),
+                ('credit-allocation:'+userId+':'+periodId, 'credit.allocation_started')):
+            cursor.execute('''insert into public.billing_events(id,user_id,subscription_id,event_category,event_type,
+                event_status,idempotency_key,metadata_json,occurred_at) values(%s,%s,%s,'audit',%s,'ACTIVE',%s,%s,%s)
+                on conflict(idempotency_key) where idempotency_key is not null do nothing''',
+                (str(uuid.uuid4()), userId, period.subscriptionId, eventType, eventKey, Json(metadata), now))
+        return periodId
+
+    def _paidContextLocked(self, cursor, subscription, now):
+        if not self.repository._usesPurchaseAuthority():
+            return None
+        coverage = self.repository._coverageSnapshotLocked(cursor, subscription, now, materialize=False)
+        return coverage if coverage.accessAllowed and coverage.currentPeriod else None
+
+    def _modeLocked(self, cursor, subscription, now):
+        if self.repository._usesPurchaseAuthority():
+            coverage = self._paidContextLocked(cursor, subscription, now)
+            return coverage.billingMode if coverage else 'none'
+        return subscription.get('billing_mode') or 'none'
+
     def resizeQuota(self,userId,domainCount,grantImmediately=False,resetUsage=False):
         """Preserve staff quota policy under the same lock as usage/top-ups."""
         from api.services.credits.creditConfig import getTokenQuotaForPlan
@@ -37,7 +111,9 @@ class ManualCreditRepository:
                 if not self._eligibleLocked(cursor,subscription,now):
                     return {'applied':False,'reason':'inactive_coverage'}
                 balance=self._balanceLocked(cursor,subscription,now)
-                count=max(1,min(4,int(subscription.get('domain_count') or 1) if domainCount is None else int(domainCount)))
+                paid = self._paidContextLocked(cursor, subscription, now)
+                count=(len(paid.currentPeriod.domains) if paid else
+                    max(1,min(4,int(subscription.get('domain_count') or 1) if domainCount is None else int(domainCount))))
                 quota=getTokenQuotaForPlan(balance['plan_tier'],count)
                 used=0 if resetUsage else int(balance['used_tokens'])
                 remaining=(quota if resetUsage else max(0,quota-used) if grantImmediately
@@ -101,9 +177,12 @@ class ManualCreditRepository:
             raise CreditResetIneligible(code)
         if not self._eligibleLocked(cursor,subscription,now):
             raise CreditResetIneligible('NO_ACTIVE_COVERAGE')
-        mode=subscription.get('billing_mode') or 'none'
-        plan='annual' if mode=='annual_prepaid' else 'pro' if mode=='monthly_prepaid' else 'free'
-        lifecycle=self.repository._json(subscription.get('billing_state')).get('manualBilling',{}).get('lifecycleId') or str(subscription['id'])
+        paid = self._paidContextLocked(cursor, subscription, now)
+        if paid:
+            self.ensureCurrentAllocation(cursor, paid.currentPeriod, now)
+        mode=paid.billingMode if paid else subscription.get('billing_mode') or 'none'
+        plan='pro' if paid else 'annual' if mode=='annual_prepaid' else 'pro' if mode=='monthly_prepaid' else 'free'
+        lifecycle=paid.lifecycleId if paid else self.repository._json(subscription.get('billing_state')).get('manualBilling',{}).get('lifecycleId') or str(subscription['id'])
         cursor.execute('select * from public.credit_balances where user_id=%s for update',(userId,))
         existing=cursor.fetchone()
         # Mirror _balanceLocked's integrity checks before any write: no partial repair on refusal.
@@ -115,7 +194,7 @@ class ManualCreditRepository:
                          or str(existing.get('lifecycle_id'))!=str(lifecycle)))):
             raise CreditResetIneligible('ALLOCATION_OWNERSHIP_INVALID')
         balance=self._balanceLocked(cursor,subscription,now)
-        count=max(1,min(4,int(subscription.get('domain_count') or 1)))
+        count=len(paid.currentPeriod.domains) if paid else max(1,min(4,int(subscription.get('domain_count') or 1)))
         quota=int(getTokenQuotaForPlan(plan,count))
         if existing is None:
             # A newly created live-trial balance is already one fresh allocation.
@@ -160,6 +239,8 @@ class ManualCreditRepository:
         snapshot=self.repository._coverageSnapshotLocked(cursor,subscription,now,materialize=True)
         if snapshot.denialReason in ('account_banned','erasure_pending','restricted_subscription'):
             return False
+        if self.repository._usesPurchaseAuthority() and (snapshot.currentPeriod or subscription.get('lifecycle_id')):
+            return snapshot.accessAllowed
         if subscription.get('billing_mode') in ('monthly_prepaid','annual_prepaid'):
             return snapshot.accessAllowed
         start,end=_utc(subscription.get('current_period_start')),_utc(subscription.get('current_period_end'))
@@ -168,6 +249,11 @@ class ManualCreditRepository:
     def _balanceLocked(self,cursor,subscription,now):
         from dateutil.relativedelta import relativedelta
         from api.services.credits.creditConfig import getTokenQuotaForPlan
+        paid = self._paidContextLocked(cursor, subscription, now)
+        if paid:
+            self.ensureCurrentAllocation(cursor, paid.currentPeriod, now)
+            cursor.execute('select * from public.credit_balances where user_id=%s for update', (subscription['user_id'],))
+            return cursor.fetchone()
         cursor.execute('select * from public.credit_balances where user_id=%s for update',(subscription['user_id'],))
         balance=cursor.fetchone()
         mode=subscription.get('billing_mode') or 'none'
@@ -226,9 +312,9 @@ class ManualCreditRepository:
                     balance = {**balance,'monthly_token_quota':0,'remaining_tokens':0}
                 coverage = self.repository._coverageSnapshotLocked(cursor,subscription,now,materialize=False)
                 nextRefill = None
-                if subscription.get('billing_mode') == 'monthly_prepaid' and coverage.nextPeriod:
+                if coverage.billingMode == 'monthly_prepaid' and coverage.nextPeriod:
                     nextRefill = coverage.nextPeriod.start
-                elif subscription.get('billing_mode') == 'annual_prepaid' and eligible:
+                elif coverage.billingMode == 'annual_prepaid' and eligible:
                     boundary = _utc(balance.get('period_end'))
                     if boundary and coverage.finalPaidEnd and boundary < coverage.finalPaidEnd:
                         nextRefill = boundary
@@ -261,7 +347,7 @@ class ManualCreditRepository:
                     context=self._context(stored)
                     if stored['operationType']!=operationType:
                         raise ValueError('CREDIT_OPERATION_IDENTITY_CONFLICT')
-                    if (context.billingMode!=subscription['billing_mode'] or context.creditPeriodId!=str(balance['credit_period_id'])
+                    if (context.billingMode!=self._modeLocked(cursor,subscription,now) or context.creditPeriodId!=str(balance['credit_period_id'])
                             or context.lifecycleId!=str(balance['lifecycle_id'])):
                         raise ValueError('CREDIT_OPERATION_RETRY_REQUIRES_NEW_EXECUTION_IDENTITY')
                     return context
@@ -272,7 +358,7 @@ class ManualCreditRepository:
                 allocation=cursor.fetchone()
                 watermark=(self.repository._json(allocation['metadata_json'])['quotaWatermark'] if allocation else
                     int(balance['remaining_tokens'])+self._monthlySettled(cursor,userId,str(balance['credit_period_id'])))
-                mode=subscription.get('billing_mode') or 'none'
+                mode=self._modeLocked(cursor,subscription,now)
                 snapshot={'userId':userId,'subscriptionId':str(subscription['id']),'billingMode':mode,
                     'lifecycleId':str(balance['lifecycle_id']),'creditPeriodId':str(balance['credit_period_id']),
                     'quotaWatermark':watermark,'operationId':operationId,'operationType':operationType,'admittedAt':now.isoformat()}
@@ -318,9 +404,14 @@ class ManualCreditRepository:
                 current = (str(balance.get('credit_period_id')) == context.creditPeriodId
                     and str(balance.get('subscription_id'))==context.subscriptionId
                     and str(balance.get('lifecycle_id'))==context.lifecycleId
-                    and subscription.get('billing_mode')==context.billingMode
+                    and self._modeLocked(cursor,subscription,now)==context.billingMode
                     and str(subscription['id'])==context.subscriptionId
                     and _utc(balance['period_end'])>now and int(balance['monthly_token_quota'])>0)
+                if current and self.repository._usesPurchaseAuthority():
+                    from api.services.credits.paidAllowancePolicy import paidCreditWindow, matchesPaidAllocation
+                    paid = self._paidContextLocked(cursor, subscription, now)
+                    window = paidCreditWindow(paid.currentPeriod, now) if paid else None
+                    current = matchesPaidAllocation(balance, window) and balance['plan_tier'] == 'pro'
                 cursor.execute('select metadata_json from public.billing_events where idempotency_key=%s',
                     ('credit-allocation:'+context.userId+':'+context.creditPeriodId,))
                 allocation=cursor.fetchone()
