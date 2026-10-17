@@ -1,5 +1,42 @@
 """Public billing responses from persisted intent and committed coverage facts."""
 
+from api.services.subscriptions.subscriptionModel import SubscriptionSnapshotV2
+
+
+def serializeSubscriptionSnapshot(snapshot: SubscriptionSnapshotV2) -> dict:
+    """Allowlist public V2 fields; keep explicit absence separate from history."""
+    def timestamp(value):
+        return value.isoformat() if value is not None else None
+
+    def period(value):
+        if value is None:
+            return None
+        return {'id': value.id, 'start': timestamp(value.start), 'end': timestamp(value.end),
+                'experts': list(value.experts), 'billingInterval': value.billingInterval,
+                'creditPeriodId': value.creditPeriodId}
+
+    trial = snapshot.trial
+    recovery = snapshot.recoverableCheckout
+    return {
+        'schemaVersion': snapshot.schemaVersion, 'subscriptionId': snapshot.subscriptionId,
+        'lifecycleId': snapshot.lifecycleId, 'planCode': snapshot.planCode,
+        'billingInterval': snapshot.billingInterval, 'status': snapshot.status,
+        'accessAllowed': snapshot.accessAllowed, 'accessSource': snapshot.accessSource,
+        'denialReason': snapshot.denialReason, 'trialAvailable': snapshot.trialAvailable,
+        'trial': {'startedAt': timestamp(trial.startedAt), 'endsAt': timestamp(trial.endsAt),
+                  'closedAt': timestamp(trial.closedAt)} if trial else None,
+        'currentPeriod': period(snapshot.currentPeriod), 'nextPeriod': period(snapshot.nextPeriod),
+        'paidUntil': timestamp(snapshot.paidUntil), 'lastPaidEnd': timestamp(snapshot.lastPaidEnd),
+        'subscribedExperts': list(snapshot.subscribedExperts), 'domainCount': snapshot.domainCount,
+        'renewalOptOut': snapshot.renewalOptOut, 'renewalAvailable': snapshot.renewalAvailable,
+        'resumeRenewalAvailable': snapshot.resumeRenewalAvailable,
+        'cancellationEffectiveAt': timestamp(snapshot.cancellationEffectiveAt),
+        'purchaseAllowed': snapshot.purchaseAllowed, 'purchaseBlockReason': snapshot.purchaseBlockReason,
+        'recoverableCheckout': {'invoiceId': recovery.invoiceId, 'attemptId': recovery.attemptId,
+                                'state': recovery.state} if recovery else None,
+        'evaluatedAt': timestamp(snapshot.evaluatedAt),
+    }
+
 def serializePeriod(period):
     if period is None:
         return None
@@ -32,12 +69,16 @@ def serializeCheckoutIntent(intent, publicKey, identity=None):
 def serializeFinalizationResult(result):
     state = {'expert_activated':'activated', 'topup_granted':'activated', 'elapsed':'expired',
         'unchanged':'awaiting_finalization'}.get(result.state,result.state)
-    return {'verified':True, 'invoiceId':result.invoiceId, 'attemptId':result.attemptId,
+    payload = {'verified':True, 'invoiceId':result.invoiceId, 'attemptId':result.attemptId,
         'state':state, 'finalized':result.finalized, 'alreadyFinalized':result.state == 'already_finalized',
         'currentPeriod':serializePeriod(result.currentPeriod), 'nextPeriod':serializePeriod(result.nextPeriod),
         'creditsRefilled':result.creditsRefilled, 'creditState':result.creditState,
         'renewalOptOut':result.renewalOptOut, 'anomalyId':result.anomalyId,
         'invoiceStatus':result.invoiceStatus}
+    subscription = getattr(result, 'subscription', None)
+    if subscription is not None:
+        payload['subscription'] = serializeSubscriptionSnapshot(subscription)
+    return payload
 
 
 def serializeInvoice(invoice):
