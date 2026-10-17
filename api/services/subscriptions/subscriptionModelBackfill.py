@@ -123,6 +123,16 @@ def factsFromRecords(row, owner, invoices, events, *, consumed):
         if event.get('user_id') != row['user_id'] or str(event.get('subscription_id')) != str(row['id']):
             raise ValueError('EVENT_OWNER_MISMATCH')
     periods = acceptedPeriods(row, invoices, events)
+    unresolved, attempts = unresolvedMoneyFacts(invoices, events)
+    trial = TrialFacts(timestamp(row.get('trial_started_at')), timestamp(row.get('trial_ends_at')),
+                       timestamp(row.get('trial_closed_at')), EXPERTS if row.get('trial_started_at') else (), consumed)
+    return SubscriptionFacts(row['user_id'], str(row['id']), str(row['lifecycle_id']) if row.get('lifecycle_id') else None,
+        row.get('plan_code'), True, trial, periods, row['renewal_opt_out'], owner['isBanned'], row['erasure_pending'],
+        unresolved, attempts[0] if len(attempts) == 1 else None)
+
+
+def unresolvedMoneyFacts(invoices, events):
+    """Labels do not prove Order closure; share this policy with runtime admission."""
     unresolved, attempts = False, []
     invoiceStates = {str(i['id']): str(i.get('status')).upper() for i in invoices}
     for event in events:
@@ -144,11 +154,7 @@ def factsFromRecords(row, owner, invoices, events, *, consumed):
         unresolved |= pending
         if pending and event.get('event_category') == 'payment_attempt' and event.get('invoice_id'):
             attempts.append(RecoverableCheckout(str(event['invoice_id']), str(event['id']), str(status)))
-    trial = TrialFacts(timestamp(row.get('trial_started_at')), timestamp(row.get('trial_ends_at')),
-                       timestamp(row.get('trial_closed_at')), EXPERTS if row.get('trial_started_at') else (), consumed)
-    return SubscriptionFacts(row['user_id'], str(row['id']), str(row['lifecycle_id']) if row.get('lifecycle_id') else None,
-        row.get('plan_code'), True, trial, periods, row['renewal_opt_out'], owner['isBanned'], row['erasure_pending'],
-        unresolved, attempts[0] if len(attempts) == 1 else None)
+    return unresolved, attempts
 
 
 def buildBackfillProposal(row, owner, invoices, events, *, now, otherSubscriptions=(), trialReview=None):

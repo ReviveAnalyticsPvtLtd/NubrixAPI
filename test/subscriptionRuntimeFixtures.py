@@ -82,3 +82,17 @@ def renewal(account):
             billingMode='monthly_prepaid', domains=context['_verifiedCoverage']['nextExperts'],
             coverageState='scheduled', revision=1)})
     return repo.createFrozenRenewalInvoice(payload, context['version'], expectedCatalogRevision=1)
+
+
+def expirePurchasedCoverage(account, *, staleCache=True):
+    """Synthetic historical paid term with deliberately untrustworthy old caches."""
+    from dateutil.relativedelta import relativedelta
+    repo, model, intent, url = account
+    start, end = NOW - relativedelta(years=2), NOW - relativedelta(years=1)
+    query(url, '''UPDATE "Invoices" SET period_start=%s,period_end=%s
+        WHERE id=%s''', (start, end, intent.invoiceId))
+    query(url, '''UPDATE subscriptions SET billing_mode='annual_prepaid',plan_type='annual',status='cancelled',
+        renewal_opt_out=true,cancellation_reason='previous lifecycle',current_period_start=%s,current_period_end=%s,
+        cancellation_requested_at=%s WHERE user_id=%s''',
+        (start, NOW + relativedelta(years=3) if staleCache else end, start, intent.userId))
+    return query(url, 'SELECT * FROM subscriptions WHERE user_id=%s', (intent.userId,), one=True)

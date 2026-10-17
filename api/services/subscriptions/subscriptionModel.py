@@ -160,6 +160,12 @@ def evaluateSubscription(facts: SubscriptionFacts, now: datetime) -> Subscriptio
     )
 
 
+def evaluatePurchaseEligibility(facts: SubscriptionFacts, now: datetime) -> tuple[bool, str | None]:
+    """One purchase policy, including the snapshot's account and money guards."""
+    snapshot = evaluateSubscription(facts, now)
+    return snapshot.purchaseAllowed, snapshot.purchaseBlockReason
+
+
 def _utc(value: datetime) -> datetime:
     if not isinstance(value, datetime) or value.tzinfo is None or value.utcoffset() is None:
         raise SubscriptionAuthorityUnavailable('Timezone-aware timestamp required')

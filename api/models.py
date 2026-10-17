@@ -182,6 +182,17 @@ class CreateSubscriptionRequest(BaseModel):
     billingMode: str | None = "monthly_prepaid"
     pricingContext: str | None = None
     expectedCatalogRevision: StrictInt | None = Field(default=None, ge=1, le=9007199254740991)
+    planCode: Literal['pro'] | None = None
+    billingInterval: Literal['month', 'year'] | None = None
+
+    @model_validator(mode='before')
+    @classmethod
+    def compatibleProInterval(cls, value):
+        if isinstance(value, dict) and ('planCode' in value or 'billingInterval' in value):
+            from api.services.subscriptions.subscriptionCompatibility import resolveProBillingInput
+            _, interval = resolveProBillingInput(value)
+            return {**value, 'billingMode': 'annual_prepaid' if interval == 'year' else 'monthly_prepaid'}
+        return value
 
 class AddDomainsRequest(BaseModel):
     domains: list[str]

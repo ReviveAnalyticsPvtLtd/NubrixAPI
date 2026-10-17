@@ -4,6 +4,7 @@ import pytest
 from api.services.billing.manualBillingContracts import CheckoutRequest, VerifiedPaymentEvidence
 from test.subscriptionRuntimeFixtures import (  # noqa: F401
     NOW, account, runtimeDb, postgres, query, selection, renewal, capture,
+    expirePurchasedCoverage,
 )
 
 pytestmark = pytest.mark.skipif(os.environ.get('RUN_MANUAL_BILLING_INTEGRATION') != '1',
@@ -138,3 +139,280 @@ def test_explicit_addition_revocation_is_respected_without_touching_frozen_quote
     query(url, 'UPDATE "Invoices" SET metadata_json=jsonb_set(metadata_json,\'{manualBilling,revokedAt}\',%s::jsonb) WHERE id=%s',
         (json.dumps(NOW.isoformat()), addition.invoiceId))
     assert repo.getCoverageSnapshot(intent.userId, NOW).currentPeriod.domains == ('banking', 'manufacturing')
+
+
+@pytest.mark.parametrize('newMode', ['monthly_prepaid', 'annual_prepaid'])
+def test_expired_annual_history_can_buy_either_interval_under_same_canonical_account(account, newMode):
+    repo, model, original, url = account
+    before = expirePurchasedCoverage(account)
+    assert not repo.getCoverageSnapshot(original.userId, NOW).accessAllowed
+    intent = repo.reserveCheckout(CheckoutRequest(original.userId, 'initial_purchase', newMode,
+        {'domains': ['telecom']}, 'fresh-purchase', expectedCatalogRevision=1))
+    pending = query(url, 'SELECT * FROM subscriptions WHERE user_id=%s', (original.userId,), one=True)
+    assert pending['renewal_opt_out'] and str(pending['lifecycle_id']) == original.lifecycleId
+    assert not repo.getCoverageSnapshot(original.userId, NOW).accessAllowed
+    result, evidence = capture(repo, intent)
+    assert result.state == 'activated'
+    after = query(url, 'SELECT * FROM subscriptions WHERE user_id=%s', (original.userId,), one=True)
+    assert after['id'] == before['id'] and after['is_canonical']
+    assert str(after['lifecycle_id']) == intent.lifecycleId != original.lifecycleId
+    assert after['plan_code'] == 'pro' and not after['renewal_opt_out']
+    assert after['cancellation_requested_at'] is None and after['cancellation_reason'] is None
+    history = query(url, "SELECT metadata_json FROM billing_events WHERE user_id=%s AND event_type='subscription.lifecycle.started' AND invoice_id=%s",
+        (original.userId, intent.invoiceId), one=True)['metadata_json']
+    assert history['previousCancellationRequestedAt'] == before['cancellation_requested_at'].isoformat()
+    assert repo.getCoverageSnapshot(original.userId, NOW).currentPeriod.start == evidence.observedAt
+    assert len(query(url, 'SELECT id FROM subscriptions WHERE user_id=%s', (original.userId,))) == 1
+
+
+@pytest.mark.parametrize('account', ['monthly_prepaid', 'annual_prepaid'], indirect=True)
+def test_opt_out_and_resume_preserve_paid_future_time_and_credits_idempotently(account):
+    repo, model, original, url = account
+    invoice = renewal(account) if original.billingMode == 'monthly_prepaid' else repo.createAnnualRenewalInvoice(original.userId)
+    attempt = repo.reserveCheckout(CheckoutRequest(original.userId, 'renewal', original.billingMode,
+        {'invoiceId': str(invoice['id'])}, expectedCatalogRevision=1))
+    capture(repo, attempt)
+    snapshot = repo.getCoverageSnapshot(original.userId, NOW)
+    credit = query(url, 'SELECT * FROM credit_balances WHERE user_id=%s', (original.userId,), one=True)
+    first = repo.setRenewalOptOut(original.userId, True, None, 'cancel')
+    again = repo.setRenewalOptOut(original.userId, True, None, 'cancel')
+    assert first['version'] == again['version']
+    assert first['cancellation_requested_at'] == NOW
+    assert first['preferenceResult']['effectiveAt'] == snapshot.finalPaidEnd.isoformat()
+    resumed = repo.setRenewalOptOut(original.userId, False, None, 'resume')
+    repeated = repo.setRenewalOptOut(original.userId, False, None, 'resume')
+    assert resumed['version'] == repeated['version'] and resumed['cancellation_requested_at'] is None
+    assert query(url, 'SELECT * FROM credit_balances WHERE user_id=%s', (original.userId,), one=True) == credit
+    assert repo.getCoverageSnapshot(original.userId, NOW).nextPeriod == snapshot.nextPeriod
+
+
+def test_expired_opt_out_cannot_resume_using_an_old_cached_future_end(account):
+    repo, model, original, url = account
+    expirePurchasedCoverage(account)
+    with pytest.raises(ValueError, match='NO_PAID_ACCESS'):
+        repo.setRenewalOptOut(original.userId, False, None, 'resume-expired')
+
+
+def test_failed_new_payment_keeps_expired_access_and_previous_lifecycle(account):
+    repo, model, original, url = account
+    before = expirePurchasedCoverage(account)
+    intent = repo.reserveCheckout(CheckoutRequest(original.userId, 'initial_purchase', 'monthly_prepaid',
+        {'domains': ['telecom']}, expectedCatalogRevision=1))
+    order = 'order-failed-repurchase-' + intent.attemptId
+    repo.bindProviderOrder(intent.attemptId, {'id': order})
+    evidence = VerifiedPaymentEvidence(intent.attemptId, intent.invoiceId, original.userId, order,
+        'pay-failed-repurchase-' + intent.attemptId, 'initial_purchase', intent.currency, 'failed',
+        'server_observation', intent.amount, NOW, None, None, False)
+    assert not repo.finalizeCapturedPayment(evidence).finalized
+    after = query(url, 'SELECT * FROM subscriptions WHERE id=%s', (before['id'],), one=True)
+    assert after['lifecycle_id'] == before['lifecycle_id'] and after['renewal_opt_out']
+    assert not repo.getCoverageSnapshot(original.userId, NOW).accessAllowed
+
+
+def test_delayed_legacy_boundary_worker_cannot_clear_credits_from_stale_expiry_cache(account):
+    from datetime import timedelta
+    repo, model, original, url = account
+    before = query(url, 'SELECT * FROM credit_balances WHERE user_id=%s', (original.userId,), one=True)
+    query(url, 'UPDATE subscriptions SET current_period_end=%s WHERE user_id=%s', (NOW - timedelta(seconds=1), original.userId))
+    repo.activateDueCoverage(original.userId, NOW)
+    assert repo.getCoverageSnapshot(original.userId, NOW).accessAllowed
+    assert query(url, 'SELECT * FROM credit_balances WHERE user_id=%s', (original.userId,), one=True) == before
+
+
+def test_failed_old_renewal_without_reconciled_closure_blocks_another_provider_order(account):
+    from api.services.billing.manualPaymentService import ManualPaymentService
+    from test.test_customer_free_payments import StrictFakeRazorpayClient
+    repo, model, original, url = account
+    invoice = renewal(account)
+    provider = StrictFakeRazorpayClient()
+    service = ManualPaymentService.forProduction(provider, repo)
+    old = service.createCheckout(CheckoutRequest(original.userId, 'renewal', 'monthly_prepaid',
+        {'invoiceId': str(invoice['id'])}, expectedCatalogRevision=1))
+    query(url, "UPDATE billing_events SET payment_status='failed',event_status='failed' WHERE id=%s", (old.attemptId,))
+    expirePurchasedCoverage(account, staleCache=False)
+    before = len(provider.order.createdPayloads)
+    with pytest.raises(ValueError, match='RECOVERY_REQUIRED'):
+        service.createCheckout(CheckoutRequest(original.userId, 'initial_purchase', 'annual_prepaid',
+            {'domains': ['telecom']}, expectedCatalogRevision=1))
+    assert len(provider.order.createdPayloads) == before
+
+
+def test_accepted_first_purchase_closes_explicit_trial_at_capture(account):
+    from datetime import timedelta
+    from uuid import uuid4
+    repo, model, original, url = account
+    user = 'trial-purchase-' + str(uuid4())
+    query(url, 'INSERT INTO "Users"("userId") VALUES(%s)', (user,))
+    row = repo.ensureCanonicalSubscription(user)
+    query(url, "UPDATE subscriptions SET plan_code='pro',trial_started_at=%s,trial_ends_at=%s WHERE id=%s",
+        (NOW - timedelta(days=1), NOW + timedelta(days=11), row['id']))
+    intent = repo.reserveCheckout(CheckoutRequest(user, 'initial_purchase', 'monthly_prepaid',
+        {'domains': ['banking']}, expectedCatalogRevision=1))
+    assert query(url, 'SELECT trial_closed_at FROM subscriptions WHERE id=%s', (row['id'],), one=True)['trial_closed_at'] is None
+    result, evidence = capture(repo, intent)
+    assert result.finalized
+    assert query(url, 'SELECT trial_closed_at FROM subscriptions WHERE id=%s', (row['id'],), one=True)['trial_closed_at'] == evidence.observedAt
+
+
+@pytest.mark.parametrize('account', ['monthly_prepaid', 'annual_prepaid'], indirect=True)
+def test_public_cancel_and_resume_use_one_owned_preference_operation(account, monkeypatch):
+    import os
+    from jose import jwt
+    from api.services.subscriptions.subscriptionService import SubscriptionService
+    repo, model, original, url = account
+    service = SubscriptionService.__new__(SubscriptionService)
+    service._getCanonicalSubscription = lambda userId, required=False: query(url, 'SELECT * FROM subscriptions WHERE user_id=%s', (userId,), one=True)
+    monkeypatch.setattr('api.services.billing.manualBillingRepository.getManualBillingRepository', lambda: repo)
+    token = jwt.encode({'userId': original.userId, 'email': 'synthetic@example.test'}, os.environ['SECRET_KEY'], algorithm='HS256')
+    credit = query(url, 'SELECT * FROM credit_balances WHERE user_id=%s', (original.userId,), one=True)
+    cancelled = service.cancelSubscription(None, token)
+    assert cancelled['renewalOptOut'] and cancelled['effectiveAt'] != 'cycle_end'
+    assert service.cancelSubscription(None, token)['effectiveAt'] == cancelled['effectiveAt']
+    resumed = service.resumeRenewal(token)
+    assert not resumed['renewalOptOut'] and not resumed['creditsRefilled']
+    assert service.resumeRenewal(token)['repeated']
+    assert query(url, 'SELECT * FROM credit_balances WHERE user_id=%s', (original.userId,), one=True) == credit
+
+
+@pytest.mark.parametrize('account', ['monthly_prepaid', 'annual_prepaid'], indirect=True)
+def test_opt_out_preserves_a_renewal_captured_before_closure_with_provider_proof(account, monkeypatch):
+    from datetime import timedelta
+    repo, model, original, url = account
+    invoice = renewal(account) if original.billingMode == 'monthly_prepaid' else repo.createAnnualRenewalInvoice(original.userId)
+    attempt = repo.reserveCheckout(CheckoutRequest(original.userId, 'renewal', original.billingMode,
+        {'invoiceId': str(invoice['id'])}, expectedCatalogRevision=1))
+    order = 'order-before-cancel-' + attempt.attemptId
+    repo.bindProviderOrder(attempt.attemptId, {'id': order})
+    monkeypatch.setattr('api.services.billing.manualBillingRepository._now', lambda: NOW + timedelta(seconds=2))
+    repo.setRenewalOptOut(original.userId, True, None, 'cancel-before-observation')
+    observed, captured = NOW + timedelta(seconds=5), NOW + timedelta(seconds=1)
+    evidence = VerifiedPaymentEvidence(attempt.attemptId, attempt.invoiceId, original.userId, order,
+        'pay-before-cancel-' + attempt.attemptId, 'renewal', attempt.currency, 'captured',
+        'provider_captured_at', attempt.amount, observed, captured, 'synthetic-attestation', True)
+    result = repo.finalizeCapturedPayment(evidence)
+    assert result.state == 'paid_scheduled' and result.renewalOptOut and result.nextPeriod is not None
+
+
+@pytest.mark.parametrize('account', ['monthly_prepaid', 'annual_prepaid'], indirect=True)
+def test_one_paid_future_slot_blocks_an_extra_payable_quote_before_order_creation(account):
+    from uuid import uuid4
+    repo, model, original, url = account
+    invoice = renewal(account) if original.billingMode == 'monthly_prepaid' else repo.createAnnualRenewalInvoice(original.userId)
+    intent = repo.reserveCheckout(CheckoutRequest(original.userId, 'renewal', original.billingMode,
+        {'invoiceId': str(invoice['id'])}, expectedCatalogRevision=1))
+    capture(repo, intent)
+    extra = str(uuid4())
+    from dateutil.relativedelta import relativedelta
+    start = repo.getCoverageSnapshot(original.userId, NOW).nextPeriod.end
+    end = start + (relativedelta(years=1) if original.billingMode == 'annual_prepaid' else relativedelta(months=1))
+    query(url, '''INSERT INTO "Invoices"(id,"userId",subscription_id,status,billing_reason,total_amount,currency,
+        period_start,period_end,metadata_json) SELECT %s,"userId",subscription_id,'UPCOMING',billing_reason,total_amount,
+        currency,%s,%s,metadata_json FROM "Invoices" WHERE id=%s''', (extra, start, end, invoice['id']))
+    with pytest.raises(ValueError, match='RENEWAL_ALREADY_PAID'):
+        repo.reserveCheckout(CheckoutRequest(original.userId, 'renewal', original.billingMode,
+            {'invoiceId': extra}, expectedCatalogRevision=1))
+
+
+@pytest.mark.parametrize('newMode', ['monthly_prepaid', 'annual_prepaid'])
+def test_duplicate_post_lapse_capture_creates_one_new_lifecycle_and_period(account, newMode):
+    from concurrent.futures import ThreadPoolExecutor
+    repo, model, original, url = account
+    before = expirePurchasedCoverage(account, staleCache=False)
+    intent = repo.reserveCheckout(CheckoutRequest(original.userId, 'initial_purchase', newMode,
+        {'domains': ['telecom']}, expectedCatalogRevision=1))
+    order = 'order-repurchase-race-' + intent.attemptId
+    repo.bindProviderOrder(intent.attemptId, {'id': order})
+    evidence = VerifiedPaymentEvidence(intent.attemptId, intent.invoiceId, original.userId, order,
+        'pay-repurchase-race-' + intent.attemptId, 'initial_purchase', intent.currency, 'captured',
+        'server_observation', intent.amount, NOW, None, None, False)
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        results = list(pool.map(repo.finalizeCapturedPayment, [evidence, evidence]))
+    assert sorted(r.state for r in results) == ['activated', 'already_finalized']
+    assert len(query(url, 'SELECT id FROM subscriptions WHERE user_id=%s', (original.userId,))) == 1
+    assert query(url, 'SELECT lifecycle_id FROM subscriptions WHERE id=%s', (before['id'],), one=True)['lifecycle_id'] == intent.lifecycleId
+
+
+@pytest.mark.parametrize('account', ['monthly_prepaid', 'annual_prepaid'], indirect=True)
+def test_capture_and_opt_out_race_retains_paid_evidence_and_current_access(account):
+    from concurrent.futures import ThreadPoolExecutor
+    repo, model, original, url = account
+    invoice = renewal(account) if original.billingMode == 'monthly_prepaid' else repo.createAnnualRenewalInvoice(original.userId)
+    intent = repo.reserveCheckout(CheckoutRequest(original.userId, 'renewal', original.billingMode,
+        {'invoiceId': str(invoice['id'])}, expectedCatalogRevision=1))
+    order = 'order-opt-out-race-' + intent.attemptId
+    repo.bindProviderOrder(intent.attemptId, {'id': order})
+    evidence = VerifiedPaymentEvidence(intent.attemptId, intent.invoiceId, original.userId, order,
+        'pay-opt-out-race-' + intent.attemptId, 'renewal', intent.currency, 'captured',
+        'server_observation', intent.amount, NOW, None, None, False)
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        finalized = pool.submit(repo.finalizeCapturedPayment, evidence)
+        cancelled = pool.submit(repo.setRenewalOptOut, original.userId, True, None, 'race-cancel')
+        result, preference = finalized.result(), cancelled.result()
+    snapshot = repo.getCoverageSnapshot(original.userId, NOW)
+    assert snapshot.accessAllowed and snapshot.renewalOptOut
+    assert result.state in ('paid_scheduled', 'requires_reconciliation')
+    if result.state == 'paid_scheduled':
+        assert snapshot.nextPeriod is not None
+    assert len(query(url, 'SELECT id FROM billing_events WHERE provider_payment_id=%s', (evidence.providerPaymentId,))) == 1
+
+
+@pytest.mark.parametrize('interval', ['month', 'year'])
+def test_expired_session_can_create_and_verify_fresh_purchase_through_http(account, monkeypatch, interval):
+    import hashlib
+    import hmac
+    import os
+    from fastapi import FastAPI
+    from fastapi.testclient import TestClient
+    from jose import jwt
+    from api.commons import verifyToken
+    import api.routers.subscriptions as routes
+    from api.services.subscriptions.subscriptionService import SubscriptionService
+    from api.services.billing.pricingContext import issuePricingContext
+    from test.test_customer_free_payments import StrictFakeRazorpayClient
+    repo, model, original, url = account
+    expirePurchasedCoverage(account)
+    provider = StrictFakeRazorpayClient()
+    service = SubscriptionService.__new__(SubscriptionService)
+    createOrder = provider.order.create
+    def uniqueOrder(payload):
+        order = createOrder(payload)
+        provider.order.orders.pop(order['id'])
+        order['id'] = 'order-http-' + original.userId + '-' + order['id']
+        provider.order.orders[order['id']] = order
+        return order
+    provider.order.create = uniqueOrder
+    service.razorpayClient = provider
+    service.VALID_DOMAINS = {'banking', 'manufacturing', 'supplychain', 'telecom'}
+    service._resolveCheckoutIdentity = lambda *_: {'email': 'synthetic@example.test', 'name': 'Synthetic', 'contact': ''}
+    # Profile/session persistence is outside this financial integration fixture.
+    # The production create/verify services and their repository stay real.
+    service._reissueTokenWithUpdatedClaims = lambda old, status, plan: jwt.encode(
+        {'userId': original.userId, 'sub_status': status, 'plan_type': plan}, os.environ['SECRET_KEY'], algorithm='HS256')
+    monkeypatch.setattr(routes, 'subscriptionService', service)
+    monkeypatch.setattr('api.services.billing.manualBillingRepository.getManualBillingRepository', lambda: repo)
+    monkeypatch.setattr('api.services.subscriptions.subscriptionService.utcNow', lambda: NOW)
+    monkeypatch.setenv('PRICING_PROXY_SECRET', 'synthetic-local-context')
+    token = jwt.encode({'userId': original.userId, 'email': 'synthetic@example.test',
+        'sub_status': 'expired', 'plan_type': 'annual'}, os.environ['SECRET_KEY'], algorithm='HS256')
+    app = FastAPI()
+    app.include_router(routes.router)
+    app.dependency_overrides[verifyToken] = lambda: token
+    client = TestClient(app)
+    created = client.post('/createSubscription', json={'domains': ['telecom'], 'contact': '',
+        'planCode': 'pro', 'billingInterval': interval, 'expectedCatalogRevision': 1,
+        'pricingContext': issuePricingContext(original.userId, 'INR', 'hosting', catalogRevision=1)})
+    assert created.status_code == 200, created.text
+    checkout = created.json()
+    order, payment = checkout['razorpayOrderId'], 'pay-http-' + checkout['attemptId']
+    payload = provider.order.createdPayloads[0]
+    assert payload['notes']['billingMode'] == ('annual_prepaid' if interval == 'year' else 'monthly_prepaid')
+    provider.payments[payment] = {'id': payment, 'order_id': order, 'status': 'captured',
+        'amount': payload['amount'], 'currency': payload['currency'], 'notes': payload['notes']}
+    signature = hmac.new(os.environ['RAZORPAY_KEY_SECRET'].encode(), (order + '|' + payment).encode(), hashlib.sha256).hexdigest()
+    verified = client.post('/verifySubscription', json={'razorpayOrderId': order, 'razorpayPaymentId': payment,
+        'razorpaySignature': signature})
+    assert verified.status_code == 200, verified.text
+    result = verified.json()
+    assert result['finalized'] and result['state'] == 'activated'
+    assert jwt.decode(result['accessToken'], os.environ['SECRET_KEY'], algorithms=['HS256'])['sub_status'] == 'active'
+    assert len(provider.order.createdPayloads) == 1 and repo.getCoverageSnapshot(original.userId).accessAllowed

@@ -96,16 +96,25 @@ class ManualBillingRepository:
         from api.services.subscriptions.subscriptionModelRepository import SubscriptionModelRepository
         return SubscriptionModelRepository(self.connectionFactory)
 
-    def _purchaseCoverageLocked(self, cursor, subscription, owner, now):
+    def _purchaseFactsLocked(self, cursor, subscription, owner, now):
         from dataclasses import replace
-        from api.services.subscriptions.subscriptionModel import SubscriptionFacts, evaluateSubscription
+        from api.services.subscriptions.subscriptionModel import SubscriptionFacts
+        from api.services.subscriptions.subscriptionModelBackfill import unresolvedMoneyFacts
         model = self._modelRepository()
         periods = model.loadAcceptedPeriods(cursor, str(subscription['id']))
         lifecycle = str(subscription.get('lifecycle_id') or '') or (max(periods, key=lambda p: p.start).lifecycleId if periods else None)
         effective = tuple(replace(p, experts=model.loadEffectiveExperts(cursor, p.id, now)) for p in periods)
-        snapshot = evaluateSubscription(SubscriptionFacts(subscription['user_id'], str(subscription['id']), lifecycle,
+        _, invoices, events = model._purchaseRecords(cursor, str(subscription['id']))
+        unresolved, attempts = unresolvedMoneyFacts(invoices, events)
+        return SubscriptionFacts(subscription['user_id'], str(subscription['id']), lifecycle,
             'pro' if periods else None, True, periods=effective, renewalOptOut=bool(subscription.get('renewal_opt_out')),
-            accountBanned=bool(owner['isBanned']), erasurePending=bool(subscription.get('erasure_pending'))), now)
+            accountBanned=bool(owner['isBanned']), erasurePending=bool(subscription.get('erasure_pending')),
+            moneyUnresolved=unresolved, recoverableCheckout=attempts[0] if len(attempts) == 1 else None)
+
+    def _purchaseCoverageLocked(self, cursor, subscription, owner, now):
+        from api.services.subscriptions.subscriptionModel import evaluateSubscription
+        facts = self._purchaseFactsLocked(cursor, subscription, owner, now)
+        snapshot = evaluateSubscription(facts, now)
         def legacyPeriod(period):
             if period is None:
                 return None
@@ -114,7 +123,7 @@ class ManualBillingRepository:
                 'annual_prepaid' if period.billingInterval == 'year' else 'monthly_prepaid', period.revokedAt)
         current, upcoming = legacyPeriod(snapshot.currentPeriod), legacyPeriod(snapshot.nextPeriod)
         mode = current.billingMode if current else 'none'
-        return CoverageSnapshot(subscription['user_id'], str(subscription['id']), lifecycle, mode, now,
+        return CoverageSnapshot(subscription['user_id'], str(subscription['id']), facts.lifecycleId, mode, now,
             current, upcoming, snapshot.paidUntil, snapshot.renewalOptOut, snapshot.accessAllowed, snapshot.denialReason)
 
     def _purchaseContextLocked(self, cursor, subscription, coverage, now):
@@ -450,7 +459,7 @@ class ManualBillingRepository:
             return
         if frozen.get('closedAt'):
             raise ValueError('CHECKOUT_CLOSED')
-        if (request.billingMode == 'annual_prepaid'
+        if ((request.billingMode == 'annual_prepaid' or self._usesPurchaseAuthority())
                 and self._coverageSnapshotLocked(cursor, subscription, now, materialize=False).nextPeriod):
             raise ValueError('RENEWAL_ALREADY_PAID')
         end = _utc(subscription.get('current_period_end'))
@@ -615,11 +624,18 @@ class ManualBillingRepository:
                     subscription = self._purchaseContextLocked(cursor, subscription, coverage, now)
                 if subscription.get('erasure_pending') or coverage.denialReason == 'account_banned':
                     raise ValueError('CHECKOUT_OWNER_NOT_ELIGIBLE')
-                if request.purpose == 'renewal' and request.billingMode == 'annual_prepaid' and coverage.nextPeriod:
+                if request.purpose == 'renewal' and (request.billingMode == 'annual_prepaid' or self._usesPurchaseAuthority()) and coverage.nextPeriod:
                     raise ValueError('RENEWAL_ALREADY_PAID')
                 if request.purpose == 'initial_purchase':
+                    if self._usesPurchaseAuthority():
+                        from api.services.subscriptions.subscriptionModel import evaluatePurchaseEligibility
+                        cursor.execute('SELECT "isBanned" FROM public."Users" WHERE "userId"=%s', (request.userId,))
+                        allowed, block = evaluatePurchaseEligibility(self._purchaseFactsLocked(cursor, subscription, cursor.fetchone(), now), now)
+                        if not allowed:
+                            raise ValueError({'recovery_required': 'RECOVERY_REQUIRED', 'current_coverage': 'EXISTING_PAID_COVERAGE',
+                                'account_restricted': 'CHECKOUT_OWNER_NOT_ELIGIBLE'}[block])
                     if coverage.currentPeriod or coverage.nextPeriod or (
-                            subscription.get('billing_mode') == 'annual_prepaid'
+                            not self._usesPurchaseAuthority() and subscription.get('billing_mode') == 'annual_prepaid'
                             and _utc(subscription.get('current_period_end')) and _utc(subscription['current_period_end']) > now):
                         raise ValueError('EXISTING_PAID_COVERAGE')
                 elif request.billingMode == 'monthly_prepaid':
@@ -627,7 +643,7 @@ class ManualBillingRepository:
                         raise ValueError('PAID_COVERAGE_REQUIRED')
                 elif request.purpose in ('expert_addition', 'topup'):
                     from api.services.subscriptions.paymentValidationService import isAccessActive
-                    if not isAccessActive(subscription, now=now):
+                    if not (coverage.accessAllowed if self._usesPurchaseAuthority() else isAccessActive(subscription, now=now)):
                         raise ValueError('PAID_COVERAGE_REQUIRED')
                 if request.purpose != 'initial_purchase' and subscription.get('billing_mode') != request.billingMode:
                     raise ValueError('CHECKOUT_MODE_CHANGED')
@@ -1321,7 +1337,7 @@ class ManualBillingRepository:
             raise ValueError('RENEWAL_NOT_ELIGIBLE')
         manualBilling['expiresAt']=(_utc(snapshot['expiresAt']) if snapshot.get('billingMode') == 'annual_prepaid'
             else min(_utc(snapshot['expiresAt']),now+timedelta(seconds=int(os.environ.get('MANUAL_CHECKOUT_TTL_SECONDS','1800'))))).isoformat()
-        if purpose == 'initial_purchase' and subscription.get('billing_mode') in ('monthly_prepaid','annual_prepaid') and _utc(subscription.get('current_period_end')) and _utc(subscription['current_period_end']) > now:
+        if purpose == 'initial_purchase' and not self._usesPurchaseAuthority() and subscription.get('billing_mode') in ('monthly_prepaid','annual_prepaid') and _utc(subscription.get('current_period_end')) and _utc(subscription['current_period_end']) > now:
             raise ValueError('EXISTING_PAID_COVERAGE')
         if purpose == 'topup' and (not _utc(subscription.get('current_period_end')) or _utc(subscription['current_period_end']) <= now):
             raise ValueError('TOPUP_NOT_ELIGIBLE')
@@ -1654,14 +1670,14 @@ class ManualBillingRepository:
         closedAt = _utc(closed.get('closedAt') or billing.get('closedAt'))
         closedReason = closed.get('closedReason') or billing.get('closedReason')
         if (reason in ('CLOSED_INVOICE', 'CLOSED_ATTEMPT') and evidence.purpose == 'renewal'
-                and frozen.get('billingMode') == 'monthly_prepaid'
+                and (frozen.get('billingMode') == 'monthly_prepaid' or self._usesPurchaseAuthority())
                 and closedReason in ('RENEWAL_DECLINED','UNPAID_PERIOD_ENDED') and closedAt
                 and evidence.timingVerified and evidence.provenCaptureAt
                 and evidence.provenCaptureAt < closedAt and cutoff and evidence.provenCaptureAt < cutoff
                 and not subscription.get('erasure_pending') and not billing.get('revokedAt')):
             reason = None
         if evidence.purpose == 'renewal':
-            if (reason is None and frozen.get('billingMode') == 'annual_prepaid'
+            if (reason is None and (frozen.get('billingMode') == 'annual_prepaid' or self._usesPurchaseAuthority())
                     and self._coverageSnapshotLocked(cursor, subscription, evidence.observedAt, materialize=False).nextPeriod):
                 reason = 'FUTURE_PERIOD_ALREADY_PAID'
             lifecycle = self._json(subscription.get('billing_state')).get('manualBilling', {}).get('lifecycleId')
@@ -1671,7 +1687,7 @@ class ManualBillingRepository:
                 lifecycle, cycleEnd = (parent.lifecycleId, parent.end) if parent else (None, None)
             if frozen.get('lifecycleId') != lifecycle: reason = 'STALE_LIFECYCLE'
             if _utc(invoice.get('period_start')) != cycleEnd: reason = 'STALE_CYCLE'
-        elif evidence.purpose == 'initial_purchase' and subscription.get('billing_mode') in ('monthly_prepaid','annual_prepaid') and (_utc(subscription.get('current_period_end')) or captureAt) > captureAt:
+        elif evidence.purpose == 'initial_purchase' and not self._usesPurchaseAuthority() and subscription.get('billing_mode') in ('monthly_prepaid','annual_prepaid') and (_utc(subscription.get('current_period_end')) or captureAt) > captureAt:
             reason = 'EXISTING_PAID_COVERAGE'
         if evidence.purpose == 'initial_purchase':
             from dateutil.relativedelta import relativedelta
@@ -1722,12 +1738,19 @@ class ManualBillingRepository:
             "paidAt"=%s, period_start=%s, period_end=%s, metadata_json=%s where id=%s''',
             (evidence.providerPaymentId,captureAt,start,end,Json(metadata),invoice['id']))
         invoice.update(status='PAID',razorpayPaymentId=evidence.providerPaymentId,period_start=start,period_end=end,metadata_json=metadata)
+        previousCancellationRequestedAt = (_isoText(subscription.get('cancellation_requested_at')) if self._usesPurchaseAuthority() else
+            self._json(subscription.get('billing_state')).get('manualBilling', {}).get('cancellationRequestedAt'))
         cursor.execute("update public.billing_events set payment_status='captured',event_status='captured',completed_at=%s where id=%s", (evidence.observedAt,attempt['id']))
         cursor.execute("update public.billing_events set event_status='FINALIZED' where id=%s",(captureId,))
+        if self._usesPurchaseAuthority() and evidence.purpose == 'initial_purchase':
+            cursor.execute('''UPDATE public.subscriptions SET plan_code='pro',lifecycle_id=%s,
+                trial_closed_at=CASE WHEN trial_started_at IS NOT NULL THEN coalesce(trial_closed_at,%s) ELSE NULL END,
+                cancellation_requested_at=NULL,version=version+1 WHERE id=%s RETURNING *''',
+                (frozen['lifecycleId'], captureAt, subscription['id']))
+            subscription.update(dict(cursor.fetchone()))
         self._recordNotification(cursor, subscription, 'payment_receipt',
             'receipt:'+evidence.providerPaymentId, {'paymentId':evidence.providerPaymentId,'invoiceId':invoice['id'], 'amount':evidence.amount,'currency':evidence.currency,'periodEnd':end.isoformat()})
         state = self._json(subscription.get('billing_state'))
-        previousCancellationRequestedAt = state.get('manualBilling',{}).get('cancellationRequestedAt')
         if evidence.purpose == 'initial_purchase':
             state.setdefault('manualBilling',{}).pop('cancellationRequestedAt',None)
         state.setdefault('manualBilling',{}).update(lifecycleId=frozen['lifecycleId'],paidFutureEnd=end.isoformat())
@@ -1866,6 +1889,11 @@ class ManualBillingRepository:
         return list(cursor.fetchall())
 
     def _activateDueCoverageLocked(self, cursor, subscription, now, invoices=None):
+        if self._usesPurchaseAuthority():
+            coverage = self._coverageSnapshotLocked(cursor, subscription, now, materialize=False)
+            # Exact access is a projection; allocation activation is a separate
+            # operation. A delayed legacy worker must not rewrite paid facts.
+            return self._result(cursor, {}, subscription, 'unchanged' if coverage.currentPeriod else 'expired', None, now=now)
         invoices = self._paidInvoicesLocked(cursor, subscription) if invoices is None else invoices
         result = self._result(cursor,{}, subscription, 'unchanged', None)
         lifecycle = self._json(subscription.get('billing_state')).get('manualBilling', {}).get('lifecycleId')
@@ -2269,7 +2297,8 @@ class ManualBillingRepository:
             'invoiceId':snapshot.nextPeriod.invoiceId if snapshot.nextPeriod else str(payable['id']) if payable else None,
             'state':'cancelled' if optOut else 'activated','refundInitiated':False,
             'cancellationReason':subscription.get('cancellation_reason'),
-            'cancellationRequestedAt':self._json(subscription.get('billing_state')).get('manualBilling',{}).get('cancellationRequestedAt')}
+            'cancellationRequestedAt':(_isoText(subscription.get('cancellation_requested_at')) if self._usesPurchaseAuthority() else
+                self._json(subscription.get('billing_state')).get('manualBilling',{}).get('cancellationRequestedAt'))}
         return {**subscription,'finalPaidEnd':finalEnd.isoformat(),'preferenceResult':facts}
 
     def setRenewalOptOut(
@@ -2289,6 +2318,9 @@ class ManualBillingRepository:
                 previous = self._canonical(cursor, userId)
                 state = self._json(previous.get('billing_state')).get('manualBilling', {})
                 finalEnd = max(filter(None, [_utc(previous.get('current_period_end')), _utc(state.get('paidFutureEnd'))]), default=None)
+                if self._usesPurchaseAuthority():
+                    coverage = self._coverageSnapshotLocked(cursor, previous, _now(), materialize=False)
+                    finalEnd = coverage.finalPaidEnd if coverage.accessAllowed else None
                 if finalEnd is None or finalEnd <= _now(): raise ValueError('NO_PAID_ACCESS_TO_CANCEL_OR_RESUME')
                 if bool(previous.get('renewal_opt_out')) == optOut:
                     return self._renewalPreferenceFactsLocked(cursor, previous, finalEnd)
@@ -2312,6 +2344,10 @@ class ManualBillingRepository:
                         f"No canonical subscription row for user {userId}"
                     )
                 billingState = self._json(row.get('billing_state'))
+                if self._usesPurchaseAuthority():
+                    cursor.execute('UPDATE public.subscriptions SET cancellation_requested_at=%s WHERE id=%s RETURNING cancellation_requested_at',
+                        (_now() if optOut else None, row['id']))
+                    row['cancellation_requested_at'] = cursor.fetchone()['cancellation_requested_at']
                 preference = billingState.setdefault('manualBilling',{})
                 if optOut:
                     preference['cancellationRequestedAt'] = _now().isoformat()

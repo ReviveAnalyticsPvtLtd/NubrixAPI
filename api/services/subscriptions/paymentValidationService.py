@@ -115,7 +115,7 @@ def isPeriodExpired(subscription: dict | None, now: datetime.datetime | None = N
     return periodEnd <= now
 
 
-def isAccessActive(subscription: dict | None, now: datetime.datetime | None = None) -> bool:
+def isAccessActive(subscription: dict | None, now: datetime.datetime | None = None, *, snapshot=None) -> bool:
     """Paid access requires timestamp-valid coverage of `now`.
 
     Status alone is never an access grant: `payment_pending` means an unpaid
@@ -124,6 +124,16 @@ def isAccessActive(subscription: dict | None, now: datetime.datetime | None = No
     in the future. At the exact end instant the old period no longer grants
     access, regardless of scheduler or JWT staleness.
     """
+    from api.services.subscriptions.subscriptionCompatibility import getSubscriptionModelPhase
+    if getSubscriptionModelPhase() in ('dual', 'v2', 'contracted'):
+        from api.services.subscriptions.subscriptionModel import SubscriptionAuthorityUnavailable, SubscriptionSnapshotV2
+        if not isinstance(snapshot, SubscriptionSnapshotV2):
+            raise SubscriptionAuthorityUnavailable('Verified subscription snapshot required')
+        current = _coerceUtc(now)
+        return bool(snapshot.accessAllowed and snapshot.accessSource == 'paid' and any(
+            period is not None and period.start <= current < period.end
+            and (period.revokedAt is None or current < period.revokedAt)
+            for period in (snapshot.currentPeriod, snapshot.nextPeriod)))
     row = subscription or {}
     status = (row.get("status") or "").lower()
     periodEnd = parseUtc(row.get("current_period_end"))
@@ -135,7 +145,11 @@ def isAccessActive(subscription: dict | None, now: datetime.datetime | None = No
     return False
 
 
-def blocksNewCheckout(subscription: dict | None, now: datetime.datetime | None = None) -> bool:
+def blocksNewCheckout(subscription: dict | None, now: datetime.datetime | None = None, *, facts=None) -> bool:
+    from api.services.subscriptions.subscriptionCompatibility import getSubscriptionModelPhase
+    if getSubscriptionModelPhase() in ('dual', 'v2', 'contracted'):
+        from api.services.subscriptions.subscriptionModel import evaluatePurchaseEligibility
+        return not evaluatePurchaseEligibility(facts, _coerceUtc(now))[0]
     return isAccessActive(subscription, now)
 
 
