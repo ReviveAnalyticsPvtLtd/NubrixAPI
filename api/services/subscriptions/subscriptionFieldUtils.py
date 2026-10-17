@@ -65,10 +65,27 @@ def normalizeDomainList(value) -> list[str]:
 
 
 def subscriptionExperts(subscription: dict | None) -> list[str]:
+    context = _verifiedContext(subscription)
+    if context is not None:
+        return list(context['experts'])
     return normalizeDomainList((subscription or {}).get("subscribed_experts"))
 
 
+def _verifiedContext(subscription):
+    from api.services.subscriptions.subscriptionCompatibility import getSubscriptionModelPhase
+    from api.services.subscriptions.subscriptionModel import SubscriptionAuthorityUnavailable
+    if getSubscriptionModelPhase() not in ('dual', 'v2', 'contracted'):
+        return None
+    context = (subscription or {}).get('_verifiedCoverage')
+    if not isinstance(context, dict) or not isinstance(context.get('experts'), list) or not isinstance(context.get('nextExperts'), list):
+        raise SubscriptionAuthorityUnavailable('Verified purchased coverage context required')
+    return context
+
+
 def subscriptionPendingRemovals(subscription: dict | None) -> list[str]:
+    context = _verifiedContext(subscription)
+    if context is not None:
+        return [e for e in context['experts'] if e not in context['nextExperts']]
     return normalizeDomainList((subscription or {}).get("pending_removals"))
 
 
@@ -78,6 +95,9 @@ def subscriptionPendingAdditions(subscription: dict | None) -> list[dict]:
 
 
 def subscriptionRenewalExperts(subscription: dict | None) -> list[str]:
+    context = _verifiedContext(subscription)
+    if context is not None:
+        return list(context['nextExperts'])
     currentExperts = subscriptionExperts(subscription)
     pendingRemovals = set(subscriptionPendingRemovals(subscription))
     return [expert for expert in currentExperts if expert not in pendingRemovals]
@@ -101,6 +121,9 @@ def buildRenewalPricingMetadata(subscription: dict | None, effectiveAt) -> dict:
 
 
 def subscriptionDomainCount(subscription: dict | None) -> int:
+    context = _verifiedContext(subscription)
+    if context is not None:
+        return len(context['experts'])
     subscription = subscription or {}
     count = subscription.get("domain_count")
     if count is None:

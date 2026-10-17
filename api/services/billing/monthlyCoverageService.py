@@ -95,9 +95,10 @@ class _OptOutStore:
 
 
 class MonthlyCoverageService:
-    def __init__(self, store=None, now=None):
+    def __init__(self, store=None, now=None, factsRepository=None):
         self.store = store or _MemoryStore()
         self.now = now or utcNow
+        self.factsRepository = factsRepository
 
     # -- calendar arithmetic --------------------------------------------------
 
@@ -184,6 +185,11 @@ class MonthlyCoverageService:
         """
         current = now or self.now()
         row = subscription or {}
+        from api.services.subscriptions.subscriptionCompatibility import getSubscriptionModelPhase
+        if getSubscriptionModelPhase() in ('dual', 'v2', 'contracted'):
+            from api.services.billing.manualBillingRepository import getManualBillingRepository
+            repository = self.factsRepository or getManualBillingRepository()
+            row = repository.getRenewalContext(userId, current)
         if (row.get("renewal_opt_out") or False):
             raise ValueError(
                 "RENEWAL_OPTED_OUT: renewal invoices are disabled for this "
@@ -238,9 +244,9 @@ class MonthlyCoverageService:
 
         nextStart = currentEnd
         nextEnd = self.addCalendarMonth(currentEnd)
-        currentExperts = list(row.get("subscribed_experts") or [])
-        pendingRemovals = set(row.get("pending_removals") or [])
-        renewalDomains = [d for d in currentExperts if d not in pendingRemovals]
+        from api.services.subscriptions.subscriptionFieldUtils import subscriptionExperts, subscriptionRenewalExperts
+        currentExperts = subscriptionExperts(row)
+        renewalDomains = subscriptionRenewalExperts(row)
         if not renewalDomains:
             raise ValueError(
                 "REMOVAL_EMPTIES_SELECTION: the next paid period must keep at "

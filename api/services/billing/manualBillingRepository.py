@@ -87,6 +87,71 @@ def _advisoryKey(userId: str) -> int:
 
 
 class ManualBillingRepository:
+    @staticmethod
+    def _usesPurchaseAuthority():
+        from api.services.subscriptions.subscriptionCompatibility import getSubscriptionModelPhase
+        return getSubscriptionModelPhase() in ('dual', 'v2', 'contracted')
+
+    def _modelRepository(self):
+        from api.services.subscriptions.subscriptionModelRepository import SubscriptionModelRepository
+        return SubscriptionModelRepository(self.connectionFactory)
+
+    def _purchaseCoverageLocked(self, cursor, subscription, owner, now):
+        from dataclasses import replace
+        from api.services.subscriptions.subscriptionModel import SubscriptionFacts, evaluateSubscription
+        model = self._modelRepository()
+        periods = model.loadAcceptedPeriods(cursor, str(subscription['id']))
+        lifecycle = str(subscription.get('lifecycle_id') or '') or (max(periods, key=lambda p: p.start).lifecycleId if periods else None)
+        effective = tuple(replace(p, experts=model.loadEffectiveExperts(cursor, p.id, now)) for p in periods)
+        snapshot = evaluateSubscription(SubscriptionFacts(subscription['user_id'], str(subscription['id']), lifecycle,
+            'pro' if periods else None, True, periods=effective, renewalOptOut=bool(subscription.get('renewal_opt_out')),
+            accountBanned=bool(owner['isBanned']), erasurePending=bool(subscription.get('erasure_pending'))), now)
+        def legacyPeriod(period):
+            if period is None:
+                return None
+            return CoveragePeriod(period.userId, period.subscriptionId, period.lifecycleId, period.creditPeriodId or '',
+                period.invoiceId, period.start, period.end, period.experts,
+                'annual_prepaid' if period.billingInterval == 'year' else 'monthly_prepaid', period.revokedAt)
+        current, upcoming = legacyPeriod(snapshot.currentPeriod), legacyPeriod(snapshot.nextPeriod)
+        mode = current.billingMode if current else 'none'
+        return CoverageSnapshot(subscription['user_id'], str(subscription['id']), lifecycle, mode, now,
+            current, upcoming, snapshot.paidUntil, snapshot.renewalOptOut, snapshot.accessAllowed, snapshot.denialReason)
+
+    def _purchaseContextLocked(self, cursor, subscription, coverage, now):
+        if not coverage.currentPeriod or not coverage.accessAllowed:
+            raise ValueError('PAID_COVERAGE_REQUIRED')
+        period = coverage.currentPeriod
+        selected = self._modelRepository().loadNextSelection(cursor, str(subscription['id']), period.lifecycleId, period.end)
+        experts = list(period.domains)
+        nextExperts = selected['experts'] if selected else experts
+        state = self._json(subscription.get('billing_state'))
+        state.setdefault('manualBilling', {})['lifecycleId'] = period.lifecycleId
+        return {**subscription, 'billing_mode': period.billingMode, 'current_period_start': period.start,
+            'current_period_end': period.end, 'subscribed_experts': experts, 'domain_count': len(experts),
+            'pending_removals': [e for e in experts if e not in nextExperts], 'billing_state': state,
+            '_verifiedCoverage': {'experts': experts, 'nextExperts': nextExperts,
+                'selectionEventId': selected['id'] if selected else None,
+                'selectionVersion': selected.get('version') if selected else None,
+                'servicePeriodId': period.invoiceId}}
+
+    def getRenewalContext(self, userId, now=None):
+        def operation(connection):
+            with connection.cursor(cursor_factory=RealDictCursor) as cursor:
+                self._lockUser(cursor, userId)
+                row = self._canonical(cursor, userId)
+                evaluated = _utc(now) if now is not None else self._modelRepository()._now(cursor)
+                coverage = self._coverageSnapshotLocked(cursor, row, evaluated, materialize=False)
+                return self._purchaseContextLocked(cursor, row, coverage, evaluated)
+        return self._run(operation)
+
+    def _pendingExpertAttemptsLocked(self, cursor, subscription, periodId):
+        cursor.execute("""SELECT * FROM public.billing_events WHERE user_id=%s AND subscription_id=%s
+            AND event_category='payment_attempt' AND payment_status IN ('created','pending_provider_ack','authorized')
+            ORDER BY id FOR UPDATE""", (subscription['user_id'], subscription['id']))
+        return [a for a in cursor.fetchall() if self._json(a.get('metadata_json')).get('manualBilling', {}).get('purpose') == 'expert_addition'
+                and self._json(a['metadata_json'])['manualBilling'].get('servicePeriodId') == periodId
+                and not self._json(a['metadata_json'])['manualBilling'].get('closedAt')]
+
     def __init__(self, connectionFactory=None):
         self.connectionFactory = connectionFactory or defaultConnectionFactory
 
@@ -377,6 +442,9 @@ class ManualBillingRepository:
                  'payloadHash': payloadHash}}), _now()))
 
     def _validateRenewalAttemptLocked(self, cursor, request, subscription, attempt, now):
+        if self._usesPurchaseAuthority():
+            coverage = self._coverageSnapshotLocked(cursor, subscription, now, materialize=False)
+            subscription = self._purchaseContextLocked(cursor, subscription, coverage, now)
         frozen = self._json(attempt.get('metadata_json')).get('manualBilling', {})
         if attempt.get('payment_status') not in ('created', 'pending_provider_ack', 'authorized'):
             return
@@ -404,6 +472,9 @@ class ManualBillingRepository:
                 or invoice.get('billing_reason') != 'renewal' or _utc(invoice.get('period_start')) != end):
             raise ValueError('RENEWAL_INVOICE_CLOSED')
         quote = self._json(invoice.get('metadata_json')).get('manualBilling', {})
+        if self._usesPurchaseAuthority() and any(quote.get(k) != subscription['_verifiedCoverage'].get(k)
+                or frozen.get(k) != quote.get(k) for k in ('selectionEventId', 'selectionVersion')):
+            raise ValueError('INVOICE_REVISION_CONFLICT')
         quotedDomains = quote.get('domains') or self._json(invoice.get('metadata_json')).get('renewalDomains')
         selected = set(self._jsonList(subscription.get('subscribed_experts'))) - set(
             self._jsonList(subscription.get('pending_removals')))
@@ -540,6 +611,8 @@ class ManualBillingRepository:
                 if request.requiresExistingAttempt:
                     raise ValueError('PRICING_CONTEXT_REQUIRED')
                 coverage = self._coverageSnapshotLocked(cursor, subscription, now, materialize=True)
+                if self._usesPurchaseAuthority() and request.purpose != 'initial_purchase':
+                    subscription = self._purchaseContextLocked(cursor, subscription, coverage, now)
                 if subscription.get('erasure_pending') or coverage.denialReason == 'account_banned':
                     raise ValueError('CHECKOUT_OWNER_NOT_ELIGIBLE')
                 if request.purpose == 'renewal' and request.billingMode == 'annual_prepaid' and coverage.nextPeriod:
@@ -573,6 +646,9 @@ class ManualBillingRepository:
                     if not invoice or str(invoice['subscription_id']) != str(subscription['id']):
                         raise ValueError('OWNED_INVOICE_NOT_FOUND')
                     frozen = self._json(invoice.get('metadata_json')).get('manualBilling', {})
+                    if self._usesPurchaseAuthority() and any(frozen.get(k) != subscription['_verifiedCoverage'].get(k)
+                            for k in ('selectionEventId', 'selectionVersion')):
+                        raise ValueError('STALE_EXPERT_SELECTION')
                     if invoice.get('billing_reason') != 'renewal' or str(invoice['status']).upper() not in ('UPCOMING', 'PAYMENT_PENDING') or _utc(invoice.get('period_start')) != end:
                         raise ValueError('RENEWAL_INVOICE_CLOSED')
                     current = subscription.get('subscribed_experts') or []
@@ -623,6 +699,8 @@ class ManualBillingRepository:
                         'billingMode': request.billingMode, 'domains': selected, 'revision': revision,
                         'catalogRevision': catalog.revision,
                         'coverageState': 'estimated', 'expiresAt': deadline.isoformat()}
+                    if self._usesPurchaseAuthority() and request.purpose == 'expert_addition':
+                        billing['servicePeriodId'] = coverage.currentPeriod.invoiceId
                     if request.purpose == 'topup':
                         billing.update(tokens=pricing.pricing_reference_snapshot_json['tokens'], packId=request.payload['packId'])
                     invoice = {'id': str(uuid.uuid4()), 'userId': request.userId, 'subscription_id': subscription['id'],
@@ -659,6 +737,9 @@ class ManualBillingRepository:
                     'periodEnd': _isoText(invoice.get('period_end')), 'expiresAt': deadline.isoformat(),
                     'tokens': frozen.get('tokens'), 'packId': frozen.get('packId'), 'requestKey': request.requestKey or str(uuid.uuid4())}
                 snapshot['catalogRevision'] = self._json(invoice.get('pricing_reference_snapshot_json')).get('catalogRevision')
+                if self._usesPurchaseAuthority():
+                    snapshot.update(servicePeriodId=frozen.get('servicePeriodId'),
+                        selectionEventId=frozen.get('selectionEventId'), selectionVersion=frozen.get('selectionVersion'))
                 return self._reserveCheckoutIntentLocked(cursor, subscription, request.userId, request.purpose,
                     snapshot['requestKey'], payload_hash, snapshot, now)
         existing = self._run(lambda connection: transaction(connection, lookupOnly=True))
@@ -775,6 +856,9 @@ class ManualBillingRepository:
             with connection.cursor(cursor_factory=RealDictCursor) as cursor:
                 self._lockUser(cursor, userId)
                 subscription = self._canonical(cursor, userId)
+                if self._usesPurchaseAuthority():
+                    coverage = self._coverageSnapshotLocked(cursor, subscription, _now(), materialize=False)
+                    subscription = self._purchaseContextLocked(cursor, subscription, coverage, _now())
                 start = _utc(subscription.get('current_period_end'))
                 if (subscription.get('billing_mode') != 'annual_prepaid' or not start
                         or subscription.get('erasure_pending') or subscription.get('renewal_opt_out')
@@ -795,6 +879,9 @@ class ManualBillingRepository:
                     manualBilling={'schemaVersion': 1, 'lifecycleId': lifecycle, 'purpose': 'renewal',
                         'billingMode': 'annual_prepaid', 'domains': metadata['renewalDomains'],
                         'coverageState': 'scheduled', 'revision': 1})
+                if self._usesPurchaseAuthority():
+                    metadata['manualBilling'].update({k: subscription['_verifiedCoverage'][k]
+                        for k in ('selectionEventId', 'selectionVersion')})
                 row = {'id': str(uuid.uuid4()), 'userId': userId, 'subscription_id': subscription['id'],
                     'billing_reason': 'renewal', 'payment_flow': 'razorpay_order_checkout',
                     'requires_customer_auth': True, 'period_start': start, 'period_end': end, 'due_date': start,
@@ -821,6 +908,9 @@ class ManualBillingRepository:
                     return None
                 self._lockUser(cursor, owner['userId'])
                 subscription = self._canonical(cursor, owner['userId'])
+                if self._usesPurchaseAuthority():
+                    coverage = self._coverageSnapshotLocked(cursor, subscription, _now(), materialize=False)
+                    subscription = self._purchaseContextLocked(cursor, subscription, coverage, _now())
                 cursor.execute('select * from public."Invoices" where id=%s for update', (invoiceId,))
                 invoice = cursor.fetchone()
                 if (not invoice or invoice['billing_reason'] != 'renewal'
@@ -845,6 +935,8 @@ class ManualBillingRepository:
                     for key in ('closedAt', 'closedReason'):
                         manual.pop(key, None)
                     manual.update(domains=selection['renewalDomains'], revision=int(manual.get('revision') or 1) + 1)
+                    if self._usesPurchaseAuthority():
+                        manual.update({k: subscription['_verifiedCoverage'][k] for k in ('selectionEventId', 'selectionVersion')})
                     metadata.update(selection, manualBilling=manual, repricingRequired=False)
                     fields['razorpay_order_id'] = None
                 elif str(invoice['status']).upper() == 'EXPIRED':
@@ -864,10 +956,15 @@ class ManualBillingRepository:
 
     def createFrozenRenewalInvoice(self, payload, expectedVersion, expectedCatalogRevision=None):
         """Freeze current catalog prices inside the renewal issuance transaction."""
+        from copy import deepcopy
+        payload = deepcopy(payload)
         def operation(connection):
             with connection.cursor(cursor_factory=RealDictCursor) as cursor:
                 self._lockUser(cursor,payload['userId'])
                 subscription=self._canonical(cursor,payload['userId'])
+                if self._usesPurchaseAuthority():
+                    coverage = self._coverageSnapshotLocked(cursor, subscription, _now(), materialize=False)
+                    subscription = self._purchaseContextLocked(cursor, subscription, coverage, _now())
                 if int(subscription['version']) != int(expectedVersion):
                     raise ValueError('STALE_SUBSCRIPTION_VERSION')
                 if subscription.get('renewal_opt_out') or subscription.get('erasure_pending') or not _utc(subscription.get('current_period_end')) or _utc(subscription['current_period_end']) <= _now():
@@ -880,6 +977,12 @@ class ManualBillingRepository:
                 removals=json.loads(removals) if isinstance(removals,str) else list(removals)
                 domains=[domain for domain in current if domain not in removals]
                 frozen=payload['metadata_json']['manualBilling']
+                if self._usesPurchaseAuthority():
+                    # Freeze the exact selection read under the owner lock, even
+                    # when the decision event existed before this invoice.
+                    frozen = payload['metadata_json']['manualBilling']
+                    frozen.update({k: subscription['_verifiedCoverage'][k]
+                        for k in ('selectionEventId', 'selectionVersion')})
                 from dateutil.relativedelta import relativedelta
                 lifecycle=self._json(subscription.get('billing_state')).get('manualBilling',{}).get('lifecycleId')
                 if frozen.get('lifecycleId') != lifecycle or _utc(payload['period_end']) != _utc(payload['period_start'])+relativedelta(months=1):
@@ -924,6 +1027,20 @@ class ManualBillingRepository:
             with connection.cursor(cursor_factory=RealDictCursor) as cursor:
                 self._lockUser(cursor,userId)
                 subscription=self._canonical(cursor,userId)
+                if self._usesPurchaseAuthority():
+                    coverage = self._coverageSnapshotLocked(cursor, subscription, _now(), materialize=False)
+                    context = self._purchaseContextLocked(cursor, subscription, coverage, _now())
+                    current, selected = list(coverage.currentPeriod.domains), context['_verifiedCoverage']['nextExperts']
+                    if not domains or len(domains) != len(set(domains)) or not set(domains) <= set(selected):
+                        raise ValueError('INVALID_EXPERT_REMOVAL')
+                    remaining = [e for e in selected if e not in domains]
+                    if not remaining:
+                        raise ValueError('USE_CANCEL_FOR_ALL_EXPERTS')
+                    self._modelRepository().saveNextSelection(cursor, str(subscription['id']), coverage.lifecycleId,
+                        coverage.currentPeriod.end, subscription['version'], remaining, now=_now())
+                    pending = [e for e in current if e not in remaining]
+                    cursor.execute('UPDATE public.subscriptions SET pending_removals=%s WHERE id=%s', (Json(pending), subscription['id']))
+                    return {'currentDomains': current, 'pendingRemovals': pending, 'effectiveAt': coverage.currentPeriod.end.isoformat()}
                 end=_utc(subscription.get('current_period_end'))
                 if not end or end <= _now() or subscription.get('erasure_pending'):
                     raise ValueError('PAID_COVERAGE_REQUIRED')
@@ -964,6 +1081,24 @@ class ManualBillingRepository:
             with connection.cursor(cursor_factory=RealDictCursor) as cursor:
                 self._lockUser(cursor,userId)
                 subscription=self._canonical(cursor,userId)
+                if self._usesPurchaseAuthority():
+                    coverage = self._coverageSnapshotLocked(cursor, subscription, _now(), materialize=False)
+                    if not coverage.currentPeriod:
+                        raise ValueError('NO_CANCELLABLE_EXPERT_ATTEMPT')
+                    candidates = [a for a in self._pendingExpertAttemptsLocked(cursor, subscription, coverage.currentPeriod.invoiceId)
+                        if domain in self._json(a['metadata_json'])['manualBilling'].get('domains', [])]
+                    if len(candidates) != 1:
+                        raise ValueError('NO_CANCELLABLE_EXPERT_ATTEMPT')
+                    attempt = candidates[0]
+                    cursor.execute('SELECT * FROM public."Invoices" WHERE id=%s AND "userId"=%s AND subscription_id=%s FOR UPDATE',
+                        (attempt['invoice_id'], userId, subscription['id']))
+                    invoice = cursor.fetchone()
+                    if not invoice or invoice['status'] == 'PAID':
+                        raise ValueError('EXPERT_ALREADY_PAID_OR_MISSING')
+                    self._closeInvoice(cursor, invoice, 'EXPERT_ADDITION_CANCELLED')
+                    return {'domain': domain, 'cancelled': True,
+                        'closedAttemptDomains': self._json(attempt['metadata_json'])['manualBilling']['domains'],
+                        'orderId': attempt['provider_order_id']}
                 pending=subscription.get('pending_additions') or []
                 pending=json.loads(pending) if isinstance(pending,str) else list(pending)
                 target=next((item for item in pending if item['domain']==domain and item.get('state')=='awaiting_payment'),None)
@@ -1123,6 +1258,8 @@ class ManualBillingRepository:
             "closedAt": None,
             "closedReason": None,
         }
+        if self._usesPurchaseAuthority():
+            manualBilling.update({k: snapshot.get(k) for k in ('servicePeriodId', 'selectionEventId', 'selectionVersion')})
 
         namespaceKey = f"{purpose}:{userId}:{requestKey}"
         if str(subscription['id']) != str(snapshot.get('subscriptionId')) or subscription.get('erasure_pending'):
@@ -1210,6 +1347,11 @@ class ManualBillingRepository:
         attemptId = snapshot.get("attemptId") or str(uuid.uuid4())
         if purpose == 'expert_addition':
             domains=list(snapshot.get('domains') or [])
+            if self._usesPurchaseAuthority():
+                coverage = self._coverageSnapshotLocked(cursor, subscription, now, materialize=False)
+                subscription = self._purchaseContextLocked(cursor, subscription, coverage, now)
+                if snapshot.get('servicePeriodId') != coverage.currentPeriod.invoiceId:
+                    raise ValueError('EXPERT_PERIOD_MISMATCH')
             current=subscription.get('subscribed_experts') or []
             current=json.loads(current) if isinstance(current,str) else list(current)
             pending=subscription.get('pending_additions') or []
@@ -1218,6 +1360,9 @@ class ManualBillingRepository:
                 if item.get('attemptId') in expiredAttemptIds and item.get('state')=='awaiting_payment':
                     item.update(state='expired',expiredAt=now.isoformat())
             openDomains={item.get('domain') for item in pending if item.get('state')=='awaiting_payment'}
+            if self._usesPurchaseAuthority():
+                openDomains = {d for a in self._pendingExpertAttemptsLocked(cursor, subscription, coverage.currentPeriod.invoiceId)
+                    for d in self._json(a['metadata_json'])['manualBilling']['domains']}
             if not domains or set(domains)&(set(current)|openDomains) or len(set(current)|openDomains|set(domains))>4:
                 raise ValueError('EXPERT_SELECTION_CONFLICT')
             if not _utc(subscription.get('current_period_end')) or _utc(subscription['current_period_end']) <= now:
@@ -1500,6 +1645,11 @@ class ManualBillingRepository:
             reason='INVALID_FROZEN_EXPERT_SELECTION'
         metadata = self._json(invoice.get('metadata_json'))
         billing = metadata.setdefault('manualBilling', {})
+        if self._usesPurchaseAuthority() and (any(billing.get(k) != frozen.get(k) for k in ('purpose', 'billingMode', 'lifecycleId'))
+                or set(billing.get('domains', [])) != set(frozen.get('domains', []))
+                or int(billing.get('revision') or 1) != int(frozen.get('revision') or 1)
+                or int(invoice.get('total_amount') or 0) != evidence.amount or invoice.get('currency') != evidence.currency):
+            reason = 'FROZEN_INVOICE_MISMATCH'
         closed = self._json(attempt.get('metadata_json')).get('manualBilling', {})
         closedAt = _utc(closed.get('closedAt') or billing.get('closedAt'))
         closedReason = closed.get('closedReason') or billing.get('closedReason')
@@ -1515,8 +1665,12 @@ class ManualBillingRepository:
                     and self._coverageSnapshotLocked(cursor, subscription, evidence.observedAt, materialize=False).nextPeriod):
                 reason = 'FUTURE_PERIOD_ALREADY_PAID'
             lifecycle = self._json(subscription.get('billing_state')).get('manualBilling', {}).get('lifecycleId')
+            cycleEnd = _utc(subscription.get('current_period_end'))
+            if self._usesPurchaseAuthority():
+                parent = self._coverageSnapshotLocked(cursor, subscription, captureAt, materialize=False).currentPeriod
+                lifecycle, cycleEnd = (parent.lifecycleId, parent.end) if parent else (None, None)
             if frozen.get('lifecycleId') != lifecycle: reason = 'STALE_LIFECYCLE'
-            if _utc(invoice.get('period_start')) != _utc(subscription.get('current_period_end')): reason = 'STALE_CYCLE'
+            if _utc(invoice.get('period_start')) != cycleEnd: reason = 'STALE_CYCLE'
         elif evidence.purpose == 'initial_purchase' and subscription.get('billing_mode') in ('monthly_prepaid','annual_prepaid') and (_utc(subscription.get('current_period_end')) or captureAt) > captureAt:
             reason = 'EXISTING_PAID_COVERAGE'
         if evidence.purpose == 'initial_purchase':
@@ -1530,14 +1684,25 @@ class ManualBillingRepository:
                         and paidStart < newEnd and captureAt < paidEnd):
                     reason = 'EXISTING_PAID_COVERAGE'
         if evidence.purpose == 'expert_addition':
-            pending = subscription.get('pending_additions') or []
-            pending = json.loads(pending) if isinstance(pending,str) else list(pending)
-            matches = [item for item in pending if item.get('orderId') == evidence.providerOrderId]
-            domains = frozen.get('domains') or []
-            if not matches or any(item.get('state') != 'awaiting_payment' for item in matches): reason = 'CLOSED_EXPERT_ATTEMPT'
-            elif set(domains) != {item.get('domain') for item in matches}: reason = 'EXPERT_SELECTION_MISMATCH'
-            elif not _utc(subscription.get('current_period_end')) or _utc(subscription['current_period_end']) <= captureAt or _utc(invoice.get('period_end')) != _utc(subscription['current_period_end']): reason = 'EXPERT_PERIOD_CLOSED'
-            elif frozen.get('lifecycleId') != self._json(subscription.get('billing_state')).get('manualBilling',{}).get('lifecycleId'): reason = 'STALE_LIFECYCLE'
+            if self._usesPurchaseAuthority():
+                coverage = self._coverageSnapshotLocked(cursor, subscription, evidence.observedAt, materialize=False)
+                period = coverage.currentPeriod
+                if not period or frozen.get('servicePeriodId') != period.invoiceId or billing.get('servicePeriodId') != period.invoiceId:
+                    reason = 'EXPERT_PERIOD_CLOSED'
+                elif (frozen.get('lifecycleId') != period.lifecycleId or billing.get('lifecycleId') != period.lifecycleId
+                        or _utc(invoice.get('period_end')) != period.end):
+                    reason = 'STALE_LIFECYCLE_OR_CYCLE'
+                elif set(frozen.get('domains', [])) != set(billing.get('domains', [])):
+                    reason = 'EXPERT_SELECTION_MISMATCH'
+            else:
+                pending = subscription.get('pending_additions') or []
+                pending = json.loads(pending) if isinstance(pending,str) else list(pending)
+                matches = [item for item in pending if item.get('orderId') == evidence.providerOrderId]
+                domains = frozen.get('domains') or []
+                if not matches or any(item.get('state') != 'awaiting_payment' for item in matches): reason = 'CLOSED_EXPERT_ATTEMPT'
+                elif set(domains) != {item.get('domain') for item in matches}: reason = 'EXPERT_SELECTION_MISMATCH'
+                elif not _utc(subscription.get('current_period_end')) or _utc(subscription['current_period_end']) <= captureAt or _utc(invoice.get('period_end')) != _utc(subscription['current_period_end']): reason = 'EXPERT_PERIOD_CLOSED'
+                elif frozen.get('lifecycleId') != self._json(subscription.get('billing_state')).get('manualBilling',{}).get('lifecycleId'): reason = 'STALE_LIFECYCLE'
         if reason:
             cursor.execute('update public.billing_events set event_status = %s, failure_reason = %s where id = %s', ('REQUIRES_RECONCILIATION',reason,captureId))
             return self._result(cursor,invoice,subscription,'requires_reconciliation',evidence.attemptId,anomalyId=captureId)
@@ -1759,6 +1924,8 @@ class ManualBillingRepository:
         owner = cursor.fetchone()
         if not owner:
             raise ValueError('OWNERSHIP_OR_USER_MISSING')
+        if self._usesPurchaseAuthority():
+            return self._purchaseCoverageLocked(cursor, subscription, owner, now)
         invoices = self._paidInvoicesLocked(cursor, subscription)
         if materialize and subscription.get('billing_mode') == 'monthly_prepaid':
             self._activateDueCoverageLocked(cursor, subscription, now, invoices)
@@ -1835,7 +2002,9 @@ class ManualBillingRepository:
         billing = metadata['manualBilling']
         period = self._coverage(invoice)
         preserveCurrent = period.start > now and self._coverageSnapshotLocked(cursor,subscription,now,materialize=False).currentPeriod is not None
-        domains = self._jsonList(subscription.get('subscribed_experts')) if preserveCurrent else list(period.domains)
+        domains = (list(self._coverageSnapshotLocked(cursor, subscription, now, materialize=False).currentPeriod.domains)
+            if preserveCurrent and self._usesPurchaseAuthority() else
+            self._jsonList(subscription.get('subscribed_experts')) if preserveCurrent else list(period.domains))
         removals = self._jsonList(subscription.get('pending_removals')) if preserveCurrent else []
         quota = getTokenQuotaForPlan('annual', len(domains))
         cursor.execute('''insert into public.credit_balances (user_id,subscription_id,plan_tier,domain_count,
@@ -1948,6 +2117,9 @@ class ManualBillingRepository:
         from api.services.credits.creditConfig import getTokenQuotaForPlan
         current=subscription.get('subscribed_experts') or []
         current=json.loads(current) if isinstance(current,str) else list(current)
+        if self._usesPurchaseAuthority():
+            coverage = self._coverageSnapshotLocked(cursor, subscription, evidence.observedAt, materialize=False)
+            current = list(coverage.currentPeriod.domains)
         added=self._json(attempt.get('metadata_json'))['manualBilling']['domains']
         combined=list(dict.fromkeys(current+added))
         if len(combined)>4 or len(combined)!=len(current)+len(added):
@@ -1956,6 +2128,10 @@ class ManualBillingRepository:
         cursor.execute('select * from public.credit_balances where user_id=%s for update',(evidence.userId,))
         credit=cursor.fetchone()
         if not credit or not credit.get('credit_period_id'): raise ValueError('CREDIT_PERIOD_MISSING')
+        if self._usesPurchaseAuthority() and (str(credit.get('subscription_id')) != str(subscription['id'])
+                or str(credit.get('lifecycle_id')) != coverage.lifecycleId
+                or not _utc(credit.get('period_start')) <= evidence.observedAt < _utc(credit.get('period_end'))):
+            raise ValueError('CREDIT_PERIOD_MISMATCH')
         pending=subscription.get('pending_additions') or []
         pending=json.loads(pending) if isinstance(pending,str) else list(pending)
         for item in pending:
@@ -1978,6 +2154,14 @@ class ManualBillingRepository:
         invoice.update(status='PAID',metadata_json=metadata)
         cursor.execute("update public.billing_events set payment_status='captured',event_status='captured',completed_at=%s where id=%s",(evidence.observedAt,attempt['id']))
         cursor.execute("update public.billing_events set event_status='FINALIZED' where id=%s",(captureId,))
+        if self._usesPurchaseAuthority():
+            self._modelRepository().recordExpertGrant(cursor, subscription, invoice, attempt, evidence, coverage.currentPeriod.invoiceId)
+            model = self._modelRepository()
+            selected = model.loadNextSelection(cursor, str(subscription['id']), coverage.lifecycleId, coverage.currentPeriod.end)
+            if selected and not selected['paid']:
+                currentRow = self._canonical(cursor, subscription['user_id'])
+                model.saveNextSelection(cursor, str(subscription['id']), coverage.lifecycleId, coverage.currentPeriod.end,
+                    currentRow['version'], list(dict.fromkeys(selected['experts'] + added)), now=evidence.observedAt)
         # The next unpaid price must be re-frozen using the updated experts.
         # Paid future invoices remain immutable.
         cursor.execute('''select * from public."Invoices" where "userId"=%s and subscription_id=%s

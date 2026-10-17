@@ -1283,6 +1283,10 @@ class SubscriptionService:
             )
             userId = decodedToken.get("userId")
             subscription = self._getCanonicalSubscription(userId=userId, required=True)
+            from api.services.subscriptions.subscriptionCompatibility import getSubscriptionModelPhase
+            if getSubscriptionModelPhase() in ('dual', 'v2', 'contracted'):
+                from api.services.billing.manualBillingRepository import getManualBillingRepository
+                subscription = getManualBillingRepository().getRenewalContext(userId)
             billingMode = (subscription.get("billing_mode") or "").lower()
             if billingMode == "annual_prepaid":
                 from api.services.billing.manualBillingRepository import getManualBillingRepository
@@ -1349,6 +1353,10 @@ class SubscriptionService:
         self, userId: str, subscription: dict, prepared: dict
     ) -> str | None:
         """Persist the prepared monthly renewal invoice revision."""
+        from api.services.subscriptions.subscriptionCompatibility import getSubscriptionModelPhase
+        if getSubscriptionModelPhase() in ('dual', 'v2', 'contracted'):
+            from api.services.billing.manualBillingRepository import getManualBillingRepository
+            subscription = getManualBillingRepository().getRenewalContext(userId)
         nextPeriod = prepared.get("nextPeriod") or {}
         if not nextPeriod.get("start"):
             return

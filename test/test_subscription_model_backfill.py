@@ -6,7 +6,7 @@ import pytest
 from api.services.subscriptions.subscriptionModelBackfill import (
     buildBackfillProposal, legacyRowHash, factsFromRecords,
 )
-from api.services.subscriptions.subscriptionModel import SubscriptionAuthorityUnavailable, evaluateSubscription
+from api.services.subscriptions.subscriptionModel import evaluateSubscription
 from test.subscriptionBackfillFixtures import NOW, source
 
 
@@ -148,4 +148,12 @@ def test_terminal_attempt_label_without_closure_proof_does_not_allow_a_second_pu
 def test_empty_subscription_labels_with_credit_history_require_review():
     row, owner, invoices, events = source()
     owner['creditHistory'] = True
+    assert buildBackfillProposal(row, owner, invoices, events, now=NOW)['resolution'] == 'needs_review'
+
+
+@pytest.mark.parametrize('field,value', [('pending_removals', ['banking']),
+    ('pending_additions', [{'domain': 'telecom', 'state': 'awaiting_payment', 'attemptId': 'missing'}])])
+def test_legacy_selection_without_owned_destination_is_reported_unresolved(field, value):
+    row, owner, invoices, events = source('paid')
+    row[field] = value
     assert buildBackfillProposal(row, owner, invoices, events, now=NOW)['resolution'] == 'needs_review'
