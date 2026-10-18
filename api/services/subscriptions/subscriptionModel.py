@@ -61,6 +61,7 @@ class SubscriptionFacts:
     erasurePending: bool = False
     moneyUnresolved: bool = False
     recoverableCheckout: RecoverableCheckout | None = None
+    nextSelectedExperts: tuple[str, ...] | None = None
 
 
 @dataclass(frozen=True)
@@ -89,6 +90,7 @@ class SubscriptionSnapshotV2:
     purchaseBlockReason: Literal['current_coverage', 'recovery_required', 'account_restricted'] | None
     recoverableCheckout: RecoverableCheckout | None
     evaluatedAt: datetime
+    nextSelectedExperts: tuple[str, ...] | None = None
     schemaVersion: Literal[2] = field(default=2, init=False)
 
 
@@ -157,6 +159,7 @@ def evaluateSubscription(facts: SubscriptionFacts, now: datetime) -> Subscriptio
         cancellationEffectiveAt=paidUntil if facts.renewalOptOut else None,
         purchaseAllowed=purchaseBlock is None, purchaseBlockReason=purchaseBlock,
         recoverableCheckout=facts.recoverableCheckout, evaluatedAt=now,
+        nextSelectedExperts=(upcoming.experts if upcoming else facts.nextSelectedExperts) if current else None,
     )
 
 
@@ -209,6 +212,8 @@ def _validatedFacts(facts: SubscriptionFacts) -> tuple[TrialFacts, tuple[Purchas
         raise SubscriptionAuthorityUnavailable('Trial closure without trial dates')
     if not isinstance(facts.periods, tuple):
         raise SubscriptionAuthorityUnavailable('Immutable purchased history required')
+    if facts.nextSelectedExperts is not None:
+        _experts(facts.nextSelectedExperts)
     periods = []
     ids, invoices = set(), set()
     for period in facts.periods:

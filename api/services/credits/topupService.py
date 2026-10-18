@@ -82,6 +82,11 @@ class TopupService:
     def _subscription(userId: str) -> dict | None:
         """Fetch the canonical subscription row, or None when absent."""
         from api.services.subscriptions.subscriptionService import subscriptionService
+        from api.services.subscriptions.subscriptionCompatibility import usesUnifiedSubscription, refreshSubscriptionProjection
+        if usesUnifiedSubscription():
+            row = subscriptionService._getCanonicalSubscription(userId=userId, required=True)
+            refreshSubscriptionProjection(userId, row)
+            return row
         return subscriptionService._getCanonicalSubscription(userId=userId, required=False)
 
     @staticmethod
@@ -143,6 +148,13 @@ class TopupService:
         Returns:
             bool: True when top-ups may be purchased.
         """
+        from api.services.subscriptions.subscriptionCompatibility import usesUnifiedSubscription
+        if usesUnifiedSubscription():
+            from api.services.subscriptions.subscriptionCompatibility import refreshSubscriptionProjection
+            projected = {}
+            refreshSubscriptionProjection((subscription or {}).get('user_id'), projected)
+            snapshot = projected['_subscriptionSnapshot']
+            return snapshot.accessAllowed and snapshot.accessSource == 'paid'
         if not subscription or subscription.get('status') == 'trial' or subscription.get('billing_mode') not in ('monthly_prepaid', 'annual_prepaid'):
             return False
         from api.services.subscriptions.subscriptionService import subscriptionService
@@ -194,6 +206,8 @@ class TopupService:
             packs.sort(key=lambda pack: pack["tokens"])
 
             return {"packs": packs, "eligible": eligible, 'currency':currency, 'catalogRevision':catalog.revision}
+        except CustomException:
+            raise
         except Exception as e:
             from api.services.billing.pricingCatalogContracts import CatalogUnavailable
             exception = CustomException(e, statusCode=503, uiMessage='Prices are temporarily unavailable.', errorCode='PRICE_UNAVAILABLE') if isinstance(e, CatalogUnavailable) else CustomException(e)
@@ -207,7 +221,10 @@ class TopupService:
         service.client = self.client
         service.razorpayClient = self.razorpayClient
         subscription = self._subscription(userId)
-        if not subscription or subscription.get('status') == 'trial' or subscription.get('billing_mode') not in ('monthly_prepaid', 'annual_prepaid'):
+        from api.services.subscriptions.subscriptionCompatibility import usesUnifiedSubscription
+        eligible = (self._isTopupEligible(subscription) if usesUnifiedSubscription() else bool(subscription
+            and subscription.get('status') != 'trial' and subscription.get('billing_mode') in ('monthly_prepaid','annual_prepaid')))
+        if not eligible:
             raise CustomException(ValueError('TOPUP_NOT_ELIGIBLE'), statusCode=403,
                 uiMessage='Credit top-ups require an active paid subscription.', errorCode='TOPUP_NOT_ELIGIBLE')
         currency = subscription.get('default_currency') or 'INR'

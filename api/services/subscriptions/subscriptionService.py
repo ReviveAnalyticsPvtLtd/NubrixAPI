@@ -1246,13 +1246,21 @@ class SubscriptionService:
                 raise ValueError('PROVIDER_ORDER_EVIDENCE_MISMATCH')
             payment = self.razorpayClient.payment.fetch(paymentId)
             result = self._finalizeManualCheckout(str(attempt['invoice_id']), orderId, paymentId, payment)
+            from api.services.subscriptions.subscriptionCompatibility import usesUnifiedSubscription, legacySubscriptionFields
+            if usesUnifiedSubscription():
+                from api.services.subscriptions.subscriptionSnapshotService import getSubscriptionSnapshotService
+                from api.services.billing.manualBillingPresentation import serializeSubscriptionSnapshot
+                try:
+                    snapshot = getSubscriptionSnapshotService().get(userId)
+                except Exception as exc:
+                    raise CustomException(exc, statusCode=503, errorCode='SUBSCRIPTION_AUTHORITY_UNAVAILABLE',
+                        uiMessage='Subscription access could not be verified. Please try again.') from exc
+                result['subscription'] = serializeSubscriptionSnapshot(snapshot)
             if result['finalized'] and purpose in ('initial_purchase', 'renewal'):
                 from api.services.subscriptions.subscriptionCompatibility import getSubscriptionModelPhase
                 if getSubscriptionModelPhase() in ('dual', 'v2', 'contracted'):
-                    coverage = repository.getCoverageSnapshot(userId)
-                    period = coverage.currentPeriod
-                    result['accessToken'] = self._reissueTokenWithUpdatedClaims(token, 'active' if period else 'expired',
-                        ('annual' if period.billingMode == 'annual_prepaid' else 'pro') if period else 'none')
+                    aliases = legacySubscriptionFields(snapshot)
+                    result['accessToken'] = self._reissueTokenWithUpdatedClaims(token, snapshot.status, aliases['planType'])
                 else:
                     result['accessToken'] = self._reissueTokenWithUpdatedClaims(token, 'active',
                         'annual' if frozen['billingMode'] == 'annual_prepaid' else 'pro')

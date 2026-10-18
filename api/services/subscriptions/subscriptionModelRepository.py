@@ -343,6 +343,64 @@ class SubscriptionModelRepository:
                 return factsFromRecords(row, owner, ownInvoices, ownEvents, consumed=payload['trialConsumed'])
         raise SubscriptionAuthorityUnavailable('Reviewed backfill is missing or stale')
 
+    def loadRuntimeFacts(self, cursor, row, now):
+        """Read explicit core facts and current owned money, never a cached label.
+
+        The migration verifier above remains frozen to its reviewed source. A
+        runtime write need not rewrite that immutable approval or pretend its
+        old financial fingerprint is still current. Trial history must have
+        an owned initialization/trial event or a valid reviewed archive.
+        """
+        from dataclasses import replace
+        from api.services.billing.manualBillingRepository import ManualBillingRepository
+        from api.services.subscriptions.subscriptionModel import TrialFacts
+        billing = ManualBillingRepository(self.connectionFactory)
+        cursor.execute('SELECT "userId","isBanned" FROM public."Users" WHERE "userId"=%s', (row['user_id'],))
+        owner = cursor.fetchone()
+        if not owner:
+            raise SubscriptionAuthorityUnavailable('Subscription owner missing')
+        facts = billing._purchaseFactsLocked(cursor, row, owner, now)
+        _, _, events = self._purchaseRecords(cursor, str(row['id']))
+        events = [e for e in events if str(e.get('subscription_id')) == str(row['id']) and e.get('event_status') == 'COMMITTED']
+        trialEvent = next((e for e in events if e['event_type'] == 'subscription.trial_started'), None)
+        initialized = any(e['event_type'] == 'subscription.model_initialized' for e in events)
+        reviewed, consumed, experts = False, False, ()
+        for stamp in (e for e in events if e['event_type'] == MODEL_EVENTS[1]):
+            payload = metadata(stamp).get('backfill', {})
+            archive = next((e for e in events if str(e['id']) == payload.get('archiveId') and e['event_type'] == MODEL_EVENTS[0]), None)
+            original = metadata(archive).get('archive', {}) if archive else {}
+            source = original.get('originalRow')
+            if (isinstance(source, dict) and source.get('user_id') == row['user_id'] and str(source.get('id')) == str(row['id'])
+                    and legacyRowHash(source) == original.get('legacyHash')
+                    and payload.get('resolution') in ('verified', 'consumed_dates_unknown')):
+                reviewed, consumed = True, bool(payload.get('trialConsumed'))
+                experts = tuple(billing._jsonList(source.get('subscribed_experts')))
+        if facts.periods:
+            if row.get('plan_code') != 'pro' or not row.get('lifecycle_id'):
+                raise SubscriptionAuthorityUnavailable('Paid core identity requires review')
+        elif not (initialized or reviewed):
+            raise SubscriptionAuthorityUnavailable('Trial history requires reviewed initialization')
+        if initialized and not reviewed and not trialEvent and not facts.periods:
+            state = billing._json(row.get('billing_state'))
+            cursor.execute('SELECT * FROM public.credit_balances WHERE user_id=%s', (row['user_id'],))
+            balance = cursor.fetchone()
+            if (row.get('current_period_start') or row.get('current_period_end') or state.get('trialConsumed')
+                    or state.get('churn_snapshot') or (balance and (balance.get('plan_tier') not in ('none', None)
+                    or balance.get('credit_period_id') or balance.get('period_start')))):
+                raise SubscriptionAuthorityUnavailable('Legacy entitlement history requires review')
+        trial = TrialFacts(consumed=consumed or bool(facts.periods))
+        if row.get('trial_started_at') is not None and (trialEvent or reviewed):
+            experts = tuple(metadata(trialEvent).get('experts', ())) if trialEvent else experts
+            if not set(experts) <= set(EXPERTS):
+                raise SubscriptionAuthorityUnavailable('Unknown trial experts')
+            trial = TrialFacts(timestamp(row['trial_started_at']), timestamp(row.get('trial_ends_at')),
+                timestamp(row.get('trial_closed_at')), experts, True)
+        elif row.get('trial_started_at') is not None and not facts.periods:
+            raise SubscriptionAuthorityUnavailable('Trial experts require owned evidence')
+        elif not facts.periods and row.get('plan_code') == 'pro' and not consumed:
+            raise SubscriptionAuthorityUnavailable('Trial history is incomplete')
+        return replace(facts, trial=trial, planCode=row.get('plan_code'))
+
     def snapshotFactsLoader(self, userId, now=None):
         try:
             with closing(self.connectionFactory()) as db:

@@ -141,6 +141,11 @@ class AdminTrialReductionRepository:
         connection = self.connectionFactory()
         try:
             with connection.cursor(cursor_factory=RealDictCursor) as cursor:
+                from api.services.subscriptions.subscriptionCompatibility import usesUnifiedSubscription
+                if usesUnifiedSubscription():
+                    from api.services.billing.manualBillingRepository import ManualBillingRepository
+                    billing = ManualBillingRepository(self.connectionFactory)
+                    billing._lockUser(cursor, userId)
                 cursor.execute(
                     "select pg_advisory_xact_lock(hashtextextended(%s, 0))",
                     (userId,),
@@ -206,6 +211,10 @@ class AdminTrialReductionRepository:
                     connection.commit()
                     return result
 
+                if usesUnifiedSubscription():
+                    from api.services.adminTrialExtensionRepository import AdminTrialExtensionRepository
+                    cursor.execute('SELECT clock_timestamp() AS current_time')
+                    subscription = AdminTrialExtensionRepository._verifiedTrialProjection(cursor, billing, userId, _asDatetime(cursor.fetchone()['current_time']))
                 errorCode = self.eligibilityError(dict(subscription))
                 if errorCode is not None:
                     result = self._recordOutcomeFailure(
@@ -284,6 +293,10 @@ class AdminTrialReductionRepository:
                         subscription["id"],
                     ),
                 )
+                if usesUnifiedSubscription():
+                    cursor.execute('UPDATE public.subscriptions SET trial_ends_at=%s WHERE id=%s', (newExpiry, subscription['id']))
+                    cursor.execute('''UPDATE public.credit_balances SET period_end=%s,balance_version=balance_version+1,updated_at=%s
+                        WHERE user_id=%s AND subscription_id=%s AND plan_tier='free' ''', (newExpiry, now, userId, subscription['id']))
                 cursor.execute(
                     f"""
                     update public.admin_free_trial_reductions

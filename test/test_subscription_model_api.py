@@ -48,6 +48,7 @@ def test_public_v2_has_explicit_nulls_and_allowlists_period_without_owner_or_inv
         'nextPeriod': None, 'paidUntil': '2027-01-31T10:00:00+00:00',
         'lastPaidEnd': '2027-01-31T10:00:00+00:00',
         'subscribedExperts': ['banking', 'telecom'], 'domainCount': 2,
+        'nextSelectedExperts': None,
         'renewalOptOut': False, 'renewalAvailable': True,
         'resumeRenewalAvailable': False, 'cancellationEffectiveAt': None,
         'purchaseAllowed': False, 'purchaseBlockReason': 'current_coverage',

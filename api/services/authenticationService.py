@@ -104,6 +104,11 @@ class AuthenticationService:
         return normalized
 
     def _getSubscriptionSnapshot(self, userId: str) -> dict | None:
+        from api.services.subscriptions.subscriptionCompatibility import usesUnifiedSubscription, refreshSubscriptionProjection
+        if usesUnifiedSubscription():
+            projected = {}
+            refreshSubscriptionProjection(userId, projected)
+            return projected
         response = self.client.table("subscriptions") \
             .select(CANONICAL_SUBSCRIPTION_SELECT) \
             .eq("user_id", userId) \
@@ -113,6 +118,9 @@ class AuthenticationService:
         return response[0] if response else None
 
     def _refreshLifecycleSnapshot(self, userId: str, subscription: dict | None) -> int:
+        from api.services.subscriptions.subscriptionCompatibility import usesUnifiedSubscription, refreshSubscriptionProjection
+        if usesUnifiedSubscription():
+            return refreshSubscriptionProjection(userId, subscription)
         if not subscription:
             return 0
         if subscription.get("billing_mode") == "monthly_prepaid":
@@ -199,6 +207,15 @@ class AuthenticationService:
         """
         Ensure a canonical subscription row exists and return it.
         """
+        from api.services.subscriptions.subscriptionCompatibility import usesUnifiedSubscription
+        if usesUnifiedSubscription():
+            from api.services.billing.manualBillingRepository import getManualBillingRepository
+            try:
+                getManualBillingRepository().ensureCanonicalSubscription(userId)
+            except Exception as exc:
+                raise CustomException(exc, statusCode=503, errorCode='SUBSCRIPTION_AUTHORITY_UNAVAILABLE',
+                    uiMessage='Subscription data could not be verified. Please try again.') from exc
+            return self._getSubscriptionSnapshot(userId)
         snapshot = self._getSubscriptionSnapshot(userId)
         if snapshot:
             return snapshot

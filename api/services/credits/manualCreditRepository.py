@@ -91,6 +91,16 @@ class ManualCreditRepository:
         coverage = self.repository._coverageSnapshotLocked(cursor, subscription, now, materialize=False)
         return coverage if coverage.accessAllowed and coverage.currentPeriod else None
 
+    def _runtimeSnapshotLocked(self, cursor, subscription, now):
+        from api.services.subscriptions.subscriptionModel import evaluateSubscription
+        return evaluateSubscription(self.repository._modelRepository().loadRuntimeFacts(cursor, subscription, now), now)
+
+    @staticmethod
+    def _trialProjection(subscription, snapshot):
+        return {**subscription, 'billing_mode':'none', 'plan_type':'free', 'status':'trial',
+            'current_period_start':snapshot.trial.startedAt, 'current_period_end':snapshot.trial.endsAt,
+            'domain_count':snapshot.domainCount, 'billing_state':{}}
+
     def _modeLocked(self, cursor, subscription, now):
         if self.repository._usesPurchaseAuthority():
             coverage = self._paidContextLocked(cursor, subscription, now)
@@ -180,6 +190,8 @@ class ManualCreditRepository:
         paid = self._paidContextLocked(cursor, subscription, now)
         if paid:
             self.ensureCurrentAllocation(cursor, paid.currentPeriod, now)
+        elif self.repository._usesPurchaseAuthority():
+            subscription = self._trialProjection(subscription, self._runtimeSnapshotLocked(cursor, subscription, now))
         mode=paid.billingMode if paid else subscription.get('billing_mode') or 'none'
         plan='pro' if paid else 'annual' if mode=='annual_prepaid' else 'pro' if mode=='monthly_prepaid' else 'free'
         lifecycle=paid.lifecycleId if paid else self.repository._json(subscription.get('billing_state')).get('manualBilling',{}).get('lifecycleId') or str(subscription['id'])
@@ -236,6 +248,8 @@ class ManualCreditRepository:
             data['billingMode'],int(data['quotaWatermark']))
 
     def _eligibleLocked(self,cursor,subscription,now):
+        if self.repository._usesPurchaseAuthority():
+            return self._runtimeSnapshotLocked(cursor, subscription, now).accessAllowed
         snapshot=self.repository._coverageSnapshotLocked(cursor,subscription,now,materialize=True)
         if snapshot.denialReason in ('account_banned','erasure_pending','restricted_subscription'):
             return False
@@ -254,6 +268,11 @@ class ManualCreditRepository:
             self.ensureCurrentAllocation(cursor, paid.currentPeriod, now)
             cursor.execute('select * from public.credit_balances where user_id=%s for update', (subscription['user_id'],))
             return cursor.fetchone()
+        if self.repository._usesPurchaseAuthority():
+            snapshot = self._runtimeSnapshotLocked(cursor, subscription, now)
+            if not snapshot.accessAllowed or snapshot.accessSource != 'trial':
+                raise ValueError('CREDIT_ALLOCATION_REQUIRES_CURRENT_COVERAGE')
+            subscription = self._trialProjection(subscription, snapshot)
         cursor.execute('select * from public.credit_balances where user_id=%s for update',(subscription['user_id'],))
         balance=cursor.fetchone()
         mode=subscription.get('billing_mode') or 'none'
@@ -410,8 +429,14 @@ class ManualCreditRepository:
                 if current and self.repository._usesPurchaseAuthority():
                     from api.services.credits.paidAllowancePolicy import paidCreditWindow, matchesPaidAllocation
                     paid = self._paidContextLocked(cursor, subscription, now)
-                    window = paidCreditWindow(paid.currentPeriod, now) if paid else None
-                    current = matchesPaidAllocation(balance, window) and balance['plan_tier'] == 'pro'
+                    if paid:
+                        current = matchesPaidAllocation(balance, paidCreditWindow(paid.currentPeriod, now)) and balance['plan_tier'] == 'pro'
+                    else:
+                        snapshot = self._runtimeSnapshotLocked(cursor, subscription, now)
+                        current = bool(snapshot.accessAllowed and snapshot.accessSource == 'trial'
+                            and balance['plan_tier'] == 'free'
+                            and snapshot.trial.startedAt <= _utc(balance['period_start']) <= now
+                            and _utc(balance['period_end']) <= snapshot.trial.endsAt)
                 cursor.execute('select metadata_json from public.billing_events where idempotency_key=%s',
                     ('credit-allocation:'+context.userId+':'+context.creditPeriodId,))
                 allocation=cursor.fetchone()

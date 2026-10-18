@@ -177,6 +177,7 @@ class SubscriptionPricingPreviewRequest(BaseModel):
 
 
 class CreateSubscriptionRequest(BaseModel):
+    model_config = {'extra':'forbid'}
     domains: list[str]
     contact: str
     billingMode: str | None = "monthly_prepaid"

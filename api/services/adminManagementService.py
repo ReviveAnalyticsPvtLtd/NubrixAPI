@@ -178,7 +178,36 @@ class AdminManagementService:
         except Exception as exc:
             logger.error("Admin subscription list failed: {}", type(exc).__name__)
             raise AdminApiError(500, "Failed to list subscriptions") from exc
-        return [_serializeSubscription(row) for row in rows]
+        from api.services.subscriptions.subscriptionCompatibility import usesUnifiedSubscription, legacySubscriptionFields
+        if not usesUnifiedSubscription():
+            return [_serializeSubscription(row) for row in rows]
+        from api.services.subscriptions.subscriptionSnapshotService import getSubscriptionSnapshotService
+        from api.services.billing.manualBillingPresentation import serializeSubscriptionSnapshot
+        results = []
+        for row in rows:
+            public = _serializeSubscription(row)
+            public['operationEligibility'] = {'extendTrial':False,'reduceTrial':False,'resetCredits':False,'editSubscription':False}
+            if row.get('is_canonical'):
+                try:
+                    snapshot = getSubscriptionSnapshotService().get(row['user_id'])
+                    if snapshot.subscriptionId != str(row['id']):
+                        raise ValueError('Canonical identity changed')
+                except Exception as exc:
+                    raise AdminApiError(503, 'SUBSCRIPTION_AUTHORITY_UNAVAILABLE') from exc
+                aliases = legacySubscriptionFields(snapshot)
+                public.update(subscription=serializeSubscriptionSnapshot(snapshot), status=snapshot.status,
+                    plan_type=aliases['planType'], billing_mode=aliases['billingMode'],
+                    current_period_start=snapshot.currentPeriod.start.isoformat() if snapshot.currentPeriod else snapshot.trial.startedAt.isoformat() if snapshot.status=='trial' else None,
+                    current_period_end=aliases['planExpire'], renewal_due_at=aliases['nextBilling'],
+                    subscribed_experts=json.dumps(list(snapshot.subscribedExperts)), domain_count=snapshot.domainCount,
+                    renewal_opt_out=snapshot.renewalOptOut, auto_renew_enabled=False,
+                    payment_collection_mode='authenticated_checkout',
+                    pending_removals=json.dumps([e for e in snapshot.subscribedExperts if e not in (snapshot.nextSelectedExperts or snapshot.subscribedExperts)]))
+                knownTrial = bool(snapshot.trial and not snapshot.trial.closedAt and snapshot.lastPaidEnd is None and snapshot.denialReason != 'erasure_pending')
+                public['operationEligibility'].update(extendTrial=knownTrial,
+                    reduceTrial=knownTrial and snapshot.status=='trial', resetCredits=snapshot.accessAllowed)
+            results.append(public)
+        return results
 
     def _isErasurePending(self, userId: str) -> bool:
         try:
@@ -227,6 +256,9 @@ class AdminManagementService:
         admin: AdminContext,
     ) -> dict:
         changedFields = sorted(patch.model_fields_set)
+        from api.services.subscriptions.subscriptionCompatibility import usesUnifiedSubscription
+        if usesUnifiedSubscription():
+            raise AdminApiError(422, 'DERIVED_SUBSCRIPTION_FIELD', {field:'Use audited subscription operations' for field in changedFields})
         try:
             existingRows = (
                 self.client.table("subscriptions")

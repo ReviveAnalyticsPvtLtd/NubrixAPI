@@ -96,6 +96,15 @@ class ManualBillingRepository:
         from api.services.subscriptions.subscriptionModelRepository import SubscriptionModelRepository
         return SubscriptionModelRepository(self.connectionFactory)
 
+    def runtimeSnapshotFactsLoader(self, userId, now=None):
+        def operation(connection):
+            with connection.cursor(cursor_factory=RealDictCursor) as cursor:
+                self._lockUser(cursor, userId)
+                row = self._canonical(cursor, userId)
+                evaluated = self._modelRepository()._now(cursor, now)
+                return self._modelRepository().loadRuntimeFacts(cursor, row, evaluated), evaluated
+        return self._run(operation)
+
     def _purchaseFactsLocked(self, cursor, subscription, owner, now):
         from dataclasses import replace
         from api.services.subscriptions.subscriptionModel import SubscriptionFacts
@@ -106,10 +115,13 @@ class ManualBillingRepository:
         effective = tuple(replace(p, experts=model.loadEffectiveExperts(cursor, p.id, now)) for p in periods)
         _, invoices, events = model._purchaseRecords(cursor, str(subscription['id']))
         unresolved, attempts = unresolvedMoneyFacts(invoices, events)
+        current = next((p for p in effective if p.start <= now < p.end and (p.revokedAt is None or now < p.revokedAt)), None)
+        selection = model.loadNextSelection(cursor, str(subscription['id']), lifecycle, current.end) if current else None
         return SubscriptionFacts(subscription['user_id'], str(subscription['id']), lifecycle,
             'pro' if periods else None, True, periods=effective, renewalOptOut=bool(subscription.get('renewal_opt_out')),
             accountBanned=bool(owner['isBanned']), erasurePending=bool(subscription.get('erasure_pending')),
-            moneyUnresolved=unresolved, recoverableCheckout=attempts[0] if len(attempts) == 1 else None)
+            moneyUnresolved=unresolved, recoverableCheckout=attempts[0] if len(attempts) == 1 else None,
+            nextSelectedExperts=tuple(selection['experts']) if selection else None)
 
     def _purchaseCoverageLocked(self, cursor, subscription, owner, now):
         from api.services.subscriptions.subscriptionModel import evaluateSubscription
@@ -369,6 +381,9 @@ class ManualBillingRepository:
                     (str(uuid.uuid4()), userId),
                 )
                 created = cursor.fetchone()
+                if self._usesPurchaseAuthority():
+                    self._modelRepository()._event(cursor, created, 'subscription.model_initialized',
+                        'subscription-initialized:'+str(created['id']), {'schemaVersion':2})
                 return dict(created)
 
         return self._run(operation)
@@ -381,6 +396,24 @@ class ManualBillingRepository:
                 subscription = self._canonical(cursor, userId)
                 cursor.execute('select clock_timestamp() as current_time')
                 now = _utc(cursor.fetchone()['current_time'])
+                if self._usesPurchaseAuthority():
+                    from api.services.subscriptions.subscriptionModel import evaluateSubscription
+                    facts = self._modelRepository().loadRuntimeFacts(cursor, subscription, now)
+                    if not evaluateSubscription(facts, now).trialAvailable or facts.moneyUnresolved:
+                        raise ValueError('TRIAL_NOT_ELIGIBLE')
+                    if not domains or len(set(domains)) != len(domains) or not set(domains) <= {'banking','manufacturing','supplychain','telecom'}:
+                        raise ValueError('INVALID_TRIAL_EXPERTS')
+                    end = now + timedelta(days=12)
+                    cursor.execute('''UPDATE public.subscriptions SET plan_code='pro',trial_started_at=%s,trial_ends_at=%s,
+                        billing_mode='none',status='trial',plan_type='free',current_period_start=%s,current_period_end=%s,
+                        subscribed_experts=%s,domain_count=%s,version=version+1,updated_at=%s WHERE id=%s RETURNING *''',
+                        (now,end,now,end,Json(list(domains)),len(domains),now,subscription['id']))
+                    activated = cursor.fetchone()
+                    self._modelRepository()._event(cursor, activated, 'subscription.trial_started',
+                        'subscription-trial:'+str(subscription['id']), {'experts':list(domains), 'startedAt':now, 'endsAt':end})
+                    from api.services.credits.manualCreditRepository import ManualCreditRepository
+                    ManualCreditRepository(self)._balanceLocked(cursor, activated, now)
+                    return dict(activated)
                 state = self._json(subscription.get('billing_state'))
                 cursor.execute('select "isBanned" from public."Users" where "userId"=%s', (userId,))
                 owner = cursor.fetchone()

@@ -12,6 +12,149 @@ pytestmark = pytest.mark.skipif(os.environ.get('RUN_MANUAL_BILLING_INTEGRATION')
 
 
 @pytest.mark.parametrize('account', ['monthly_prepaid', 'annual_prepaid'], indirect=True)
+def test_runtime_snapshot_follows_financial_writes_without_backfill_stamp_rewrites(account):
+    from api.services.subscriptions.subscriptionSnapshotService import SubscriptionSnapshotService
+    repo, _, initial, url = account
+    service = SubscriptionSnapshotService(repo.runtimeSnapshotFactsLoader)
+    before = service.get(initial.userId, NOW)
+    assert before.status == 'active' and before.domainCount == 2
+    repo.setRenewalOptOut(initial.userId, True, 'Synthetic preference', 'runtime-snapshot-optout')
+    assert service.get(initial.userId, NOW).renewalOptOut
+    addition = repo.reserveCheckout(CheckoutRequest(initial.userId, 'expert_addition', before.currentPeriod and ('annual_prepaid' if before.billingInterval == 'year' else 'monthly_prepaid'), {'domains':['telecom']}, expectedCatalogRevision=1))
+    capture(repo, addition)
+    assert service.get(initial.userId, NOW).subscribedExperts == ('banking','manufacturing','telecom')
+    expired = service.get(initial.userId, before.currentPeriod.end)
+    assert expired.status == 'expired' and expired.purchaseAllowed and not expired.accessAllowed
+
+
+def newUnifiedTrial(account):
+    from uuid import uuid4
+    repo, _, _, url = account
+    user = 'trial-consumer-' + str(uuid4())
+    query(url, 'INSERT INTO "Users"("userId") VALUES(%s)', (user,))
+    row = repo.ensureCanonicalSubscription(user)
+    activated = repo.activateTrial(user, ('banking','telecom'))
+    return user, activated
+
+
+def test_new_trial_explicit_dates_are_once_only_and_ignore_legacy_cache(account):
+    from api.services.subscriptions.subscriptionSnapshotService import SubscriptionSnapshotService
+    repo, _, _, url = account
+    user, row = newUnifiedTrial(account)
+    service = SubscriptionSnapshotService(repo.runtimeSnapshotFactsLoader)
+    trial = service.get(user)
+    assert trial.status == 'trial' and trial.trial.startedAt and trial.trial.endsAt
+    assert trial.subscribedExperts == ('banking','telecom')
+    query(url, "UPDATE subscriptions SET current_period_end='2099-01-01',status='active',subscribed_experts='[\"supplychain\"]' WHERE user_id=%s", (user,))
+    assert service.get(user, trial.trial.endsAt).status == 'expired'
+    with pytest.raises(ValueError, match='TRIAL_NOT_ELIGIBLE'):
+        repo.activateTrial(user, ('banking',))
+
+
+def test_trial_authority_events_cannot_be_rewritten(account):
+    import psycopg2
+    repo, _, _, url = account
+    user, _ = newUnifiedTrial(account)
+    for statement in ("UPDATE billing_events SET metadata_json='{}' WHERE user_id=%s AND event_type='subscription.trial_started'",
+                      "DELETE FROM billing_events WHERE user_id=%s AND event_type='subscription.model_initialized'"):
+        with pytest.raises(psycopg2.Error, match='immutable'):
+            query(url, statement, (user,))
+
+
+def test_legacy_trial_without_review_is_unavailable_instead_of_guessed(account):
+    from api.services.subscriptions.subscriptionSnapshotService import SubscriptionSnapshotService
+    from api.services.subscriptions.subscriptionModel import SubscriptionAuthorityUnavailable
+    repo, _, initial, url = account
+    query(url, "UPDATE subscriptions SET plan_code=NULL,lifecycle_id=NULL,trial_started_at=NULL,trial_ends_at=NULL WHERE user_id=%s", (initial.userId,))
+    with pytest.raises(SubscriptionAuthorityUnavailable):
+        SubscriptionSnapshotService(repo.runtimeSnapshotFactsLoader).get(initial.userId)
+
+
+def test_trial_admin_changes_explicit_deadline_preserve_history_and_allocation_fences(account):
+    from uuid import uuid4
+    import psycopg2
+    from api.services.adminTrialExtensionRepository import AdminTrialExtensionRepository
+    from api.services.adminTrialReductionRepository import AdminTrialReductionRepository
+    from api.services.subscriptions.subscriptionSnapshotService import SubscriptionSnapshotService
+    repo, _, _, url = account
+    user, row = newUnifiedTrial(account)
+    service = SubscriptionSnapshotService(repo.runtimeSnapshotFactsLoader)
+    before = service.get(user)
+    repo.activateDueCoverage(user, NOW)
+    from api.services.credits.manualCreditRepository import ManualCreditRepository
+    ManualCreditRepository(repo).balanceSnapshot(user)
+    query(url, 'UPDATE credit_balances SET used_tokens=700,remaining_tokens=monthly_token_quota-700,topup_tokens=500 WHERE user_id=%s', (user,))
+    admin = str(uuid4())
+    query(url, "INSERT INTO admin_users(id,email,name,password_hash) VALUES(%s,%s,'Synthetic','synthetic')", (admin, admin+'@example.test'))
+    extensions = AdminTrialExtensionRepository(lambda:psycopg2.connect(url))
+    extension = extensions.createOrGetExtension(str(uuid4()), 'a'*64, user, 3, 'Synthetic extension', admin)
+    result = extensions.extendUser(str(extension['id']), user, 3, before.evaluatedAt)
+    assert result['outcome'] == 'EXTENDED'
+    after = service.get(user)
+    assert after.trial.startedAt == before.trial.startedAt and after.trial.endsAt > before.trial.endsAt
+    balance = query(url, 'SELECT * FROM credit_balances WHERE user_id=%s', (user,), one=True)
+    assert (balance['used_tokens'], balance['remaining_tokens'], balance['topup_tokens']) == (0, 3_000_000, 500)
+    reductions = AdminTrialReductionRepository(lambda:psycopg2.connect(url))
+    reduction = reductions.createOrGetReduction(str(uuid4()), 'b'*64, user, 1, 'Synthetic reduction', admin)
+    assert reductions.reduceUser(str(reduction['id']), user, 1)['outcome'] == 'REDUCED'
+    reduced = query(url, 'SELECT * FROM credit_balances WHERE user_id=%s', (user,), one=True)
+    assert reduced['credit_period_id'] == balance['credit_period_id'] and reduced['remaining_tokens'] == balance['remaining_tokens']
+    assert service.get(user).trial.endsAt < after.trial.endsAt
+
+
+def test_trial_credit_reset_uses_explicit_trial_despite_poisoned_legacy_mode(account):
+    import psycopg2
+    from datetime import datetime, timezone
+    from psycopg2.extras import RealDictCursor
+    from api.services.credits.manualCreditRepository import ManualCreditRepository
+    repo, _, _, url = account
+    user, row = newUnifiedTrial(account)
+    query(url, "UPDATE subscriptions SET billing_mode='annual_prepaid',status='active',plan_type='annual' WHERE user_id=%s", (user,))
+    credits = ManualCreditRepository(repo)
+    assert credits.admit(user, 'reporting_query', 'trial-current').billingMode == 'none'
+    with psycopg2.connect(url) as db, db.cursor(cursor_factory=RealDictCursor) as cursor:
+        repo._lockUser(cursor, user)
+        reset = credits.resetQuotaLocked(cursor, repo._canonical(cursor, user), datetime.now(timezone.utc))
+    assert reset['after']['monthlyTokenQuota'] == 3_000_000 and reset['after']['planTier'] == 'free'
+
+
+def test_delayed_trial_credit_sync_cannot_overwrite_a_later_paid_allocation(account, monkeypatch):
+    import psycopg2
+    from uuid import uuid4
+    from datetime import datetime, timezone
+    from api.services.adminTrialExtensionRepository import AdminTrialExtensionRepository
+    repo, _, _, url = account
+    monkeypatch.setattr('api.services.billing.manualBillingRepository._now', lambda:datetime.now(timezone.utc))
+    user, row = newUnifiedTrial(account)
+    admin = str(uuid4())
+    query(url, "INSERT INTO admin_users(id,email,name,password_hash) VALUES(%s,%s,'Synthetic','synthetic')", (admin, admin+'@example.test'))
+    extensions = AdminTrialExtensionRepository(lambda:psycopg2.connect(url))
+    operation = extensions.createOrGetExtension(str(uuid4()), 'c'*64, user, 2, 'Synthetic sync', admin)
+    result = extensions.extendUser(str(operation['id']), user, 2, datetime.now(timezone.utc))
+    intent = repo.reserveCheckout(CheckoutRequest(user, 'initial_purchase', 'monthly_prepaid', {'domains':['banking']}, expectedCatalogRevision=1))
+    capture(repo, intent, now=datetime.now(timezone.utc))
+    before = query(url, 'SELECT * FROM credit_balances WHERE user_id=%s', (user,), one=True)
+    query(url, "UPDATE subscriptions SET billing_mode='none',plan_type='free',status='trial' WHERE user_id=%s", (user,))
+    def forbidden(_):
+        pytest.fail('Delayed trial cache reset cannot publish over purchased credits')
+    synced = extensions.synchronizeCreditExtension(str(operation['id']), forbidden)
+    assert synced['credit_sync_status'] == 'CANCELLED'
+    assert query(url, 'SELECT * FROM credit_balances WHERE user_id=%s', (user,), one=True) == before
+
+
+def test_trial_settlement_charges_the_current_trial_bucket(account):
+    from api.services.credits.manualCreditRepository import ManualCreditRepository
+    repo, _, _, url = account
+    user, _ = newUnifiedTrial(account)
+    credits = ManualCreditRepository(repo)
+    context = credits.admit(user, 'reporting_query', 'trial-spend')
+    result = credits.settle(context, 700, 'synthetic-run')
+    assert not result['historicalPeriod']
+    row = query(url, 'SELECT * FROM credit_balances WHERE user_id=%s', (user,), one=True)
+    assert row['remaining_tokens'] == 3_000_000 - 700 and row['used_tokens'] == 700
+
+
+@pytest.mark.parametrize('account', ['monthly_prepaid', 'annual_prepaid'], indirect=True)
 def test_future_purchase_preserves_current_allocation_until_exact_boundary(account):
     repo, _, initial, url = account
     # Adopt a reviewed existing allocation without resetting already spent tokens.
@@ -545,5 +688,7 @@ def test_expired_session_can_create_and_verify_fresh_purchase_through_http(accou
     assert verified.status_code == 200, verified.text
     result = verified.json()
     assert result['finalized'] and result['state'] == 'activated'
+    assert result['subscription']['schemaVersion'] == 2
+    assert result['subscription']['status'] == 'active' and result['subscription']['billingInterval'] == interval
     assert jwt.decode(result['accessToken'], os.environ['SECRET_KEY'], algorithms=['HS256'])['sub_status'] == 'active'
     assert len(provider.order.createdPayloads) == 1 and repo.getCoverageSnapshot(original.userId).accessAllowed

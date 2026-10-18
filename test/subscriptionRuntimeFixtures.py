@@ -20,7 +20,8 @@ def runtimeDb(postgres):
     root = Path(__file__).resolve().parents[1]
     with psycopg2.connect(postgres) as db, db.cursor() as cursor:
         cursor.execute((root / 'supabase/migrations/20261017211222_expand_subscription_model_v2.sql').read_text())
-        for path in sorted((root / 'supabase/migrations').glob('*_protect_subscription_purchase_authority.sql')):
+        for path in sorted(list((root / 'supabase/migrations').glob('*_protect_subscription_purchase_authority.sql'))
+                + list((root / 'supabase/migrations').glob('*_protect_subscription_trial_authority.sql'))):
             if path.read_text().strip():
                 cursor.execute(path.read_text())
     return postgres
