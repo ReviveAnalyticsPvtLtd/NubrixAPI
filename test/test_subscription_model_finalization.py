@@ -11,6 +11,167 @@ pytestmark = pytest.mark.skipif(os.environ.get('RUN_MANUAL_BILLING_INTEGRATION')
     reason='Guarded disposable PostgreSQL opt-in; skip is UNVERIFIED')
 
 
+def workerFor(account):
+    from api.services.subscriptions.subscriptionWorkerService import SubscriptionWorkerService
+    repo, _, initial, url = account
+    class Owners:
+        def table(self,name):
+            assert name == 'subscriptions'
+            return self
+        def select(self,_):
+            return self
+        def eq(self,*_):
+            return self
+        def execute(self):
+            from types import SimpleNamespace
+            return SimpleNamespace(data=query(url,'SELECT id,user_id,erasure_pending FROM subscriptions WHERE user_id=%s',(initial.userId,)))
+    return SubscriptionWorkerService(Owners(),repo)
+
+
+@pytest.mark.parametrize('account',['monthly_prepaid','annual_prepaid'],indirect=True)
+def test_delayed_worker_cannot_refill_or_extend_unpaid_time(account):
+    from api.services.subscriptions.subscriptionSnapshotService import SubscriptionSnapshotService
+    repo, _, initial, url = account
+    snapshot = SubscriptionSnapshotService(repo.runtimeSnapshotFactsLoader).get(initial.userId,NOW)
+    before = query(url,'SELECT * FROM credit_balances WHERE user_id=%s',(initial.userId,),one=True)
+    query(url,"UPDATE subscriptions SET current_period_end='2099-01-01',status='active' WHERE user_id=%s",(initial.userId,))
+    result = workerFor(account).execute(now=snapshot.currentPeriod.end)
+    assert result['errors']==0 and result['materialized']==0
+    assert not SubscriptionSnapshotService(repo.runtimeSnapshotFactsLoader).get(initial.userId,snapshot.currentPeriod.end).accessAllowed
+    assert query(url,'SELECT * FROM credit_balances WHERE user_id=%s',(initial.userId,),one=True)==before
+
+
+@pytest.mark.parametrize('account',['annual_prepaid'],indirect=True)
+def test_annual_worker_t30_and_t7_are_durable_milestones_not_statuses(account,monkeypatch):
+    from datetime import timedelta
+    from api.services.subscriptions.subscriptionSnapshotService import SubscriptionSnapshotService
+    repo, _, initial, url = account
+    owned = SubscriptionSnapshotService(repo.runtimeSnapshotFactsLoader).get(initial.userId,NOW)
+    before = query(url,'SELECT status,version FROM subscriptions WHERE user_id=%s',(initial.userId,),one=True)
+    query(url,"UPDATE subscriptions SET current_period_end='2099-01-01' WHERE user_id=%s",(initial.userId,))
+    for days in (20,5,0.5):
+        now = owned.currentPeriod.end-timedelta(days=days)
+        monkeypatch.setattr('api.services.billing.manualBillingRepository._now',lambda:now)
+        result = workerFor(account).execute(interval='year',reminders=True,now=now)
+        assert result['errors']==0 and result['enqueued']==1
+    events = query(url,"SELECT metadata_json FROM billing_events WHERE user_id=%s AND event_type='email.billing_intent.committed' AND metadata_json->>'notificationType'<>'payment_receipt' ORDER BY occurred_at,id",(initial.userId,))
+    assert {e['metadata_json']['notificationType'] for e in events} == {
+        'annual_renewal_upcoming','monthly_renewal_ready','monthly_renewal_reminder'}
+    assert all(e['metadata_json']['metadata']['billingInterval']=='year' for e in events)
+    assert all(e['metadata_json']['metadata'].get('renewalDeadline')==owned.currentPeriod.end.isoformat() for e in events)
+    import psycopg2
+    from api.services.notifications.notificationDeliveryRepository import NotificationDeliveryRepository
+    deliveries = NotificationDeliveryRepository(lambda:psycopg2.connect(url))
+    for event in events:
+        intent = event['metadata_json']
+        deliveries.enqueueBillingNotification(intent['userId'],intent['subscriptionId'],intent['notificationType'],
+            intent['dedupeKey'],intent['periodEnd'],intent['metadata'])
+    assert query(url,'SELECT status,version FROM subscriptions WHERE user_id=%s',(initial.userId,),one=True)==before
+    repo.setRenewalOptOut(initial.userId,True,'synthetic optout','worker-annual-optout')
+    assert workerFor(account).execute(interval='year',reminders=True,now=now)['enqueued']==0
+
+
+def test_worker_and_lazy_read_keep_one_allocation_and_used_balance(account):
+    from api.services.credits.manualCreditRepository import ManualCreditRepository
+    repo, _, initial, url = account
+    credits = ManualCreditRepository(repo)
+    before = credits.balanceSnapshot(initial.userId)
+    query(url,'UPDATE credit_balances SET remaining_tokens=remaining_tokens-17,used_tokens=used_tokens+17 WHERE user_id=%s',(initial.userId,))
+    for _ in range(2):
+        assert workerFor(account).execute(now=NOW)['errors']==0
+        credits.balanceSnapshot(initial.userId)
+    row = query(url,'SELECT * FROM credit_balances WHERE user_id=%s',(initial.userId,),one=True)
+    assert row['remaining_tokens']==before['remaining_tokens']-17
+    markers = query(url,"SELECT id FROM billing_events WHERE user_id=%s AND idempotency_key LIKE 'credit-window:%%'",(initial.userId,))
+    assert len(markers)==1
+
+
+def test_erasure_explicitly_blocks_before_mutating_immutable_trial_evidence(account):
+    import psycopg2
+    from api.adminErrors import AdminApiError
+    from api.services.userErasureRepository import UserErasureRepository
+    repo, _, initial, url = account
+    user, _ = newUnifiedTrial(account)
+    erasure = UserErasureRepository(lambda:psycopg2.connect(url))
+    erasure.freezeBilling(user)
+    with pytest.raises(AdminApiError,match='SUBSCRIPTION_ERASURE_RETENTION_PENDING'):
+        erasure.deleteDatabaseData('synthetic-request',user,[])
+    assert query(url,'SELECT "userId" FROM "Users" WHERE "userId"=%s',(user,),one=True)
+    assert len(query(url,"SELECT id FROM billing_events WHERE user_id=%s AND event_type IN ('subscription.model_initialized','subscription.trial_started')",(user,)))==2
+
+
+@pytest.mark.parametrize('change,expected',[('unchanged','AUTHORIZED'),('revision','REJECTED'),('money_hold','HELD'),('closed_with_money','REJECTED')])
+def test_dispatch_fences_invoice_revision_and_holds_unknown_money(account,monkeypatch,change,expected):
+    from datetime import timedelta
+    from api.services.notifications.notificationDeliveryRepository import NotificationDeliveryRepository
+    import psycopg2
+    repo, _, initial, url = account
+    from dateutil.relativedelta import relativedelta
+    # Keep the actual database dispatch clock inside T-7. This also proves
+    # rejection isn't an accidental result of a simulated future-only window.
+    end = NOW+timedelta(days=5)
+    query(url,'UPDATE "Invoices" SET period_start=%s,period_end=%s WHERE id=%s',
+        (end-relativedelta(months=1),end,initial.invoiceId))
+    query(url,'UPDATE credit_balances SET period_start=%s,period_end=%s WHERE user_id=%s',
+        (end-relativedelta(months=1),end,initial.userId))
+    when = NOW
+    assert workerFor(account).execute(reminders=True,now=when)['enqueued']==1
+    intent = query(url,"SELECT metadata_json FROM billing_events WHERE user_id=%s AND event_type='email.billing_intent.committed' AND metadata_json->>'notificationType'='monthly_renewal_ready'",(initial.userId,),one=True)['metadata_json']
+    deliveries = NotificationDeliveryRepository(lambda:psycopg2.connect(url))
+    row,_ = deliveries.enqueueBillingNotification(intent['userId'],intent['subscriptionId'],intent['notificationType'],intent['dedupeKey'],intent['periodEnd'],intent['metadata'])
+    query(url,"UPDATE notification_deliveries SET status='SENDING',lease_owner='worker',claimed_payload_version=payload_version WHERE id=%s",(row['id'],))
+    if change=='revision':
+        query(url,"UPDATE \"Invoices\" SET metadata_json=jsonb_set(metadata_json,'{manualBilling,revision}','2') WHERE id=%s",(intent['metadata']['invoiceId'],))
+    if change in ('money_hold','closed_with_money'):
+        query(url,"""INSERT INTO billing_events(user_id,subscription_id,invoice_id,event_category,event_type,event_status)
+            VALUES(%s,%s,%s,'reconciliation','payment.capture','REQUIRES_RECONCILIATION')""",
+            (initial.userId,intent['subscriptionId'],intent['metadata']['invoiceId']))
+    if change=='closed_with_money':
+        query(url,'UPDATE "Invoices" SET status=\'VOID\' WHERE id=%s',(intent['metadata']['invoiceId'],))
+    assert deliveries.authorizeBillingSubmissionResult(str(row['id']),'worker',row['payload_version'])==expected
+    submitted = query(url,'SELECT submission_started_at FROM notification_deliveries WHERE id=%s',(row['id'],),one=True)['submission_started_at']
+    assert (submitted is not None)==(expected=='AUTHORIZED')
+
+
+@pytest.mark.parametrize('account',['annual_prepaid'],indirect=True)
+def test_annual_expert_removal_service_uses_owned_selection(account,monkeypatch):
+    import os
+    import jwt
+    from api.services.subscriptions.subscriptionService import SubscriptionService
+    repo, _, initial, url = account
+    class Owner:
+        data = [{'userId':initial.userId}]
+        def table(self,*_): return self
+        def select(self,*_): return self
+        def eq(self,*_): return self
+        def execute(self): return self
+    service = SubscriptionService.__new__(SubscriptionService)
+    service.VALID_DOMAINS = {'banking','manufacturing','supplychain','telecom'}
+    service.client = Owner()
+    service._getCanonicalSubscription = lambda **_:repo.getRenewalContext(initial.userId,NOW)
+    monkeypatch.setattr('api.services.billing.manualBillingRepository.getManualBillingRepository',lambda:repo)
+    token = jwt.encode({'userId':initial.userId,'email':'synthetic@example.test'},os.environ['SECRET_KEY'],algorithm='HS256')
+    assert service.removeDomain(['manufacturing'],token)['pendingRemovals']==['manufacturing']
+    rows = query(url,"SELECT metadata_json FROM billing_events WHERE user_id=%s AND event_type='subscription.next_selection'",(initial.userId,))
+    assert len(rows)==1
+
+
+@pytest.mark.parametrize('account',['annual_prepaid'],indirect=True)
+def test_opted_out_annual_worker_preserves_purchased_next_year(account,monkeypatch):
+    from api.services.subscriptions.subscriptionSnapshotService import SubscriptionSnapshotService
+    repo, _, initial, url = account
+    invoice = repo.createAnnualRenewalInvoice(initial.userId)
+    checkout = repo.reserveCheckout(CheckoutRequest(initial.userId,'renewal','annual_prepaid',{'invoiceId':str(invoice['id'])},expectedCatalogRevision=1))
+    capture(repo,checkout)
+    service = SubscriptionSnapshotService(repo.runtimeSnapshotFactsLoader)
+    before = service.get(initial.userId,NOW)
+    repo.setRenewalOptOut(initial.userId,True,'synthetic optout','worker-paid-future-optout')
+    assert workerFor(account).execute(reminders=True,now=NOW)['enqueued']==0
+    after = service.get(initial.userId,NOW)
+    assert after.nextPeriod==before.nextPeriod and after.paidUntil==before.paidUntil
+    assert after.accessAllowed and after.renewalOptOut
+
+
 @pytest.mark.parametrize('account', ['monthly_prepaid', 'annual_prepaid'], indirect=True)
 def test_runtime_snapshot_follows_financial_writes_without_backfill_stamp_rewrites(account):
     from api.services.subscriptions.subscriptionSnapshotService import SubscriptionSnapshotService
@@ -565,6 +726,8 @@ def test_opt_out_preserves_a_renewal_captured_before_closure_with_provider_proof
         'provider_captured_at', attempt.amount, observed, captured, 'synthetic-attestation', True)
     result = repo.finalizeCapturedPayment(evidence)
     assert result.state == 'paid_scheduled' and result.renewalOptOut and result.nextPeriod is not None
+    notice = query(url,"SELECT metadata_json FROM billing_events WHERE user_id=%s AND event_type='email.billing_intent.committed' AND metadata_json->>'notificationType'='monthly_cancellation_confirmation'",(original.userId,),one=True)['metadata_json']
+    assert notice['metadata']['finalPaidEnd'] == result.nextPeriod.end.isoformat()
 
 
 @pytest.mark.parametrize('account', ['monthly_prepaid', 'annual_prepaid'], indirect=True)

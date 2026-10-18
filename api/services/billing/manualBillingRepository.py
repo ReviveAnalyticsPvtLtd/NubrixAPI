@@ -1803,6 +1803,8 @@ class ManualBillingRepository:
             cursor.execute('update public.subscriptions set renewal_opt_out=false,cancellation_reason=null where id=%s', (subscription['id'],))
             subscription.update(renewal_opt_out=False, cancellation_reason=None)
         if frozen['billingMode'] == 'annual_prepaid':
+            if self._usesPurchaseAuthority() and subscription.get('renewal_opt_out'):
+                self._refreshCancellationFactsLocked(cursor, subscription, end)
             return self._applyAnnualPayment(cursor, invoice, subscription, evidence.observedAt, evidence.attemptId)
         if subscription.get('renewal_opt_out'):
             self._refreshCancellationFactsLocked(cursor, subscription, end)
@@ -1914,6 +1916,31 @@ class ManualBillingRepository:
                 self._lockUser(cursor, userId)
                 subscription = self._canonical(cursor, userId)
                 return self._unresolvedCycleCaptureLocked(cursor, subscription, cycleEnd)
+        return self._run(operation)
+
+    def enqueueSubscriptionNotification(self, intent, now):
+        """Recheck an owned cycle and accepted revision under the financial lock."""
+        def operation(connection):
+            with connection.cursor(cursor_factory=RealDictCursor) as cursor:
+                self._lockUser(cursor,intent['userId'])
+                row = self._canonical(cursor,intent['userId'])
+                from api.services.subscriptions.subscriptionModel import evaluateSubscription
+                owned = evaluateSubscription(self._modelRepository().loadRuntimeFacts(cursor,row,now),now)
+                metadata = dict(intent.get('metadata') or {})
+                invoice = None
+                if metadata.get('invoiceId'):
+                    cursor.execute('SELECT * FROM public."Invoices" WHERE id=%s AND "userId"=%s AND subscription_id=%s',
+                        (metadata['invoiceId'],row['user_id'],row['id']))
+                    invoice = cursor.fetchone()
+                    if invoice:
+                        metadata['invoiceRevision'] = self._json(invoice.get('metadata_json')).get('manualBilling',{}).get('revision')
+                from api.services.notifications.billingNotificationService import isBillingNotificationEligible
+                delivery = {'notification_type':intent['notificationType'],'period_end':intent['periodEnd'],'metadata_json':metadata}
+                if not isBillingNotificationEligible(delivery,{'subscription':row,'invoice':invoice,'subscriptionSnapshot':owned},now):
+                    return False
+                metadata['periodEnd'] = intent['periodEnd']
+                self._recordNotification(cursor,row,intent['notificationType'],intent['dedupeKey'],metadata)
+                return True
         return self._run(operation)
 
     def _paidInvoicesLocked(self, cursor, subscription):
@@ -2287,6 +2314,9 @@ class ManualBillingRepository:
 
     def _recordNotification(self, cursor, subscription, notificationType, dedupeKey, metadata):
         metadata = dict(metadata)
+        if self._usesPurchaseAuthority():
+            metadata.update(lifecycleId=str(subscription.get('lifecycle_id') or ''),
+                cancellationRequestedAt=_isoText(subscription.get('cancellation_requested_at')))
         invoiceId = metadata.get('invoiceId')
         if invoiceId:
             cursor.execute('select * from public."Invoices" where id=%s and "userId"=%s',(invoiceId,subscription['user_id']))
@@ -2298,11 +2328,20 @@ class ManualBillingRepository:
                     purpose=billing.get('purpose') or invoice.get('billing_reason'),
                     periodStart=str(invoice.get('period_start') or ''),serviceEnd=str(invoice.get('period_end') or ''),
                     serviceRevoked=bool(billing.get('revokedAt')))
+                if self._usesPurchaseAuthority():
+                    metadata.update(invoiceRevision=billing.get('revision'),
+                        billingInterval='year' if billing.get('billingMode')=='annual_prepaid' else 'month')
                 if notificationType in ('monthly_renewal_ready','monthly_renewal_reminder'):
                     metadata.update(nextStart=str(invoice.get('period_start') or ''),nextEnd=str(invoice.get('period_end') or ''),
                         renewalDeadline=str(subscription.get('current_period_end') or ''))
         current = self._canonical(cursor,subscription['user_id'])
         snapshot = self._coverageSnapshotLocked(cursor,current,_now(),materialize=False)
+        if self._usesPurchaseAuthority():
+            period = snapshot.currentPeriod or snapshot.nextPeriod
+            if period:
+                metadata['billingInterval'] = 'year' if period.billingMode=='annual_prepaid' else 'month'
+            if snapshot.currentPeriod and notificationType in ('annual_renewal_upcoming','monthly_renewal_ready','monthly_renewal_reminder'):
+                metadata['renewalDeadline'] = snapshot.currentPeriod.end.isoformat()
         if snapshot.currentPeriod:
             metadata.update(currentStart=snapshot.currentPeriod.start.isoformat(),currentEnd=snapshot.currentPeriod.end.isoformat())
         if snapshot.nextPeriod:

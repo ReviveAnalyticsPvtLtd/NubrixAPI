@@ -81,6 +81,7 @@ class SubscriptionModelRepository:
                         proposals.append(proposal)
         counts = {key: sum(p['resolution'] == key for p in proposals) for key in ('verified', 'consumed_dates_unknown', 'needs_review')}
         return {'schemaVersion': 2, 'readOnly': True, 'counts': counts, 'proposals': proposals,
+                'consumerBlockers': ['SUBSCRIPTION_ERASURE_RETENTION_PENDING'],
                 'authorizesCutover': False}
 
     def _event(self, cursor, row, eventType, key, payload, *, invoiceId=None):

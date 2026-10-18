@@ -7,6 +7,15 @@ const base = {
   trackingTag:"nubrix_delivery:5f5618db-6b67-4117-b392-e6cbf38e3758",
 };
 
+Deno.test('annual milestones describe Pro with yearly coverage', () => {
+  const upcoming = renderBillingMessage(parseBillingRequest({...base,notificationType:'annual_renewal_upcoming',
+    metadata:{billingInterval:'year',invoiceId:'annual-invoice'}}),'https://app.example.test');
+  if (!upcoming.subject.includes('Pro') || !upcoming.htmlContent.includes('annual-invoice')) throw new Error('missing annual awareness');
+  const ready = renderBillingMessage(parseBillingRequest({...base,notificationType:'monthly_renewal_ready',
+    metadata:{billingInterval:'year'}}),'https://app.example.test');
+  if (ready.subject.includes('monthly') || ready.textContent.includes('next calendar month')) throw new Error('year sold as month');
+});
+
 Deno.test("all billing types render their own escaped message", () => {
   const subjects = new Set<string>();
   for (const notificationType of BILLING_TYPES) {

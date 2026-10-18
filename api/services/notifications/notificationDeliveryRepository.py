@@ -27,6 +27,7 @@ _TERMINAL_STATUSES = {
 # template surfaces an operator error at dispatch, never a trial-template
 # substitution.
 _BILLING_NOTIFICATION_TEMPLATE_VERSIONS = {
+    "annual_renewal_upcoming": "1",
     "monthly_renewal_ready": "1",
     "monthly_renewal_reminder": "1",
     "monthly_subscription_expired": "1",
@@ -367,9 +368,16 @@ class NotificationDeliveryRepository:
                 held = (row['notification_type'] in _SOLICITATION_TYPES
                     and repository._unresolvedCycleCaptureLocked(cursor, subscription, parseUtc(row.get('period_end'))))
                 snapshot = {'subscription':subscription,'invoice':invoice,'unresolvedOwnedCapture':held}
+                from api.services.subscriptions.subscriptionCompatibility import usesUnifiedSubscription
+                if usesUnifiedSubscription():
+                    from api.services.subscriptions.subscriptionModel import evaluateSubscription
+                    snapshot['subscriptionSnapshot'] = evaluateSubscription(
+                        repository._modelRepository().loadRuntimeFacts(cursor,subscription,observedAt),observedAt)
+                    held = held or (row['notification_type'] in _SOLICITATION_TYPES | {'monthly_cancellation_confirmation'}
+                        and snapshot['subscriptionSnapshot'].purchaseBlockReason=='recovery_required')
                 if not isBillingNotificationEligible(row,snapshot,observedAt):
                     # A hold never revives a message whose own window or facts have lapsed.
-                    if held and isBillingNotificationEligible(row,{**snapshot,'unresolvedOwnedCapture':False},observedAt):
+                    if held and isBillingNotificationEligible(row,{**snapshot,'unresolvedOwnedCapture':False},observedAt,ignoreMoneyHold=True):
                         return 'HELD'
                     return 'REJECTED'
                 cursor.execute('update public.notification_deliveries set submission_started_at=clock_timestamp() where id=%s',(deliveryId,))

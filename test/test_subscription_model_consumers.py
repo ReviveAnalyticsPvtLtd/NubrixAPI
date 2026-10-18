@@ -167,3 +167,171 @@ def test_topup_authority_failure_is_retryable_503(unified, monkeypatch):
     with pytest.raises(CustomException) as error:
         TopupService._isTopupEligible({'user_id':USER})
     assert error.value.statusCode == 503
+
+
+def test_unified_annual_overdue_workers_never_read_or_mutate_legacy_states(unified):
+    from nubrix.triggers.tasks.pastDueSuspensionTask import PastDueSuspensionTask
+    from nubrix.triggers.tasks.renewalLifecycleTask import RenewalLifecycleTask
+    unified(factsFor('expired'))
+    overdue = PastDueSuspensionTask.__new__(PastDueSuspensionTask)
+    overdue.client = NoDatabase()
+    assert overdue.execute()['past_due']['transitioned'] == 0
+    reminders = RenewalLifecycleTask.__new__(RenewalLifecycleTask)
+    reminders.client = NoDatabase()
+    assert reminders.execute()['reminders']['sent'] == 0
+
+
+def test_unified_solicitations_ignore_poisoned_cached_deadline(unified):
+    from api.services.notifications.billingNotificationService import buildBillingNotificationIntent
+    unified(factsFor('monthly'))
+    row = {'id':SUBSCRIPTION,'user_id':USER,'status':'active','billing_mode':'monthly_prepaid',
+        'current_period_end':(NOW-timedelta(seconds=1)).isoformat(),
+        'billing_state':{'manualBilling':{'lifecycleId':'wrong'}}}
+    # Actual coverage ends next month: a stale cache must not create an expiry.
+    assert buildBillingNotificationIntent({'type':'monthly_subscription_expired'},
+        {'subscription':row,'cycleId':row['current_period_end']},NOW) is None
+
+
+def test_trial_warning_uses_explicit_trial_instead_of_annual_cache(unified):
+    from api.services.notifications.trialExpiryNotificationService import buildTrialExpiryIntent
+    facts = factsFor('trial')
+    now = facts.trial.endsAt-timedelta(days=2)
+    unified(facts, now)
+    intent = buildTrialExpiryIntent({'id':SUBSCRIPTION,'user_id':USER,'status':'active',
+        'billing_mode':'annual_prepaid','current_period_end':'2099-01-01T00:00:00Z'},now)
+    assert intent is not None
+    assert intent['periodEnd'] == '2026-10-22T10:00:00+00:00'
+
+
+def test_optout_suppresses_solicitation_without_losing_paid_future(unified):
+    from api.services.notifications.billingNotificationService import buildBillingNotificationIntent
+    snapshot = unified(replace(factsFor('paid_future'), renewalOptOut=True))
+    row = {'id':SUBSCRIPTION,'user_id':USER,'billing_mode':'monthly_prepaid',
+        'renewal_opt_out':False,'current_period_end':NOW.isoformat()}
+    assert snapshot.paidUntil.isoformat() == '2026-12-17T10:00:00+00:00'
+    assert buildBillingNotificationIntent({'type':'monthly_subscription_expired'},
+        {'subscription':row,'cycleId':NOW.isoformat()},NOW) is None
+
+
+def test_unified_erasure_freeze_does_not_reference_removed_fields(unified):
+    from api.services.userErasureRepository import UserErasureRepository
+    from test.test_user_erasure_repository import FakeConnection
+    connection = FakeConnection()
+    UserErasureRepository(lambda:connection).freezeBilling(USER)
+    sql = ' '.join(q for q,_ in connection.state['executed'])
+    assert 'auto_renew_enabled' not in sql and 'renewal_due_at' not in sql
+
+
+@pytest.mark.parametrize('taskName', ['MonthlyRenewalTask','AnnualRenewalTask','EntitlementBoundaryTask'])
+def test_unified_workers_scan_canonical_owners_without_legacy_filters(unified, taskName):
+    from importlib import import_module
+    module = import_module('nubrix.triggers.tasks.'+taskName[0].lower()+taskName[1:])
+    cls = getattr(module,taskName)
+    class EmptyOwners:
+        data = []
+        def table(self,name):
+            assert name == 'subscriptions'
+            return self
+        def select(self,fields):
+            assert set(fields.replace(' ','').split(',')) <= {'id','user_id','erasure_pending'}
+            return self
+        def eq(self,field,value):
+            assert field == 'is_canonical' and value is True
+            return self
+        def execute(self):
+            return self
+    worker = cls.__new__(cls)
+    worker.client = EmptyOwners()
+    worker.now = worker._now = lambda:NOW
+    worker.execute()
+
+
+def test_stale_cancellation_cannot_describe_a_new_lifecycle(unified):
+    from api.services.notifications.billingNotificationService import isBillingNotificationEligible
+    unified(replace(factsFor('monthly'),renewalOptOut=True))
+    row = {'id':SUBSCRIPTION,'user_id':USER,'cancellation_requested_at':NOW.isoformat()}
+    delivery = {'notification_type':'monthly_cancellation_confirmation','metadata_json':{
+        'lifecycleId':'previous-lifecycle','cancellationRequestedAt':NOW.isoformat()}}
+    assert not isBillingNotificationEligible(delivery,{'subscription':row},NOW)
+
+
+@pytest.mark.parametrize('unresolved,eligible',[(False,True),(True,False)])
+def test_unknown_money_holds_even_a_current_cancellation_notice(unified,unresolved,eligible):
+    from api.services.notifications.billingNotificationService import isBillingNotificationEligible
+    from test.subscriptionModelFixtures import LIFECYCLE
+    facts = factsFor('monthly')
+    unified(replace(facts,renewalOptOut=True,moneyUnresolved=unresolved))
+    end = facts.periods[0].end
+    row = {'id':SUBSCRIPTION,'user_id':USER,'cancellation_requested_at':NOW.isoformat()}
+    delivery = {'notification_type':'monthly_cancellation_confirmation','period_end':end,'metadata_json':{
+        'lifecycleId':LIFECYCLE,'cancellationRequestedAt':NOW.isoformat(),'finalPaidEnd':end}}
+    assert isBillingNotificationEligible(delivery,{'subscription':row},NOW) is eligible
+
+
+def test_unified_renewal_notice_requires_original_lifecycle_metadata(unified):
+    from api.services.notifications.billingNotificationService import isBillingNotificationEligible
+    from test.subscriptionModelFixtures import LIFECYCLE
+    facts = factsFor('monthly')
+    now = facts.periods[0].end-timedelta(days=5)
+    unified(facts,now)
+    invoice = {'id':'renewal','userId':USER,'subscription_id':SUBSCRIPTION,'status':'UPCOMING',
+        'period_start':facts.periods[0].end,'metadata_json':{'manualBilling':{'lifecycleId':LIFECYCLE,'revision':1}}}
+    delivery = {'notification_type':'monthly_renewal_ready','period_end':facts.periods[0].end,
+        'metadata_json':{'invoiceId':'renewal','invoiceRevision':1}}
+    assert not isBillingNotificationEligible(delivery,{'subscription':{'id':SUBSCRIPTION,'user_id':USER},'invoice':invoice},now)
+
+
+def test_unified_erasure_stages_take_financial_lock_before_legacy_lock(unified):
+    from api.services.userErasureRepository import UserErasureRepository
+    from api.services.billing.manualBillingRepository import _advisoryKey
+    from test.test_user_erasure_repository import FakeConnection
+    for operation in ('create','delete'):
+        connection = FakeConnection()
+        repository = UserErasureRepository(lambda:connection)
+        if operation=='create':
+            repository.createRequest(USER,'a'*64,'admin','synthetic-request',None)
+        else:
+            repository.deleteDatabaseData('synthetic-request',USER,[])
+        locks = [params for sql,params in connection.state['executed'] if 'pg_advisory_xact_lock' in sql]
+        assert locks[:2] == [(_advisoryKey(USER),),(USER,)]
+        assert not any('auto_renew_enabled' in sql or 'renewal_due_at' in sql for sql,_ in connection.state['executed'])
+
+
+def test_annual_expiry_intent_retains_year_interval_for_email(unified):
+    from api.services.notifications.billingNotificationService import buildBillingNotificationIntent
+    facts = factsFor('annual')
+    end = facts.periods[0].end
+    unified(facts,end)
+    intent = buildBillingNotificationIntent({'type':'monthly_subscription_expired'},
+        {'subscription':{'id':SUBSCRIPTION,'user_id':USER},'cycleId':end.isoformat()},end)
+    assert intent['metadata']['billingInterval']=='year'
+
+
+def test_reconciliation_still_recovers_money_before_closing_checkouts(monkeypatch):
+    from types import SimpleNamespace
+    from nubrix.triggers.tasks.reconciliationTask import ReconciliationTask
+    from api.services.billing.manualBillingRecoveryService import ManualBillingRecoveryService
+    from api.services.credits.manualCreditRepository import ManualCreditRepository
+    calls = []
+    repository = SimpleNamespace(expireStaleCheckouts=lambda:calls.append('expire') or {})
+    monkeypatch.setattr('api.services.billing.manualBillingRepository.getManualBillingRepository',lambda:repository)
+    monkeypatch.setattr(ManualBillingRecoveryService,'execute',lambda self:calls.append('recover') or {})
+    monkeypatch.setattr(ManualCreditRepository,'recoverUsage',lambda self:{})
+    task = ReconciliationTask.__new__(ReconciliationTask)
+    task.razorpayClient = object()
+    task._reconcileStaleAttempts = lambda:{'resolved':0,'errors':0}
+    task._generateAnomalyReport = lambda:{'totalAnomalies':0}
+    task.execute()
+    assert calls == ['recover','expire']
+
+
+def test_cancellation_notice_with_old_paid_end_cannot_dispatch(unified):
+    from api.services.notifications.billingNotificationService import isBillingNotificationEligible
+    from test.subscriptionModelFixtures import LIFECYCLE
+    facts = factsFor('paid_future')
+    unified(replace(facts,renewalOptOut=True))
+    oldEnd = facts.periods[0].end
+    row = {'id':SUBSCRIPTION,'user_id':USER,'cancellation_requested_at':NOW}
+    delivery = {'notification_type':'monthly_cancellation_confirmation','period_end':oldEnd,
+        'metadata_json':{'lifecycleId':LIFECYCLE,'cancellationRequestedAt':NOW,'finalPaidEnd':oldEnd}}
+    assert not isBillingNotificationEligible(delivery,{'subscription':row},NOW)

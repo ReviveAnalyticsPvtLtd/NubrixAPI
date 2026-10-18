@@ -65,6 +65,10 @@ class PastDueSuspensionTask:
         Returns:
             dict: Counts for past_due and suspension operations.
         """
+        from api.services.subscriptions.subscriptionCompatibility import usesUnifiedSubscription
+        if usesUnifiedSubscription():
+            return {'past_due': {'transitioned': 0, 'skipped': 0, 'errors': 0},
+                'suspension': {'suspended': 0, 'skipped': 0, 'errors': 0}}
         logger.info("Past-due/suspension task started")
         pastDueResults = self._sweepPastDue()
         suspensionResults = self._sweepSuspension()

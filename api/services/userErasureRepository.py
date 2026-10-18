@@ -74,6 +74,10 @@ class UserErasureRepository:
         connection = self.connectionFactory()
         try:
             with connection.cursor(cursor_factory=RealDictCursor) as cursor:
+                from api.services.subscriptions.subscriptionCompatibility import usesUnifiedSubscription
+                if usesUnifiedSubscription():
+                    from api.services.billing.manualBillingRepository import _advisoryKey
+                    cursor.execute('select pg_advisory_xact_lock(%s)',(_advisoryKey(userId),))
                 cursor.execute(
                     "select pg_advisory_xact_lock(hashtextextended(%s, 0))",
                     (userId,),
@@ -165,11 +169,12 @@ class UserErasureRepository:
                     """,
                     [(request["id"], stepName) for stepName in ERASURE_STEP_NAMES],
                 )
+                renewalFreeze = 'renewal_opt_out = true' if usesUnifiedSubscription() else 'auto_renew_enabled = false'
                 cursor.execute(
-                    """
+                    f"""
                     update public.subscriptions
                     set erasure_pending = true,
-                        auto_renew_enabled = false,
+                        {renewalFreeze},
                         updated_at = now()
                     where user_id = %s
                     """,
@@ -426,6 +431,22 @@ class UserErasureRepository:
             connection.close()
 
     def freezeBilling(self, userId: str) -> None:
+        from api.services.subscriptions.subscriptionCompatibility import usesUnifiedSubscription
+        if usesUnifiedSubscription():
+            connection = self.connectionFactory()
+            try:
+                with connection.cursor() as cursor:
+                    from api.services.billing.manualBillingRepository import _advisoryKey
+                    cursor.execute('select pg_advisory_xact_lock(%s)',(_advisoryKey(userId),))
+                    cursor.execute('''update public.subscriptions set erasure_pending = true,
+                        renewal_opt_out = true, updated_at = now() where user_id = %s''', (userId,))
+                connection.commit()
+            except Exception:
+                connection.rollback()
+                raise
+            finally:
+                connection.close()
+            return
         self._execute(
             """
             update public.subscriptions
@@ -463,16 +484,30 @@ class UserErasureRepository:
         connection = self.connectionFactory()
         try:
             with connection.cursor() as cursor:
+                from api.services.billing.manualBillingRepository import _advisoryKey
+                from api.services.subscriptions.subscriptionCompatibility import usesUnifiedSubscription
+                unified = usesUnifiedSubscription()
+                if unified:
+                    cursor.execute('select pg_advisory_xact_lock(%s)',(_advisoryKey(userId),))
                 cursor.execute(
                     "select pg_advisory_xact_lock(hashtextextended(%s, 0))",
                     (userId,),
                 )
-                from api.services.billing.manualBillingRepository import _advisoryKey
-                cursor.execute('select pg_advisory_xact_lock(%s)',(_advisoryKey(userId),))
+                if not unified:
+                    cursor.execute('select pg_advisory_xact_lock(%s)',(_advisoryKey(userId),))
                 if self._tableExists(cursor,'billing_events'):
                     cursor.execute("select id from public.billing_events where user_id=%s and event_type='refund.intent' and event_status <> 'processed' limit 1",(userId,))
                     if cursor.fetchone() is not None:
                         raise AdminApiError(409,'Approved refund must be reconciled before financial records are anonymised')
+                    cursor.execute('''select id from public.billing_events where user_id=%s
+                        and event_type in ('subscription.legacy_snapshot','subscription.model_backfill',
+                            'subscription.next_selection','subscription.expert_grant',
+                            'subscription.model_initialized','subscription.trial_started') limit 1''',(userId,))
+                    if cursor.fetchone() is not None:
+                        # Do not bypass immutable evidence triggers or partially
+                        # scrub money. The separately planned retention workflow
+                        # must resolve this before rollout can be enabled.
+                        raise AdminApiError(409,'SUBSCRIPTION_ERASURE_RETENTION_PENDING')
                 self._scrubNotificationDeliveries(cursor, userId)
                 if self._tableExists(cursor, "Invoices"):
                     cursor.execute(

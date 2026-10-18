@@ -809,7 +809,8 @@ class SubscriptionService:
             if not userRecord.data:
                 raise Exception("User not found")
             subscription = self._getCanonicalSubscription(userId=userId, required=True)
-            if subscription.get("billing_mode") == "monthly_prepaid":
+            from api.services.subscriptions.subscriptionCompatibility import usesUnifiedSubscription
+            if usesUnifiedSubscription() or subscription.get("billing_mode") == "monthly_prepaid":
                 from api.services.billing.manualBillingRepository import getManualBillingRepository
                 return getManualBillingRepository().scheduleExpertRemoval(userId,normalizedDomains)
             subscription = self._reconcilePendingAdditions(subscription)
