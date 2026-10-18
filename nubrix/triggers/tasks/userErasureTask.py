@@ -16,6 +16,7 @@ from api.services.userErasureRepository import (
     ERASURE_STEP_NAMES,
     getUserErasureRepository,
 )
+from api.services.userErasureRetention import ErasureLeaseLost
 from utils.initMethods import invalidate_data_cache
 from utils.logger import logger
 
@@ -273,7 +274,7 @@ class UserErasureExternalCleanup:
     @staticmethod
     def _isMissing(exc: Exception) -> bool:
         status = getattr(exc, "status", None) or getattr(exc, "status_code", None)
-        return status == 404 or "not found" in str(exc).lower()
+        return str(status)=='404' or getattr(exc,'code',None)=='user_not_found'
 
 
 class UserErasureTask:
@@ -315,18 +316,25 @@ class UserErasureTask:
         if not userId:
             return {"requestId": requestId, "status": request.get("status")}
 
-        inventory = self.repository.inventory(userId)
+        def lease():
+            if not self.repository.renewLease(requestId,workerId,self.leaseSeconds):
+                raise ErasureLeaseLost('ERASURE_LEASE_LOST')
+
+        try:
+            lease()
+            inventory = self.repository.inventory(userId)
+        except ErasureLeaseLost:
+            return {'requestId':requestId,'status':'LEASE_LOST'}
+        except Exception:
+            try:
+                self.repository.startStep(requestId,'inventory',workerId=workerId)
+                self.repository.failStep(requestId,'inventory',_ERROR_CODES['inventory'],self.maxAttempts,workerId=workerId)
+            except ErasureLeaseLost:
+                return {'requestId':requestId,'status':'LEASE_LOST'}
+            return {'requestId':requestId,'status':'PARTIALLY_FAILED'}
         storedInventory = request.get("resource_manifest") or {}
-        projectIds = list(
-            inventory.get("projectIds") or storedInventory.get("projectIds") or []
-        )
-        workspaceIds = list(
-            inventory.get("workspaceIds")
-            or storedInventory.get("workspaceIds")
-            or []
-        )
-        if inventory.get("projectIds") or inventory.get("workspaceIds"):
-            self.repository.saveInventory(requestId, projectIds, workspaceIds)
+        projectIds = sorted(set(inventory.get('projectIds',[])) | set(storedInventory.get('projectIds',[])))
+        workspaceIds = sorted(set(inventory.get('workspaceIds',[])) | set(storedInventory.get('workspaceIds',[])))
         completed = {
             step["step_name"]
             for step in request.get("steps", [])
@@ -335,12 +343,9 @@ class UserErasureTask:
 
         handlers = {
             "revoke_access": lambda: self.external.revokeAccess(userId),
-            "inventory": lambda: {
-                "projects": len(projectIds),
-                "workspaces": len(workspaceIds),
-            },
+            "inventory": lambda: self._saveInventory(requestId,projectIds,workspaceIds,workerId),
             "stop_billing": lambda: self._stopBilling(
-                userId, inventory.get("billingCredentials") or []
+                requestId,userId,workerId
             ),
             "delete_storage": lambda: self.external.deleteStorage(
                 userId, projectIds
@@ -350,26 +355,33 @@ class UserErasureTask:
             ),
             "delete_auth_identity": lambda: self.external.deleteAuthIdentity(userId),
             "delete_database_data": lambda: self.repository.deleteDatabaseData(
-                requestId, userId, projectIds
+                requestId, userId, projectIds, workerId=workerId
             ),
             "verify_and_finalize": lambda: self._verifyAndFinalize(
-                requestId, userId, projectIds
+                requestId, userId, projectIds, workerId
             ),
         }
 
         for stepName in ERASURE_STEP_NAMES:
             if stepName in completed:
                 continue
-            self.repository.startStep(requestId, stepName)
             try:
+                lease()
+                self.repository.startStep(requestId, stepName,workerId=workerId)
                 details = handlers[stepName]() or {}
                 if stepName != "verify_and_finalize":
-                    self.repository.completeStep(requestId, stepName, details)
+                    lease()
+                    self.repository.completeStep(requestId, stepName, details,workerId=workerId)
+            except ErasureLeaseLost:
+                return {'requestId':requestId,'status':'LEASE_LOST'}
             except Exception:
                 errorCode = _ERROR_CODES[stepName]
-                retryScheduled = self.repository.failStep(
-                    requestId, stepName, errorCode, self.maxAttempts
-                )
+                try:
+                    retryScheduled = self.repository.failStep(
+                        requestId, stepName, errorCode, self.maxAttempts,workerId=workerId
+                    )
+                except ErasureLeaseLost:
+                    return {'requestId':requestId,'status':'LEASE_LOST'}
                 if not retryScheduled:
                     self.audit.record(
                         action="user.erasure.failed",
@@ -404,7 +416,7 @@ class UserErasureTask:
         return {"requestId": requestId, "status": "COMPLETED"}
 
     def _verifyAndFinalize(
-        self, requestId: str, userId: str, projectIds: list[str]
+        self, requestId: str, userId: str, projectIds: list[str], workerId: str
     ) -> dict:
         self.external.deleteTransientState(userId, projectIds)
         databaseResiduals = self.repository.verifyDatabaseErasure(userId)
@@ -412,7 +424,7 @@ class UserErasureTask:
             raise RuntimeError("database residuals remain")
         externalResiduals = self.external.verifyExternalErasure(userId, projectIds)
         details = {"databaseResiduals": 0, **externalResiduals}
-        self.repository.finalizeRequest(requestId, details)
+        self.repository.finalizeRequest(requestId, details,workerId=workerId)
         return details
 
     def _deleteTransientState(self, userId: str, projectIds: list[str]) -> dict:
@@ -420,10 +432,14 @@ class UserErasureTask:
         details = self.external.deleteTransientState(userId, projectIds) or {}
         return {**details, "trialCreditSyncsCancelled": cancelled}
 
-    def _stopBilling(self, userId: str, billingCredentials: list[dict]) -> dict:
-        details = self.external.stopBilling(billingCredentials)
+    def _saveInventory(self,requestId,projectIds,workspaceIds,workerId):
+        self.repository.saveInventory(requestId,projectIds,workspaceIds,workerId=workerId)
+        return {'projects':len(projectIds),'workspaces':len(workspaceIds)}
+
+    def _stopBilling(self, requestId, userId, workerId) -> dict:
         self.repository.freezeBilling(userId)
-        return details
+        self.repository.prepareRetention(requestId,userId,workerId)
+        return {'billingFrozen':True,'policyCode':'ORIGINAL_AUDITS_RETAINED'}
 
     def sweep(self, limit: int = 100) -> dict:
         requestIds = self.repository.listClaimable(limit)

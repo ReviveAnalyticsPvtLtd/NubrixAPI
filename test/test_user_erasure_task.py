@@ -39,20 +39,26 @@ class FakeRepository:
             ],
         }
 
-    def startStep(self, requestId, stepName):
+    def renewLease(self,requestId,workerId,leaseSeconds):
+        return True
+
+    def prepareRetention(self,requestId,userId,workerId):
+        self.calls.append(('retention',requestId))
+
+    def startStep(self, requestId, stepName, **kwargs):
         self.calls.append(("start", stepName))
         for step in self.request["steps"]:
             if step["step_name"] == stepName:
                 step["attempt_count"] += 1
                 step["status"] = "IN_PROGRESS"
 
-    def completeStep(self, requestId, stepName, details=None, status="COMPLETED"):
+    def completeStep(self, requestId, stepName, details=None, status="COMPLETED", **kwargs):
         self.calls.append(("complete", stepName))
         for step in self.request["steps"]:
             if step["step_name"] == stepName:
                 step["status"] = status
 
-    def failStep(self, requestId, stepName, errorCode, maxAttempts):
+    def failStep(self, requestId, stepName, errorCode, maxAttempts, **kwargs):
         self.calls.append(("failed", stepName, errorCode))
         self.request["status"] = "PARTIALLY_FAILED"
         return self.retryScheduled
@@ -60,14 +66,14 @@ class FakeRepository:
     def freezeBilling(self, userId):
         self.calls.append(("billing", userId))
 
-    def saveInventory(self, requestId, projectIds, workspaceIds):
+    def saveInventory(self, requestId, projectIds, workspaceIds, **kwargs):
         self.calls.append(("save-inventory", len(projectIds), len(workspaceIds)))
         self.request["resource_manifest"] = {
             "projectIds": list(projectIds),
             "workspaceIds": list(workspaceIds),
         }
 
-    def deleteDatabaseData(self, requestId, userId, projectIds):
+    def deleteDatabaseData(self, requestId, userId, projectIds, **kwargs):
         self.calls.append(("database", userId))
 
     def cancelPendingTrialCreditSync(self, userId):
@@ -78,7 +84,7 @@ class FakeRepository:
         self.calls.append(("verify-db", userId))
         return {}
 
-    def finalizeRequest(self, requestId, details):
+    def finalizeRequest(self, requestId, details, **kwargs):
         self.calls.append(("finalize", requestId))
         self.scrubbed = True
         self.request["target_user_id"] = None
@@ -155,6 +161,43 @@ def test_worker_runs_steps_in_order_and_scrubs_identity_only_after_verification(
     assert repository.calls[-1][0] == "finalize"
     assert ("cancel-trial-credit-sync", "user-1") in repository.calls
     assert [call[0] for call in cleanup.calls].count("delete_transient_state") == 2
+
+
+def test_inventory_failure_is_durable_before_any_destructive_cleanup():
+    repository = FakeRepository()
+    cleanup = FakeExternalCleanup()
+    def unavailable(_):
+        raise RuntimeError('synthetic inventory outage')
+    repository.inventory = unavailable
+    assert _task(repository,cleanup).execute('request-1')['status']=='PARTIALLY_FAILED'
+    assert ('failed','inventory','INVENTORY_FAILED') in repository.calls
+    assert not any(call[0].startswith('delete_') for call in cleanup.calls)
+
+
+def test_worker_losing_lease_after_external_cleanup_cannot_advance_or_fail_request():
+    repository = FakeRepository()
+    cleanup = FakeExternalCleanup()
+    def storage(*args):
+        repository.renewLease=lambda *args:False
+        return {}
+    cleanup.deleteStorage=storage
+    result = _task(repository,cleanup).execute('request-1')
+    assert result['status']=='LEASE_LOST'
+    assert ('complete','delete_storage') not in repository.calls
+    assert not any(call[0] in ('failed','database','finalize') for call in repository.calls)
+
+
+def test_auth_gateway_not_found_message_is_not_missing_identity_proof():
+    from nubrix.triggers.tasks.userErasureTask import UserErasureExternalCleanup
+    assert not UserErasureExternalCleanup._isMissing(RuntimeError('gateway not found; request not sent'))
+
+
+def test_retry_inventory_preserves_union_of_stored_and_current_resources():
+    repository = FakeRepository()
+    repository.request['resource_manifest']={'projectIds':['old-project'],'workspaceIds':['old-workspace']}
+    cleanup = FakeExternalCleanup()
+    _task(repository,cleanup).execute('request-1')
+    assert ('delete_storage','user-1',('old-project','project-1')) in cleanup.calls
 
 
 def test_worker_records_stable_error_code_and_stops_after_transient_failure():

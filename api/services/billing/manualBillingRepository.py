@@ -216,6 +216,18 @@ class ManualBillingRepository:
                     (Json({'lastRecoveryAt':_now().isoformat(),'lastRecoveryOutcome':outcome or 'checked'}),eventId))
         return self._run(operation)
 
+    def _refreshFinancialOwnerLocked(self,cursor,eventId,owner):
+        """Erasure can commit between the optimistic owner read and its lock."""
+        cursor.execute('SELECT user_id FROM public.billing_events WHERE id=%s',(eventId,))
+        current = cursor.fetchone()
+        if current is None:
+            raise ValueError('FINANCIAL_EVENT_MISSING')
+        if current['user_id']!=owner['user_id']:
+            if current['user_id'] is not None:
+                raise ValueError('FINANCIAL_EVENT_OWNER_CHANGED')
+            self._lockUser(cursor,None)
+        return {**owner,'user_id':current['user_id']}
+
     def markClosedAttemptReconciled(self, attemptId):
         def operation(connection):
             with connection.cursor(cursor_factory=RealDictCursor) as cursor:
@@ -224,6 +236,7 @@ class ManualBillingRepository:
                 if not owner:
                     raise ValueError('ATTEMPT_MISSING')
                 self._lockUser(cursor,owner['user_id'])
+                owner = self._refreshFinancialOwnerLocked(cursor,attemptId,owner)
                 if owner['user_id'] is not None:
                     self._canonical(cursor,owner['user_id'])
                 cursor.execute('select metadata_json from public.billing_events where id=%s for update',(attemptId,))
@@ -268,6 +281,7 @@ class ManualBillingRepository:
                 if not owner:
                     raise ValueError('ATTEMPT_MISSING')
                 self._lockUser(cursor, owner['user_id'])
+                owner = self._refreshFinancialOwnerLocked(cursor,attemptId,owner)
                 if owner['user_id'] is not None:
                     self._canonical(cursor, owner['user_id'])
                 cursor.execute('select id from public."Invoices" where id=%s for update', (owner['invoice_id'],))
@@ -305,10 +319,11 @@ class ManualBillingRepository:
             with connection.cursor(cursor_factory=RealDictCursor) as cursor:
                 cursor.execute('select user_id,invoice_id from public.billing_events where id=%s', (attemptId,))
                 owner = cursor.fetchone()
-                if not owner or owner['user_id'] is None:
+                if not owner:
                     return False
                 self._lockUser(cursor, owner['user_id'])
-                subscription = self._canonical(cursor, owner['user_id'])
+                owner = self._refreshFinancialOwnerLocked(cursor,attemptId,owner)
+                subscription = self._canonical(cursor, owner['user_id']) if owner['user_id'] is not None else None
                 cursor.execute('select * from public."Invoices" where id=%s for update', (owner['invoice_id'],))
                 invoice = cursor.fetchone()
                 cursor.execute('select * from public.billing_events where id=%s for update', (attemptId,))
@@ -331,7 +346,7 @@ class ManualBillingRepository:
                     (Json(metadata), attemptId))
                 if billing.get('purpose') != 'renewal':
                     self._closeInvoice(cursor, invoice, 'ORDER_NOT_CREATED')
-                if billing.get('purpose') == 'expert_addition':
+                if subscription and billing.get('purpose') == 'expert_addition':
                     pending = self._jsonList(subscription.get('pending_additions'))
                     for item in pending:
                         if item.get('attemptId') == attemptId and item.get('state') == 'awaiting_payment':
@@ -1508,6 +1523,7 @@ class ManualBillingRepository:
                 previous=cursor.fetchone()
                 if not previous: raise ValueError('ATTEMPT_MISSING')
                 self._lockUser(cursor,previous['user_id'])
+                previous = self._refreshFinancialOwnerLocked(cursor,attemptId,previous)
                 subscription = self._canonical(cursor, previous['user_id']) if previous['user_id'] is not None else None
                 if subscription:
                     cursor.execute('select id from public."Invoices" where id=%s and "userId"=%s for update',
@@ -1577,7 +1593,12 @@ class ManualBillingRepository:
                 if not owner or owner['user_id'] is None:
                     return False
                 self._lockUser(cursor, owner['user_id'])
-                self._canonical(cursor, owner['user_id'])
+                owner = self._refreshFinancialOwnerLocked(cursor,attemptId,owner)
+                if owner['user_id'] is None:
+                    return False
+                subscription = self._canonical(cursor, owner['user_id'])
+                if subscription.get('erasure_pending'):
+                    return False
                 cursor.execute('select id from public."Invoices" where id=%s for update', (owner['invoice_id'],))
                 cursor.fetchone()
                 cursor.execute('select metadata_json from public.billing_events where id=%s for update', (attemptId,))
@@ -1629,11 +1650,19 @@ class ManualBillingRepository:
         def operation(connection):
             with connection.cursor(cursor_factory=RealDictCursor) as cursor:
                 self._lockUser(cursor, evidence.userId)
-                if evidence.userId is None:
+                cursor.execute('select user_id from public.billing_events where id=%s',(evidence.attemptId,))
+                owner = cursor.fetchone()
+                if owner and owner['user_id'] is None:
+                    self._lockUser(cursor,None)
                     cursor.execute('select * from public.billing_events where id=%s',(evidence.attemptId,))
-                    erasedAttempt=cursor.fetchone()
-                    if erasedAttempt and erasedAttempt['user_id'] is None:
-                        return self._recordErasedCapture(cursor,erasedAttempt,evidence)
+                    erasedAttempt = cursor.fetchone()
+                    if evidence.userId is not None:
+                        requestId = self._json(erasedAttempt.get('metadata_json')).get('erasureRequestId')
+                        cursor.execute('SELECT request_id FROM private.retained_user_subjects WHERE request_id=%s AND original_user_id=%s',
+                            (requestId,evidence.userId))
+                        if not cursor.fetchone():
+                            raise ValueError('ERASED_CAPTURE_OWNER_MISMATCH')
+                    return self._recordErasedCapture(cursor,erasedAttempt,evidence)
                 subscription = self._canonical(cursor, evidence.userId)
                 existingCoverage = self._paidInvoicesLocked(cursor, subscription) if evidence.purpose == 'initial_purchase' else []
                 cursor.execute('select * from public."Invoices" where id = %s for update', (evidence.invoiceId,))
@@ -1868,11 +1897,16 @@ class ManualBillingRepository:
         invoice=cursor.fetchone()
         if (not invoice or invoice['userId'] is not None or str(attempt['invoice_id'])!=evidence.invoiceId
             or attempt.get('provider_order_id')!=evidence.providerOrderId or int(attempt['amount'])!=evidence.amount
-            or attempt['currency']!=evidence.currency or evidence.financialStatus!='captured'):
+            or attempt['currency']!=evidence.currency):
             raise ValueError('ERASED_CAPTURE_EVIDENCE_MISMATCH')
-        cursor.execute('select id,invoice_id from public.billing_events where provider_payment_id=%s',(evidence.providerPaymentId,))
+        if evidence.financialStatus!='captured':
+            return FinalizationResult(evidence.invoiceId,evidence.attemptId,'awaiting_capture','unchanged',
+                False,False,True,None,None,None)
+        cursor.execute('select * from public.billing_events where provider_payment_id=%s for update',(evidence.providerPaymentId,))
         existing=cursor.fetchone()
-        if existing and str(existing['invoice_id']) != evidence.invoiceId:
+        if existing and (str(existing['invoice_id']) != evidence.invoiceId
+                or existing.get('provider_order_id')!=evidence.providerOrderId
+                or int(existing.get('amount') or 0)!=evidence.amount or existing.get('currency')!=evidence.currency):
             raise ValueError('PAYMENT_ALREADY_BOUND')
         anomalyId=str(existing['id']) if existing else str(uuid.uuid4())
         if not existing:
@@ -2418,6 +2452,13 @@ class ManualBillingRepository:
             'cancellationReason':subscription.get('cancellation_reason'),
             'cancellationRequestedAt':(_isoText(subscription.get('cancellation_requested_at')) if self._usesPurchaseAuthority() else
                 self._json(subscription.get('billing_state')).get('manualBilling',{}).get('cancellationRequestedAt'))}
+        if self._usesPurchaseAuthority():
+            from api.services.subscriptions.subscriptionModel import evaluateSubscription
+            from api.services.billing.manualBillingPresentation import serializeSubscriptionSnapshot
+            model = self._modelRepository()
+            evaluated = model._now(cursor)
+            verified = evaluateSubscription(model.loadRuntimeFacts(cursor,subscription,evaluated),evaluated)
+            facts['subscription'] = serializeSubscriptionSnapshot(verified)
         return {**subscription,'finalPaidEnd':finalEnd.isoformat(),'preferenceResult':facts}
 
     def setRenewalOptOut(
@@ -2702,6 +2743,7 @@ class ManualBillingRepository:
                 row=cursor.fetchone()
                 if not row: raise ValueError('REFUND_INTENT_MISSING')
                 self._lockUser(cursor,row['user_id'])
+                row = self._refreshFinancialOwnerLocked(cursor,refundIntentId,row)
                 cursor.execute('select metadata_json from public.billing_events where id=%s for update',(refundIntentId,))
                 metadata=self._json(cursor.fetchone()['metadata_json'])
                 expected={item['paymentId']:item for item in metadata['items']}
@@ -2712,12 +2754,14 @@ class ManualBillingRepository:
                     previous=metadata['providerRefunds'].get(item['paymentId'])
                     if previous and previous.get('id') != refund['id']: raise ValueError('EXCESS_REFUND_IDENTITY')
                     if previous and previous.get('status') == 'processed': continue
-                    metadata['providerRefunds'][item['paymentId']]=refund
+                    metadata['providerRefunds'][item['paymentId']]=(
+                        {key:refund[key] for key in ('id','payment_id','amount','currency','status') if key in refund}
+                        if row['user_id'] is None else refund)
                 refunds=list(metadata['providerRefunds'].values())
                 state='processed' if len(refunds)==len(expected) and all(r['status']=='processed' for r in refunds) else 'failed' if any(r['status']=='failed' for r in refunds) else 'pending' if refunds else metadata['refundState']
                 metadata['refundState']=state
                 cursor.execute('update public.billing_events set metadata_json=%s,event_status=%s where id=%s',(Json(metadata),state,refundIntentId))
-                if state == 'processed':
+                if state == 'processed' and row['user_id'] is not None:
                     subscription=self._canonical(cursor,row['user_id'])
                     self._recordNotification(cursor,subscription,'subscription_refund_processed','refund:'+refundIntentId+':processed',{'refundIntentId':refundIntentId,'amount':metadata['amount'],'currency':metadata['items'][0]['currency'],'accessExpired':metadata['accessExpired'],'currentAccessPreserved':metadata['currentAccessPreserved'],'cutoff':metadata['cutoff']})
                 return {'refundIntentId':refundIntentId,'refundState':state,'accessRestored':False}

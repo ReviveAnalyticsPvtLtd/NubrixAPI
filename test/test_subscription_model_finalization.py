@@ -709,6 +709,36 @@ def test_public_cancel_and_resume_use_one_owned_preference_operation(account, mo
     assert query(url, 'SELECT * FROM credit_balances WHERE user_id=%s', (original.userId,), one=True) == credit
 
 
+@pytest.mark.parametrize('account',['monthly_prepaid','annual_prepaid'],indirect=True)
+def test_preference_http_results_include_current_v2_snapshot_on_repeated_actions(account,monkeypatch):
+    from fastapi import FastAPI
+    from fastapi.testclient import TestClient
+    from jose import jwt
+    from api.commons import verifyToken
+    from api.routers import subscriptions as routes
+    from api.services.subscriptions.subscriptionService import SubscriptionService
+    repo,_,initial,url = account
+    service = SubscriptionService.__new__(SubscriptionService)
+    service._getCanonicalSubscription = lambda userId,required=False: query(url,
+        'SELECT * FROM subscriptions WHERE user_id=%s',(userId,),one=True)
+    monkeypatch.setattr(routes,'subscriptionService',service)
+    monkeypatch.setattr('api.services.billing.manualBillingRepository.getManualBillingRepository',lambda:repo)
+    token = jwt.encode({'userId':initial.userId,'email':'synthetic@example.test'},os.environ['SECRET_KEY'],algorithm='HS256')
+    app = FastAPI()
+    app.include_router(routes.router)
+    app.dependency_overrides[verifyToken]=lambda:token
+    with TestClient(app) as client:
+        for endpoint,optOut in [('cancelSubscription',True),('cancelSubscription',True),('resumeRenewal',False),('resumeRenewal',False)]:
+            response = client.post('/'+endpoint,json={})
+            assert response.status_code==200
+            body = response.json()
+            assert body['status']=='SUCCESS'
+            assert body['data']['subscription']['schemaVersion']==2
+            assert body['data']['subscription']['renewalOptOut']==optOut
+            assert body['data']['subscription']['accessAllowed'] is True
+            assert body['data']['subscription']['billingInterval']==('year' if initial.billingMode=='annual_prepaid' else 'month')
+
+
 @pytest.mark.parametrize('account', ['monthly_prepaid', 'annual_prepaid'], indirect=True)
 def test_opt_out_preserves_a_renewal_captured_before_closure_with_provider_proof(account, monkeypatch):
     from datetime import timedelta

@@ -42,7 +42,7 @@ def test_erasure_preserves_accepted_provider_state_for_reconciliation():
     )
     assert "provider_message_id" not in query
     assert "provider_status" not in query
-    assert "next_reconcile_at" not in query
+    assert "coalesce(next_reconcile_at,now())" in query
     assert "when status in ('pending', 'retry_pending', 'sending')" in query
 
 

@@ -478,33 +478,8 @@ class NotificationDeliveryRepository:
         )
 
     def cancelAndScrubUser(self, userId: str) -> int:
-        return self._writeCount(
-            """
-            update public.notification_deliveries
-            set status = case
-                    when status in ('PENDING', 'RETRY_PENDING', 'SENDING')
-                        then 'CANCELLED'
-                    else status
-                end,
-                terminal_at = case
-                    when status in ('PENDING', 'RETRY_PENDING', 'SENDING')
-                        then now()
-                    else terminal_at
-                end,
-                user_id = null,
-                subscription_id = null,
-                lease_owner = null,
-                lease_expires_at = null,
-                next_reconcile_at = case
-                    when status in ('PENDING', 'RETRY_PENDING', 'SENDING')
-                        then null
-                    else next_reconcile_at
-                end,
-                updated_at = now()
-            where user_id = %s
-            """,
-            (userId,),
-        )
+        from api.services.userErasureRetention import NOTIFICATION_ERASURE_SQL
+        return self._writeCount(NOTIFICATION_ERASURE_SQL,(userId,))
 
     def deleteTerminalBefore(self, cutoff: str) -> int:
         return self._writeCount(
