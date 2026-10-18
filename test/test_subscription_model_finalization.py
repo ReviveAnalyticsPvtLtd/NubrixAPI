@@ -29,6 +29,48 @@ def workerFor(account):
 
 
 @pytest.mark.parametrize('account',['monthly_prepaid','annual_prepaid'],indirect=True)
+@pytest.mark.parametrize('expired',[False,True])
+def test_auth_verify_http_uses_actual_owned_snapshot_without_subscription_writes(account,monkeypatch,expired):
+    from fastapi import FastAPI
+    from fastapi.testclient import TestClient
+    from jose import jwt
+    from api import commons
+    from api.routers import authentication as routes
+    from api.services.authenticationService import AuthenticationService
+    from api.services.credits.creditService import creditService
+    from test.test_user_access_enforcement import FakeClient
+    repo,_,initial,url = account
+    if expired: expirePurchasedCoverage(account)
+    owner = {'userId':initial.userId,'email':'synthetic@example.test','isBanned':False,
+        'onboarded':True,'currentWorkspaceId':None,'profileImage':None}
+    token = jwt.encode({'userId':initial.userId,'email':owner['email'],'sub_status':'active','plan_type':'annual'},
+        os.environ['SECRET_KEY'],algorithm='HS256')
+    transport = FakeClient([owner],sessions=[{'userId':initial.userId,'email':owner['email'],'accessToken':token}])
+    service = AuthenticationService.__new__(AuthenticationService)
+    service.client = transport
+    monkeypatch.setattr(commons,'client',transport)
+    monkeypatch.setattr(routes,'authenticationService',service)
+    monkeypatch.setattr('api.services.billing.manualBillingRepository.getManualBillingRepository',lambda:repo)
+    monkeypatch.setattr(creditService,'getBalanceSnapshot',lambda _:None)
+    before = query(url,'SELECT * FROM subscriptions WHERE user_id=%s',(initial.userId,),one=True)
+    balance = query(url,'SELECT * FROM credit_balances WHERE user_id=%s',(initial.userId,),one=True)
+    app = FastAPI()
+    app.include_router(routes.router,prefix='/auth')
+    with TestClient(app) as http:
+        response = http.get('/auth/verify',headers={'Authorization':'Bearer '+token})
+    assert response.status_code==200
+    body = response.json()
+    assert body['userId']==initial.userId and body['onboarded'] is True
+    assert body['credits'] is None
+    snapshot = body['subscription']
+    assert snapshot['schemaVersion']==2 and snapshot['status']==('expired' if expired else 'active')
+    assert snapshot['accessAllowed'] is not expired and snapshot['purchaseAllowed'] is expired
+    if expired: assert snapshot['currentPeriod'] is None and snapshot['paidUntil'] is None
+    assert query(url,'SELECT * FROM subscriptions WHERE user_id=%s',(initial.userId,),one=True)==before
+    assert query(url,'SELECT * FROM credit_balances WHERE user_id=%s',(initial.userId,),one=True)==balance
+
+
+@pytest.mark.parametrize('account',['monthly_prepaid','annual_prepaid'],indirect=True)
 def test_delayed_worker_cannot_refill_or_extend_unpaid_time(account):
     from api.services.subscriptions.subscriptionSnapshotService import SubscriptionSnapshotService
     repo, _, initial, url = account
