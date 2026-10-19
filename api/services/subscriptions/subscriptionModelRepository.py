@@ -45,10 +45,10 @@ class SubscriptionModelRepository:
 
     @staticmethod
     def _related(row, rows, invoices, events):
-        ownInvoices = [i for i in invoices if str(i.get('subscription_id')) == str(row['id']) or i.get('subscription_id') is None]
-        ownEvents = [e for e in events if str(e.get('subscription_id')) == str(row['id']) or e.get('subscription_id') is None]
+        # Conflicting money is account-wide, including owned historical rows.
+        # The facts adapter separately scopes periods to this subscription.
         others = [r for r in rows if str(r['id']) != str(row['id'])]
-        return ownInvoices, ownEvents, others
+        return invoices, events, others
 
     @staticmethod
     def _now(cursor, requested=None):
@@ -102,6 +102,17 @@ class SubscriptionModelRepository:
 
     def archiveLegacySnapshot(self, cursor, row):
         self._lock(cursor, row['user_id'])
+        cursor.execute('SELECT 1 FROM public.subscriptions WHERE user_id=%s AND erasure_pending LIMIT 1', (row['user_id'],))
+        if cursor.fetchone() is not None:
+            raise ValueError('REVIEW_ERASURE_PENDING')
+        # An in-flight legacy bootstrap may create an unflagged shell after an
+        # erasure accepted an account with no subscription. The durable request
+        # remains authoritative even when there was no row to mark pending.
+        cursor.execute("SELECT to_regclass('public.user_erasure_requests') AS request_table")
+        if cursor.fetchone()['request_table'] is not None:
+            cursor.execute("SELECT 1 FROM public.user_erasure_requests WHERE target_user_id=%s AND status <> 'COMPLETED' LIMIT 1", (row['user_id'],))
+            if cursor.fetchone() is not None:
+                raise ValueError('REVIEW_ERASURE_PENDING')
         cursor.execute('SELECT * FROM public.subscriptions WHERE id=%s AND user_id=%s FOR UPDATE', (row['id'], row['user_id']))
         current = cursor.fetchone()
         if not current or legacyRowHash(current) != legacyRowHash(row):
@@ -128,32 +139,66 @@ class SubscriptionModelRepository:
             raise ValueError('REVIEW_VERSION_CHANGED')
         return dict(result)
 
+    @staticmethod
+    def _requireApproval(decision):
+        if any(not isinstance(decision.get(k), str) or not decision[k].strip() for k in ('reviewedBy', 'reviewReference')):
+            raise ValueError('REVIEW_REQUIRED')
+
+    def _checkedReview(self, cursor, decision, now):
+        rows, owner, invoices, events = self._records(cursor, decision['userId'])
+        row = next((r for r in rows if str(r['id']) == decision['subscriptionId']), None)
+        if row is None:
+            raise ValueError('REVIEW_OWNER_OR_SUBSCRIPTION_CHANGED')
+        ownInvoices, ownEvents, others = self._related(row, rows, invoices, events)
+        archiveKey = f"subscription-archive:{row['id']}:{decision['expectedVersion']}:{decision['legacyHash']}"
+        cursor.execute('SELECT * FROM public.billing_events WHERE idempotency_key=%s', (archiveKey,))
+        archived = cursor.fetchone()
+        if archived:
+            original = metadata(archived).get('archive', {}).get('originalRow')
+            if (archived['event_type'] != MODEL_EVENTS[0] or archived['event_status'] != 'COMMITTED'
+                    or archived['user_id'] != row['user_id'] or str(archived['subscription_id']) != str(row['id'])
+                    or not isinstance(original, dict) or original.get('user_id') != row['user_id']
+                    or str(original.get('id')) != str(row['id']) or original.get('version') != decision['expectedVersion']
+                    or legacyRowHash(original) != decision['legacyHash']):
+                raise ValueError('REVIEW_ARCHIVE_CONFLICT')
+            cursor.execute('SELECT * FROM public.billing_events WHERE idempotency_key=%s', (f"subscription-backfill:{archived['id']}",))
+            stamp = cursor.fetchone()
+            if stamp:
+                payload = metadata(stamp)['backfill']
+                if (stamp['event_type'] != MODEL_EVENTS[1] or stamp['event_status'] != 'COMMITTED'
+                        or stamp['user_id'] != row['user_id'] or str(stamp['subscription_id']) != str(row['id'])
+                        or payload['approvalHash'] != evidenceHash(decision)
+                        or not self._stampMatches(row, owner, ownInvoices, ownEvents, others, payload)):
+                    raise ValueError('REVIEW_REPLAY_CHANGED')
+                return row, None
+        proposal = buildBackfillProposal(row, owner, ownInvoices, ownEvents, now=self._now(cursor, now),
+            otherSubscriptions=others, trialReview=decision.get('trialReview'))
+        if any(jsonValue(decision.get(k)) != jsonValue(v) for k, v in proposal.items()):
+            raise ValueError('REVIEW_EVIDENCE_CHANGED')
+        return row, proposal
+
+    def checkReviewedDecision(self, decision, *, now=None):
+        """Validate fresh or exactly applied approvals without changing rows."""
+        self._requireApproval(decision)
+        try:
+            with closing(self.connectionFactory()) as db:
+                db.set_session(readonly=True)
+                with db, db.cursor(cursor_factory=RealDictCursor) as cursor:
+                    _, proposal = self._checkedReview(cursor, decision, now)
+                    return 'already_applied' if proposal is None else proposal['resolution']
+        except ValueError as exc:
+            if str(exc).startswith('REVIEW_'):
+                return 'stale'
+            raise
+
     def applyReviewedDecision(self, decision, *, now=None):
         if getSubscriptionModelPhase() not in ('legacy', 'shadow'):
             raise ValueError('REVIEW_PHASE_NOT_ALLOWED')
-        if any(not isinstance(decision.get(k), str) or not decision[k].strip() for k in ('reviewedBy', 'reviewReference')):
-            raise ValueError('REVIEW_REQUIRED')
+        self._requireApproval(decision)
         with closing(self.connectionFactory()) as db, db, db.cursor(cursor_factory=RealDictCursor) as cursor:
-            rows, owner, invoices, events = self._records(cursor, decision['userId'])
-            row = next((r for r in rows if str(r['id']) == decision['subscriptionId']), None)
-            if row is None:
-                raise ValueError('REVIEW_OWNER_OR_SUBSCRIPTION_CHANGED')
-            ownInvoices, ownEvents, others = self._related(row, rows, invoices, events)
-            archiveKey = f"subscription-archive:{row['id']}:{decision['expectedVersion']}:{decision['legacyHash']}"
-            cursor.execute('SELECT * FROM public.billing_events WHERE idempotency_key=%s', (archiveKey,))
-            archived = cursor.fetchone()
-            if archived:
-                cursor.execute('SELECT * FROM public.billing_events WHERE idempotency_key=%s', (f"subscription-backfill:{archived['id']}",))
-                stamp = cursor.fetchone()
-                if stamp:
-                    payload = metadata(stamp)['backfill']
-                    if (payload['approvalHash'] != evidenceHash(decision) or not self._stampMatches(row, owner, ownInvoices, ownEvents, others, payload)):
-                        raise ValueError('REVIEW_REPLAY_CHANGED')
-                    return {'status': 'already_applied', 'subscriptionId': str(row['id'])}
-            proposal = buildBackfillProposal(row, owner, ownInvoices, ownEvents, now=self._now(cursor, now),
-                otherSubscriptions=others, trialReview=decision.get('trialReview'))
-            if any(jsonValue(decision.get(k)) != jsonValue(v) for k, v in proposal.items()):
-                raise ValueError('REVIEW_EVIDENCE_CHANGED')
+            row, proposal = self._checkedReview(cursor, decision, now)
+            if proposal is None:
+                return {'status': 'already_applied', 'subscriptionId': str(row['id'])}
             archiveId = self.archiveLegacySnapshot(cursor, row)
             if proposal['resolution'] == 'needs_review':
                 return {'status': 'needs_review', 'subscriptionId': str(row['id']), 'archiveId': archiveId}
@@ -191,7 +236,7 @@ class SubscriptionModelRepository:
                             and legacyRowHash(original) == archived.get('legacyHash')
                             and stableLegacyHash(original) == payload.get('sourceStableHash'))
             if archiveValid and payload.get('resolution') in ('verified', 'consumed_dates_unknown') and self._stampMatches(row, owner, ownInvoices, ownEvents, others, payload):
-                return factsFromRecords(row, owner, ownInvoices, ownEvents, consumed=payload['trialConsumed'])
+                return factsFromRecords(row, owner, ownInvoices, ownEvents, consumed=payload['trialConsumed'], otherSubscriptions=others)
         raise SubscriptionAuthorityUnavailable('Reviewed backfill is missing or stale')
 
     def snapshotFactsLoader(self, userId, now=None):

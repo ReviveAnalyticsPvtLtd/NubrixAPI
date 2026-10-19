@@ -41,10 +41,10 @@ def main(argv=None):
             counts = {status: sum(r['status'] == status for r in results) for status in ('applied', 'already_applied', 'needs_review')}
             print(json.dumps({'dryRun': False, 'counts': counts, 'authorizesCutover': False}))
             return 1 if counts['needs_review'] else 0
-        reviews = {d['subscriptionId']: d['trialReview'] for d in decisions if d.get('trialReview')}
-        current = {p['subscriptionId']: p for p in repo.inventory(trialReviews=reviews)['proposals']}
-        stale = sum(d['subscriptionId'] not in current or any(d.get(k) != v for k, v in current[d['subscriptionId']].items()) for d in decisions)
-        print(json.dumps({'dryRun': True, 'reviewedDecisions': len(decisions), 'staleDecisions': stale, 'authorizesCutover': False}))
+        statuses = [repo.checkReviewedDecision(decision) for decision in decisions]
+        stale = statuses.count('stale')
+        print(json.dumps({'dryRun': True, 'reviewedDecisions': len(decisions), 'staleDecisions': stale,
+            'alreadyAppliedDecisions': statuses.count('already_applied'), 'authorizesCutover': False}))
         return 1 if stale else 0
     except Exception:
         # Connection errors can contain credentials. Keep failure output fixed.
