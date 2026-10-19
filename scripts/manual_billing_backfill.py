@@ -184,6 +184,8 @@ def dryRunReport(
 
 def applyMapping(mappingFilePath: str) -> dict:
     """Apply an operator-reviewed mapping file. Writes require review sign-off."""
+    from scripts.subscription_storage_guard import requireLegacySubscriptionStorage, checkLegacySubscriptionStorage
+    requireLegacySubscriptionStorage()
     with open(mappingFilePath, "r", encoding="utf-8") as handle:
         reviewed = json.load(handle)
     if not reviewed.get("reviewed") or not reviewed.get("approved_by"):
@@ -205,6 +207,10 @@ def applyMapping(mappingFilePath: str) -> dict:
         from api.services.billing.manualBillingRepository import _advisoryKey, _utc
         import uuid
         with connection.cursor(cursor_factory=RealDictCursor) as cursor:
+            # Hold off additive/contract DDL until this historical transaction
+            # completes. A schema check alone would race an expansion commit.
+            cursor.execute('LOCK TABLE public.subscriptions IN SHARE ROW EXCLUSIVE MODE')
+            checkLegacySubscriptionStorage(cursor)
             for entry in reviewed.get("mappings") or []:
                 cursor.execute('select pg_advisory_xact_lock(%s)',(_advisoryKey(entry['user_id']),))
                 cursor.execute('select * from public.subscriptions where user_id=%s order by id for update',(entry['user_id'],))
@@ -310,6 +316,13 @@ def main(argv: list[str] | None = None) -> int:
     )
     args = parser.parse_args(argv)
 
+    from scripts.subscription_storage_guard import requireLegacySubscriptionStorage, checkLegacySubscriptionStorage
+    try:
+        requireLegacySubscriptionStorage()
+    except ValueError as exc:
+        print(str(exc), file=sys.stderr)
+        return 2
+
     if args.apply:
         result = applyMapping(args.apply)
         print(json.dumps(result, indent=2))
@@ -329,6 +342,11 @@ def main(argv: list[str] | None = None) -> int:
     try:
         connection.set_session(readonly=True, autocommit=True)
         with connection.cursor(cursor_factory=RealDictCursor) as cursor:
+            try:
+                checkLegacySubscriptionStorage(cursor)
+            except ValueError as exc:
+                print(str(exc), file=sys.stderr)
+                return 2
             cursor.execute(
                 """
                 select id, user_id, status, billing_mode,
