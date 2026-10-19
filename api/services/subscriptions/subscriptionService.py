@@ -687,9 +687,6 @@ class SubscriptionService:
             )
             userId = decodedToken.get("userId")
             userEmail = decodedToken.get("email")
-            currentTime = datetime.datetime.now(datetime.timezone.utc)
-            trialDurationDays = 12
-            trialExpiry = currentTime + datetime.timedelta(days=trialDurationDays)
             experts = ["banking", "manufacturing", "supplychain", "telecom"]
             from api.services.billing.manualBillingRepository import getManualBillingRepository
             repository = getManualBillingRepository()
@@ -699,7 +696,11 @@ class SubscriptionService:
             except ValueError as exc:
                 raise CustomException(exc, statusCode=409,
                     uiMessage="A free trial is not available for this account.") from exc
-            trialExpiry = activated['current_period_end']
+            from api.services.subscriptions.subscriptionCompatibility import getSubscriptionModelPhase
+            unified = getSubscriptionModelPhase() in ('dual', 'v2', 'contracted')
+            currentTime = activated['trial_started_at' if unified else 'current_period_start']
+            trialExpiry = activated['trial_ends_at' if unified else 'current_period_end']
+            trialDurationDays = (trialExpiry - currentTime).days
             records = self.client.table("Users").select("fullName").eq("userId", userId).limit(1).execute()
             name = records.data[0]["fullName"] if records.data else userEmail
             self._sendFreeTrialEmail(email=userEmail, name=name)

@@ -11,8 +11,26 @@ from api.services.subscriptions.subscriptionModel import (
 
 NEW_COLUMNS = frozenset({'plan_code', 'lifecycle_id', 'trial_started_at', 'trial_ends_at',
                          'trial_closed_at', 'cancellation_requested_at'})
+RETAINED_COLUMNS = frozenset(('id','user_id','is_canonical','lifecycle_id','plan_code',
+    'trial_started_at','trial_ends_at','trial_closed_at','renewal_opt_out',
+    'cancellation_requested_at','cancellation_reason','default_currency',
+    'admin_credit_generation','version','erasure_pending','created_at','updated_at'))
+RETIRED_COLUMNS = frozenset(('billing_mode','current_period_start','current_period_end',
+    'renewal_due_at','auto_renew_enabled','payment_collection_mode','status',
+    'subscribed_experts','domain_count','pending_removals','pending_additions','billing_state','plan_type'))
 MODEL_EVENTS = ('subscription.legacy_snapshot', 'subscription.model_backfill')
 EXPERTS = ('banking', 'manufacturing', 'supplychain', 'telecom')
+
+
+def observedStorageShape(row):
+    """Describe an actual RETURNING * row; never infer shape from rollout env."""
+    if not RETAINED_COLUMNS <= row.keys():
+        raise SubscriptionAuthorityUnavailable('Subscription storage facts unavailable')
+    if RETIRED_COLUMNS <= row.keys():
+        return 'expanded'
+    if not RETIRED_COLUMNS & row.keys():
+        return 'retained'
+    raise SubscriptionAuthorityUnavailable('Partial subscription contraction')
 
 
 def jsonValue(value):

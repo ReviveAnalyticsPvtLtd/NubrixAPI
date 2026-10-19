@@ -359,13 +359,13 @@ class ManualBillingRepository:
         def operation(connection):
             with connection.cursor(cursor_factory=RealDictCursor) as cursor:
                 self._lockUser(cursor, userId)
+                unified = self._usesPurchaseAuthority()
+                fields = '*' if unified else '''id, user_id, billing_mode, status, plan_type,
+                    current_period_start, current_period_end, renewal_due_at, auto_renew_enabled,
+                    payment_collection_mode, default_currency, version, erasure_pending, is_canonical'''
                 cursor.execute(
-                    """
-                    select id, user_id, billing_mode, status, plan_type,
-                           current_period_start, current_period_end,
-                           renewal_due_at, auto_renew_enabled,
-                           payment_collection_mode, default_currency,
-                           version, erasure_pending, is_canonical
+                    f"""
+                    select {fields}
                     from public.subscriptions
                     where user_id = %s and is_canonical = true
                     limit 1
@@ -378,7 +378,12 @@ class ManualBillingRepository:
                 cursor.execute("select id from public.subscriptions where user_id=%s limit 1", (userId,))
                 if cursor.fetchone() is not None:
                     raise ValueError("CANONICAL_BACKFILL_REQUIRED")
-                cursor.execute(
+                if unified:
+                    cursor.execute('''insert into public.subscriptions
+                        (id,user_id,default_currency,is_canonical) VALUES(%s,%s,'INR',true) RETURNING *''',
+                        (str(uuid.uuid4()),userId))
+                else:
+                    cursor.execute(
                     """
                     insert into public.subscriptions (
                         id, user_id, billing_mode, status, plan_type,
@@ -396,9 +401,11 @@ class ManualBillingRepository:
                     (str(uuid.uuid4()), userId),
                 )
                 created = cursor.fetchone()
-                if self._usesPurchaseAuthority():
+                if unified:
+                    from api.services.subscriptions.subscriptionModelBackfill import observedStorageShape
                     self._modelRepository()._event(cursor, created, 'subscription.model_initialized',
-                        'subscription-initialized:'+str(created['id']), {'schemaVersion':2})
+                        'subscription-initialized:'+str(created['id']),
+                        {'schemaVersion':2,'storageShape':observedStorageShape(created)})
                 return dict(created)
 
         return self._run(operation)
@@ -420,9 +427,8 @@ class ManualBillingRepository:
                         raise ValueError('INVALID_TRIAL_EXPERTS')
                     end = now + timedelta(days=12)
                     cursor.execute('''UPDATE public.subscriptions SET plan_code='pro',trial_started_at=%s,trial_ends_at=%s,
-                        billing_mode='none',status='trial',plan_type='free',current_period_start=%s,current_period_end=%s,
-                        subscribed_experts=%s,domain_count=%s,version=version+1,updated_at=%s WHERE id=%s RETURNING *''',
-                        (now,end,now,end,Json(list(domains)),len(domains),now,subscription['id']))
+                        version=version+1,updated_at=%s WHERE id=%s RETURNING *''',
+                        (now,end,now,subscription['id']))
                     activated = cursor.fetchone()
                     self._modelRepository()._event(cursor, activated, 'subscription.trial_started',
                         'subscription-trial:'+str(subscription['id']), {'experts':list(domains), 'startedAt':now, 'endsAt':end})
