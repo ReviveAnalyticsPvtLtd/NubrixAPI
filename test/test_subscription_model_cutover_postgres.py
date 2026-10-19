@@ -15,6 +15,21 @@ pytestmark = pytest.mark.skipif(os.environ.get('RUN_MANUAL_BILLING_INTEGRATION')
 
 
 @pytest.fixture
+def strictFixtureCredentials(monkeypatch):
+    """Catch masked-DSN reuse even when the local test cluster trusts localhost."""
+    from psycopg2.extensions import parse_dsn
+    expected=parse_dsn(os.environ['SUBSCRIPTION_MODEL_TEST_DATABASE_URL'])
+    connect=psycopg2.connect
+    def checked(dsn,*args,**kwargs):
+        actual=parse_dsn(dsn)
+        if all(actual.get(key)==expected.get(key) for key in ('host','port','dbname','user')):
+            if actual.get('password')!=expected.get('password'):
+                raise psycopg2.OperationalError('Disposable fixture credentials do not match the explicit test DSN')
+        return connect(dsn,*args,**kwargs)
+    monkeypatch.setattr(psycopg2,'connect',checked)
+
+
+@pytest.fixture
 def retainedDb(modelDb):
     # Actual committed retention-table DDL, with the smallest referenced parent.
     factory,_=modelDb
@@ -74,10 +89,9 @@ def test_unknown_view_changes_dependency_review_and_financial_change_changes_dig
     assert second['financial']!=collect(factory)['financial']
 
 
-def test_historical_tools_refuse_v2_columns_even_with_legacy_env(modelDb,monkeypatch,tmp_path,capsys):
+def test_historical_tools_refuse_v2_columns_even_with_legacy_env(modelDb,monkeypatch,tmp_path,capsys,strictFixtureCredentials):
     factory,repo=modelDb;seed(factory);before=financial(factory)
-    with closing(factory()) as db:
-        monkeypatch.setenv('DATABASE_URL',db.dsn)
+    monkeypatch.setenv('DATABASE_URL',os.environ['SUBSCRIPTION_MODEL_TEST_DATABASE_URL'])
     monkeypatch.setenv('SUBSCRIPTION_MODEL_PHASE','legacy')
     from scripts.manual_billing_inventory import main as inventory
     from scripts.manual_billing_backfill import main as backfill,applyMapping
@@ -91,10 +105,9 @@ def test_historical_tools_refuse_v2_columns_even_with_legacy_env(modelDb,monkeyp
     assert OWNER['userId'] not in capsys.readouterr().out
 
 
-def test_cli_uses_redacted_report_and_read_only_connection(modelDb,monkeypatch,capsys):
+def test_cli_uses_redacted_report_and_read_only_connection(modelDb,monkeypatch,capsys,strictFixtureCredentials):
     factory,repo=modelDb;seed(factory);repo.applyReviewedDecision(decision(repo),now=NOW)
-    with closing(factory()) as db:
-        monkeypatch.setenv('SUBSCRIPTION_MODEL_CUTOVER_DATABASE_URL',db.dsn)
+    monkeypatch.setenv('SUBSCRIPTION_MODEL_CUTOVER_DATABASE_URL',os.environ['SUBSCRIPTION_MODEL_TEST_DATABASE_URL'])
     from scripts.subscription_model_cutover import main
     assert main(['--check','--phase','v2'])==1
     result=json.loads(capsys.readouterr().out)
@@ -113,10 +126,9 @@ def test_collector_enforces_readonly_before_runtime_authority_reads(modelDb,monk
         collect(factory)
 
 
-def test_dependency_review_output_is_explicit_inspectable_and_never_overwrites(modelDb,monkeypatch,tmp_path,capsys):
+def test_dependency_review_output_is_explicit_inspectable_and_never_overwrites(modelDb,monkeypatch,tmp_path,capsys,strictFixtureCredentials):
     factory,repo=modelDb;seed(factory)
-    with closing(factory()) as db:
-        monkeypatch.setenv('SUBSCRIPTION_MODEL_CUTOVER_DATABASE_URL',db.dsn)
+    monkeypatch.setenv('SUBSCRIPTION_MODEL_CUTOVER_DATABASE_URL',os.environ['SUBSCRIPTION_MODEL_TEST_DATABASE_URL'])
     from scripts.subscription_model_cutover import main
     path=tmp_path/'private-dependency-review.json'
     args=['--check','--phase','v2','--dependency-output',str(path)]
