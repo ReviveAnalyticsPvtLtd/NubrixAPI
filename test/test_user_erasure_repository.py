@@ -69,6 +69,8 @@ class FakeCursor:
             self.current = self.state.get("requestRow")
         elif "event_type='refund.intent'" in normalized:
             self.current = self.state.get('pendingRefund')
+        elif "from public.billing_events" in normalized and "event_type = any" in normalized:
+            self.current = self.state.get('modelEvidence')
         else:
             self.current = None
 
@@ -173,6 +175,19 @@ def test_create_request_persists_all_steps_and_freezes_billing_transactionally()
         and "subscription_id = null" in query
         for query, _params in connection.state["executed"]
     )
+
+
+def test_model_audit_retention_defers_erasure_before_ban_session_or_request_changes():
+    connection = FakeConnection(tables={'billing_events'}, modelEvidence={'id': 'retained-original-audit'})
+    with pytest.raises(AdminApiError, match='retained subscription audits') as error:
+        _repository(connection).createRequest('user-1', 'a' * 64, 'admin-1',
+            '8cfdb150-417d-47ab-acd1-fef39d2bc14e', None)
+    assert error.value.statusCode == 409
+    assert connection.commits == 0 and connection.rollbacks == 1
+    assert connection.state['userRow']['isBanned'] is False
+    assert not connection.state['executemany']
+    assert not any(query.startswith(('update ', 'delete ', 'insert '))
+        for query, _ in connection.state['executed'])
 
 
 def test_create_request_locks_then_bans_and_revokes_sessions_before_workflow_mutations():

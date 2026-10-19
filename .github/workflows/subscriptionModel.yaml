@@ -1,0 +1,97 @@
+name: subscription-model
+
+on:
+  pull_request:
+    branches: [main, feature/subscription-model-expand, feature/subscription-lifecycle-unify]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: subscription-model-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  unit:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
+        with:
+          python-version: '3.12'
+      - uses: astral-sh/setup-uv@d0cc045d04ccac9d8b7881df0226f9e82c39688e # v6
+        with:
+          enable-cache: true
+      - name: Install locked dependencies
+        run: uv sync --python 3.12 --frozen --group dev
+      - name: Unit and regression tests (integration skips remain unverified)
+        run: uv run --python 3.12 --frozen --group dev pytest -q
+
+  postgres:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    services:
+      postgres:
+        image: postgres:17
+        env:
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: disposable-ci-only
+          POSTGRES_DB: manual_billing_test_subscription_model
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres -d manual_billing_test_subscription_model"
+          --health-interval 5s --health-timeout 5s --health-retries 12
+    env:
+      RUN_MANUAL_BILLING_INTEGRATION: '1'
+      RUN_LIVE_SCHEMA_INTEGRATION: '1'
+      MANUAL_BILLING_TEST_DATABASE_URL: postgresql://postgres:disposable-ci-only@127.0.0.1:5432/manual_billing_test_subscription_model
+      LIVE_SCHEMA_TEST_DATABASE_URL: postgresql://postgres:disposable-ci-only@127.0.0.1:5432/manual_billing_test_live_shape
+      SUBSCRIPTION_MODEL_TEST_DATABASE_URL: postgresql://postgres:disposable-ci-only@127.0.0.1:5432/manual_billing_test_subscription_expand
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
+        with:
+          python-version: '3.12'
+      - uses: astral-sh/setup-uv@d0cc045d04ccac9d8b7881df0226f9e82c39688e # v6
+        with:
+          enable-cache: true
+      - name: Install locked dependencies
+        run: uv sync --python 3.12 --frozen --group dev
+      - name: Create second disposable fixture database
+        run: |
+          uv run --python 3.12 --frozen --group dev python - <<'PY'
+          import os
+          from contextlib import closing
+          import psycopg2
+          with closing(psycopg2.connect(os.environ['MANUAL_BILLING_TEST_DATABASE_URL'])) as connection:
+              connection.autocommit = True
+              with connection.cursor() as cursor:
+                  cursor.execute('CREATE DATABASE manual_billing_test_live_shape')
+                  cursor.execute('CREATE DATABASE manual_billing_test_subscription_expand')
+                  # Roles are cluster-wide. Both fixtures need Supabase's real
+                  # service-role bypass semantics, independent of module order.
+                  cursor.execute('CREATE ROLE service_role NOLOGIN BYPASSRLS')
+          PY
+      - name: PostgreSQL financial and current-shape regressions
+        run: |
+          uv run --python 3.12 --frozen --group dev pytest -q \
+            test/test_manual_billing_postgres_integration.py \
+            test/test_catalog_invoice_postgres.py \
+            test/test_admin_credit_reset_postgres.py \
+            test/test_gap_remediation_postgres.py \
+            test/test_live_billing_schema_postgres.py \
+            test/test_subscription_model_postgres.py \
+            --junitxml="$RUNNER_TEMP/subscription-postgres.xml"
+      - name: Require executed PostgreSQL cases
+        run: |
+          uv run --python 3.12 --frozen --group dev python - <<'PY'
+          import os
+          import xml.etree.ElementTree as ET
+          root = ET.parse(os.path.join(os.environ['RUNNER_TEMP'], 'subscription-postgres.xml')).getroot()
+          cases = root.findall('.//testcase')
+          assert cases, 'PostgreSQL acceptance collected no cases'
+          assert not root.findall('.//skipped'), 'Skipped PostgreSQL cases are UNVERIFIED'
+          PY

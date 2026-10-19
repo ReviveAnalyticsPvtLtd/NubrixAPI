@@ -308,3 +308,26 @@ def test_forward_fix_migrations_can_be_reapplied_without_regranting_clients(actu
             for migration in fixes: cursor.execute(migration.read_text(encoding='utf-8'))
     with pytest.raises(psycopg2.errors.InsufficientPrivilege):
         asRole(actualSchema,'anon','select * from public.credit_balances limit 0')
+
+
+def test_retained_financial_schema_defers_erasure_before_mutating_archived_subject(actualSchema):
+    from api.adminErrors import AdminApiError
+    from api.services.subscriptions.subscriptionModelRepository import SubscriptionModelRepository
+    from api.services.userErasureRepository import UserErasureRepository
+    user, subscription, _ = seedPaid(actualSchema)
+    factory = lambda: psycopg2.connect(actualSchema)
+    repo = SubscriptionModelRepository(factory)
+    with closing(factory()) as db, db, db.cursor(cursor_factory=RealDictCursor) as cursor:
+        cursor.execute((ROOT/'supabase/migrations/20261017211222_expand_subscription_model_v2.sql').read_text())
+        cursor.execute('SELECT * FROM subscriptions WHERE id=%s', (subscription,))
+        archiveId = repo.archiveLegacySnapshot(cursor, dict(cursor.fetchone()))
+    before = query(actualSchema, 'SELECT * FROM "Users" WHERE "userId"=%s', (user,))
+    audit = query(actualSchema, 'SELECT * FROM billing_events WHERE id=%s', (archiveId,))
+    with pytest.raises(psycopg2.errors.RaiseException, match='immutable'):
+        query(actualSchema, "UPDATE billing_events SET user_id=NULL,metadata_json='{}' WHERE id=%s", (archiveId,))
+    with pytest.raises(AdminApiError, match='retained subscription audits') as error:
+        UserErasureRepository(factory).createRequest(user, 'a'*64, str(uuid.uuid4()), str(uuid.uuid4()), None)
+    assert error.value.statusCode == 409
+    assert query(actualSchema, 'SELECT * FROM "Users" WHERE "userId"=%s', (user,)) == before
+    assert query(actualSchema, 'SELECT * FROM billing_events WHERE id=%s', (archiveId,)) == audit
+    assert query(actualSchema, 'SELECT erasure_pending FROM subscriptions WHERE id=%s', (subscription,)) == [{'erasure_pending': False}]

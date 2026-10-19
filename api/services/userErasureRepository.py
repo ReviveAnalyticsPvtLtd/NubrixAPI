@@ -78,6 +78,19 @@ class UserErasureRepository:
                     "select pg_advisory_xact_lock(hashtextextended(%s, 0))",
                     (userId,),
                 )
+                # Serialize request acceptance with model archival. BE-1 keeps
+                # original audits immutable; its legacy erasure cannot retain
+                # them. Refuse before ban/session changes or external cleanup.
+                from api.services.billing.manualBillingRepository import _advisoryKey
+                from api.services.subscriptions.subscriptionModelBackfill import MODEL_EVENTS
+                cursor.execute('select pg_advisory_xact_lock(%s)', (_advisoryKey(userId),))
+                if self._tableExists(cursor, 'billing_events'):
+                    cursor.execute('''select id from public.billing_events
+                        where event_type = any(%s) and (user_id=%s or subscription_id in
+                            (select id from public.subscriptions where user_id=%s)) limit 1''',
+                        (list(MODEL_EVENTS), userId, userId))
+                    if cursor.fetchone() is not None:
+                        raise AdminApiError(409, 'User erasure is deferred while retained subscription audits require the retention-aware erasure workflow')
                 cursor.execute(
                     """
                     select "userId", "isBanned", "bannedAt", "bannedBy",

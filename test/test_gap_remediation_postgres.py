@@ -42,9 +42,9 @@ def initial_checkout_user(postgres):
 def test_two_sessions_replace_initial_checkout_once(postgres, replacement_key):
     repo, user = initial_checkout_user(postgres)
     with patch('api.services.billing.billingEngine._getMonthlyBasePrice', return_value=REFERENCE):
-        first = repo.reserveCheckout(CheckoutRequest(user, 'initial_purchase', 'monthly_prepaid', {'domains': ['banking']}, 'original'))
+        first = repo.reserveCheckout(CheckoutRequest(user, 'initial_purchase', 'monthly_prepaid', {'domains': ['banking']}, 'original', expectedCatalogRevision=1))
         repo.bindProviderOrder(first.attemptId, {'id': 'original-' + str(uuid.uuid4())})
-        changed = CheckoutRequest(user, 'initial_purchase', 'monthly_prepaid', {'domains': ['telecom']}, replacement_key)
+        changed = CheckoutRequest(user, 'initial_purchase', 'monthly_prepaid', {'domains': ['telecom']}, replacement_key, expectedCatalogRevision=1)
         with ThreadPoolExecutor(max_workers=2) as pool:
             results = list(pool.map(repo.reserveCheckout, [changed, changed]))
     assert results[0].attemptId == results[1].attemptId != first.attemptId
@@ -59,14 +59,14 @@ def test_two_sessions_replace_initial_checkout_once(postgres, replacement_key):
 def test_two_sessions_replace_vs_original_capture_cannot_grant_both(postgres):
     repo, user = initial_checkout_user(postgres)
     with patch('api.services.billing.billingEngine._getMonthlyBasePrice', return_value=REFERENCE):
-        first = repo.reserveCheckout(CheckoutRequest(user, 'initial_purchase', 'monthly_prepaid', {'domains': ['banking']}, 'original'))
+        first = repo.reserveCheckout(CheckoutRequest(user, 'initial_purchase', 'monthly_prepaid', {'domains': ['banking']}, 'original', expectedCatalogRevision=1))
         first = repo.bindProviderOrder(first.attemptId, {'id': 'original-' + str(uuid.uuid4())})
         money = VerifiedPaymentEvidence(first.attemptId, first.invoiceId, user, first.razorpayOrderId,
             'payment-' + str(uuid.uuid4()), 'initial_purchase', 'INR', 'captured', 'server_observation',
             first.amount, NOW, NOW, None, True)
         def replace_checkout():
             try:
-                return repo.reserveCheckout(CheckoutRequest(user, 'initial_purchase', 'monthly_prepaid', {'domains': ['telecom']}, 'changed'))
+                return repo.reserveCheckout(CheckoutRequest(user, 'initial_purchase', 'monthly_prepaid', {'domains': ['telecom']}, 'changed', expectedCatalogRevision=1))
             except ValueError as exc:
                 assert str(exc) == 'EXISTING_PAID_COVERAGE'
                 return None
@@ -108,7 +108,7 @@ def test_two_sessions_retry_zero_order_failure_creates_one_replacement(postgres)
         with db.cursor() as sql: sql.execute('insert into public."Users"("userId") values(%s)',(user,))
     repo=ManualBillingRepository(lambda:psycopg2.connect(postgres))
     provider=OrderProvider();service=ManualPaymentService.forProduction(provider,repo)
-    request=CheckoutRequest(user,'initial_purchase','monthly_prepaid',{'domains':['banking']},None)
+    request=CheckoutRequest(user,'initial_purchase','monthly_prepaid',{'domains':['banking']},None,expectedCatalogRevision=1)
     with patch('api.services.billing.billingEngine._getMonthlyBasePrice',return_value=REFERENCE):
         with pytest.raises(RuntimeError): service.createCheckout(request)
         with psycopg2.connect(postgres) as db:
@@ -129,7 +129,7 @@ def test_two_sessions_retry_zero_order_failure_creates_one_replacement(postgres)
 def test_two_sessions_cancel_addition_does_not_lose_other_reservation(payment):
     repo,initial,url=payment;repo.finalizeCapturedPayment(initial)
     def reserve(domain,key):
-        return repo.reserveCheckout(CheckoutRequest(initial.userId,'expert_addition','monthly_prepaid',{'domains':[domain]},key))
+        return repo.reserveCheckout(CheckoutRequest(initial.userId,'expert_addition','monthly_prepaid',{'domains':[domain]},key,expectedCatalogRevision=1))
     with patch('api.services.billing.billingEngine._getMonthlyBasePrice',return_value=REFERENCE):
         first=reserve('telecom','first')
         with ThreadPoolExecutor(max_workers=2) as pool:
@@ -144,7 +144,7 @@ def test_two_sessions_cancel_addition_does_not_lose_other_reservation(payment):
 def test_two_sessions_cancel_vs_capture_cannot_overwrite_activated_addition(payment):
     repo,initial,url=payment;repo.finalizeCapturedPayment(initial)
     with patch('api.services.billing.billingEngine._getMonthlyBasePrice',return_value=REFERENCE):
-        intent=repo.reserveCheckout(CheckoutRequest(initial.userId,'expert_addition','monthly_prepaid',{'domains':['telecom']},'addition'))
+        intent=repo.reserveCheckout(CheckoutRequest(initial.userId,'expert_addition','monthly_prepaid',{'domains':['telecom']},'addition',expectedCatalogRevision=1))
     order='order-'+str(uuid.uuid4());repo.bindProviderOrder(intent.attemptId,{'id':order})
     money=VerifiedPaymentEvidence(intent.attemptId,intent.invoiceId,initial.userId,order,'pay-'+str(uuid.uuid4()),'expert_addition','INR','captured','server_observation',intent.amount,NOW,None,None,False)
     def cancel():
