@@ -14,6 +14,10 @@ import psycopg2
 from psycopg2.extras import Json, RealDictCursor
 
 from api.adminErrors import AdminApiError
+from api.services.userErasureRetention import (
+    assertErasureLease, retentionAvailable, prepareRetention, archiveOriginals,
+    operationalMetadata, PROTECTED_EVENTS,
+)
 
 
 ERASURE_STEP_NAMES = (
@@ -30,7 +34,8 @@ ERASURE_STEP_NAMES = (
 REQUEST_SELECT = """
     id, target_user_id, subject_fingerprint, requested_by, idempotency_key,
     status, last_error_code, attempt_count, created_at, updated_at, started_at,
-    completed_at, next_retry_at, lease_expires_at, resource_manifest
+    completed_at, next_retry_at, lease_expires_at, resource_manifest,
+    retention_manifest, worker_id
 """
 
 
@@ -74,22 +79,25 @@ class UserErasureRepository:
         connection = self.connectionFactory()
         try:
             with connection.cursor(cursor_factory=RealDictCursor) as cursor:
+                from api.services.subscriptions.subscriptionCompatibility import usesUnifiedSubscription
+                if usesUnifiedSubscription():
+                    from api.services.billing.manualBillingRepository import _advisoryKey
+                    cursor.execute('select pg_advisory_xact_lock(%s)',(_advisoryKey(userId),))
                 cursor.execute(
                     "select pg_advisory_xact_lock(hashtextextended(%s, 0))",
                     (userId,),
                 )
-                # Serialize request acceptance with model archival. BE-1 keeps
-                # original audits immutable; its legacy erasure cannot retain
-                # them. Refuse before ban/session changes or external cleanup.
+                # Serialize with archival and require the retention workflow
+                # before accepting protected audits for erasure.
                 from api.services.billing.manualBillingRepository import _advisoryKey
-                from api.services.subscriptions.subscriptionModelBackfill import MODEL_EVENTS
-                cursor.execute('select pg_advisory_xact_lock(%s)', (_advisoryKey(userId),))
+                if not usesUnifiedSubscription():
+                    cursor.execute('select pg_advisory_xact_lock(%s)', (_advisoryKey(userId),))
                 if self._tableExists(cursor, 'billing_events'):
                     cursor.execute('''select id from public.billing_events
                         where event_type = any(%s) and (user_id=%s or subscription_id in
                             (select id from public.subscriptions where user_id=%s)) limit 1''',
-                        (list(MODEL_EVENTS), userId, userId))
-                    if cursor.fetchone() is not None:
+                        (list(PROTECTED_EVENTS), userId, userId))
+                    if cursor.fetchone() is not None and not retentionAvailable(cursor):
                         raise AdminApiError(409, 'User erasure is deferred while retained subscription audits require the retention-aware erasure workflow')
                 cursor.execute(
                     """
@@ -178,11 +186,12 @@ class UserErasureRepository:
                     """,
                     [(request["id"], stepName) for stepName in ERASURE_STEP_NAMES],
                 )
+                renewalFreeze = 'renewal_opt_out = true' if usesUnifiedSubscription() else 'auto_renew_enabled = false'
                 cursor.execute(
-                    """
+                    f"""
                     update public.subscriptions
                     set erasure_pending = true,
-                        auto_renew_enabled = false,
+                        {renewalFreeze},
                         updated_at = now()
                     where user_id = %s
                     """,
@@ -328,7 +337,41 @@ class UserErasureRepository:
         finally:
             connection.close()
 
-    def startStep(self, requestId: str, stepName: str) -> None:
+    def renewLease(self, requestId: str, workerId: str, leaseSeconds: int) -> bool:
+        connection = self.connectionFactory()
+        try:
+            with connection.cursor() as cursor:
+                cursor.execute('''UPDATE public.user_erasure_requests
+                    SET lease_expires_at=clock_timestamp()+(%s*interval '1 second')
+                    WHERE id=%s AND worker_id=%s AND status='IN_PROGRESS'
+                    AND lease_expires_at>clock_timestamp() RETURNING id''',
+                    (leaseSeconds,requestId,workerId))
+                changed = cursor.fetchone() is not None
+            connection.commit()
+            return changed
+        finally:
+            connection.close()
+
+    def prepareRetention(self, requestId, userId, workerId):
+        connection = self.connectionFactory()
+        try:
+            with connection.cursor() as cursor:
+                from api.services.billing.manualBillingRepository import _advisoryKey
+                cursor.execute('SELECT pg_advisory_xact_lock(%s)',(_advisoryKey(userId),))
+                assertErasureLease(cursor,requestId,workerId,userId)
+                cursor.execute('SELECT "isBanned" FROM public."Users" WHERE "userId"=%s FOR UPDATE',(userId,))
+                row = cursor.fetchone()
+                if row is not None and not row[0]:
+                    raise RuntimeError('ERASURE_ACCOUNT_NOT_FROZEN')
+                prepareRetention(cursor,requestId,userId)
+            connection.commit()
+        except Exception:
+            connection.rollback()
+            raise
+        finally:
+            connection.close()
+
+    def startStep(self, requestId: str, stepName: str, *, workerId=None) -> None:
         self._execute(
             """
             update public.user_erasure_steps
@@ -339,6 +382,7 @@ class UserErasureRepository:
               and status not in ('COMPLETED', 'SKIPPED', 'RETAINED')
             """,
             (requestId, stepName),
+            requestId=requestId, workerId=workerId,
         )
 
     def completeStep(
@@ -347,6 +391,7 @@ class UserErasureRepository:
         stepName: str,
         details: dict | None = None,
         status: str = "COMPLETED",
+        *, workerId=None,
     ) -> None:
         self._execute(
             """
@@ -356,6 +401,7 @@ class UserErasureRepository:
             where request_id = %s and step_name = %s
             """,
             (status, Json(details or {}), requestId, stepName),
+            requestId=requestId, workerId=workerId,
         )
 
     def failStep(
@@ -364,10 +410,13 @@ class UserErasureRepository:
         stepName: str,
         errorCode: str,
         maxAttempts: int,
+        *, workerId=None,
     ) -> bool:
         connection = self.connectionFactory()
         try:
             with connection.cursor() as cursor:
+                if workerId is not None or retentionAvailable(cursor):
+                    assertErasureLease(cursor,requestId,workerId)
                 cursor.execute(
                     """
                     select attempt_count
@@ -439,6 +488,22 @@ class UserErasureRepository:
             connection.close()
 
     def freezeBilling(self, userId: str) -> None:
+        from api.services.subscriptions.subscriptionCompatibility import usesUnifiedSubscription
+        if usesUnifiedSubscription():
+            connection = self.connectionFactory()
+            try:
+                with connection.cursor() as cursor:
+                    from api.services.billing.manualBillingRepository import _advisoryKey
+                    cursor.execute('select pg_advisory_xact_lock(%s)',(_advisoryKey(userId),))
+                    cursor.execute('''update public.subscriptions set erasure_pending = true,
+                        renewal_opt_out = true, updated_at = now() where user_id = %s''', (userId,))
+                connection.commit()
+            except Exception:
+                connection.rollback()
+                raise
+            finally:
+                connection.close()
+            return
         self._execute(
             """
             update public.subscriptions
@@ -451,7 +516,7 @@ class UserErasureRepository:
         )
 
     def saveInventory(
-        self, requestId: str, projectIds: list[str], workspaceIds: list[str]
+        self, requestId: str, projectIds: list[str], workspaceIds: list[str], *, workerId=None
     ) -> None:
         self._execute(
             """
@@ -468,26 +533,64 @@ class UserErasureRepository:
                 ),
                 requestId,
             ),
+            requestId=requestId, workerId=workerId,
         )
 
     def deleteDatabaseData(
-        self, requestId: str, userId: str, projectIds: list[str]
+        self, requestId: str, userId: str, projectIds: list[str], *, workerId=None
     ) -> None:
         connection = self.connectionFactory()
         try:
             with connection.cursor() as cursor:
+                from api.services.billing.manualBillingRepository import _advisoryKey
+                from api.services.subscriptions.subscriptionCompatibility import usesUnifiedSubscription
+                unified = usesUnifiedSubscription()
+                if unified:
+                    cursor.execute('select pg_advisory_xact_lock(%s)',(_advisoryKey(userId),))
                 cursor.execute(
                     "select pg_advisory_xact_lock(hashtextextended(%s, 0))",
                     (userId,),
                 )
-                from api.services.billing.manualBillingRepository import _advisoryKey
-                cursor.execute('select pg_advisory_xact_lock(%s)',(_advisoryKey(userId),))
-                if self._tableExists(cursor,'billing_events'):
+                if not unified:
+                    cursor.execute('select pg_advisory_xact_lock(%s)',(_advisoryKey(userId),))
+                retained = retentionAvailable(cursor)
+                if retained:
+                    assertErasureLease(cursor,requestId,workerId,userId)
+                    archiveOriginals(cursor,requestId,userId)
+                    cursor.execute('''DELETE FROM public.billing_events WHERE event_type=ANY(%s)
+                        AND (user_id=%s OR subscription_id IN (SELECT id FROM public.subscriptions WHERE user_id=%s))''',
+                        (list(PROTECTED_EVENTS),userId,userId))
+                    for table,column in (('Invoices','"userId"'),('billing_events','user_id')):
+                        cursor.execute(f'''SELECT id,metadata_json FROM public."{table}"
+                            WHERE {column}=%s OR subscription_id IN (SELECT id FROM public.subscriptions WHERE user_id=%s)
+                            FOR UPDATE''',(userId,userId))
+                        for recordId,metadata in cursor.fetchall():
+                            extra = ''' ,failure_reason=NULL,
+                                idempotency_key=CASE WHEN position(%s in coalesce(idempotency_key,''))>0
+                                    THEN 'erased:'||encode(sha256(convert_to(idempotency_key,'UTF8')),'hex')
+                                    ELSE idempotency_key END''' if table=='billing_events' else ''',
+                                pricing_reference_snapshot_json='{}'::jsonb,tax_breakdown_json='{}'::jsonb,
+                                place_of_supply_snapshot=NULL'''
+                            parameters = (Json(operationalMetadata(metadata,requestId)),)
+                            if table=='billing_events': parameters += (userId,)
+                            cursor.execute(f'''UPDATE public."{table}" SET {column}=NULL,subscription_id=NULL,
+                                metadata_json=%s {extra} WHERE id=%s''',
+                                (*parameters,recordId))
+                elif self._tableExists(cursor,'billing_events'):
                     cursor.execute("select id from public.billing_events where user_id=%s and event_type='refund.intent' and event_status <> 'processed' limit 1",(userId,))
                     if cursor.fetchone() is not None:
                         raise AdminApiError(409,'Approved refund must be reconciled before financial records are anonymised')
+                    cursor.execute('''select id from public.billing_events where user_id=%s
+                        and event_type in ('subscription.legacy_snapshot','subscription.model_backfill',
+                            'subscription.next_selection','subscription.expert_grant',
+                            'subscription.model_initialized','subscription.trial_started') limit 1''',(userId,))
+                    if cursor.fetchone() is not None:
+                        # Do not bypass immutable evidence triggers or partially
+                        # scrub money. The separately planned retention workflow
+                        # must resolve this before rollout can be enabled.
+                        raise AdminApiError(409,'SUBSCRIPTION_ERASURE_RETENTION_PENDING')
                 self._scrubNotificationDeliveries(cursor, userId)
-                if self._tableExists(cursor, "Invoices"):
+                if not retained and self._tableExists(cursor, "Invoices"):
                     cursor.execute(
                         """
                         update public."Invoices"
@@ -497,7 +600,7 @@ class UserErasureRepository:
                         """,
                         (userId,),
                     )
-                if self._tableExists(cursor, "billing_events"):
+                if not retained and self._tableExists(cursor, "billing_events"):
                     cursor.execute(
                         """
                         update public.billing_events
@@ -509,6 +612,13 @@ class UserErasureRepository:
                         (userId,),
                     )
                 if self._tableExists(cursor, "WebhookEvents"):
+                    if retained:
+                        # Older events may never have acquired a user_id link.
+                        # Match the same retained provider identities as late writes.
+                        cursor.execute('''UPDATE public."WebhookEvents" SET erasure_request_id=%s,
+                            user_id=NULL,payload='{}'::jsonb
+                            WHERE private.erasure_request_for_webhook(user_id,payload)=%s''',
+                            (requestId,requestId))
                     cursor.execute(
                         """
                         update public."WebhookEvents"
@@ -630,10 +740,12 @@ class UserErasureRepository:
         finally:
             connection.close()
 
-    def finalizeRequest(self, requestId: str, details: dict) -> None:
+    def finalizeRequest(self, requestId: str, details: dict, *, workerId=None) -> None:
         connection = self.connectionFactory()
         try:
             with connection.cursor() as cursor:
+                if workerId is not None or retentionAvailable(cursor):
+                    assertErasureLease(cursor,requestId,workerId)
                 cursor.execute(
                     """
                     update public.user_erasure_steps
@@ -695,10 +807,12 @@ class UserErasureRepository:
         finally:
             connection.close()
 
-    def _execute(self, query: str, parameters: tuple) -> None:
+    def _execute(self, query: str, parameters: tuple, *, requestId=None, workerId=None) -> None:
         connection = self.connectionFactory()
         try:
             with connection.cursor() as cursor:
+                if requestId is not None and (workerId is not None or retentionAvailable(cursor)):
+                    assertErasureLease(cursor,requestId,workerId)
                 cursor.execute(query, parameters)
             connection.commit()
         except Exception:
@@ -719,28 +833,8 @@ class UserErasureRepository:
     def _scrubNotificationDeliveries(self, cursor, userId: str) -> None:
         if not self._tableExists(cursor, "notification_deliveries"):
             return
-        cursor.execute(
-            """
-            update public.notification_deliveries
-            set status = case
-                    when status in ('PENDING', 'RETRY_PENDING', 'SENDING')
-                        then 'CANCELLED'
-                    else status
-                end,
-                terminal_at = case
-                    when status in ('PENDING', 'RETRY_PENDING', 'SENDING')
-                        then now()
-                    else terminal_at
-                end,
-                user_id = null,
-                subscription_id = null,
-                lease_owner = null,
-                lease_expires_at = null,
-                updated_at = now()
-            where user_id = %s
-            """,
-            (userId,),
-        )
+        from api.services.userErasureRetention import NOTIFICATION_ERASURE_SQL
+        cursor.execute(NOTIFICATION_ERASURE_SQL,(userId,))
 
     def _deleteByUser(
         self, cursor, tableName: str, columnName: str, userId: str

@@ -30,3 +30,8 @@ class SubscriptionSnapshotService:
         if now is not None and evaluatedAt != now:
             raise SubscriptionAuthorityUnavailable('Inconsistent explicit evaluation time')
         return evaluateSubscription(facts, evaluatedAt)
+
+
+def getSubscriptionSnapshotService() -> SubscriptionSnapshotService:
+    from api.services.billing.manualBillingRepository import getManualBillingRepository
+    return SubscriptionSnapshotService(getManualBillingRepository().runtimeSnapshotFactsLoader)

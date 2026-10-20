@@ -113,6 +113,10 @@ def recalculateSubscriptionDays() -> dict:
     edgeFunctionUrl = os.environ.get("FREE_TRIAL_EXPIRY_WARNING_EMAIL_URL", "")
     client = create_client(os.environ["SUPABASE_URL"], os.environ["SUPABASE_KEY"])
     now = datetime.now(timezone.utc)
+    from api.services.subscriptions.subscriptionCompatibility import usesUnifiedSubscription
+    if usesUnifiedSubscription():
+        from api.services.subscriptions.subscriptionWorkerService import SubscriptionWorkerService
+        return SubscriptionWorkerService(client).execute(trialWarnings=True,now=now)
     notificationService = (
         getTrialExpiryNotificationService() if emailMode == "outbox" else None
     )

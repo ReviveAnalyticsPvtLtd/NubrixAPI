@@ -82,7 +82,25 @@ def _ownedSubscriptionIds(row, others):
     return {str(row['id']), *(str(other['id']) for other in others)}
 
 
-def acceptedPeriods(row, invoices, events, *, otherSubscriptions=()) -> tuple[PurchasedPeriod, ...]:
+def acceptedCapture(row, invoice, events):
+    """Match the committed capture to the complete owned invoice identity."""
+    matches = [e for e in events if e.get('event_type') == 'payment.capture'
+               and e.get('event_status') == 'FINALIZED'
+               and str(e.get('invoice_id')) == str(invoice['id'])
+               and e.get('provider_payment_id') == invoice.get('razorpayPaymentId')
+               and e.get('provider_order_id') == invoice.get('razorpay_order_id')
+               and e.get('amount') == invoice.get('total_amount')
+               and e.get('currency') == invoice.get('currency')]
+    if (len(matches) != 1 or not invoice.get('razorpayPaymentId')
+            or not invoice.get('razorpay_order_id') or not timestamp(invoice.get('paidAt'))
+            or type(invoice.get('total_amount')) is not int or invoice['total_amount'] <= 0):
+        raise ValueError('CAPTURE_EVIDENCE_MISSING')
+    if any(e.get('user_id') != row['user_id'] or str(e.get('subscription_id')) != str(row['id']) for e in matches):
+        raise ValueError('CAPTURE_OWNER_MISMATCH')
+    return matches[0]
+
+
+def acceptedPeriods(row, invoices, events, *, otherSubscriptions=(), allowExpertAdditions=False) -> tuple[PurchasedPeriod, ...]:
     owned = _ownedSubscriptionIds(row, otherSubscriptions)
     periods = []
     for invoice in invoices:
@@ -97,21 +115,11 @@ def acceptedPeriods(row, invoices, events, *, otherSubscriptions=()) -> tuple[Pu
         frozen = manualMetadata(invoice)
         if invoice.get('billing_reason') == 'add_on' and frozen.get('purpose') in (None, 'topup'):
             continue
+        if allowExpertAdditions and frozen.get('purpose') == 'expert_addition':
+            continue  # Runtime repository separately requires the owned grant.
         if frozen.get('purpose') not in ('initial_purchase', 'renewal'):
             raise ValueError('SERVICE_OR_EXPERT_HISTORY_REQUIRES_REVIEW')
-        matches = [e for e in events if e.get('event_type') == 'payment.capture'
-                   and e.get('event_status') == 'FINALIZED'
-                   and str(e.get('invoice_id')) == str(invoice['id'])
-                   and e.get('provider_payment_id') == invoice.get('razorpayPaymentId')
-                   and e.get('provider_order_id') == invoice.get('razorpay_order_id')
-                   and e.get('amount') == invoice.get('total_amount')
-                   and e.get('currency') == invoice.get('currency')]
-        if (len(matches) != 1 or not invoice.get('razorpayPaymentId')
-                or not invoice.get('razorpay_order_id') or not timestamp(invoice.get('paidAt'))
-                or type(invoice.get('total_amount')) is not int or invoice['total_amount'] <= 0):
-            raise ValueError('CAPTURE_EVIDENCE_MISSING')
-        if any(e.get('user_id') != row['user_id'] or str(e.get('subscription_id')) != str(row['id']) for e in matches):
-            raise ValueError('CAPTURE_OWNER_MISMATCH')
+        acceptedCapture(row, invoice, events)
         interval = {'monthly_prepaid': 'month', 'monthly_recurring': 'month', 'annual_prepaid': 'year'}.get(frozen.get('billingMode'))
         domains = frozen.get('domains')
         if not interval or not isinstance(domains, list) or not 1 <= len(domains) <= 4 or not set(domains) <= set(EXPERTS):
@@ -135,6 +143,16 @@ def factsFromRecords(row, owner, invoices, events, *, consumed, otherSubscriptio
                 (event.get('subscription_id') is not None and str(event['subscription_id']) not in owned)):
             raise ValueError('EVENT_OWNER_MISMATCH')
     periods = acceptedPeriods(row, invoices, events, otherSubscriptions=otherSubscriptions)
+    unresolved, attempts = unresolvedMoneyFacts(invoices, events)
+    trial = TrialFacts(timestamp(row.get('trial_started_at')), timestamp(row.get('trial_ends_at')),
+                       timestamp(row.get('trial_closed_at')), EXPERTS if row.get('trial_started_at') else (), consumed)
+    return SubscriptionFacts(row['user_id'], str(row['id']), str(row['lifecycle_id']) if row.get('lifecycle_id') else None,
+        row.get('plan_code'), True, trial, periods, row['renewal_opt_out'], owner['isBanned'], row['erasure_pending'],
+        unresolved, attempts[0] if len(attempts) == 1 else None)
+
+
+def unresolvedMoneyFacts(invoices, events):
+    """Labels do not prove Order closure; share this policy with runtime admission."""
     unresolved, attempts = False, []
     invoiceStates = {str(i['id']): str(i.get('status')).upper() for i in invoices}
     for event in events:
@@ -156,11 +174,7 @@ def factsFromRecords(row, owner, invoices, events, *, consumed, otherSubscriptio
         unresolved |= pending
         if pending and event.get('event_category') == 'payment_attempt' and event.get('invoice_id'):
             attempts.append(RecoverableCheckout(str(event['invoice_id']), str(event['id']), str(status)))
-    trial = TrialFacts(timestamp(row.get('trial_started_at')), timestamp(row.get('trial_ends_at')),
-                       timestamp(row.get('trial_closed_at')), EXPERTS if row.get('trial_started_at') else (), consumed)
-    return SubscriptionFacts(row['user_id'], str(row['id']), str(row['lifecycle_id']) if row.get('lifecycle_id') else None,
-        row.get('plan_code'), True, trial, periods, row['renewal_opt_out'], owner['isBanned'], row['erasure_pending'],
-        unresolved, attempts[0] if len(attempts) == 1 else None)
+    return unresolved, attempts
 
 
 def _checkHistoricalService(row, others, invoices, events, now):
@@ -194,6 +208,25 @@ def buildBackfillProposal(row, owner, invoices, events, *, now, otherSubscriptio
         state = metadata(row, 'billing_state')
         manual = manualMetadata(row, 'billing_state')
         paid = acceptedPeriods(row, invoices, events, otherSubscriptions=otherSubscriptions)
+        removals = row.get('pending_removals') or []
+        removals = json.loads(removals) if isinstance(removals, str) else removals
+        if removals:
+            lifecycle = manual.get('lifecycleId')
+            destinations = [metadata(e).get('nextSelection', {}) for e in events
+                if e.get('event_type') == 'subscription.next_selection' and e.get('event_status') == 'COMMITTED']
+            current = set(row.get('subscribed_experts') or [])
+            if not any(d.get('lifecycleId') == lifecycle and timestamp(d.get('cycleStart')) == timestamp(row.get('current_period_end'))
+                       and set(d.get('experts', [])) == current - set(removals) for d in destinations):
+                raise ValueError('LEGACY_REMOVAL_DESTINATION_REQUIRES_REVIEW')
+        additions = row.get('pending_additions') or []
+        additions = json.loads(additions) if isinstance(additions, str) else additions
+        for addition in additions:
+            attempt = next((e for e in events if str(e.get('id')) == str(addition.get('attemptId'))
+                and e.get('event_category') == 'payment_attempt'), None)
+            frozen = manualMetadata(attempt) if attempt else {}
+            if (not frozen.get('servicePeriodId') or addition.get('domain') not in frozen.get('domains', [])
+                    or frozen.get('purpose') != 'expert_addition'):
+                raise ValueError('LEGACY_ADDITION_DESTINATION_REQUIRES_REVIEW')
         consumed = bool(state.get('trialConsumed') or state.get('trialConsumedAt') or row.get('plan_type') == 'free'
                         or (trialReview or {}).get('consumed'))
         if otherSubscriptions and not (trialReview or {}).get('consumed'):

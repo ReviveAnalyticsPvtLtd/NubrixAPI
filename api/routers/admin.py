@@ -324,7 +324,7 @@ async def listAuditEvents(
     )
 
 
-@router.get("/subscriptions", response_model=list[AdminSubscriptionView])
+@router.get("/subscriptions", response_model=list[AdminSubscriptionView], response_model_exclude_unset=True)
 async def listSubscriptions(
     _admin: AdminContext = Depends(verifyAdmin),
     service: AdminManagementService = Depends(getAdminManagementService),
@@ -333,7 +333,7 @@ async def listSubscriptions(
 
 
 @router.patch(
-    "/subscriptions/{subscriptionId}", response_model=AdminSubscriptionView
+    "/subscriptions/{subscriptionId}", response_model=AdminSubscriptionView, deprecated=True, response_model_exclude_unset=True
 )
 async def updateSubscription(
     subscriptionId: str,

@@ -10,6 +10,36 @@ from api.services.subscriptions.subscriptionModel import Interval, SubscriptionS
 ModelPhase = Literal['legacy', 'shadow', 'dual', 'v2', 'contracted']
 
 
+def usesUnifiedSubscription() -> bool:
+    return getSubscriptionModelPhase() in ('dual', 'v2', 'contracted')
+
+
+def refreshSubscriptionProjection(userId, row):
+    """Replace only the caller's display copy. Never persist derived state."""
+    from api.services.subscriptions.subscriptionSnapshotService import getSubscriptionSnapshotService
+    from utils.exceptionHandler import CustomException
+    try:
+        snapshot = row.get('_subscriptionSnapshot') or getSubscriptionSnapshotService().get(userId)
+        if row.get('id') is not None and str(row['id']) != snapshot.subscriptionId:
+            raise ValueError('Canonical identity changed')
+    except Exception as exc:
+        raise CustomException(exc, statusCode=503, errorCode='SUBSCRIPTION_AUTHORITY_UNAVAILABLE',
+            uiMessage='Subscription access could not be verified. Please try again.') from exc
+    aliases = legacySubscriptionFields(snapshot)
+    current = snapshot.currentPeriod
+    row.update(id=snapshot.subscriptionId, user_id=userId, status=snapshot.status,
+        plan_type=aliases['planType'], billing_mode=aliases['billingMode'],
+        current_period_start=(current.start.isoformat() if current else snapshot.trial.startedAt.isoformat() if snapshot.status == 'trial' else None),
+        current_period_end=aliases['planExpire'], renewal_due_at=aliases['nextBilling'],
+        subscribed_experts=list(snapshot.subscribedExperts), domain_count=snapshot.domainCount,
+        renewal_opt_out=snapshot.renewalOptOut, _subscriptionSnapshot=snapshot,
+        _verifiedCoverage={'experts':list(snapshot.subscribedExperts),
+            'nextExperts':list(snapshot.nextSelectedExperts or snapshot.subscribedExperts)})
+    import math
+    deadline = current.end if current else snapshot.trial.endsAt if snapshot.status == 'trial' else None
+    return max(0, math.ceil((deadline - snapshot.evaluatedAt).total_seconds()/86400)) if deadline else 0
+
+
 def getSubscriptionModelPhase() -> ModelPhase:
     """Read at use time; parsing a phase never activates a rollout by itself."""
     phase = os.environ.get('SUBSCRIPTION_MODEL_PHASE', 'legacy')

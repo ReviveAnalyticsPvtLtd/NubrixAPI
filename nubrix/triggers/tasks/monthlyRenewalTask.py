@@ -59,6 +59,10 @@ class MonthlyRenewalTask:
 
     def execute(self, now=None) -> dict:
         current = now or self.now()
+        from api.services.subscriptions.subscriptionCompatibility import usesUnifiedSubscription
+        if usesUnifiedSubscription():
+            from api.services.subscriptions.subscriptionWorkerService import SubscriptionWorkerService
+            return SubscriptionWorkerService(self.client).execute(interval='month',reminders=True,now=current)
         logger.info("Monthly renewal task started")
         results = {
             "prepared": 0,

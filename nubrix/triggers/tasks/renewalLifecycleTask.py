@@ -57,6 +57,10 @@ class RenewalLifecycleTask:
         Returns:
             dict: Counts for reminder operations.
         """
+        from api.services.subscriptions.subscriptionCompatibility import usesUnifiedSubscription
+        if usesUnifiedSubscription():
+            # The shared durable worker owns both intervals' milestones.
+            return {'reminders': {'sent': 0, 'skipped': 0, 'errors': 0}}
         logger.info("Renewal reminder task started")
         reminderResults = self._sweepReminders()
         logger.info(

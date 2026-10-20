@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import json
 import sys
 import uuid
 from pathlib import Path
@@ -29,6 +30,8 @@ def buildParser() -> argparse.ArgumentParser:
         "retry", help="Resume a partially failed erasure request."
     )
     retry.add_argument("--request-id", required=True, type=_requestId)
+    status = subparsers.add_parser('status',help='Report account deletion and explicitly retained original audit data.')
+    status.add_argument('--request-id',required=True,type=_requestId)
     return parser
 
 
@@ -50,6 +53,14 @@ def main(argv=None, repository=None, enqueue=None) -> int:
     if not request:
         print("Erasure request not found.", file=sys.stderr)
         return 1
+    if args.command=='status':
+        print(json.dumps({'requestId':args.request_id,'status':request.get('status'),
+            'completedAt':str(request['completed_at']) if request.get('completed_at') else None,
+            'lastErrorCode':request.get('last_error_code'),
+            'steps':[{key:step.get(key) for key in ('step_name','status','last_error_code')}
+                for step in request.get('steps',[])],
+            'retention':request.get('retention_manifest') or {}},sort_keys=True))
+        return 0
     if request.get("status") != "PARTIALLY_FAILED":
         print("Erasure request cannot be retried in its current state.", file=sys.stderr)
         return 1

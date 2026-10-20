@@ -61,6 +61,18 @@ class CreditPeriodEngine:
     def __init__(self, store=None):
         self.store = store or _BalanceStore()
 
+    def ensureCurrentAllocation(self, userId, period, now, quotaTokens):
+        from api.services.credits.paidAllowancePolicy import paidCreditWindow
+        window = paidCreditWindow(period, now)
+        row = self.store.getBalance(userId)
+        if window is None:
+            return {'allocated': False, 'row': dict(row or {}), 'operationId': None}
+        if (row and row.get('lifecycle_id') == window.lifecycleId
+                and row.get('period_start') == window.start.isoformat()
+                and row.get('period_end') == window.end.isoformat()):
+            return {'allocated': False, 'row': dict(row), 'operationId': None}
+        return self.ensurePaidCreditPeriod(userId, window, quotaTokens)
+
     # -- allocation ------------------------------------------------------------
 
     def ensurePaidCreditPeriod(

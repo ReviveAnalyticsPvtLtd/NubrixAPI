@@ -20,6 +20,8 @@ def buildTrialExpiryIntent(
     subscription: dict,
     now: datetime.datetime,
 ) -> dict | None:
+    from api.services.notifications.billingNotificationService import notificationSnapshot
+    subscription = notificationSnapshot({'subscription':subscription},now)['subscription']
     if subscription.get("erasure_pending"):
         return None
     if (subscription.get("status") or "").lower() != "trial":

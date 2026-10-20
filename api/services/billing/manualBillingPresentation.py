@@ -28,6 +28,7 @@ def serializeSubscriptionSnapshot(snapshot: SubscriptionSnapshotV2) -> dict:
         'currentPeriod': period(snapshot.currentPeriod), 'nextPeriod': period(snapshot.nextPeriod),
         'paidUntil': timestamp(snapshot.paidUntil), 'lastPaidEnd': timestamp(snapshot.lastPaidEnd),
         'subscribedExperts': list(snapshot.subscribedExperts), 'domainCount': snapshot.domainCount,
+        'nextSelectedExperts': list(snapshot.nextSelectedExperts) if snapshot.nextSelectedExperts is not None else None,
         'renewalOptOut': snapshot.renewalOptOut, 'renewalAvailable': snapshot.renewalAvailable,
         'resumeRenewalAvailable': snapshot.resumeRenewalAvailable,
         'cancellationEffectiveAt': timestamp(snapshot.cancellationEffectiveAt),
@@ -99,6 +100,15 @@ def serializeInvoice(invoice):
 
 def subscriptionDisplayFacts(subscription):
     """Display real paid periods; unavailable reads expose an unknown state."""
+    from api.services.subscriptions.subscriptionCompatibility import usesUnifiedSubscription, legacySubscriptionFields
+    if usesUnifiedSubscription():
+        snapshot = subscription.get('_subscriptionSnapshot')
+        if not isinstance(snapshot, SubscriptionSnapshotV2):
+            from api.services.subscriptions.subscriptionSnapshotService import getSubscriptionSnapshotService
+            snapshot = getSubscriptionSnapshotService().get(subscription['user_id'])
+        aliases = legacySubscriptionFields(snapshot)
+        aliases.pop('status')  # Login's envelope status remains SUCCESS.
+        return {**aliases, 'subscription':serializeSubscriptionSnapshot(snapshot)}
     from api.services.billing.manualBillingRepository import getManualBillingRepository
     facts = {'billingStateAvailable':False,'renewalOptOut':subscription.get('renewal_opt_out'),
         'cancellationEffectiveEnd':None,'currentPeriod':None,'nextPeriod':None,'paidPeriodPrice':None}

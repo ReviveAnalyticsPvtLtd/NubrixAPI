@@ -1,21 +1,16 @@
 {
-  "version": "4.0.2",
+  "version": "4.0.3",
   "token_to_credit_ratio": 10000,
   "quotas": {
-    "free": {
+    "trial": {
       "monthly_tokens": 3000000,
       "scales_with_domains": false,
-      "description": "Free-tier and trial users (12-day trial period) — 300 credits"
+      "description": "Once-only 12-day trial allowance — 300 credits"
     },
     "pro": {
       "tokens_per_domain": 10000000,
       "scales_with_domains": true,
-      "description": "Pro monthly subscribers — 1,000 credits per domain, pooled"
-    },
-    "annual": {
-      "tokens_per_domain": 10000000,
-      "scales_with_domains": true,
-      "description": "Annual prepaid subscribers — 1,000 credits per domain per month, pooled"
+      "description": "Pro included monthly allowance for either purchased interval — 1,000 credits per domain, pooled"
     },
     "none": {
       "monthly_tokens": 0,

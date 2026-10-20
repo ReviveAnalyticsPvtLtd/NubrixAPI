@@ -19,6 +19,19 @@ from api.services.subscriptions.subscriptionSnapshotService import SubscriptionS
 from test.subscriptionModelFixtures import NOW, USER, factsFor
 
 
+def test_create_request_maps_pro_interval_before_legacy_default_is_applied():
+    from api.models import CreateSubscriptionRequest
+    request = CreateSubscriptionRequest(domains=['banking'], contact='', planCode='pro', billingInterval='year')
+    assert request.billingMode == 'annual_prepaid'
+
+
+def test_create_request_rejects_conflicting_pro_interval_and_legacy_mode():
+    from api.models import CreateSubscriptionRequest
+    with pytest.raises(HTTPException) as exc:
+        CreateSubscriptionRequest(domains=['banking'], contact='', planCode='pro', billingInterval='year', billingMode='monthly_prepaid')
+    assert exc.value.status_code == 422
+
+
 def test_public_v2_has_explicit_nulls_and_allowlists_period_without_owner_or_invoice():
     snapshot = evaluateSubscription(factsFor('annual'), NOW)
     payload = serializeSubscriptionSnapshot(snapshot)
@@ -35,6 +48,7 @@ def test_public_v2_has_explicit_nulls_and_allowlists_period_without_owner_or_inv
         'nextPeriod': None, 'paidUntil': '2027-01-31T10:00:00+00:00',
         'lastPaidEnd': '2027-01-31T10:00:00+00:00',
         'subscribedExperts': ['banking', 'telecom'], 'domainCount': 2,
+        'nextSelectedExperts': None,
         'renewalOptOut': False, 'renewalAvailable': True,
         'resumeRenewalAvailable': False, 'cancellationEffectiveAt': None,
         'purchaseAllowed': False, 'purchaseBlockReason': 'current_coverage',

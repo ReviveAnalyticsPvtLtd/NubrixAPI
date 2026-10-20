@@ -173,6 +173,14 @@ class AdminSubscriptionPatch(_StrictModel):
     subscribed_experts: str | None = None
     domain_count: int | None = Field(default=None, ge=1, le=4)
 
+    @model_validator(mode="before")
+    @classmethod
+    def rejectDerivedFields(cls, value):
+        from api.services.subscriptions.subscriptionCompatibility import usesUnifiedSubscription
+        if usesUnifiedSubscription():
+            raise ValueError('DERIVED_SUBSCRIPTION_FIELD: use audited subscription operations')
+        return value
+
     @model_validator(mode="after")
     def validatePatch(self):
         if not self.model_fields_set:
@@ -233,6 +241,8 @@ class AdminAuditEventView(_StrictModel):
 
 
 class AdminSubscriptionView(_StrictModel):
+    subscription: dict[str, Any] | None = None
+    operationEligibility: dict[str, bool] | None = None
     id: str
     user_id: str
     billing_mode: str

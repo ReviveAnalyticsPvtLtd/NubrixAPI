@@ -94,6 +94,17 @@ class SubscriptionEntitlementService:
         self.client = dbClient
 
     def get(self, userId: str) -> SubscriptionEntitlement:
+        from api.services.subscriptions.subscriptionCompatibility import usesUnifiedSubscription, legacySubscriptionFields
+        if usesUnifiedSubscription():
+            from api.services.subscriptions.subscriptionSnapshotService import getSubscriptionSnapshotService
+            try:
+                snapshot = getSubscriptionSnapshotService().get(userId)
+                aliases = legacySubscriptionFields(snapshot)
+                paid = snapshot.accessAllowed and snapshot.accessSource == 'paid'
+                return SubscriptionEntitlement(userId, snapshot.status, aliases['planType'], aliases['planExpire'],
+                    paid, snapshot.accessAllowed, paid, paid)
+            except Exception as exc:
+                raise EntitlementUnavailableError('Subscription facts unavailable') from exc
         row = self._resolveCanonicalRow(userId)
         if row and row.get("billing_mode") == "monthly_prepaid":
             from api.services.billing.manualBillingRepository import getManualBillingRepository

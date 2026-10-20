@@ -104,6 +104,11 @@ class AuthenticationService:
         return normalized
 
     def _getSubscriptionSnapshot(self, userId: str) -> dict | None:
+        from api.services.subscriptions.subscriptionCompatibility import usesUnifiedSubscription, refreshSubscriptionProjection
+        if usesUnifiedSubscription():
+            projected = {}
+            refreshSubscriptionProjection(userId, projected)
+            return projected
         response = self.client.table("subscriptions") \
             .select(CANONICAL_SUBSCRIPTION_SELECT) \
             .eq("user_id", userId) \
@@ -112,7 +117,52 @@ class AuthenticationService:
             .execute().data
         return response[0] if response else None
 
+    def getVerificationFacts(self, userId: str) -> dict:
+        """Refresh authenticated account facts without accepting browser claims."""
+        try:
+            rows = self.client.table("Users").select(
+                "userId,email,onboarded,currentWorkspaceId,profileImage,isBanned"
+            ).eq("userId", userId).limit(1).execute().data
+            if not rows:
+                raise CustomException(ValueError("Authenticated account missing"),
+                    statusCode=401, uiMessage="Please sign in again.", errorCode="SESSION_ACCOUNT_MISSING")
+            owner = rows[0]
+            onboarded = owner.get("onboarded")
+            if (owner.get("userId") != userId
+                    or not isinstance(owner.get("email"), str) or not owner["email"].strip()
+                    or type(onboarded) not in (bool, int) or onboarded not in (False, True)
+                    or owner.get("currentWorkspaceId") is not None and not isinstance(owner["currentWorkspaceId"], str)
+                    or owner.get("profileImage") is not None and not isinstance(owner["profileImage"], str)):
+                raise ValueError("Invalid authenticated account facts")
+            if owner.get("isBanned"):
+                raise accountAccessRevokedException(userId)
+        except CustomException:
+            raise
+        except Exception as exc:
+            raise CustomException(exc, statusCode=503, errorCode="SESSION_AUTHORITY_UNAVAILABLE",
+                uiMessage="Account session could not be verified. Please try again.") from exc
+
+        from api.services.subscriptions.subscriptionSnapshotService import getSubscriptionSnapshotService
+        from api.services.billing.manualBillingPresentation import serializeSubscriptionSnapshot
+        try:
+            snapshot = getSubscriptionSnapshotService().get(userId)
+            subscription = serializeSubscriptionSnapshot(snapshot)
+        except Exception as exc:
+            raise CustomException(exc, statusCode=503, errorCode="SUBSCRIPTION_AUTHORITY_UNAVAILABLE",
+                uiMessage="Subscription access could not be verified. Please try again.") from exc
+        return {
+            "userId": userId,
+            "email": owner["email"],
+            "onboarded": bool(onboarded),
+            "currentWorkspaceId": owner.get("currentWorkspaceId"),
+            "profileImage": owner.get("profileImage"),
+            "subscription": subscription,
+        }
+
     def _refreshLifecycleSnapshot(self, userId: str, subscription: dict | None) -> int:
+        from api.services.subscriptions.subscriptionCompatibility import usesUnifiedSubscription, refreshSubscriptionProjection
+        if usesUnifiedSubscription():
+            return refreshSubscriptionProjection(userId, subscription)
         if not subscription:
             return 0
         if subscription.get("billing_mode") == "monthly_prepaid":
@@ -199,6 +249,15 @@ class AuthenticationService:
         """
         Ensure a canonical subscription row exists and return it.
         """
+        from api.services.subscriptions.subscriptionCompatibility import usesUnifiedSubscription
+        if usesUnifiedSubscription():
+            from api.services.billing.manualBillingRepository import getManualBillingRepository
+            try:
+                getManualBillingRepository().ensureCanonicalSubscription(userId)
+            except Exception as exc:
+                raise CustomException(exc, statusCode=503, errorCode='SUBSCRIPTION_AUTHORITY_UNAVAILABLE',
+                    uiMessage='Subscription data could not be verified. Please try again.') from exc
+            return self._getSubscriptionSnapshot(userId)
         snapshot = self._getSubscriptionSnapshot(userId)
         if snapshot:
             return snapshot
