@@ -6,7 +6,7 @@ import pytest
 from api.services.subscriptions.subscriptionModelBackfill import (
     buildBackfillProposal, legacyRowHash, factsFromRecords,
 )
-from api.services.subscriptions.subscriptionModel import evaluateSubscription
+from api.services.subscriptions.subscriptionModel import SubscriptionAuthorityUnavailable, evaluateSubscription
 from test.subscriptionBackfillFixtures import NOW, source
 
 
@@ -149,6 +149,97 @@ def test_empty_subscription_labels_with_credit_history_require_review():
     row, owner, invoices, events = source()
     owner['creditHistory'] = True
     assert buildBackfillProposal(row, owner, invoices, events, now=NOW)['resolution'] == 'needs_review'
+
+
+@pytest.mark.parametrize('churned', [False, True])
+def test_reviewed_consumed_proof_survives_missing_legacy_markers(churned):
+    row, owner, invoices, events = source()
+    if churned:
+        row['billing_state']['churn_snapshot'] = {'historical': True}
+        row['status'] = 'expired'
+    proposal = buildBackfillProposal(row, owner, invoices, events, now=NOW,
+        trialReview={'consumed': True, 'reviewReference': 'reviewed-original-trial'})
+    assert proposal['resolution'] == 'consumed_dates_unknown'
+    facts = factsFromRecords(row | proposal['patch'], owner, invoices, events, consumed=proposal['trialConsumed'])
+    snapshot = evaluateSubscription(facts, NOW)
+    assert snapshot.status == 'expired' and not snapshot.trialAvailable and snapshot.purchaseAllowed
+
+
+@pytest.mark.parametrize('condition,eventType', [('paid', 'credit.usage_reported'), ('trial', 'free_trial.activated')])
+def test_owner_scoped_audits_do_not_disqualify_proven_service(condition, eventType):
+    row, owner, invoices, events = source(condition)
+    events.append(dict(id='owned-audit', user_id=owner['userId'], subscription_id=None,
+        event_category='audit', event_type=eventType, event_status='SETTLED', metadata_json={}))
+    proposal = buildBackfillProposal(row, owner, invoices, events, now=NOW)
+    assert proposal['resolution'] == 'verified'
+    facts = factsFromRecords(row | proposal['patch'], owner, invoices, events, consumed=proposal['trialConsumed'])
+    assert evaluateSubscription(facts, NOW).accessAllowed
+    events[-1]['user_id'] = 'different-owner'
+    assert buildBackfillProposal(row, owner, invoices, events, now=NOW)['resolution'] == 'needs_review'
+
+
+@pytest.mark.parametrize('shape', [None, [], 'unstructured-original'])
+@pytest.mark.parametrize('location', ['state', 'invoice', 'event'])
+def test_malformed_nested_metadata_becomes_an_inspectable_discrepancy(location, shape):
+    row, owner, invoices, events = source('paid')
+    target = row['billing_state'] if location == 'state' else invoices[0]['metadata_json'] if location == 'invoice' else events[0]['metadata_json']
+    target['manualBilling'] = shape
+    proposal = buildBackfillProposal(row, owner, invoices, events, now=NOW)
+    assert proposal['resolution'] == 'needs_review' and proposal['patch'] is None
+    assert proposal['reasons'] == ['INVALID_MANUAL_BILLING_METADATA']
+
+
+def test_historical_subscription_money_is_an_account_guard_and_review_fence():
+    from api.services.subscriptions.subscriptionModelRepository import SubscriptionModelRepository
+    row, owner, _, _ = source()
+    old = row | {'id': '10000000-0000-4000-8000-000000000009', 'is_canonical': False}
+    invoice = dict(id='historical-invoice', userId=owner['userId'], subscription_id=old['id'], status='PAYMENT_PENDING')
+    attempt = dict(id='historical-attempt', user_id=owner['userId'], subscription_id=old['id'],
+        invoice_id=invoice['id'], event_category='payment_attempt', event_type='checkout',
+        payment_status='authorized', metadata_json={})
+    invoices, events, others = SubscriptionModelRepository._related(row, [row, old], [invoice], [attempt])
+    review = {'consumed': True, 'reviewReference': 'reviewed-history'}
+    proposal = buildBackfillProposal(row, owner, invoices, events, now=NOW, otherSubscriptions=others, trialReview=review)
+    assert proposal['resolution'] == 'consumed_dates_unknown'
+    empty = buildBackfillProposal(row, owner, [], [], now=NOW, otherSubscriptions=others, trialReview=review)
+    assert proposal['evidenceHash'] != empty['evidenceHash']
+    facts = factsFromRecords(row | proposal['patch'], owner, invoices, events,
+        consumed=True, otherSubscriptions=others)
+    snapshot = evaluateSubscription(facts, NOW)
+    assert not snapshot.purchaseAllowed and snapshot.purchaseBlockReason == 'recovery_required'
+    attempt['payment_status'] = 'failed'
+    attempt['metadata_json'] = {'manualBilling': {'closedAt': NOW.isoformat(), 'closureReconciledAt': NOW.isoformat()}}
+    currentInvoices, currentEvents, _ = SubscriptionModelRepository._related(row, [row, old], [invoice], [attempt])
+    changed = buildBackfillProposal(row, owner, currentInvoices, currentEvents, now=NOW, otherSubscriptions=others, trialReview=review)
+    assert changed['evidenceHash'] != proposal['evidenceHash']
+    cleared = factsFromRecords(row | changed['patch'], owner, currentInvoices, currentEvents, consumed=True, otherSubscriptions=others)
+    assert evaluateSubscription(cleared, NOW).purchaseAllowed
+
+
+@pytest.mark.parametrize('coverage', ['current', 'future', 'unproven', 'elapsed'])
+def test_reviewed_trial_consumption_cannot_discard_other_owned_paid_service(coverage):
+    row, owner, _, _ = source()
+    old, _, invoices, events = source('paid')
+    old['id'] = '10000000-0000-4000-8000-000000000009'
+    old['is_canonical'] = False
+    invoices[0]['subscription_id'] = old['id']
+    events[0]['subscription_id'] = old['id']
+    if coverage == 'future':
+        invoices[0]['period_start'] = NOW + timedelta(days=1)
+    elif coverage == 'elapsed':
+        invoices[0]['period_start'] = NOW - timedelta(days=32)
+        invoices[0]['period_end'] = NOW - timedelta(days=1)
+    elif coverage == 'unproven':
+        invoices[0]['period_end'] = None
+    proposal = buildBackfillProposal(row, owner, invoices, events, now=NOW, otherSubscriptions=[old],
+        trialReview={'consumed': True, 'reviewReference': 'trial-consumption-only'})
+    if coverage != 'elapsed':
+        assert proposal['resolution'] == 'needs_review' and proposal['patch'] is None
+    else:
+        assert proposal['resolution'] == 'consumed_dates_unknown'
+        facts = factsFromRecords(row | proposal['patch'], owner, invoices, events, consumed=True, otherSubscriptions=[old])
+        snapshot = evaluateSubscription(facts, NOW)
+        assert snapshot.status == 'expired' and snapshot.purchaseAllowed and snapshot.currentPeriod is None
 
 
 @pytest.mark.parametrize('field,value', [('pending_removals', ['banking']),

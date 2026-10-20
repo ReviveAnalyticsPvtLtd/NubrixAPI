@@ -238,6 +238,12 @@ def test_unified_workers_scan_canonical_owners_without_legacy_filters(unified, t
         def eq(self,field,value):
             assert field == 'is_canonical' and value is True
             return self
+        def order(self,field):
+            assert field == 'id'
+            return self
+        def limit(self,maximum):
+            assert maximum > 0
+            return self
         def execute(self):
             return self
     worker = cls.__new__(cls)

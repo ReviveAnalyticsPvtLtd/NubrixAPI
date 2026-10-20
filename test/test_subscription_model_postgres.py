@@ -264,6 +264,12 @@ def test_cli_defaults_to_read_only_and_requires_explicit_reviewed_apply(modelDb,
         assert cursor.fetchone()[0] == 0
     assert backfill(['--reviewed-file', str(reviewFile), '--apply']) == 0
     assert backfill(['--reviewed-file', str(reviewFile), '--apply']) == 0
+    assert backfill(['--reviewed-file', str(reviewFile)]) == 0
+    assert json.loads(capsys.readouterr().out.splitlines()[-1])['alreadyAppliedDecisions'] == 1
+    with closing(factory()) as db, db, db.cursor() as cursor:
+        cursor.execute('UPDATE subscriptions SET version=version+1')
+    assert backfill(['--reviewed-file', str(reviewFile)]) == 1
+    assert json.loads(capsys.readouterr().out.splitlines()[-1])['staleDecisions'] == 1
     assert financial(factory) == before
 
 
@@ -277,3 +283,97 @@ def test_unexplained_retained_credits_never_make_an_old_account_trial_eligible(m
     assert repo.applyReviewedDecision(proposed, now=NOW)['status'] == 'needs_review'
     with pytest.raises(SubscriptionAuthorityUnavailable):
         SubscriptionSnapshotService(repo.snapshotFactsLoader).get(OWNER['userId'], NOW)
+
+
+def test_markerless_reviewed_consumption_survives_apply_and_load(modelDb):
+    factory, repo = modelDb
+    seed(factory, 'none')
+    approved = decision(repo, trialReviews={SUB: {'consumed': True, 'reviewReference': 'original-trial-proof'}})
+    assert approved['resolution'] == 'consumed_dates_unknown'
+    repo.applyReviewedDecision(approved, now=NOW)
+    snapshot = SubscriptionSnapshotService(repo.snapshotFactsLoader).get(OWNER['userId'], NOW)
+    assert snapshot.status == 'expired' and not snapshot.trialAvailable and snapshot.purchaseAllowed
+
+
+@pytest.mark.parametrize('mutation', ['add_attempt', 'settle_attempt', 'change_invoice'])
+def test_historical_subscription_money_fences_apply_and_replay(modelDb, mutation):
+    factory, repo = modelDb
+    seed(factory, 'none')
+    with closing(factory()) as db, db, db.cursor() as cursor:
+        cursor.execute('INSERT INTO subscriptions(id,user_id,is_canonical) VALUES(\'10000000-0000-4000-8000-000000000009\',%s,false) RETURNING id', (OWNER['userId'],))
+        old = str(cursor.fetchone()[0])
+        cursor.execute('INSERT INTO "Invoices"("userId",subscription_id,status) VALUES(%s,%s,\'PAYMENT_PENDING\') RETURNING id', (OWNER['userId'], old))
+        invoice = str(cursor.fetchone()[0])
+        cursor.execute('''INSERT INTO billing_events(user_id,subscription_id,invoice_id,event_category,event_type,payment_status)
+            VALUES(%s,%s,%s,'payment_attempt','checkout','authorized')''', (OWNER['userId'], old, invoice))
+    approved = decision(repo, trialReviews={SUB: {'consumed': True, 'reviewReference': 'original-trial-proof'}})
+    assert repo.checkReviewedDecision(approved, now=NOW) == 'consumed_dates_unknown'
+    repo.applyReviewedDecision(approved, now=NOW)
+    assert repo.checkReviewedDecision(approved, now=NOW) == 'already_applied'
+    snapshot = SubscriptionSnapshotService(repo.snapshotFactsLoader).get(OWNER['userId'], NOW)
+    assert not snapshot.purchaseAllowed and snapshot.purchaseBlockReason == 'recovery_required'
+    with closing(factory()) as db, db, db.cursor() as cursor:
+        if mutation == 'add_attempt':
+            cursor.execute('''INSERT INTO billing_events(user_id,subscription_id,invoice_id,event_category,event_type,payment_status)
+                VALUES(%s,%s,%s,'payment_attempt','checkout','authorized')''', (OWNER['userId'], old, invoice))
+        elif mutation == 'settle_attempt':
+            cursor.execute("UPDATE billing_events SET payment_status='cancelled',metadata_json=%s WHERE subscription_id=%s",
+                (Json({'manualBilling': {'closedAt': NOW.isoformat(), 'closureReconciledAt': NOW.isoformat()}}), old))
+        else:
+            cursor.execute('UPDATE "Invoices" SET total_amount=99 WHERE id=%s', (invoice,))
+    with pytest.raises(ValueError, match='REVIEW_REPLAY_CHANGED'):
+        repo.applyReviewedDecision(approved, now=NOW)
+    assert repo.checkReviewedDecision(approved, now=NOW) == 'stale'
+    with pytest.raises(SubscriptionAuthorityUnavailable):
+        SubscriptionSnapshotService(repo.snapshotFactsLoader).get(OWNER['userId'], NOW)
+
+
+def test_inventory_reports_malformed_row_without_losing_other_accounts(modelDb):
+    factory, repo = modelDb
+    seed(factory, 'none')
+    with closing(factory()) as db, db, db.cursor() as cursor:
+        cursor.execute('UPDATE subscriptions SET billing_state=%s', (Json({'manualBilling': None}),))
+        cursor.execute('INSERT INTO "Users"("userId") VALUES(\'second-owner\')')
+        cursor.execute('INSERT INTO subscriptions(user_id,is_canonical) VALUES(\'second-owner\',true)')
+    report = repo.inventory(now=NOW)
+    assert report['counts'] == {'verified': 1, 'needs_review': 1, 'consumed_dates_unknown': 0}
+
+
+def test_archive_refuses_an_already_pending_erasure(modelDb):
+    factory, repo = modelDb
+    seed(factory, 'none')
+    with closing(factory()) as db, db, db.cursor(cursor_factory=RealDictCursor) as cursor:
+        cursor.execute('UPDATE subscriptions SET erasure_pending=true RETURNING *')
+        row = dict(cursor.fetchone())
+    with pytest.raises(ValueError, match='REVIEW_ERASURE_PENDING'):
+        with closing(factory()) as db, db, db.cursor(cursor_factory=RealDictCursor) as cursor:
+            repo.archiveLegacySnapshot(cursor, row)
+    with closing(factory()) as db, db, db.cursor() as cursor:
+        cursor.execute('SELECT count(*) FROM billing_events')
+        assert cursor.fetchone()[0] == 0
+
+
+@pytest.mark.parametrize('requestStatus', ['PENDING', 'IN_PROGRESS', 'PARTIALLY_FAILED', 'COMPLETED'])
+def test_active_erasure_request_prevents_archiving_a_late_unflagged_subscription(modelDb, requestStatus):
+    from api.services.billing.manualBillingRepository import ManualBillingRepository
+    factory, repo = modelDb
+    with closing(factory()) as db, db, db.cursor() as cursor:
+        cursor.execute('INSERT INTO "Users"("userId") VALUES(%s)', (OWNER['userId'],))
+        # Only the actual request columns consumed by the interlock are needed.
+        cursor.execute('CREATE TABLE user_erasure_requests(target_user_id text,status text NOT NULL)')
+        cursor.execute('INSERT INTO user_erasure_requests VALUES(%s,%s)', (OWNER['userId'], requestStatus))
+    created = ManualBillingRepository(factory).ensureCanonicalSubscription(OWNER['userId'])
+    assert created['erasure_pending'] is False
+    with closing(factory()) as db, db, db.cursor(cursor_factory=RealDictCursor) as cursor:
+        cursor.execute('SELECT * FROM subscriptions WHERE id=%s', (created['id'],))
+        row = dict(cursor.fetchone())
+    if requestStatus == 'COMPLETED':
+        with closing(factory()) as db, db, db.cursor(cursor_factory=RealDictCursor) as cursor:
+            repo.archiveLegacySnapshot(cursor, row)
+    else:
+        with pytest.raises(ValueError, match='REVIEW_ERASURE_PENDING'):
+            with closing(factory()) as db, db, db.cursor(cursor_factory=RealDictCursor) as cursor:
+                repo.archiveLegacySnapshot(cursor, row)
+    with closing(factory()) as db, db, db.cursor() as cursor:
+        cursor.execute('SELECT count(*) FROM billing_events')
+        assert cursor.fetchone()[0] == (1 if requestStatus == 'COMPLETED' else 0)

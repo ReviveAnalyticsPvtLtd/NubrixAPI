@@ -17,14 +17,26 @@ def workerFor(account):
     class Owners:
         def table(self,name):
             assert name == 'subscriptions'
+            self.after = None
             return self
         def select(self,_):
             return self
         def eq(self,*_):
             return self
+        def order(self,field):
+            assert field == 'id'
+            return self
+        def limit(self,maximum):
+            assert maximum > 0
+            return self
+        def gt(self,field,value):
+            assert field == 'id'
+            self.after = value
+            return self
         def execute(self):
             from types import SimpleNamespace
-            return SimpleNamespace(data=query(url,'SELECT id,user_id,erasure_pending FROM subscriptions WHERE user_id=%s',(initial.userId,)))
+            return SimpleNamespace(data=query(url,'SELECT id,user_id,erasure_pending FROM subscriptions WHERE user_id=%s AND (%s::uuid IS NULL OR id>%s::uuid) ORDER BY id',
+                (initial.userId,self.after,self.after)))
     return SubscriptionWorkerService(Owners(),repo)
 
 

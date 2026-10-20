@@ -108,12 +108,17 @@ class ManualBillingRepository:
     def _purchaseFactsLocked(self, cursor, subscription, owner, now):
         from dataclasses import replace
         from api.services.subscriptions.subscriptionModel import SubscriptionFacts
-        from api.services.subscriptions.subscriptionModelBackfill import unresolvedMoneyFacts
+        from api.services.subscriptions.subscriptionModelBackfill import unresolvedMoneyFacts, _checkHistoricalService
         model = self._modelRepository()
         periods = model.loadAcceptedPeriods(cursor, str(subscription['id']))
         lifecycle = str(subscription.get('lifecycle_id') or '') or (max(periods, key=lambda p: p.start).lifecycleId if periods else None)
         effective = tuple(replace(p, experts=model.loadEffectiveExperts(cursor, p.id, now)) for p in periods)
-        _, invoices, events = model._purchaseRecords(cursor, str(subscription['id']))
+        _, invoices, events, others = model._accountPurchaseRecords(cursor, str(subscription['id']))
+        try:
+            _checkHistoricalService(subscription, others, invoices, events, now)
+        except (ValueError, KeyError, TypeError) as exc:
+            from api.services.subscriptions.subscriptionModel import SubscriptionAuthorityUnavailable
+            raise SubscriptionAuthorityUnavailable('Owned historical service requires review') from exc
         unresolved, attempts = unresolvedMoneyFacts(invoices, events)
         current = next((p for p in effective if p.start <= now < p.end and (p.revokedAt is None or now < p.revokedAt)), None)
         selection = model.loadNextSelection(cursor, str(subscription['id']), lifecycle, current.end) if current else None
@@ -674,6 +679,23 @@ class ManualBillingRepository:
                     raise ValueError('CHECKOUT_OWNER_NOT_ELIGIBLE')
                 if request.purpose == 'renewal' and (request.billingMode == 'annual_prepaid' or self._usesPurchaseAuthority()) and coverage.nextPeriod:
                     raise ValueError('RENEWAL_ALREADY_PAID')
+                if self._usesPurchaseAuthority() and request.purpose == 'renewal':
+                    # A fresh empty provider observation permits the existing
+                    # same-invoice retry policy. Close that original attempt
+                    # under the owner lock before checking account-wide money.
+                    cursor.execute('''select * from public.billing_events where user_id=%s
+                        and invoice_id=%s and event_category='payment_attempt'
+                        and payment_status in ('created','pending_provider_ack') order by id for update''',
+                        (request.userId, request.payload.get('invoiceId')))
+                    for attempt in cursor.fetchall():
+                        frozen = self._json(attempt.get('metadata_json')).get('manualBilling', {})
+                        expiry = _utc(frozen.get('expiresAt'))
+                        if (frozen.get('purpose') == 'renewal' and expiry and expiry <= now
+                                and self._mayExpireCheckoutAttempt(attempt, now)):
+                            self._expireCheckoutAttemptLocked(cursor, attempt, now, reconciled=True)
+                    cursor.execute('SELECT "isBanned" FROM public."Users" WHERE "userId"=%s', (request.userId,))
+                    if self._purchaseFactsLocked(cursor, subscription, cursor.fetchone(), now).moneyUnresolved:
+                        raise ValueError('RECOVERY_REQUIRED')
                 if request.purpose == 'initial_purchase':
                     if self._usesPurchaseAuthority():
                         from api.services.subscriptions.subscriptionModel import evaluatePurchaseEligibility
@@ -1201,9 +1223,11 @@ class ManualBillingRepository:
                     requestKey, payloadHash, snapshot, _utc(cursor.fetchone()['current_time']))
         return self._run(operation)
 
-    def _expireCheckoutAttemptLocked(self, cursor, attempt, now):
+    def _expireCheckoutAttemptLocked(self, cursor, attempt, now, *, reconciled=False):
         metadata=self._json(attempt.get('metadata_json'))
         metadata.setdefault('manualBilling',{}).update(closedAt=now.isoformat(),closedReason='CHECKOUT_EXPIRED')
+        if reconciled:
+            metadata['manualBilling']['closureReconciledAt'] = now.isoformat()
         cursor.execute("update public.billing_events set payment_status='expired',event_status='expired',metadata_json=%s where id=%s",
             (Json(metadata),attempt['id']))
 
