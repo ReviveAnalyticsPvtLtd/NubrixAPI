@@ -84,6 +84,7 @@ class CheckoutRequest:
     currency: str = "INR"
     requiresExistingAttempt: bool = False
     expectedCatalogRevision: int | None = None
+    purchaseDraftRevision: int | None = None
 
 
 @dataclass(frozen=True)

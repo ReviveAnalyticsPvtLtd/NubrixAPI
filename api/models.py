@@ -20,6 +20,19 @@ class SignUp(BaseModel):
     email: str
     password: str
 
+
+class CancelPurchaseCheckoutRequest(BaseModel):
+    model_config = {'extra': 'forbid'}
+    expectedOperationRevision: StrictInt = Field(ge=0, le=9007199254740991)
+
+
+class SubmitPurchaseDraftRequest(BaseModel):
+    model_config = {'extra': 'forbid'}
+    draftRevision: StrictInt = Field(ge=1, le=9007199254740991)
+    contact: str = Field(default='', max_length=32)
+    pricingContext: str = Field(min_length=1, max_length=4096)
+    expectedCatalogRevision: StrictInt = Field(ge=1, le=9007199254740991)
+
 class Login(BaseModel):
     email: str
     password: str

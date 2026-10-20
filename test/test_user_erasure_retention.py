@@ -25,3 +25,14 @@ def test_existing_refund_submission_key_is_never_lost_even_with_invalid_state():
     cleaned = operationalMetadata({'refundIntentId':'refund-1','items':[],
         'submissions':{'payment-1':None}},'request-1')
     assert cleaned['submissions']['payment-1']=='unknown'
+
+
+def test_cancelled_purchase_recovery_facts_survive_erasure_without_contact():
+    cleaned = operationalMetadata({'manualBilling': {'purpose': 'initial_purchase', 'purchaseDraftRevision': 2,
+        'purchaseCapturePolicy': 'manual', 'purchaseCancellationAcceptedAt': '2026-10-20T12:00:00+00:00',
+        'authorizedPaymentId': 'payment-1', 'contact': '+919999999999'}}, 'request-1')
+    assert cleaned['manualBilling']['purchaseDraftRevision'] == 2
+    assert cleaned['manualBilling']['purchaseCapturePolicy'] == 'manual'
+    assert cleaned['manualBilling']['authorizedPaymentId'] == 'payment-1'
+    assert cleaned['manualBilling']['purchaseCancellationAcceptedAt'] == '2026-10-20T12:00:00+00:00'
+    assert 'contact' not in cleaned['manualBilling']

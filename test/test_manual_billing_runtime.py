@@ -89,6 +89,9 @@ class SqlConnection:
             return _now().isoformat()
         self.connection.create_function("clock_timestamp", 0, wallClock)
         self.connection.create_function("pg_advisory_xact_lock", 1, lambda _: 1)
+        self.connection.create_function('to_regclass', 1, lambda name:
+            name if self.connection.execute('SELECT 1 FROM sqlite_master WHERE type=\'table\' AND name=?',
+                                            (name.split('.')[-1],)).fetchone() else None)
 
     def cursor(self, **kwargs):
         return SqlCursor(self.connection.cursor())

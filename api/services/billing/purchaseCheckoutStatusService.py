@@ -39,7 +39,27 @@ class PurchaseCheckoutStatusService:
             and intent.state in ('created', 'pending_provider_ack')
             and self.repository.mayResumeInitialCheckout(userId, attemptId))
         from dataclasses import replace
-        return replace(status, capabilities=PurchaseCheckoutCapabilities(mayResumeOriginal=bool(payable)))
+        status = replace(status, capabilities=PurchaseCheckoutCapabilities(mayResumeOriginal=bool(payable)))
+        from api.services.billing.purchaseCheckoutRepository import storedPurchaseControl
+        return applyPurchaseControl(status, storedPurchaseControl(self.repository, userId, attemptId))
+
+
+def applyPurchaseControl(status, control):
+    from dataclasses import replace
+    if not control:
+        return status
+    accepted = control.get('cancellation_accepted_at')
+    status = replace(status, operationRevision=int(control['operation_revision']),
+        cancellationAcceptedAt=accepted.isoformat() if accepted else None)
+    if status.state in ('completed', 'needs_attention'):
+        return status
+    if accepted:
+        return replace(status, state='cancelled', pendingReason='ORIGINAL_CHECKOUT_CLOSED',
+                       capabilities=PurchaseCheckoutCapabilities())
+    if control.get('cancellation_requested_at'):
+        return replace(status, state='cancellation_pending', pendingReason='CAPTURE_OUTCOME_PENDING',
+                       capabilities=PurchaseCheckoutCapabilities())
+    return status
 
 
 def reducePurchaseCheckoutStatus(attempt, intent, providerState, results=(), mayResume=False):

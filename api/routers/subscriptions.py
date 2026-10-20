@@ -16,7 +16,7 @@ from fastapi.responses import ORJSONResponse
 from fastapi import APIRouter, Depends, Header, Request, HTTPException
 from fastapi.security import HTTPAuthorizationCredentials
 from api.commons import verifyToken
-from api.models import SubscriptionPricingPreviewRequest, SavePurchaseDraftRequest
+from api.models import SubscriptionPricingPreviewRequest, SavePurchaseDraftRequest, CancelPurchaseCheckoutRequest, SubmitPurchaseDraftRequest
 
 router = APIRouter()
 """
@@ -70,6 +70,64 @@ def getPurchaseDraft(token=Depends(verifyToken)):
 @router.put('/purchase-draft')
 def savePurchaseDraft(request: SavePurchaseDraftRequest, token=Depends(verifyToken)):
     return _purchaseDraftResponse(token, request)
+
+
+def _purchaseActionResponse(action, token, request, key, attemptId=None):
+    import os
+    from dataclasses import asdict
+    from uuid import UUID
+    from jose import jwt, JWTError
+    from api.services.billing.purchaseCheckoutRepository import getPurchaseCheckoutRepository
+    from api.services.billing.purchaseCheckoutService import PurchaseCheckoutService
+    headers = {'Cache-Control': 'private, no-store'}
+    try:
+        userId = jwt.decode(token, os.environ['SECRET_KEY'], algorithms=['HS256']).get('userId')
+        if not isinstance(userId, str) or not userId:
+            raise JWTError('Missing identity')
+    except JWTError:
+        return ORJSONResponse({'message': 'Authentication required.', 'errorCode': 'AUTHENTICATION_REQUIRED'}, status_code=401, headers=headers)
+    if attemptId is not None:
+        try:
+            UUID(attemptId)
+        except ValueError:
+            return ORJSONResponse({'message': 'Checkout was not found.', 'errorCode': 'PURCHASE_CHECKOUT_NOT_FOUND'}, status_code=404, headers=headers)
+    try:
+        service = PurchaseCheckoutService(getPurchaseCheckoutRepository(), subscriptionService.razorpayClient)
+        if action == 'cancel':
+            result = {'schemaVersion': 1, **asdict(service.cancel(userId, attemptId, request.expectedOperationRevision, key))}
+        else:
+            result = service.submit(userId, request.draftRevision, request.contact, request.pricingContext, request.expectedCatalogRevision, key)
+        return ORJSONResponse(result, headers=headers)
+    except ValueError as exc:
+        code = str(exc)
+        if code == 'OWNED_PAYMENT_ATTEMPT_MISSING':
+            return ORJSONResponse({'message': 'Checkout was not found.', 'errorCode': 'PURCHASE_CHECKOUT_NOT_FOUND'}, status_code=404, headers=headers)
+        if code in ('PURCHASE_ACTIONS_UNAVAILABLE', 'PURCHASE_CAPTURE_NOT_ELIGIBLE', 'PURCHASE_ALREADY_COMPLETED',
+                    'PURCHASE_DRAFT_STALE', 'PURCHASE_CHECKOUT_STALE', 'PURCHASE_DRAFT_NOT_ALLOWED',
+                    'PURCHASE_REPLACEMENT_CONFIRMATION_REQUIRED', 'PURCHASE_FUNDS_PENDING', 'IDEMPOTENCY_CONFLICT',
+                    'PRICING_CHANGED', 'PRICING_CONTEXT_REQUIRED', 'PRICING_CONTEXT_EXPIRED', 'PRICING_CONTEXT_INVALID',
+                    'INVALID_REQUEST_KEY', 'EXISTING_PAID_COVERAGE', 'CHECKOUT_OWNER_NOT_ELIGIBLE', 'BILLING_CURRENCY_CONFLICT'):
+            return ORJSONResponse({'message': 'Please reload and review your purchase.', 'errorCode': code},
+                status_code=422 if code == 'INVALID_REQUEST_KEY' else 403 if code in ('PURCHASE_DRAFT_NOT_ALLOWED','CHECKOUT_OWNER_NOT_ELIGIBLE') else 409, headers=headers)
+        from utils.logger import logger
+        logger.exception('Purchase action authority was invalid')
+    except Exception:
+        from utils.logger import logger
+        logger.exception('Purchase action unavailable')
+    return ORJSONResponse({'message': 'Your purchase is being reconciled. Please check its status.',
+                          'errorCode': 'PURCHASE_ACTION_UNAVAILABLE'}, status_code=503, headers=headers)
+
+
+@router.post('/purchase-checkouts/{attemptId}/cancel')
+def cancelPurchaseCheckout(attemptId: str, request: CancelPurchaseCheckoutRequest,
+        key: str | None = Header(default=None, alias='Idempotency-Key'), token=Depends(verifyToken)):
+    return _purchaseActionResponse('cancel', token, request, key, attemptId)
+
+
+@router.post('/purchase-draft/checkout')
+def submitPurchaseDraft(request: SubmitPurchaseDraftRequest,
+        key: str | None = Header(default=None, alias='Idempotency-Key'), token=Depends(verifyToken)):
+    return _purchaseActionResponse('submit', token, request, key)
 
 
 @router.post('/purchase-checkouts/{attemptId}/status')

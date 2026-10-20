@@ -74,7 +74,22 @@ class ManualBillingRecoveryService:
             self.repository.bindProviderOrder(str(attempt['id']),order)
             orderId = order['id']
             attempt = {**attempt, 'provider_order_id': orderId}
-        results = self.applyObservation(attempt, self.inspectAttempt(attempt))
+        snapshot = self.inspectAttempt(attempt)
+        results = self.applyObservation(attempt, snapshot)
+        # Background recovery may resume eligible durable capture work. The
+        # shared status-only applyObservation path never submits capture/refund.
+        if snapshot.complete and snapshot.outcome == 'authorized':
+            from api.services.billing.manualPaymentService import ManualPaymentService
+            for payment in snapshot.payments:
+                if payment.get('status') == 'authorized':
+                    metadata = self.repository._json(attempt.get('metadata_json')).get('manualBilling', {})
+                    if metadata.get('purpose') == 'initial_purchase' and attempt['user_id'] is not None:
+                        result = ManualPaymentService.forProduction(self.provider, self.repository).finalizeCapturedPayment(
+                            VerifiedPaymentEvidence(str(attempt['id']), str(attempt['invoice_id']), attempt['user_id'],
+                                orderId, payment['id'], 'initial_purchase', payment['currency'], 'authorized',
+                                'server_observation', int(payment['amount']), snapshot.observedAt, None, None, False))
+                        if result.state != 'awaiting_capture':
+                            results += (result,)
         return sum(result.state != 'awaiting_capture' for result in results)
 
     def applyObservation(self, attempt, snapshot):

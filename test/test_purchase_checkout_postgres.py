@@ -302,3 +302,437 @@ def test_missing_schema_fails_enabled_reads_and_preserves_disabled_path(drafts, 
         assert not PurchaseDraftService(repo).get(user).enabled
     finally:
         query(url, 'ALTER TABLE synthetic_hidden_drafts RENAME TO subscription_purchase_drafts')
+
+
+def controlledPurchase(drafts, monkeypatch, domains=('banking', 'manufacturing'), interval='month', currency='INR'):
+    from test.test_purchase_capture import SyntheticPurchaseProvider
+    name = 'api.services.billing.purchaseCheckoutService'
+    assert importlib.util.find_spec(name), 'Guarded purchase service must exist'
+    actions = importlib.import_module(name)
+    monkeypatch.setattr(actions, 'purchaseActionsReady', lambda: True)
+    monkeypatch.setenv('SUBSCRIPTION_MANUAL_CAPTURE_CURRENCIES', 'INR,USD')
+    repo, _, user, _ = drafts
+    repo.saveDraft(user, 0, list(domains), interval)
+    pricing = {'userId': user, 'domains': list(domains), 'billingMode': 'monthly_prepaid' if interval == 'month' else 'annual_prepaid',
+               'currency': currency, 'catalogRevision': 1}
+    intent = repo.reserveDraftCheckout(user, 1, pricing, 'initial')
+    provider = SyntheticPurchaseProvider()
+    from api.services.billing.manualPaymentService import ManualPaymentService
+    intent = ManualPaymentService.forProduction(provider, repo).openReservedCheckout(intent)
+    return repo, provider, intent, actions.PurchaseCheckoutService(repo, provider)
+
+
+def authorization(repo, provider, intent):
+    from api.services.billing.manualBillingContracts import VerifiedPaymentEvidence
+    from api.services.billing.manualBillingRepository import _now
+    payment = provider.authorize(intent)
+    evidence = VerifiedPaymentEvidence(intent.attemptId, intent.invoiceId, intent.userId, intent.razorpayOrderId,
+        payment['id'], 'initial_purchase', intent.currency, 'authorized', 'server_observation', intent.amount,
+        _now(), None, None, False)
+    repo.finalizeCapturedPayment(evidence)
+    return evidence
+
+
+def test_cancellation_wins_before_capture_and_preserves_authorization(drafts, monkeypatch):
+    from dataclasses import replace
+    repo, provider, intent, service = controlledPurchase(drafts, monkeypatch)
+    evidence = authorization(repo, provider, intent)
+    op = repo.reserveCapture(intent.userId, intent.attemptId, evidence.providerPaymentId)
+    state = service.cancel(intent.userId, intent.attemptId, 1, 'cancel-first')
+    assert state.checkout.cancellationAcceptedAt is not None
+    assert repo.captureOperation(str(op['id']))['state'] == 'cancelled'
+    assert repo.attemptById(intent.userId, intent.attemptId)['payment_status'] == 'authorized'
+    assert repo.beginCaptureSubmission(str(op['id']), state.checkout.operationRevision) is None
+    result = repo.finalizeCapturedPayment(replace(evidence, financialStatus='captured'))
+    assert result.state == 'requires_reconciliation' and not result.finalized
+    assert not repo.getCoverageSnapshot(intent.userId).accessAllowed
+    assert query(drafts[3], 'SELECT status FROM "Invoices" WHERE id=%s', (intent.invoiceId,), one=True)['status'] == 'VOID'
+    assert provider.captureCalls == []
+
+
+def test_submission_started_wins_and_cancellation_stays_pending(drafts, monkeypatch):
+    repo, provider, intent, service = controlledPurchase(drafts, monkeypatch)
+    evidence = authorization(repo, provider, intent)
+    op = repo.reserveCapture(intent.userId, intent.attemptId, evidence.providerPaymentId)
+    claim = repo.beginCaptureSubmission(str(op['id']), 1)
+    assert claim is not None
+    state = service.cancel(intent.userId, intent.attemptId, 2, 'cancel-in-flight')
+    assert state.checkout.cancellationAcceptedAt is None
+    assert state.checkout.state == 'cancellation_pending'
+    from dataclasses import replace
+    result = repo.recordCaptureOutcome(str(op['id']), replace(evidence, financialStatus='captured'))
+    assert result['state'] == 'succeeded'
+    assert repo.getCoverageSnapshot(intent.userId).accessAllowed
+    replay = service.cancel(intent.userId, intent.attemptId, 2, 'cancel-in-flight')
+    assert replay.checkout.state == 'completed'
+
+
+@pytest.mark.parametrize('fault', ['before', 'after'])
+def test_ambiguous_capture_never_resubmits_and_lookup_resolves(drafts, monkeypatch, fault):
+    from api.services.billing.manualBillingRepository import _now
+    repo, provider, intent, _ = controlledPurchase(drafts, monkeypatch)
+    evidence = authorization(repo, provider, intent)
+    op = repo.reserveCapture(intent.userId, intent.attemptId, evidence.providerPaymentId)
+    from api.services.billing.purchaseCaptureService import PurchaseCaptureService
+    service = PurchaseCaptureService(repo, provider)
+    provider.captureFault = fault
+    assert service.execute(str(op['id']))['state'] == 'outcome_unknown'
+    assert len(provider.captureCalls) == 1
+    result = service.execute(str(op['id']))
+    assert len(provider.captureCalls) == 1
+    assert result['state'] == ('succeeded' if fault == 'after' else 'outcome_unknown')
+    assert repo.getCoverageSnapshot(intent.userId).accessAllowed is (fault == 'after')
+
+
+def test_cancel_idempotency_and_stale_revision_are_not_new_mutations(drafts, monkeypatch):
+    repo, provider, intent, service = controlledPurchase(drafts, monkeypatch)
+    first = service.cancel(intent.userId, intent.attemptId, 1, 'cancel-key')
+    replay = service.cancel(intent.userId, intent.attemptId, 1, 'cancel-key')
+    assert replay.checkout.operationRevision == first.checkout.operationRevision
+    with pytest.raises(ValueError, match='IDEMPOTENCY_CONFLICT'):
+        service.cancel(intent.userId, intent.attemptId, 2, 'cancel-key')
+    with pytest.raises(ValueError, match='PURCHASE_CHECKOUT_STALE'):
+        service.cancel(intent.userId, intent.attemptId, 1, 'another-key')
+
+
+@pytest.mark.parametrize('currency', ['INR', 'USD'])
+@pytest.mark.parametrize('interval', ['month', 'year'])
+@pytest.mark.parametrize('original,changed', [(('banking',), ['banking', 'telecom']), (('banking', 'telecom'), ['banking'])])
+def test_explicit_cancel_then_latest_draft_replaces_frozen_selection(drafts, monkeypatch, currency, interval, original, changed):
+    repo, provider, intent, service = controlledPurchase(drafts, monkeypatch, original, interval, currency)
+    assert provider.orderCalls[0]['payment'] == {'capture': 'manual'}
+    old = query(drafts[3], 'SELECT amount,total_amount,currency FROM "Invoices" WHERE id=%s', (intent.invoiceId,), one=True)
+    repo.saveDraft(intent.userId, 1, changed, interval)
+    pricing = {'userId': intent.userId, 'domains': changed, 'billingMode': intent.billingMode, 'currency': currency, 'catalogRevision': 1}
+    with pytest.raises(ValueError, match='PURCHASE_REPLACEMENT_CONFIRMATION_REQUIRED'):
+        repo.reserveDraftCheckout(intent.userId, 2, pricing, 'replace')
+    service.cancel(intent.userId, intent.attemptId, 1, 'cancel-old')
+    new = repo.reserveDraftCheckout(intent.userId, 2, pricing, 'replace')
+    assert new.attemptId != intent.attemptId and new.snapshot['domains'] == sorted(changed)
+    assert repo.getControl(intent.userId, new.attemptId)['draft_revision'] == 2
+    assert str(repo.getControl(intent.userId, new.attemptId)['predecessor_attempt_id']) == intent.attemptId
+    assert query(drafts[3], 'SELECT amount,total_amount,currency FROM "Invoices" WHERE id=%s', (intent.invoiceId,), one=True) == old
+    assert len(provider.orderCalls) == 1
+
+
+def test_legacy_purchase_cannot_bypass_unresolved_control_when_gate_is_off(drafts, monkeypatch):
+    from api.services.billing.manualBillingContracts import CheckoutRequest
+    repo, provider, intent, service = controlledPurchase(drafts, monkeypatch)
+    authorization(repo, provider, intent)
+    service.cancel(intent.userId, intent.attemptId, 1, 'cancel')
+    monkeypatch.delenv('SUBSCRIPTION_EDITABLE_CHECKOUT_ENABLED')
+    with pytest.raises(ValueError, match='PURCHASE_FUNDS_PENDING'):
+        drafts[1].reserveCheckout(CheckoutRequest(intent.userId, 'initial_purchase', intent.billingMode,
+            {'domains': ['telecom']}, 'old-client', expectedCatalogRevision=1))
+
+
+@pytest.mark.parametrize('source', ['browser', 'webhook', 'recovery'])
+def test_authorization_paths_capture_once_after_status_read(drafts, monkeypatch, source):
+    from api.services.billing.manualPaymentService import ManualPaymentService
+    from api.services.billing.purchaseCheckoutStatusService import PurchaseCheckoutStatusService
+    from api.services.billing.manualBillingRecoveryService import ManualBillingRecoveryService
+    repo, provider, intent, _ = controlledPurchase(drafts, monkeypatch)
+    payment = provider.authorize(intent)
+    assert PurchaseCheckoutStatusService(repo, provider).refresh(intent.userId, intent.attemptId).state == 'awaiting_capture'
+    assert not provider.captureCalls
+    if source == 'browser':
+        from api.services.billing.manualBillingRepository import _now
+        def observe():
+            evidence = ManualPaymentService.buildPaymentEvidence(provider.payment.fetch(payment['id']),
+                attemptId=intent.attemptId, invoiceId=intent.invoiceId, userId=intent.userId,
+                purpose='initial_purchase', observedAt=_now())
+            return ManualPaymentService.forProduction(provider, repo).finalizeCapturedPayment(evidence)
+    elif source == 'recovery':
+        def observe():
+            return ManualBillingRecoveryService(repo, provider).recoverAttempt(repo.attemptById(intent.userId, intent.attemptId))
+    else:
+        from api.services.subscriptions.subscriptionService import SubscriptionService
+        from api.services.webhookService import WebhookService
+        subscription = SubscriptionService.__new__(SubscriptionService)
+        subscription.razorpayClient = provider
+        monkeypatch.setattr('api.services.subscriptions.subscriptionService.subscriptionService', subscription)
+        monkeypatch.setattr('api.services.billing.manualBillingRepository.getManualBillingRepository', lambda: repo)
+        def observe():
+            return WebhookService.__new__(WebhookService)._handlePaymentAuthorized({'payload': {'payment': {'entity': provider.payment.fetch(payment['id'])}}})
+    first = observe()
+    if source == 'browser':
+        assert first.finalized
+    elif source == 'webhook':
+        assert first is None  # Signed-event handlers acknowledge via the webhook processor.
+    else:
+        assert first >= 1
+    observe()
+    assert len(provider.captureCalls) == 1
+    assert provider.captureCalls[0] == (payment['id'], {'amount': intent.amount, 'currency': intent.currency})
+    assert repo.getCoverageSnapshot(intent.userId).accessAllowed
+
+
+def test_late_authorization_records_money_without_reviving_cancelled_purchase(drafts, monkeypatch):
+    from api.services.billing.manualPaymentService import ManualPaymentService
+    from api.services.billing.manualBillingRepository import _now
+    repo, provider, intent, service = controlledPurchase(drafts, monkeypatch)
+    service.cancel(intent.userId, intent.attemptId, 1, 'cancel-unpaid')
+    payment = provider.authorize(intent)
+    evidence = ManualPaymentService.buildPaymentEvidence(payment, attemptId=intent.attemptId, invoiceId=intent.invoiceId,
+        userId=intent.userId, purpose='initial_purchase', observedAt=_now())
+    ManualPaymentService.forProduction(provider, repo).finalizeCapturedPayment(evidence)
+    attempt = repo.attemptById(intent.userId, intent.attemptId)
+    assert attempt['payment_status'] == 'authorized'
+    assert not repo._json(attempt['metadata_json'])['manualBilling'].get('closureReconciledAt')
+    assert not provider.captureCalls and not repo.getCoverageSnapshot(intent.userId).accessAllowed
+
+
+def test_provider_call_holds_no_database_lock_and_cancellation_reports_pending(drafts, monkeypatch):
+    from api.services.billing.purchaseCaptureService import PurchaseCaptureService
+    repo, provider, intent, cancel = controlledPurchase(drafts, monkeypatch)
+    evidence = authorization(repo, provider, intent)
+    op = repo.reserveCapture(intent.userId, intent.attemptId, evidence.providerPaymentId)
+    cancellations = []
+    def duringNetwork():
+        with ThreadPoolExecutor(max_workers=1) as pool:
+            state = pool.submit(cancel.cancel, intent.userId, intent.attemptId, 2, 'network-cancel').result(timeout=5)
+            cancellations.append(state)
+    provider.onCapture = duringNetwork
+    assert PurchaseCaptureService(repo, provider).execute(str(op['id']))['state'] == 'succeeded'
+    assert cancellations[0].checkout.state == 'cancellation_pending'
+    assert cancellations[0].checkout.cancellationAcceptedAt is None
+    assert len(provider.captureCalls) == 1
+
+
+def test_failed_finalization_after_provider_acceptance_is_lookup_only(drafts, monkeypatch):
+    from api.services.billing.purchaseCaptureService import PurchaseCaptureService
+    repo, provider, intent, _ = controlledPurchase(drafts, monkeypatch)
+    evidence = authorization(repo, provider, intent)
+    op = repo.reserveCapture(intent.userId, intent.attemptId, evidence.providerPaymentId)
+    original = repo.recordCaptureOutcome
+    def failedWrite(*_):
+        raise RuntimeError('synthetic crash before financial persist')
+    monkeypatch.setattr(repo, 'recordCaptureOutcome', failedWrite)
+    capture = PurchaseCaptureService(repo, provider)
+    assert capture.execute(str(op['id']))['state'] == 'outcome_unknown'
+    assert not repo.getCoverageSnapshot(intent.userId).accessAllowed
+    monkeypatch.setattr(repo, 'recordCaptureOutcome', original)
+    assert capture.recover(str(op['id']))['state'] == 'succeeded'
+    assert len(provider.captureCalls) == 1
+
+
+def test_cancelled_order_acknowledgement_is_recovered_without_new_order(drafts, monkeypatch):
+    from api.services.billing.manualPaymentService import ManualPaymentService
+    from api.services.billing.manualBillingRecoveryService import ManualBillingRecoveryService
+    repo, provider, first, service = controlledPurchase(drafts, monkeypatch)
+    service.cancel(first.userId, first.attemptId, 1, 'close-first')
+    repo.saveDraft(first.userId, 1, ['telecom'], 'month')
+    pricing = {'userId': first.userId, 'domains': ['telecom'], 'billingMode': 'monthly_prepaid', 'currency': 'INR', 'catalogRevision': 1}
+    intent = repo.reserveDraftCheckout(first.userId, 2, pricing, 'second')
+    def lostAcknowledgement(payload):
+        provider.createOrder(payload)
+        raise TimeoutError('synthetic order accepted before lost reply')
+    provider.order.create = lostAcknowledgement
+    with pytest.raises(RuntimeError, match='ORDER_ACK_UNKNOWN'):
+        ManualPaymentService.forProduction(provider, repo).openReservedCheckout(intent)
+    service.cancel(first.userId, intent.attemptId, 0, 'close-second')
+    ManualBillingRecoveryService(repo, provider).recoverAttempt(repo.attemptById(first.userId, intent.attemptId))
+    recovered = repo.attemptById(first.userId, intent.attemptId)
+    assert recovered['provider_order_id'] and repo._json(recovered['metadata_json'])['manualBilling']['closedAt']
+    assert repo.getControl(first.userId, intent.attemptId)['cancellation_accepted_at'] is not None
+    assert len(provider.orderCalls) == 2 and not provider.captureCalls
+
+
+def test_stale_draft_and_changed_catalog_reserve_nothing(drafts, monkeypatch):
+    repo, provider, first, service = controlledPurchase(drafts, monkeypatch)
+    service.cancel(first.userId, first.attemptId, 1, 'cancel')
+    repo.saveDraft(first.userId, 1, ['telecom'], 'year')
+    pricing = {'userId': first.userId, 'domains': ['telecom'], 'billingMode': 'annual_prepaid', 'currency': 'INR', 'catalogRevision': 999}
+    before = query(drafts[3], 'SELECT id FROM "Invoices" WHERE "userId"=%s', (first.userId,))
+    with pytest.raises(ValueError, match='PURCHASE_DRAFT_STALE'):
+        repo.reserveDraftCheckout(first.userId, 1, pricing, 'new')
+    with pytest.raises(ValueError, match='PRICING_CHANGED'):
+        repo.reserveDraftCheckout(first.userId, 2, pricing, 'new')
+    assert query(drafts[3], 'SELECT id FROM "Invoices" WHERE "userId"=%s', (first.userId,)) == before
+    assert len(provider.orderCalls) == 1
+
+
+def test_same_closed_legacy_key_returns_old_identity_and_no_gateway_call(drafts, monkeypatch):
+    from api.services.billing.manualBillingContracts import CheckoutRequest
+    from api.services.billing.manualPaymentService import ManualPaymentService
+    from test.test_purchase_capture import SyntheticPurchaseProvider
+    from api.services.billing.purchaseCheckoutService import PurchaseCheckoutService
+    repo, billing, user, _ = drafts
+    request = CheckoutRequest(user, 'initial_purchase', 'monthly_prepaid', {'domains': ['banking']}, 'legacy', expectedCatalogRevision=1)
+    provider = SyntheticPurchaseProvider()
+    intent = ManualPaymentService.forProduction(provider, billing).createCheckout(request)
+    assert 'payment' not in provider.orderCalls[0]
+    monkeypatch.setattr('api.services.billing.purchaseCheckoutService.purchaseActionsReady', lambda: True)
+    PurchaseCheckoutService(repo, provider).cancel(user, intent.attemptId, 0, 'cancel-legacy')
+    replay = ManualPaymentService.forProduction(provider, billing).createCheckout(request)
+    assert replay.attemptId == intent.attemptId and replay.state == 'cancelled'
+    assert len(provider.orderCalls) == 1
+
+
+def test_capture_recovery_with_gate_disabled_and_no_resubmission(drafts, monkeypatch):
+    from api.services.billing.purchaseCaptureService import PurchaseCaptureService
+    repo, provider, intent, _ = controlledPurchase(drafts, monkeypatch)
+    evidence = authorization(repo, provider, intent)
+    op = repo.reserveCapture(intent.userId, intent.attemptId, evidence.providerPaymentId)
+    provider.captureFault = 'after'
+    capture = PurchaseCaptureService(repo, provider)
+    assert capture.execute(str(op['id']))['state'] == 'outcome_unknown'
+    monkeypatch.setattr('api.services.billing.purchaseCheckoutService.purchaseActionsReady', lambda: False)
+    monkeypatch.delenv('SUBSCRIPTION_EDITABLE_CHECKOUT_ENABLED')
+    assert capture.recover(str(op['id']))['state'] == 'succeeded'
+    assert len(provider.captureCalls) == 1
+
+
+def test_capture_claim_crash_before_send_never_blindly_posts(drafts, monkeypatch):
+    from api.services.billing.purchaseCaptureService import PurchaseCaptureService
+    repo, provider, intent, _ = controlledPurchase(drafts, monkeypatch)
+    evidence = authorization(repo, provider, intent)
+    op = repo.reserveCapture(intent.userId, intent.attemptId, evidence.providerPaymentId)
+    assert repo.beginCaptureSubmission(str(op['id']), 1)
+    assert PurchaseCaptureService(repo, provider).execute(str(op['id']))['state'] in ('submission_started', 'outcome_unknown')
+    assert not provider.captureCalls and not repo.getCoverageSnapshot(intent.userId).accessAllowed
+
+
+def test_capture_committed_before_lost_finalizer_reply_does_not_grant_twice(drafts, monkeypatch):
+    from api.services.billing.purchaseCaptureService import PurchaseCaptureService
+    repo, provider, intent, _ = controlledPurchase(drafts, monkeypatch)
+    evidence = authorization(repo, provider, intent)
+    op = repo.reserveCapture(intent.userId, intent.attemptId, evidence.providerPaymentId)
+    original = repo.finalizeCapturedPayment
+    def committedThenCrashed(value):
+        original(value)
+        raise RuntimeError('synthetic crash after financial commit')
+    monkeypatch.setattr(repo, 'finalizeCapturedPayment', committedThenCrashed)
+    capture = PurchaseCaptureService(repo, provider)
+    assert capture.execute(str(op['id']))['state'] == 'outcome_unknown'
+    assert repo.getCoverageSnapshot(intent.userId).accessAllowed
+    monkeypatch.setattr(repo, 'finalizeCapturedPayment', original)
+    assert capture.recover(str(op['id']))['state'] == 'succeeded'
+    assert len(provider.captureCalls) == 1
+    assert len(query(drafts[3], "SELECT id FROM billing_events WHERE user_id=%s AND event_type='payment.capture'", (intent.userId,))) == 1
+
+
+def test_concurrent_capture_executors_submit_once(drafts, monkeypatch):
+    from threading import Event
+    from api.services.billing.purchaseCaptureService import PurchaseCaptureService
+    repo, provider, intent, _ = controlledPurchase(drafts, monkeypatch)
+    evidence = authorization(repo, provider, intent)
+    op = repo.reserveCapture(intent.userId, intent.attemptId, evidence.providerPaymentId)
+    entered, release = Event(), Event()
+    def delayedReply():
+        entered.set()
+        assert release.wait(5)
+    provider.onCapture = delayedReply
+    capture = PurchaseCaptureService(repo, provider)
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        first = pool.submit(capture.execute, str(op['id']))
+        assert entered.wait(5)
+        second = pool.submit(capture.execute, str(op['id']))
+        try:
+            assert second.result(timeout=5)['state'] in ('submission_started', 'outcome_unknown')
+        finally:
+            release.set()
+        assert first.result(timeout=5)['state'] == 'succeeded'
+    assert len(provider.captureCalls) == 1
+
+
+def test_captured_lookup_and_failed_release_never_post_another_capture(drafts, monkeypatch):
+    from api.services.billing.purchaseCaptureService import PurchaseCaptureService
+    repo, provider, intent, _ = controlledPurchase(drafts, monkeypatch)
+    evidence = authorization(repo, provider, intent)
+    op = repo.reserveCapture(intent.userId, intent.attemptId, evidence.providerPaymentId)
+    assert repo.beginCaptureSubmission(str(op['id']), 1)
+    provider.payments[evidence.providerPaymentId]['status'] = 'failed'
+    capture = PurchaseCaptureService(repo, provider)
+    assert capture.recover(str(op['id']))['state'] == 'cancelled'
+    assert capture.execute(str(op['id']))['state'] == 'cancelled'
+    assert not provider.captureCalls and not repo.getCoverageSnapshot(intent.userId).accessAllowed
+
+
+def test_submit_http_verifies_signed_pricing_and_keeps_contact_out_of_storage(drafts, monkeypatch):
+    from fastapi import FastAPI
+    from fastapi.testclient import TestClient
+    from jose import jwt
+    from api.commons import verifyToken
+    from api.services.billing.pricingContext import issuePricingContext
+    from test.test_purchase_capture import SyntheticPurchaseProvider
+    import api.routers.subscriptions as routes
+    repo, _, user, url = drafts
+    repo.saveDraft(user, 0, ['banking'], 'year')
+    provider = SyntheticPurchaseProvider()
+    monkeypatch.setattr('api.services.billing.purchaseCheckoutService.purchaseActionsReady', lambda: True)
+    monkeypatch.setenv('SUBSCRIPTION_MANUAL_CAPTURE_CURRENCIES', 'INR,USD')
+    monkeypatch.setenv('PRICING_PROXY_SECRET', 'synthetic-test-pricing')
+    monkeypatch.setattr('api.services.billing.purchaseCheckoutRepository.getPurchaseCheckoutRepository', lambda: repo)
+    monkeypatch.setattr(routes.subscriptionService, 'razorpayClient', provider)
+    token = jwt.encode({'userId': user, 'email': 'synthetic@example.test'}, os.environ['SECRET_KEY'], algorithm='HS256')
+    app = FastAPI()
+    app.include_router(routes.router)
+    app.dependency_overrides[verifyToken] = lambda: token
+    client = TestClient(app)
+    payload = {'draftRevision': 1, 'expectedCatalogRevision': 1, 'contact': '+919999999999',
+        'pricingContext': issuePricingContext('foreign-owner', 'USD', 'hosting', catalogRevision=1)}
+    denied = client.post('/purchase-draft/checkout', json=payload, headers={'Idempotency-Key': 'ui-pay'})
+    assert denied.status_code == 409 and denied.json()['errorCode'] == 'PRICING_CONTEXT_INVALID'
+    assert not provider.orderCalls
+    payload['pricingContext'] = issuePricingContext(user, 'USD', 'hosting', catalogRevision=1)
+    response = client.post('/purchase-draft/checkout', json=payload, headers={'Idempotency-Key': 'ui-pay'})
+    assert response.status_code == 200, response.text
+    assert response.json()['checkout']['currency'] == 'USD'
+    assert response.headers['cache-control'] == 'private, no-store'
+    assert provider.orderCalls[0]['payment'] == {'capture': 'manual'}
+    frozen = query(url, 'SELECT metadata_json FROM "Invoices" WHERE "userId"=%s', (user,), one=True)['metadata_json']
+    assert '+919999999999' not in str(frozen)
+    assert len(provider.orderCalls) == 1
+
+
+@pytest.mark.parametrize('condition', ['other_capture', 'order_outage', 'another_authorization'])
+def test_capture_does_not_charge_with_conflicting_or_unknown_order_evidence(drafts, monkeypatch, condition):
+    from api.services.billing.purchaseCaptureService import PurchaseCaptureService
+    repo, provider, intent, _ = controlledPurchase(drafts, monkeypatch)
+    evidence = authorization(repo, provider, intent)
+    operation = repo.reserveCapture(intent.userId, intent.attemptId, evidence.providerPaymentId)
+    if condition == 'order_outage':
+        def unavailable(_):
+            raise TimeoutError('synthetic Order read unavailable')
+        provider.order.fetch = unavailable
+    else:
+        other = provider.authorize(intent, 'pay-other-' + str(uuid4()))
+        if condition == 'other_capture':
+            provider.payments[other['id']]['status'] = 'captured'
+    result = PurchaseCaptureService(repo, provider).execute(str(operation['id']))
+    assert not provider.captureCalls
+    assert result['state'] in ('queued', 'cancelled', 'needs_attention')
+    assert repo.getCoverageSnapshot(intent.userId).accessAllowed is (condition == 'other_capture')
+
+
+def test_newer_unknown_observation_invalidates_old_unpaid_cancellation_proof(drafts, monkeypatch):
+    from dataclasses import replace
+    from datetime import timedelta
+    from api.services.billing.manualBillingRecoveryService import ManualBillingRecoveryService
+    repo, provider, intent, _ = controlledPurchase(drafts, monkeypatch)
+    old = ManualBillingRecoveryService(repo, provider).inspectAttempt(repo.attemptById(intent.userId, intent.attemptId))
+    repo.recordProviderObservation(intent.attemptId, old)
+    repo.recordProviderObservation(intent.attemptId, replace(old, outcome='unknown', complete=False, observedAt=old.observedAt+timedelta(seconds=1)))
+    repo.acceptCancellation(intent.userId, intent.attemptId, 1, 'cancel-stale-read', old)
+    frozen = repo._json(repo.attemptById(intent.userId, intent.attemptId)['metadata_json'])['manualBilling']
+    assert frozen['purchaseCancellationAcceptedAt']
+    assert not frozen.get('closureReconciledAt')
+
+
+@pytest.mark.parametrize('latest', ['unknown', 'captured'])
+def test_capture_claim_respects_newer_provider_evidence(drafts, monkeypatch, latest):
+    from dataclasses import replace
+    from datetime import timedelta
+    from api.services.billing.manualBillingRecoveryService import ManualBillingRecoveryService
+    repo, provider, intent, _ = controlledPurchase(drafts, monkeypatch)
+    evidence = authorization(repo, provider, intent)
+    operation = repo.reserveCapture(intent.userId, intent.attemptId, evidence.providerPaymentId)
+    if latest == 'captured':
+        provider.payments[evidence.providerPaymentId]['status'] = 'captured'
+    observation = ManualBillingRecoveryService(repo, provider).inspectAttempt(repo.attemptById(intent.userId, intent.attemptId))
+    if latest == 'unknown':
+        observation = replace(observation, outcome='unknown', complete=False)
+    repo.recordProviderObservation(intent.attemptId, observation)
+    assert repo.beginCaptureSubmission(str(operation['id']), 1) is None
+    assert not provider.captureCalls

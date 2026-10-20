@@ -309,8 +309,10 @@ class ManualBillingRepository:
                     'outcome': snapshot.outcome, 'checkedAt': snapshot.observedAt.isoformat(),
                     'complete': snapshot.complete, 'hasPayments': bool(snapshot.payments)}
                 status = attempt['payment_status']
-                if snapshot.outcome == 'authorized' and not billing.get('closedAt') and status in ('created', 'pending_provider_ack'):
+                if snapshot.outcome == 'authorized' and (not billing.get('closedAt') or billing.get('purchaseCancellationAcceptedAt')) and status in ('created', 'pending_provider_ack', 'cancelled'):
                     status = 'authorized'
+                    if billing.get('purchaseCancellationAcceptedAt'):
+                        billing.pop('closureReconciledAt', None)
                 cursor.execute('update public.billing_events set metadata_json=%s,payment_status=%s where id=%s',
                     (Json(metadata), status, attemptId))
         return self._run(operation)
@@ -589,6 +591,8 @@ class ManualBillingRepository:
             raise ValueError('BILLING_CURRENCY_UNSUPPORTED')
         if request.purpose == 'initial_purchase':
             identity['currency'] = request.currency
+            if request.purchaseDraftRevision is not None:
+                identity['purchaseDraftRevision'] = request.purchaseDraftRevision
         payload_hash = _payloadHash(identity)
 
         def hashMatches(frozen):
@@ -675,6 +679,9 @@ class ManualBillingRepository:
                     raise ValueError('BILLING_CURRENCY_CONFLICT')
                 cursor.execute('select clock_timestamp() as current_time')
                 now = _utc(cursor.fetchone()['current_time'])
+                if request.purpose == 'initial_purchase':
+                    from api.services.billing.purchaseCheckoutRepository import guardInitialPurchaseLocked
+                    guardInitialPurchaseLocked(self, cursor, request, subscription, now)
                 existing, replacements = lookup(cursor, now, subscription, matchOnly=replayOnly)
                 if existing is not None or lookupOnly:
                     return existing
@@ -793,6 +800,8 @@ class ManualBillingRepository:
                         'billingMode': request.billingMode, 'domains': selected, 'revision': revision,
                         'catalogRevision': catalog.revision,
                         'coverageState': 'estimated', 'expiresAt': deadline.isoformat()}
+                    if request.purchaseDraftRevision is not None:
+                        billing.update(purchaseDraftRevision=request.purchaseDraftRevision, purchaseCapturePolicy='manual')
                     if self._usesPurchaseAuthority() and request.purpose == 'expert_addition':
                         billing['servicePeriodId'] = coverage.currentPeriod.invoiceId
                     if request.purpose == 'topup':
@@ -834,8 +843,14 @@ class ManualBillingRepository:
                 if self._usesPurchaseAuthority():
                     snapshot.update(servicePeriodId=frozen.get('servicePeriodId'),
                         selectionEventId=frozen.get('selectionEventId'), selectionVersion=frozen.get('selectionVersion'))
-                return self._reserveCheckoutIntentLocked(cursor, subscription, request.userId, request.purpose,
+                if request.purchaseDraftRevision is not None:
+                    snapshot.update(purchaseDraftRevision=request.purchaseDraftRevision, purchaseCapturePolicy='manual')
+                intent = self._reserveCheckoutIntentLocked(cursor, subscription, request.userId, request.purpose,
                     snapshot['requestKey'], payload_hash, snapshot, now)
+                if request.purchaseDraftRevision is not None:
+                    from api.services.billing.purchaseCheckoutRepository import bindPurchaseControlLocked
+                    bindPurchaseControlLocked(cursor, request, intent)
+                return intent
         existing = self._run(lambda connection: transaction(connection, lookupOnly=True))
         if existing is not None or replayOnly:
             return existing
@@ -1157,18 +1172,19 @@ class ManualBillingRepository:
                 return {'currentDomains':current,'pendingRemovals':pending,'effectiveAt':end.isoformat()}
         return self._run(operation)
 
-    def _closeInvoice(self,cursor,invoice,reason,*,now=None,replacementInvoiceId=None):
+    def _closeInvoice(self,cursor,invoice,reason,*,now=None,replacementInvoiceId=None,preserveAuthorization=False):
         closure = {'closedAt':(now or _now()).isoformat(), 'closedReason':reason}
         if replacementInvoiceId is not None:
             closure['supersededByInvoiceId'] = str(replacementInvoiceId)
         metadata=self._json(invoice.get('metadata_json'))
         metadata.setdefault('manualBilling',{}).update(closure)
         cursor.execute('update public."Invoices" set status=\'VOID\',metadata_json=%s where id=%s',(Json(metadata),invoice['id']))
-        cursor.execute("select id,metadata_json from public.billing_events where invoice_id=%s and event_category='payment_attempt' and payment_status in ('created','pending_provider_ack','authorized') order by id for update", (invoice['id'],))
+        cursor.execute("select id,metadata_json,payment_status from public.billing_events where invoice_id=%s and event_category='payment_attempt' and payment_status in ('created','pending_provider_ack','authorized') order by id for update", (invoice['id'],))
         for row in cursor.fetchall():
             old = self._json(row.get('metadata_json'))
             old.setdefault('manualBilling', {}).update(closure)
-            cursor.execute("update public.billing_events set payment_status='cancelled',event_status='cancelled',metadata_json=%s where id=%s", (Json(old), row['id']))
+            status = 'authorized' if preserveAuthorization and row['payment_status'] == 'authorized' else 'cancelled'
+            cursor.execute("update public.billing_events set payment_status=%s,event_status=%s,metadata_json=%s where id=%s", (status,status,Json(old), row['id']))
 
     def cancelExpertAddition(self,userId,domain):
         def operation(connection):
@@ -1356,6 +1372,8 @@ class ManualBillingRepository:
         }
         if self._usesPurchaseAuthority():
             manualBilling.update({k: snapshot.get(k) for k in ('servicePeriodId', 'selectionEventId', 'selectionVersion')})
+        if snapshot.get('purchaseDraftRevision') is not None:
+            manualBilling.update({k: snapshot[k] for k in ('purchaseDraftRevision','purchaseCapturePolicy')})
 
         namespaceKey = f"{purpose}:{userId}:{requestKey}"
         if str(subscription['id']) != str(snapshot.get('subscriptionId')) or subscription.get('erasure_pending'):
@@ -1589,6 +1607,8 @@ class ManualBillingRepository:
                     raise ValueError(
                         f"Attempt {attemptId} is not bindable (closed or missing)"
                     )
+                from api.services.billing.purchaseCheckoutRepository import bindControlledOrderLocked
+                bindControlledOrderLocked(cursor, attemptId, order['id'])
                 if row['user_id'] is None:
                     return self._intentFromAttemptRow(row,self._json(row.get('metadata_json')),None,'erased_checkout')
                 cursor.execute('update public."Invoices" set razorpay_order_id=%s where id=%s and "userId"=%s',
@@ -1740,11 +1760,17 @@ class ManualBillingRepository:
                     str(attempt.get('currency')).upper() != evidence.currency.upper()):
                     raise ValueError('PAYMENT_EVIDENCE_MISMATCH')
                 if evidence.financialStatus != 'captured':
-                    if evidence.financialStatus == 'authorized' and attempt['payment_status'] in ('created', 'pending_provider_ack'):
+                    if evidence.financialStatus == 'authorized' and attempt['payment_status'] in ('created', 'pending_provider_ack', 'authorized', 'cancelled'):
                         previous = frozen.get('providerObservation', {})
-                        if not frozen.get('closedAt'):
+                        if previous.get('outcome') != 'captured' and (not frozen.get('closedAt') or frozen.get('purchaseCancellationAcceptedAt')):
                             attemptMetadata = self._json(attempt.get('metadata_json'))
                             attemptBilling = attemptMetadata.setdefault('manualBilling', {})
+                            attemptBilling.setdefault('authorizedPaymentId', evidence.providerPaymentId)
+                            if frozen.get('purchaseCancellationAcceptedAt'):
+                                attemptBilling.pop('closureReconciledAt', None)
+                                invoiceMetadata = self._json(invoice.get('metadata_json'))
+                                invoiceMetadata.setdefault('manualBilling', {}).pop('closureReconciledAt', None)
+                                cursor.execute('UPDATE public."Invoices" SET metadata_json=%s WHERE id=%s', (Json(invoiceMetadata), invoice['id']))
                             # A validated fetched payment proves authorization,
                             # but is not a complete listing of all Order payments.
                             if previous.get('outcome') != 'captured' and (
@@ -1802,6 +1828,8 @@ class ManualBillingRepository:
                 or int(billing.get('revision') or 1) != int(frozen.get('revision') or 1)
                 or int(invoice.get('total_amount') or 0) != evidence.amount or invoice.get('currency') != evidence.currency):
             reason = 'FROZEN_INVOICE_MISMATCH'
+        if evidence.purpose == 'initial_purchase' and frozen.get('purchaseCancellationAcceptedAt'):
+            reason = 'PURCHASE_CANCELLED'
         closed = self._json(attempt.get('metadata_json')).get('manualBilling', {})
         closedAt = _utc(closed.get('closedAt') or billing.get('closedAt'))
         closedReason = closed.get('closedReason') or billing.get('closedReason')
