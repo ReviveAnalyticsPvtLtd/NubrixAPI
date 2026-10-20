@@ -299,6 +299,8 @@ class ManualBillingRepository:
                 metadata = self._json(attempt.get('metadata_json'))
                 billing = metadata.setdefault('manualBilling', {})
                 previous = billing.get('providerObservation', {})
+                if previous.get('outcome') == 'captured' and snapshot.outcome != 'captured':
+                    return  # A later non-capture is not proof that captured money vanished.
                 if previous.get('checkedAt') and _utc(previous['checkedAt']) > snapshot.observedAt:
                     return
                 if previous.get('hasPayments') and not snapshot.payments and snapshot.outcome == 'unpaid':
@@ -1659,6 +1661,34 @@ class ManualBillingRepository:
                 return row
         return self._run(operation)
 
+    def mayResumeInitialCheckout(self, userId: str, attemptId: str) -> bool:
+        """Advisory UI capability; submission still rechecks owner and money."""
+        def operation(connection):
+            with connection.cursor(cursor_factory=RealDictCursor) as cursor:
+                self._lockUser(cursor, userId)
+                subscription = self._canonical(cursor, userId)
+                now = _now()
+                coverage = self._coverageSnapshotLocked(cursor, subscription, now, materialize=False)
+                if coverage.currentPeriod is not None or coverage.denialReason not in (
+                        None, 'no_paid_coverage', 'no_subscription', 'expired'):
+                    return False
+                cursor.execute("select * from public.billing_events where id=%s and user_id=%s and event_category='payment_attempt'",
+                    (attemptId, userId))
+                attempt = cursor.fetchone()
+                if not attempt or str(attempt.get('subscription_id')) != str(subscription['id']):
+                    return False
+                frozen = self._json(attempt.get('metadata_json')).get('manualBilling', {})
+                observation = frozen.get('providerObservation', {})
+                checked = _utc(observation.get('checkedAt'))
+                expiry = _utc(frozen.get('expiresAt'))
+                return bool(frozen.get('purpose') == 'initial_purchase' and not frozen.get('closedAt')
+                    and attempt.get('payment_status') in ('created', 'pending_provider_ack')
+                    and attempt.get('provider_order_id') == observation.get('orderId')
+                    and observation.get('complete') and observation.get('outcome') == 'unpaid'
+                    and checked and timedelta(0) <= now - checked <= timedelta(seconds=60)
+                    and expiry and expiry > now)
+        return self._run(operation)
+
     def recordUnmappedPayment(self, payment: dict):
         """Unknown historical money remains visible without guessing its owner or grant."""
         def operation(connection):
@@ -1710,6 +1740,20 @@ class ManualBillingRepository:
                     str(attempt.get('currency')).upper() != evidence.currency.upper()):
                     raise ValueError('PAYMENT_EVIDENCE_MISMATCH')
                 if evidence.financialStatus != 'captured':
+                    if evidence.financialStatus == 'authorized' and attempt['payment_status'] in ('created', 'pending_provider_ack'):
+                        previous = frozen.get('providerObservation', {})
+                        if not frozen.get('closedAt'):
+                            attemptMetadata = self._json(attempt.get('metadata_json'))
+                            attemptBilling = attemptMetadata.setdefault('manualBilling', {})
+                            # A validated fetched payment proves authorization,
+                            # but is not a complete listing of all Order payments.
+                            if previous.get('outcome') != 'captured' and (
+                                    not previous.get('checkedAt') or _utc(previous['checkedAt']) <= evidence.observedAt):
+                                attemptBilling['providerObservation'] = {'orderId': evidence.providerOrderId,
+                                    'outcome': 'authorized', 'checkedAt': evidence.observedAt.isoformat(),
+                                    'complete': False, 'hasPayments': True}
+                            cursor.execute('update public.billing_events set payment_status=%s,metadata_json=%s where id=%s',
+                                ('authorized', Json(attemptMetadata), evidence.attemptId))
                     return self._result(cursor,invoice, subscription, 'awaiting_capture', evidence.attemptId)
                 # A payment identity is global; a separate grant identity is per invoice.
                 cursor.execute('select * from public.billing_events where provider_payment_id = %s for update', (evidence.providerPaymentId,))

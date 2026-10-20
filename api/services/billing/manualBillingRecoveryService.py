@@ -74,7 +74,11 @@ class ManualBillingRecoveryService:
             self.repository.bindProviderOrder(str(attempt['id']),order)
             orderId = order['id']
             attempt = {**attempt, 'provider_order_id': orderId}
-        snapshot = self.inspectAttempt(attempt)
+        results = self.applyObservation(attempt, self.inspectAttempt(attempt))
+        return sum(result.state != 'awaiting_capture' for result in results)
+
+    def applyObservation(self, attempt, snapshot):
+        """Persist one inspection and settle only its verified captured money."""
         self.repository.recordProviderObservation(str(attempt['id']), snapshot)
         if snapshot.outcome == 'unknown':
             raise RuntimeError('PROVIDER_STATUS_UNKNOWN')
@@ -82,23 +86,23 @@ class ManualBillingRecoveryService:
         metadata = json.loads(metadata) if isinstance(metadata,str) else metadata
         frozen = metadata.get('manualBilling',{})
         # No timestamp on a payment entity is treated as proof of capture time.
-        resolved = 0
+        results = []
         for payment in snapshot.payments:
             if payment.get('status') != 'captured':
                 continue
-            if payment.get('order_id') != orderId:
+            if payment.get('order_id') != attempt['provider_order_id']:
                 raise ValueError('RECOVERY_PAYMENT_ORDER_MISMATCH')
             evidence = VerifiedPaymentEvidence(str(attempt['id']),str(attempt['invoice_id']),
-                attempt['user_id'],orderId,payment['id'],frozen.get('purpose','erased_checkout'),payment['currency'],
+                attempt['user_id'],attempt['provider_order_id'],payment['id'],frozen.get('purpose','erased_checkout'),payment['currency'],
                 'captured','server_observation',int(payment['amount']),snapshot.observedAt,
                 None,None,False)
             result = self.repository.finalizeCapturedPayment(evidence)
-            resolved += int(result.state != 'awaiting_capture')
+            results.append(result)
         if frozen.get('closedAt') and snapshot.outcome == 'unpaid' and not snapshot.payments:
             # A successful complete provider listing settles cancellation wording;
             # a later capture is still audited against the original cutoff.
             self.repository.markClosedAttemptReconciled(str(attempt['id']))
-        return resolved
+        return tuple(results)
 
     def recoverRefund(self, intent):
         metadata = intent['metadata_json']
