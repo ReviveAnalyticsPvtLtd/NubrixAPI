@@ -128,6 +128,13 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--json", action="store_true", help="emit JSON output")
     args = parser.parse_args(argv)
 
+    from scripts.subscription_storage_guard import requireLegacySubscriptionStorage
+    try:
+        requireLegacySubscriptionStorage()
+    except ValueError as exc:
+        print(str(exc), file=sys.stderr)
+        return 2
+
     databaseUrl = os.environ.get("DATABASE_URL")
     if not databaseUrl:
         print(
@@ -151,6 +158,11 @@ def main(argv: list[str] | None = None) -> int:
             cursor.execute("""select column_name from information_schema.columns
                 where table_schema='public' and table_name='subscriptions'""")
             subscriptionColumns={row['column_name'] for row in cursor.fetchall()}
+            try:
+                requireLegacySubscriptionStorage(subscriptionColumns)
+            except ValueError as exc:
+                print(str(exc), file=sys.stderr)
+                return 2
             cursor.execute("""select column_name from information_schema.columns
                 where table_schema='public' and table_name='credit_balances'""")
             creditColumns={row['column_name'] for row in cursor.fetchall()}

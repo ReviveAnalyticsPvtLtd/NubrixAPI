@@ -16,6 +16,36 @@ from psycopg2.extras import Json
 from api.services.billing.manualBillingContracts import VerifiedPaymentEvidence, RefundQuote
 from api.services.billing.manualBillingRepository import ManualBillingRepository
 
+
+def test_verified_authorization_is_durable_without_paid_coverage(postgres):
+    from dataclasses import replace
+    from api.services.billing.manualBillingContracts import CheckoutRequest
+    user = 'authorization-' + str(uuid.uuid4())
+    with psycopg2.connect(postgres) as connection:
+        with connection.cursor() as cursor:
+            cursor.execute('INSERT INTO public."Users"("userId") VALUES(%s)', (user,))
+    repository = ManualBillingRepository(lambda: psycopg2.connect(postgres))
+    repository.ensureCanonicalSubscription(user)
+    intent = repository.reserveCheckout(CheckoutRequest(user, 'initial_purchase', 'monthly_prepaid',
+        {'domains': ['banking']}, 'authorization', expectedCatalogRevision=1))
+    order = 'order-' + str(uuid.uuid4())
+    repository.bindProviderOrder(intent.attemptId, {'id': order})
+    evidence = VerifiedPaymentEvidence(intent.attemptId, intent.invoiceId, user, order,
+        'payment-' + str(uuid.uuid4()), 'initial_purchase', intent.currency, 'authorized',
+        'server_observation', intent.amount, datetime.now(timezone.utc), None, None, False)
+    authorized = repository.finalizeCapturedPayment(evidence)
+    assert not authorized.finalized and authorized.state == 'awaiting_capture'
+    attempt = repository.attemptById(user, intent.attemptId)
+    assert attempt['payment_status'] == 'authorized'
+    observation = repository._json(attempt['metadata_json'])['manualBilling']['providerObservation']
+    assert observation['outcome'] == 'authorized' and not observation['complete']
+    assert not repository.getCoverageSnapshot(user).accessAllowed
+    assert not repository.mayResumeInitialCheckout(user, intent.attemptId)
+    captured = repository.finalizeCapturedPayment(replace(evidence, financialStatus='captured'))
+    assert captured.finalized
+    repository.finalizeCapturedPayment(evidence)
+    assert repository.attemptById(user, intent.attemptId)['payment_status'] == 'captured'
+
 pytestmark = pytest.mark.skipif(os.environ.get("RUN_MANUAL_BILLING_INTEGRATION") != "1", reason="Disposable PostgreSQL opt-in required; skipped is UNVERIFIED")
 ROOT = Path(__file__).resolve().parents[1]
 NOW = datetime.now(timezone.utc)

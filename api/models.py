@@ -3,9 +3,35 @@ from typing import Literal
 from pydantic import BaseModel, Field, StrictInt, model_validator
 from enum import Enum
 
+
+class SavePurchaseDraftRequest(BaseModel):
+    model_config = {'extra': 'forbid'}
+    expectedRevision: StrictInt = Field(ge=0, le=9007199254740991)
+    domains: list[Literal['banking', 'manufacturing', 'supplychain', 'telecom']] = Field(min_length=1, max_length=4)
+    billingInterval: Literal['month', 'year']
+
+    @model_validator(mode='after')
+    def uniqueDomains(self):
+        if len(set(self.domains)) != len(self.domains):
+            raise ValueError('Duplicate domains are not allowed')
+        return self
+
 class SignUp(BaseModel):
     email: str
     password: str
+
+
+class CancelPurchaseCheckoutRequest(BaseModel):
+    model_config = {'extra': 'forbid'}
+    expectedOperationRevision: StrictInt = Field(ge=0, le=9007199254740991)
+
+
+class SubmitPurchaseDraftRequest(BaseModel):
+    model_config = {'extra': 'forbid'}
+    draftRevision: StrictInt = Field(ge=1, le=9007199254740991)
+    contact: str = Field(default='', max_length=32)
+    pricingContext: str = Field(min_length=1, max_length=4096)
+    expectedCatalogRevision: StrictInt = Field(ge=1, le=9007199254740991)
 
 class Login(BaseModel):
     email: str

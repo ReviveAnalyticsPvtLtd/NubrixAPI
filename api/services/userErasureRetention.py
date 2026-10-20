@@ -78,8 +78,60 @@ def retentionManifest(counts, obligations=None):
         'retentionExpiresAt':None,'purgeScheduled':False}
 
 
-def archiveOriginals(cursor,requestId,userId):
+PURCHASE_TABLES = ('subscription_purchase_drafts', 'subscription_purchase_checkout_controls', 'subscription_purchase_operations')
+
+
+def purchaseErasureInventory(cursor, userId):
+    present = []
+    for table in PURCHASE_TABLES:
+        cursor.execute('SELECT to_regclass(%s)', ('public.' + table,))
+        present.append(bool(scalar(cursor.fetchone())))
+    if not any(present):
+        return {}
+    if not all(present):
+        raise RuntimeError('PURCHASE_STORAGE_UNAVAILABLE')
     counts = {}
+    for table in PURCHASE_TABLES:
+        cursor.execute(f'SELECT count(*) FROM public.{table} WHERE user_id=%s', (userId,))
+        counts[table] = int(scalar(cursor.fetchone()))
+    cursor.execute('''SELECT count(*) FROM public.subscription_purchase_operations
+        WHERE user_id=%s AND state NOT IN ('succeeded','cancelled')''', (userId,))
+    counts['unresolvedPurchaseOperations'] = int(scalar(cursor.fetchone()))
+    cursor.execute('''SELECT count(*) FROM public.subscription_purchase_checkout_controls c
+        JOIN public.billing_events b ON b.id=c.attempt_id WHERE c.user_id=%s
+        AND c.cancellation_requested_at IS NOT NULL AND b.payment_status<>'captured'
+        AND b.metadata_json->'manualBilling'->>'closureReconciledAt' IS NULL''',(userId,))
+    counts['unresolvedPurchaseCancellations'] = int(scalar(cursor.fetchone()))
+    return counts
+
+
+def archivePurchaseOriginals(cursor, requestId, userId):
+    counts = {}
+    inventory = purchaseErasureInventory(cursor, userId)
+    if inventory.get('unresolvedPurchaseOperations') or inventory.get('unresolvedPurchaseCancellations'):
+        raise RuntimeError('PURCHASE_OPERATIONS_UNRESOLVED')
+    for table, identity in (('subscription_purchase_checkout_controls', 'attempt_id'), ('subscription_purchase_operations', 'id')):
+        if table not in inventory:
+            continue
+        cursor.execute(f'''INSERT INTO private.retained_user_records
+            (request_id,source_table,source_id,original_record,record_hash)
+            SELECT %s,%s,e.{identity},to_jsonb(e),encode(sha256(convert_to(to_jsonb(e)::text,'UTF8')),'hex')
+            FROM public.{table} e WHERE e.user_id=%s ON CONFLICT(source_table,source_id) DO NOTHING''',
+            (requestId, table, userId))
+        cursor.execute(f'''SELECT count(*) FROM public.{table} e WHERE e.user_id=%s
+            AND NOT EXISTS(SELECT 1 FROM private.retained_user_records a WHERE a.request_id=%s
+                AND a.source_table=%s AND a.source_id=e.{identity} AND a.original_record=to_jsonb(e))''',
+            (userId, requestId, table))
+        if scalar(cursor.fetchone()):
+            raise ValueError('ERASURE_RETAINED_COPY_CONFLICT')
+        cursor.execute('SELECT count(*) FROM private.retained_user_records WHERE request_id=%s AND source_table=%s',
+                       (requestId, table))
+        counts[table] = int(scalar(cursor.fetchone()))
+    return counts
+
+
+def archiveOriginals(cursor,requestId,userId):
+    counts = archivePurchaseOriginals(cursor, requestId, userId)
     for table,column in (('billing_events','user_id'),('Invoices','"userId"')):
         cursor.execute(f'''SELECT count(*) FROM public."{table}" e WHERE e.{column} IS NOT NULL
             AND e.{column}<>%s AND e.subscription_id IN (SELECT id FROM public.subscriptions WHERE user_id=%s)''',
@@ -116,7 +168,8 @@ def archiveOriginals(cursor,requestId,userId):
 _MANUAL_FIELDS = ('purpose','billingMode','lifecycleId','servicePeriodId','selectionEventId','selectionVersion',
     'invoiceId','attemptId','revision','currency','frozenAmount','payloadHash','periodStart','periodEnd',
     'expiresAt','closedAt','closedReason','closureReconciledAt','orderCreationClaimedAt',
-    'zeroOrderLookupAt','coverageState','creditPeriodId','providerPaymentId','revokedAt','refundIntentId')
+    'zeroOrderLookupAt','coverageState','creditPeriodId','providerPaymentId','revokedAt','refundIntentId',
+    'purchaseDraftRevision','purchaseCapturePolicy','purchaseCancellationAcceptedAt','authorizedPaymentId')
 
 
 def _fields(value, keys):

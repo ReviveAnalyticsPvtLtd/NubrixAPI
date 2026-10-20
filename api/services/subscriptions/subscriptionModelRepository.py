@@ -10,7 +10,7 @@ from api.services.billing.manualBillingPresentation import serializeSubscription
 from api.services.subscriptions.subscriptionModel import SubscriptionAuthorityUnavailable, evaluateSubscription
 from api.services.subscriptions.subscriptionCompatibility import getSubscriptionModelPhase
 from api.services.subscriptions.subscriptionModelBackfill import (
-    NEW_COLUMNS, MODEL_EVENTS, EXPERTS, acceptedCapture, acceptedPeriods, buildBackfillProposal, evidenceHash, financialEvidenceHash,
+    NEW_COLUMNS, RETIRED_COLUMNS, MODEL_EVENTS, EXPERTS, acceptedCapture, acceptedPeriods, buildBackfillProposal, evidenceHash, financialEvidenceHash,
     factsFromRecords, jsonValue, legacyRow, legacyRowHash, metadata, stableLegacyHash, timestamp,
 )
 
@@ -400,6 +400,10 @@ class SubscriptionModelRepository:
                 return factsFromRecords(row, owner, ownInvoices, ownEvents, consumed=payload['trialConsumed'], otherSubscriptions=others)
         raise SubscriptionAuthorityUnavailable('Reviewed backfill is missing or stale')
 
+    def _runtimeBillingRepository(self):
+        from api.services.billing.manualBillingRepository import ManualBillingRepository
+        return ManualBillingRepository(self.connectionFactory)
+
     def loadRuntimeFacts(self, cursor, row, now):
         """Read explicit core facts and current owned money, never a cached label.
 
@@ -409,9 +413,8 @@ class SubscriptionModelRepository:
         an owned initialization/trial event or a valid reviewed archive.
         """
         from dataclasses import replace
-        from api.services.billing.manualBillingRepository import ManualBillingRepository
         from api.services.subscriptions.subscriptionModel import TrialFacts
-        billing = ManualBillingRepository(self.connectionFactory)
+        billing = self._runtimeBillingRepository()
         cursor.execute('SELECT "userId","isBanned" FROM public."Users" WHERE "userId"=%s', (row['user_id'],))
         owner = cursor.fetchone()
         if not owner:
@@ -420,7 +423,16 @@ class SubscriptionModelRepository:
         _, _, events = self._purchaseRecords(cursor, str(row['id']))
         events = [e for e in events if str(e.get('subscription_id')) == str(row['id']) and e.get('event_status') == 'COMMITTED']
         trialEvent = next((e for e in events if e['event_type'] == 'subscription.trial_started'), None)
-        initialized = any(e['event_type'] == 'subscription.model_initialized' for e in events)
+        initializers = [e for e in events if e['event_type'] == 'subscription.model_initialized']
+        initialized = bool(initializers)
+        originals = {}
+        for event in (e for e in events if e['event_type'] == MODEL_EVENTS[0]):
+            archive = metadata(event).get('archive', {})
+            source = archive.get('originalRow') if isinstance(archive,dict) else None
+            if (isinstance(source,dict) and archive.get('schemaVersion')==2
+                    and source.get('user_id')==row['user_id'] and str(source.get('id'))==str(row['id'])
+                    and legacyRowHash(source)==archive.get('legacyHash')):
+                originals[str(event['id'])]=source
         reviewed, consumed, experts = False, False, ()
         for stamp in (e for e in events if e['event_type'] == MODEL_EVENTS[1]):
             payload = metadata(stamp).get('backfill', {})
@@ -438,11 +450,25 @@ class SubscriptionModelRepository:
         elif not (initialized or reviewed):
             raise SubscriptionAuthorityUnavailable('Trial history requires reviewed initialization')
         if initialized and not reviewed and not trialEvent and not facts.periods:
-            state = billing._json(row.get('billing_state'))
+            retainedInitializer = any(metadata(e).get('schemaVersion')==2
+                and metadata(e).get('storageShape')=='retained' for e in initializers)
+            historicalProof = any(RETIRED_COLUMNS <= source.keys() for source in originals.values())
+            if not RETIRED_COLUMNS <= row.keys() and not historicalProof and not retainedInitializer:
+                raise SubscriptionAuthorityUnavailable('Retained legacy history requires owned evidence')
+            # The current row no longer contains history after contraction.
+            # Original owned audits still constrain once-only trial eligibility.
+            history = [row,*originals.values()]
+            legacyConsumed = any(source.get('current_period_start') or source.get('current_period_end')
+                or billing._json(source.get('billing_state')).get('trialConsumed')
+                or billing._json(source.get('billing_state')).get('trialConsumedAt')
+                or billing._json(source.get('billing_state')).get('churn_snapshot')
+                or source.get('plan_type') in ('free','pro','annual')
+                or source.get('billing_mode') not in ('none',None)
+                or ('status' in source and source.get('status')!='none')
+                or source.get('admin_credit_generation') for source in history)
             cursor.execute('SELECT * FROM public.credit_balances WHERE user_id=%s', (row['user_id'],))
             balance = cursor.fetchone()
-            if (row.get('current_period_start') or row.get('current_period_end') or state.get('trialConsumed')
-                    or state.get('churn_snapshot') or (balance and (balance.get('plan_tier') not in ('none', None)
+            if (legacyConsumed or (balance and (balance.get('plan_tier') not in ('none', None)
                     or balance.get('credit_period_id') or balance.get('period_start')))):
                 raise SubscriptionAuthorityUnavailable('Legacy entitlement history requires review')
         if trialEvent and row.get('trial_started_at') is None and not facts.periods:

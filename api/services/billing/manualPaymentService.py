@@ -117,6 +117,10 @@ class ManualPaymentService:
                     original = self.repository._intentFromAttemptRow(updated, metadata, request.userId, request.purpose)
                     return replace(original, state='requires_reconciliation')
         intent = self.repository.reserveCheckout(request)
+        return self.openReservedCheckout(intent)
+
+    def openReservedCheckout(self, intent):
+        """Submit only an already committed original reservation."""
         if intent.razorpayOrderId or intent.state not in ('created', 'pending_provider_ack', 'authorized'):
             # Historical-key replays retain closed intent identity. They
             # must never submit or recover an unsubmitted cancelled order.
@@ -125,25 +129,30 @@ class ManualPaymentService:
             raise RuntimeError('PAYMENT_PROVIDER_NOT_CONFIGURED')
         if not self.repository.claimProviderOrderCreation(intent.attemptId):
             from api.services.billing.manualBillingRecoveryService import ManualBillingRecoveryService
-            attempt = self.repository.attemptById(request.userId, intent.attemptId)
+            attempt = self.repository.attemptById(intent.userId, intent.attemptId)
             ManualBillingRecoveryService(self.repository, self.razorpayClient).recoverAttempt(attempt)
-            attempt = self.repository.attemptById(request.userId, intent.attemptId)
+            attempt = self.repository.attemptById(intent.userId, intent.attemptId)
             intent = self.repository._intentFromAttemptRow(attempt,
-                self.repository._json(attempt.get('metadata_json')), request.userId, request.purpose)
+                self.repository._json(attempt.get('metadata_json')), intent.userId, intent.purpose)
             if not intent.razorpayOrderId:
                 raise RuntimeError('ORDER_ACK_UNKNOWN')
             return intent
-        noteType = _PURPOSE_ORDER_NOTE_TYPES[request.purpose]
-        if request.purpose == 'renewal' and request.billingMode == 'annual_prepaid':
+        noteType = _PURPOSE_ORDER_NOTE_TYPES[intent.purpose]
+        if intent.purpose == 'renewal' and intent.billingMode == 'annual_prepaid':
             noteType = 'annual_renewal'
-        notes = {'userId': request.userId, 'invoiceId': intent.invoiceId,
-            'attemptId': intent.attemptId, 'type': noteType, 'purpose': request.purpose,
-            'billingMode': request.billingMode, 'domains': ', '.join(intent.snapshot.get('domains') or [])}
-        if request.purpose == 'topup':
+        notes = {'userId': intent.userId, 'invoiceId': intent.invoiceId,
+            'attemptId': intent.attemptId, 'type': noteType, 'purpose': intent.purpose,
+            'billingMode': intent.billingMode, 'domains': ', '.join(intent.snapshot.get('domains') or [])}
+        if intent.purpose == 'topup':
             notes.update(packId=intent.snapshot['packId'], tokens=str(intent.snapshot['tokens']))
+        payload = {'amount': intent.amount, 'currency': intent.currency, 'receipt': intent.attemptId, 'notes': notes}
+        if intent.snapshot.get('purchaseCapturePolicy') == 'manual':
+            from api.services.billing.purchaseCheckoutService import requirePurchaseActions, requireManualCaptureCurrency
+            requirePurchaseActions()
+            requireManualCaptureCurrency(intent.currency)
+            payload['payment'] = {'capture': 'manual'}
         try:
-            order = self.razorpayClient.order.create({'amount': intent.amount, 'currency': intent.currency,
-                'receipt': intent.attemptId, 'notes': notes})
+            order = self.razorpayClient.order.create(payload)
             if (not order.get('id') or int(order.get('amount', -1)) != intent.amount
                     or order.get('currency') != intent.currency):
                 raise ValueError('PROVIDER_ORDER_EVIDENCE_MISMATCH')
@@ -308,7 +317,23 @@ class ManualPaymentService:
           grant.
         """
         if self.repository is not None:
-            return self.repository.finalizeCapturedPayment(evidence)
+            result = self.repository.finalizeCapturedPayment(evidence)
+            if (evidence.financialStatus == 'captured' and evidence.purpose == 'initial_purchase'
+                    and result.state == 'requires_reconciliation' and hasattr(self.repository,'connectionFactory')):
+                from api.services.billing.purchaseCheckoutRepository import PurchaseCheckoutRepository
+                PurchaseCheckoutRepository(self.repository.connectionFactory).reserveCompensation(evidence)
+            if evidence.financialStatus == 'authorized' and evidence.purpose == 'initial_purchase':
+                from api.services.billing.purchaseCheckoutService import purchaseActionsReady
+                if purchaseActionsReady():
+                    from api.services.billing.purchaseCheckoutRepository import PurchaseCheckoutRepository
+                    from api.services.billing.purchaseCaptureService import PurchaseCaptureService
+                    repository = PurchaseCheckoutRepository(self.repository.connectionFactory)
+                    operation = repository.reserveCapture(evidence.userId, evidence.attemptId, evidence.providerPaymentId)
+                    if operation:
+                        outcome = PurchaseCaptureService(repository, self.razorpayClient).execute(str(operation['id']))
+                        if isinstance(outcome.get('finalizationResult'), FinalizationResult):
+                            return outcome['finalizationResult']
+            return result
         invoiceId = evidence.invoiceId
         operationKey = f"finalize:{invoiceId}"
 

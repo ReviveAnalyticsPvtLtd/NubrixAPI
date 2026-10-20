@@ -15,7 +15,7 @@ from psycopg2.extras import Json, RealDictCursor
 
 from api.adminErrors import AdminApiError
 from api.services.userErasureRetention import (
-    assertErasureLease, retentionAvailable, prepareRetention, archiveOriginals,
+    assertErasureLease, retentionAvailable, prepareRetention, archiveOriginals, purchaseErasureInventory,
     operationalMetadata, PROTECTED_EVENTS,
 )
 
@@ -483,6 +483,7 @@ class UserErasureRepository:
                     "projectIds": projectIds,
                     "workspaceIds": workspaceIds,
                     "billingCredentials": [],
+                    "purchaseStorage": purchaseErasureInventory(cursor, userId),
                 }
         finally:
             connection.close()
@@ -554,9 +555,19 @@ class UserErasureRepository:
                 if not unified:
                     cursor.execute('select pg_advisory_xact_lock(%s)',(_advisoryKey(userId),))
                 retained = retentionAvailable(cursor)
+                purchases = purchaseErasureInventory(cursor, userId)
+                if purchases.get('unresolvedPurchaseOperations'):
+                    raise AdminApiError(409, 'PURCHASE_OPERATIONS_UNRESOLVED')
+                if not retained and any(purchases.get(table) for table in
+                        ('subscription_purchase_checkout_controls', 'subscription_purchase_operations')):
+                    raise AdminApiError(409, 'SUBSCRIPTION_ERASURE_RETENTION_PENDING')
                 if retained:
                     assertErasureLease(cursor,requestId,workerId,userId)
                     archiveOriginals(cursor,requestId,userId)
+                    for table in ('subscription_purchase_operations', 'subscription_purchase_checkout_controls'):
+                        if table in purchases:
+                            cursor.execute(f'''UPDATE public.{table} SET user_id=NULL,erasure_request_id=%s
+                                WHERE user_id=%s''', (requestId, userId))
                     cursor.execute('''DELETE FROM public.billing_events WHERE event_type=ANY(%s)
                         AND (user_id=%s OR subscription_id IN (SELECT id FROM public.subscriptions WHERE user_id=%s))''',
                         (list(PROTECTED_EVENTS),userId,userId))
@@ -667,6 +678,7 @@ class UserErasureRepository:
                 self._deleteByUser(cursor, "Projects", '"ownerUserId"', userId)
                 self._deleteByUser(cursor, "Workspaces", '"ownerId"', userId)
                 self._deleteByUser(cursor, "credit_balances", "user_id", userId)
+                self._deleteByUser(cursor, 'subscription_purchase_drafts', 'user_id', userId)
                 self._deleteByUser(
                     cursor, "credit_balances_backup_pre_019", "user_id", userId
                 )
@@ -695,6 +707,9 @@ class UserErasureRepository:
             ("WebhookEvents", "user_id"),
             ("admin_free_trial_extensions", "user_id"),
             ("admin_free_trial_reductions", "user_id"),
+            ('subscription_purchase_drafts', 'user_id'),
+            ('subscription_purchase_checkout_controls', 'user_id'),
+            ('subscription_purchase_operations', 'user_id'),
         )
         residuals = {}
         connection = self.connectionFactory()

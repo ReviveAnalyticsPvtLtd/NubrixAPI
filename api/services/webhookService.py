@@ -572,7 +572,23 @@ class WebhookService:
             event (dict): The Razorpay webhook event.
         """
         refundEntity = event.get("payload", {}).get("refund", {}).get("entity", {})
-        intentId = (refundEntity.get("notes") or {}).get("refundIntentId")
+        notes = refundEntity.get('notes')
+        notes = notes if isinstance(notes,dict) else {}
+        operationId = notes.get('purchaseOperationId')
+        if operationId:
+            from api.services.billing.purchaseCheckoutRepository import getPurchaseCheckoutRepository
+            from api.services.billing.purchaseCompensationService import PurchaseCompensationService
+            from api.services.subscriptions.subscriptionService import subscriptionService
+            repository = getPurchaseCheckoutRepository()
+            operation = repository.operationById(operationId)
+            if (operation['kind'] != 'compensation' or operation['provider_payment_id'] != refundEntity.get('payment_id')
+                    or operation['currency'] != refundEntity.get('currency')):
+                raise ValueError('PURCHASE_REFUND_WEBHOOK_BINDING_INVALID')
+            # Signed callbacks can be stale. Recover fetched financial truth;
+            # this path never submits a refund or uses discretionary authority.
+            PurchaseCompensationService(repository,subscriptionService.razorpayClient).recover(operationId)
+            return
+        intentId = notes.get("refundIntentId")
         if intentId:
             from api.services.billing.manualBillingRepository import getManualBillingRepository
             getManualBillingRepository().settleRefundEvidence(intentId, {"refunds": [refundEntity]})

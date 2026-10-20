@@ -2,6 +2,10 @@
 import argparse
 import json
 from pathlib import Path
+import sys
+
+sys.path.insert(0,str(Path(__file__).resolve().parents[1]))
+from scripts.subscription_storage_guard import requireLegacySubscriptionStorage
 
 ROOT=Path(__file__).resolve().parents[1]
 EXPAND=(
@@ -17,6 +21,8 @@ EXPAND=(
     '20261007154210_index_unresolved_cycle_money.sql',
     '20261007194402_allow_inactive_credit_domains.sql',
     '20261007194411_restrict_financial_data_access.sql',
+    '20261020172948_add_editable_purchase_checkout.sql',
+    '20261021001500_recover_cancelled_purchase.sql',
 )
 CONTRACT='20261005195626_contract_recurring_billing_fields.sql'
 RETIREMENT_EVIDENCE=(
@@ -28,7 +34,8 @@ RETIREMENT_EVIDENCE=(
 )
 
 
-def buildMigrationPlan(appliedVersions:set[str],phase:str)->list[Path]:
+def buildMigrationPlan(appliedVersions:set[str],phase:str,subscriptionColumns=())->list[Path]:
+    requireLegacySubscriptionStorage(subscriptionColumns)
     if phase not in ('expand','contract'): raise ValueError('INVALID_MIGRATION_PHASE')
     if phase=='contract':
         missing=[name.split('_')[0] for name in EXPAND if name.split('_')[0] not in appliedVersions]
@@ -46,11 +53,15 @@ def main():
     parser=argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--phase',choices=('expand','contract'),required=True)
     parser.add_argument('--applied-versions',required=True,help='Local JSON list of actual applied version strings')
+    parser.add_argument('--subscription-columns',required=True,help='Private JSON list from current schema inventory; this offline tool cannot inspect the database')
     args=parser.parse_args()
     applied=json.loads(Path(args.applied_versions).read_text(encoding='utf-8'))
     if not isinstance(applied,list) or not all(isinstance(version,str) and version.isdigit() for version in applied):
         parser.error('Applied versions must be a JSON list of numeric version strings.')
-    try: paths=buildMigrationPlan(set(applied),args.phase)
+    columns=json.loads(Path(args.subscription_columns).read_text(encoding='utf-8'))
+    if not isinstance(columns,list) or not columns or not all(isinstance(column,str) for column in columns):
+        parser.error('Subscription columns must be a nonempty JSON list of column names.')
+    try: paths=buildMigrationPlan(set(applied),args.phase,columns)
     except ValueError as error:
         print(json.dumps({'phase':args.phase,'allowlist':[],'blocker':str(error)}))
         return 1
