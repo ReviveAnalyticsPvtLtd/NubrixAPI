@@ -16,12 +16,60 @@ from fastapi.responses import ORJSONResponse
 from fastapi import APIRouter, Depends, Header, Request, HTTPException
 from fastapi.security import HTTPAuthorizationCredentials
 from api.commons import verifyToken
-from api.models import SubscriptionPricingPreviewRequest
+from api.models import SubscriptionPricingPreviewRequest, SavePurchaseDraftRequest
 
 router = APIRouter()
 """
 Router for subscription-related endpoints.
 """
+
+
+def _purchaseDraftResponse(token, request=None):
+    import os
+    from dataclasses import asdict
+    from jose import jwt, JWTError
+    from api.services.billing.purchaseDraftService import PurchaseDraftService
+    from api.services.billing.purchaseCheckoutRepository import getPurchaseCheckoutRepository
+    headers = {'Cache-Control': 'private, no-store'}
+    try:
+        userId = jwt.decode(token, os.environ['SECRET_KEY'], algorithms=['HS256']).get('userId')
+        if not isinstance(userId, str) or not userId:
+            raise JWTError('Missing identity')
+    except JWTError:
+        return ORJSONResponse({'message': 'Authentication required.', 'errorCode': 'AUTHENTICATION_REQUIRED'},
+                              status_code=401, headers=headers)
+    service = PurchaseDraftService(getPurchaseCheckoutRepository())
+    try:
+        result = service.get(userId) if request is None else service.save(userId, request)
+        return ORJSONResponse({'schemaVersion': 1, **asdict(result)}, headers=headers)
+    except ValueError as exc:
+        code = str(exc)
+        if code in ('EDITABLE_CHECKOUT_DISABLED', 'PURCHASE_DRAFT_STALE', 'PURCHASE_DRAFT_NOT_ALLOWED'):
+            body = {'message': 'Please reload your plan selection.', 'errorCode': code}
+            if code == 'PURCHASE_DRAFT_STALE':
+                try:
+                    body['editor'] = {'schemaVersion': 1, **asdict(service.get(userId))}
+                except Exception:
+                    return ORJSONResponse({'message': 'Plan selection is temporarily unavailable.',
+                        'errorCode': 'PURCHASE_STORAGE_UNAVAILABLE'}, status_code=503, headers=headers)
+            return ORJSONResponse(body, status_code=403 if code == 'PURCHASE_DRAFT_NOT_ALLOWED' else 409, headers=headers)
+        from utils.logger import logger
+        logger.exception('Purchase draft authority was invalid')
+    except Exception:
+        from utils.logger import logger
+        logger.exception('Purchase draft storage unavailable')
+    return ORJSONResponse({'message': 'Plan selection is temporarily unavailable.',
+                          'errorCode': 'PURCHASE_STORAGE_UNAVAILABLE'}, status_code=503, headers=headers)
+
+
+@router.get('/purchase-draft')
+def getPurchaseDraft(token=Depends(verifyToken)):
+    return _purchaseDraftResponse(token)
+
+
+@router.put('/purchase-draft')
+def savePurchaseDraft(request: SavePurchaseDraftRequest, token=Depends(verifyToken)):
+    return _purchaseDraftResponse(token, request)
 
 
 @router.post('/purchase-checkouts/{attemptId}/status')

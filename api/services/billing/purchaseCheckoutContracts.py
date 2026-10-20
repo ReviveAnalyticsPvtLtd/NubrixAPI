@@ -26,3 +26,21 @@ class PurchaseCheckoutStatus:
     cancellationAcceptedAt: str | None = None
     refundState: str = 'none'
     capabilities: PurchaseCheckoutCapabilities = field(default_factory=PurchaseCheckoutCapabilities)
+
+
+@dataclass(frozen=True)
+class PurchaseDraft:
+    userId: str
+    revision: int = 0
+    domains: tuple[str, ...] = ()
+    billingInterval: Literal['month', 'year'] = 'month'
+    updatedAt: str | None = None
+
+
+@dataclass(frozen=True)
+class PurchaseEditorState:
+    userId: str
+    draft: PurchaseDraft
+    enabled: bool = False
+    checkout: PurchaseCheckoutStatus | None = None
+    capabilities: PurchaseCheckoutCapabilities = field(default_factory=PurchaseCheckoutCapabilities)

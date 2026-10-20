@@ -33,32 +33,39 @@ class PurchaseCheckoutStatusService:
         if purpose not in ('initial_purchase', 'renewal', 'expert_addition', 'topup'):
             raise ValueError('PURCHASE_CHECKOUT_METADATA_INVALID')
         intent = self.repository._intentFromAttemptRow(attempt, metadata, userId, purpose)
-        recorded = frozen.get('providerObservation', {})
-        payable = False
-        if any(result.state == 'requires_reconciliation' for result in results):
-            state, reason = 'needs_attention', 'PAYMENT_REQUIRES_RECONCILIATION'
-        elif attempt['payment_status'] == 'captured':
-            state, reason = 'completed', None
-        elif intent.state == 'requires_reconciliation':
-            state, reason = 'needs_attention', 'PAYMENT_REQUIRES_RECONCILIATION'
-        elif frozen.get('closedAt') or intent.state in ('expired', 'cancelled', 'superseded'):
-            state, reason = 'cancelled', 'ORIGINAL_CHECKOUT_CLOSED'
-        elif providerState == 'unknown':
-            state, reason = 'status_unknown', 'PROVIDER_STATUS_UNKNOWN'
-        elif attempt['payment_status'] == 'authorized' or recorded.get('outcome') == 'authorized':
-            state, reason = 'awaiting_capture', 'PAYMENT_AWAITING_CAPTURE'
-        elif recorded.get('outcome') == 'processing':
-            state, reason = 'processing', 'PAYMENT_PROCESSING'
-        elif recorded.get('outcome') == 'unpaid' and recorded.get('complete'):
-            state, reason = 'unpaid', None
-            payable = bool(intent.razorpayOrderId and intent.expiresAt > _now()
-                and intent.state in ('created', 'pending_provider_ack'))
-        else:
-            state, reason = 'status_unknown', 'PROVIDER_STATUS_UNKNOWN'
+        status = reducePurchaseCheckoutStatus(attempt, intent, providerState, results)
+        payable = (status.state == 'unpaid' and purpose == 'initial_purchase'
+            and intent.razorpayOrderId and intent.expiresAt > _now()
+            and intent.state in ('created', 'pending_provider_ack')
+            and self.repository.mayResumeInitialCheckout(userId, attemptId))
+        from dataclasses import replace
+        return replace(status, capabilities=PurchaseCheckoutCapabilities(mayResumeOriginal=bool(payable)))
 
-        # Other purposes retain their existing resumption APIs. Initial-purchase
-        # capability must also respect a fresh owner/coverage restriction check.
-        payable = payable and purpose == 'initial_purchase' and self.repository.mayResumeInitialCheckout(userId, attemptId)
-        return PurchaseCheckoutStatus(userId, intent.invoiceId, intent.attemptId,
-            purpose, state, providerState, reason,
-            capabilities=PurchaseCheckoutCapabilities(mayResumeOriginal=payable))
+
+def reducePurchaseCheckoutStatus(attempt, intent, providerState, results=(), mayResume=False):
+    """One conservative reducer shared by status refresh and stored editor reads."""
+    from api.services.billing.manualBillingRepository import ManualBillingRepository
+    frozen = ManualBillingRepository._json(attempt.get('metadata_json')).get('manualBilling', {})
+    recorded = frozen.get('providerObservation', {})
+    if any(result.state == 'requires_reconciliation' for result in results):
+        state, reason = 'needs_attention', 'PAYMENT_REQUIRES_RECONCILIATION'
+    elif attempt['payment_status'] == 'captured':
+        state, reason = 'completed', None
+    elif intent.state == 'requires_reconciliation':
+        state, reason = 'needs_attention', 'PAYMENT_REQUIRES_RECONCILIATION'
+    elif frozen.get('closedAt') or intent.state in ('expired', 'cancelled', 'superseded'):
+        state, reason = 'cancelled', 'ORIGINAL_CHECKOUT_CLOSED'
+    elif providerState == 'unknown':
+        state, reason = 'status_unknown', 'PROVIDER_STATUS_UNKNOWN'
+    elif attempt['payment_status'] == 'authorized' or recorded.get('outcome') == 'authorized':
+        state, reason = 'awaiting_capture', 'PAYMENT_AWAITING_CAPTURE'
+    elif recorded.get('outcome') == 'processing':
+        state, reason = 'processing', 'PAYMENT_PROCESSING'
+    elif recorded.get('outcome') == 'unpaid' and recorded.get('complete'):
+        state, reason = 'unpaid', None
+    else:
+        state, reason = 'status_unknown', 'PROVIDER_STATUS_UNKNOWN'
+
+    return PurchaseCheckoutStatus(intent.userId, intent.invoiceId, intent.attemptId,
+        intent.purpose, state, providerState, reason,
+        capabilities=PurchaseCheckoutCapabilities(mayResumeOriginal=bool(mayResume and state == 'unpaid')))

@@ -28,6 +28,10 @@ def erasureDb(runtimeDb):
         cursor.execute((root/'supabase/migrations/20260823190224_create_user_erasure_workflow.sql').read_text())
         for path in (root/'supabase/migrations').glob('*_complete_subscription_erasure_retention.sql'):
             cursor.execute(path.read_text())
+        # The legacy fixture allowlist installs additive storage before this
+        # fixture's retention schema. Reapply its idempotent archive extension.
+        for path in (root/'supabase/migrations').glob('*_add_editable_purchase_checkout.sql'):
+            cursor.execute(path.read_text())
     return runtimeDb
 
 
