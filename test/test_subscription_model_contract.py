@@ -112,9 +112,20 @@ def test_restrictions_prevent_trial_without_creating_credit_or_trial_history(boo
         admin=query(factory,"INSERT INTO admin_users(email,name,password_hash) VALUES(%s,'Synthetic','not-a-real-password') RETURNING id",(str(uuid4())+'@example.test',),True)['id']
         query(factory,'UPDATE "Users" SET "isBanned"=true,"bannedAt"=now(),"bannedBy"=%s WHERE "userId"=%s',(admin,user))
     else:query(factory,'UPDATE subscriptions SET erasure_pending=true WHERE user_id=%s',(user,))
-    with pytest.raises(ValueError,match='TRIAL_NOT_ELIGIBLE'):repo.activateTrial(user,('banking',))
-    assert not query(factory,'SELECT user_id FROM credit_balances WHERE user_id=%s',(user,))
-    assert not query(factory,"SELECT id FROM billing_events WHERE user_id=%s AND event_type='subscription.trial_started'",(user,))
+    try:
+        with pytest.raises(ValueError,match='TRIAL_NOT_ELIGIBLE'):repo.activateTrial(user,('banking',))
+        assert not query(factory,'SELECT user_id FROM credit_balances WHERE user_id=%s',(user,))
+        assert not query(factory,"SELECT id FROM billing_events WHERE user_id=%s AND event_type='subscription.trial_started'",(user,))
+        if restriction=='erasure':
+            with closing(factory()) as db,db,db.cursor(cursor_factory=RealDictCursor) as cursor:
+                row=query(factory,'SELECT * FROM subscriptions WHERE user_id=%s',(user,),True)
+                with pytest.raises(ValueError,match='REVIEW_ERASURE_PENDING'):
+                    SubscriptionModelRepository(factory).archiveLegacySnapshot(cursor,row)
+    finally:
+        # This temporary negative fixture is not a real erasure request. The
+        # subsequent module contraction must not archive an active erasure.
+        if restriction=='erasure':
+            query(factory,'UPDATE subscriptions SET erasure_pending=false WHERE user_id=%s',(user,))
 
 
 def oldNative(repo,factory,user):

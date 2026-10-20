@@ -87,6 +87,19 @@ def metadata(row, field='metadata_json') -> dict:
     return value
 
 
+def manualMetadata(row, field='metadata_json') -> dict:
+    value = metadata(row, field).get('manualBilling', {})
+    if not isinstance(value, dict):
+        raise ValueError('INVALID_MANUAL_BILLING_METADATA')
+    return value
+
+
+def _ownedSubscriptionIds(row, others):
+    if any(other.get('user_id') != row['user_id'] for other in others):
+        raise ValueError('SUBSCRIPTION_OWNER_MISMATCH')
+    return {str(row['id']), *(str(other['id']) for other in others)}
+
+
 def acceptedCapture(row, invoice, events):
     """Match the committed capture to the complete owned invoice identity."""
     matches = [e for e in events if e.get('event_type') == 'payment.capture'
@@ -105,14 +118,19 @@ def acceptedCapture(row, invoice, events):
     return matches[0]
 
 
-def acceptedPeriods(row, invoices, events, *, allowExpertAdditions=False) -> tuple[PurchasedPeriod, ...]:
+def acceptedPeriods(row, invoices, events, *, otherSubscriptions=(), allowExpertAdditions=False) -> tuple[PurchasedPeriod, ...]:
+    owned = _ownedSubscriptionIds(row, otherSubscriptions)
     periods = []
     for invoice in invoices:
-        if invoice.get('userId') != row['user_id'] or str(invoice.get('subscription_id')) != str(row['id']):
+        if invoice.get('userId') != row['user_id'] or str(invoice.get('subscription_id')) not in owned:
             raise ValueError('INVOICE_OWNER_MISMATCH')
+        # Historical rows contribute account-level money guards and review
+        # evidence, never service authority for this subscription identity.
+        if str(invoice['subscription_id']) != str(row['id']):
+            continue
         if str(invoice.get('status')).upper() != 'PAID':
             continue
-        frozen = metadata(invoice).get('manualBilling', {})
+        frozen = manualMetadata(invoice)
         if invoice.get('billing_reason') == 'add_on' and frozen.get('purpose') in (None, 'topup'):
             continue
         if allowExpertAdditions and frozen.get('purpose') == 'expert_addition':
@@ -134,13 +152,15 @@ def acceptedPeriods(row, invoices, events, *, allowExpertAdditions=False) -> tup
     return tuple(periods)
 
 
-def factsFromRecords(row, owner, invoices, events, *, consumed):
+def factsFromRecords(row, owner, invoices, events, *, consumed, otherSubscriptions=()):
     if not owner or owner.get('userId') != row['user_id'] or type(owner.get('isBanned')) is not bool:
         raise ValueError('OWNER_AUTHORITY_MISSING')
+    owned = _ownedSubscriptionIds(row, otherSubscriptions)
     for event in events:
-        if event.get('user_id') != row['user_id'] or str(event.get('subscription_id')) != str(row['id']):
+        if (event.get('user_id') != row['user_id'] or
+                (event.get('subscription_id') is not None and str(event['subscription_id']) not in owned)):
             raise ValueError('EVENT_OWNER_MISMATCH')
-    periods = acceptedPeriods(row, invoices, events)
+    periods = acceptedPeriods(row, invoices, events, otherSubscriptions=otherSubscriptions)
     unresolved, attempts = unresolvedMoneyFacts(invoices, events)
     trial = TrialFacts(timestamp(row.get('trial_started_at')), timestamp(row.get('trial_ends_at')),
                        timestamp(row.get('trial_closed_at')), EXPERTS if row.get('trial_started_at') else (), consumed)
@@ -154,7 +174,7 @@ def unresolvedMoneyFacts(invoices, events):
     unresolved, attempts = False, []
     invoiceStates = {str(i['id']): str(i.get('status')).upper() for i in invoices}
     for event in events:
-        frozen = metadata(event).get('manualBilling', {})
+        frozen = manualMetadata(event)
         status = event.get('payment_status')
         pending = (event.get('event_type') in ('payment.capture', 'payment.unmapped')
                    and event.get('event_status') in ('OBSERVED', 'REQUIRES_RECONCILIATION'))
@@ -175,6 +195,23 @@ def unresolvedMoneyFacts(invoices, events):
     return unresolved, attempts
 
 
+def _checkHistoricalService(row, others, invoices, events, now):
+    # A trial-consumption review cannot resolve a different row's paid service.
+    # Validate that service separately; never move its grants onto this row.
+    for historical in others:
+        siblings = (row, *(other for other in others if str(other['id']) != str(historical['id'])))
+        periods = acceptedPeriods(historical, invoices, events, otherSubscriptions=siblings)
+        if not periods and (historical.get('billing_mode') not in ('none', None)
+                            or historical.get('plan_type') in ('pro', 'annual')):
+            raise ValueError('OTHER_PAID_HISTORY_REQUIRES_REVIEW')
+        for period in periods:
+            if period.start is None or period.end is None or period.end <= period.start:
+                raise ValueError('OTHER_PAID_HISTORY_REQUIRES_REVIEW')
+            end = min(period.end, period.revokedAt) if period.revokedAt else period.end
+            if end > now:
+                raise ValueError('OTHER_PAID_SERVICE_REQUIRES_REVIEW')
+
+
 def buildBackfillProposal(row, owner, invoices, events, *, now, otherSubscriptions=(), trialReview=None):
     """Return an inspectable proposal; only the transaction layer can apply it."""
     proposal = {'schemaVersion': 2, 'subscriptionId': str(row['id']), 'userId': row['user_id'],
@@ -187,11 +224,12 @@ def buildBackfillProposal(row, owner, invoices, events, *, now, otherSubscriptio
                 or not isinstance(trialReview.get('reviewReference'), str) or not trialReview['reviewReference'].strip()):
             raise ValueError('TRIAL_REVIEW_REFERENCE_REQUIRED')
         state = metadata(row, 'billing_state')
-        paid = acceptedPeriods(row, invoices, events)
+        manual = manualMetadata(row, 'billing_state')
+        paid = acceptedPeriods(row, invoices, events, otherSubscriptions=otherSubscriptions)
         removals = row.get('pending_removals') or []
         removals = json.loads(removals) if isinstance(removals, str) else removals
         if removals:
-            lifecycle = state.get('manualBilling', {}).get('lifecycleId')
+            lifecycle = manual.get('lifecycleId')
             destinations = [metadata(e).get('nextSelection', {}) for e in events
                 if e.get('event_type') == 'subscription.next_selection' and e.get('event_status') == 'COMMITTED']
             current = set(row.get('subscribed_experts') or [])
@@ -203,13 +241,15 @@ def buildBackfillProposal(row, owner, invoices, events, *, now, otherSubscriptio
         for addition in additions:
             attempt = next((e for e in events if str(e.get('id')) == str(addition.get('attemptId'))
                 and e.get('event_category') == 'payment_attempt'), None)
-            frozen = metadata(attempt).get('manualBilling', {}) if attempt else {}
+            frozen = manualMetadata(attempt) if attempt else {}
             if (not frozen.get('servicePeriodId') or addition.get('domain') not in frozen.get('domains', [])
                     or frozen.get('purpose') != 'expert_addition'):
                 raise ValueError('LEGACY_ADDITION_DESTINATION_REQUIRES_REVIEW')
-        consumed = bool(state.get('trialConsumed') or state.get('trialConsumedAt') or row.get('plan_type') == 'free')
+        consumed = bool(state.get('trialConsumed') or state.get('trialConsumedAt') or row.get('plan_type') == 'free'
+                        or (trialReview or {}).get('consumed'))
         if otherSubscriptions and not (trialReview or {}).get('consumed'):
             raise ValueError('OTHER_SUBSCRIPTION_HISTORY_REQUIRES_REVIEW')
+        _checkHistoricalService(row, otherSubscriptions, invoices, events, now)
         started, ended, closed = None, None, None
         resolution = 'verified'
         if consumed:
@@ -222,15 +262,13 @@ def buildBackfillProposal(row, owner, invoices, events, *, now, otherSubscriptio
                 resolution = 'consumed_dates_unknown'
             else:
                 raise ValueError('TRIAL_DATES_REQUIRE_REVIEW')
-        elif otherSubscriptions:
-            consumed, resolution = True, 'consumed_dates_unknown'
         if not paid and (row.get('billing_mode') not in ('none', None) or row.get('plan_type') in ('pro', 'annual')):
             raise ValueError('PAID_HISTORY_REQUIRES_REVIEW')
         if not paid and not consumed and (row.get('status') != 'none' or row.get('current_period_start') or row.get('current_period_end') or state.get('churn_snapshot')):
             raise ValueError('UNKNOWN_SERVICE_HISTORY')
         if not paid and not consumed and ((owner or {}).get('creditHistory') or row.get('admin_credit_generation')):
             raise ValueError('CREDIT_OR_ADMIN_HISTORY_REQUIRES_REVIEW')
-        lifecycle = metadata(row, 'billing_state').get('manualBilling', {}).get('lifecycleId')
+        lifecycle = manual.get('lifecycleId')
         if paid:
             lifecycle = lifecycle or max(paid, key=lambda p: p.start).lifecycleId
         if lifecycle:
@@ -239,8 +277,8 @@ def buildBackfillProposal(row, owner, invoices, events, *, now, otherSubscriptio
             closed = min(p.start for p in paid)
         patch = jsonValue(dict(plan_code='pro' if consumed or paid else None,
             lifecycle_id=lifecycle, trial_started_at=started, trial_ends_at=ended, trial_closed_at=closed,
-            cancellation_requested_at=timestamp(state.get('manualBilling', {}).get('cancellationRequestedAt'))))
-        facts = factsFromRecords(row | patch, owner, invoices, events, consumed=consumed)
+            cancellation_requested_at=timestamp(manual.get('cancellationRequestedAt'))))
+        facts = factsFromRecords(row | patch, owner, invoices, events, consumed=consumed, otherSubscriptions=otherSubscriptions)
         evaluateSubscription(facts, now)
         proposal.update(resolution=resolution, patch=patch, trialConsumed=consumed)
     except (ValueError, KeyError, TypeError, SubscriptionAuthorityUnavailable) as exc:

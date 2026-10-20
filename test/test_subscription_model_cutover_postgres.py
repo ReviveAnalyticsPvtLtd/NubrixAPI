@@ -38,7 +38,8 @@ def retainedDb(modelDb):
         'CREATE OR REPLACE FUNCTION public.guard_subscription_model_evidence()',1)[0]
     with closing(factory()) as db,db,db.cursor() as cursor:
         cursor.execute('DROP SCHEMA IF EXISTS private CASCADE')
-        cursor.execute('CREATE TABLE public.user_erasure_requests(id uuid PRIMARY KEY)')
+        cursor.execute('''CREATE TABLE public.user_erasure_requests(id uuid PRIMARY KEY,
+            target_user_id text,status text NOT NULL DEFAULT 'PENDING')''')
         cursor.execute(prefix)
     yield modelDb
     with closing(factory()) as db,db,db.cursor() as cursor:
@@ -48,6 +49,43 @@ def retainedDb(modelDb):
 def collect(factory):
     from scripts.subscription_model_cutover import collectState
     return collectState(factory)
+
+
+def test_collector_does_not_hold_account_locks_during_financial_hashing(modelDb, monkeypatch):
+    from api.services.billing.manualBillingRepository import _advisoryKey
+    from scripts import subscription_model_cutover as cutover
+    factory, repo = modelDb
+    seed(factory)
+    repo.applyReviewedDecision(decision(repo), now=NOW)
+    original = cutover._financialDigests
+    observed = []
+    def whileCollectorIsOpen(cursor):
+        with closing(factory()) as writer, writer, writer.cursor() as other:
+            other.execute('SELECT pg_try_advisory_xact_lock(%s)', (_advisoryKey(OWNER['userId']),))
+            assert other.fetchone()[0], 'Read-only review holds the payment owner lock'
+            other.execute('UPDATE subscriptions SET version=version+1 WHERE user_id=%s RETURNING version', (OWNER['userId'],))
+            observed.append(other.fetchone()[0])
+        return original(cursor)
+    monkeypatch.setattr(cutover, '_financialDigests', whileCollectorIsOpen)
+    result = collect(factory)
+    assert len(observed) == 1
+    assert result['rows'][0]['version'] == observed[0] - 1
+    assert result['authorityFailures'] == 0
+    with closing(factory()) as db, db.cursor() as cursor:
+        cursor.execute('SELECT version FROM subscriptions WHERE user_id=%s', (OWNER['userId'],))
+        assert cursor.fetchone()[0] == observed[0]
+
+
+@pytest.mark.parametrize('readonly,isolation', [(False,'REPEATABLE READ'),(True,'READ COMMITTED')])
+def test_snapshot_reader_refuses_ordinary_runtime_transactions(modelDb, readonly, isolation):
+    from scripts.subscription_model_cutover import _snapshotRepository
+    from psycopg2.extras import RealDictCursor
+    factory, _ = modelDb
+    with closing(factory()) as db:
+        db.set_session(readonly=readonly, isolation_level=isolation)
+        with db, db.cursor(cursor_factory=RealDictCursor) as cursor:
+            with pytest.raises(ValueError, match='READ_ONLY_REPEATABLE_SNAPSHOT_REQUIRED'):
+                _snapshotRepository(factory)._records(cursor, OWNER['userId'])
 
 
 def test_real_review_archive_and_finances_are_observed_without_writes(modelDb):

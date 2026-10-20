@@ -269,11 +269,36 @@ def _retentionProtected(cursor):
     return triggers and cursor.fetchone()['present']
 
 
+def _snapshotRepository(connectionFactory):
+    from api.services.billing.manualBillingRepository import ManualBillingRepository
+    from api.services.subscriptions.subscriptionModelRepository import SubscriptionModelRepository
+
+    class SnapshotModel(SubscriptionModelRepository):
+        @staticmethod
+        def _lock(cursor, userId):
+            # The collector already has a consistent MVCC snapshot. Keep the
+            # bypass local and refuse it in an ordinary runtime transaction.
+            cursor.execute("""SELECT current_setting('transaction_read_only') AS readonly,
+                current_setting('transaction_isolation') AS isolation""")
+            settings = cursor.fetchone()
+            if settings['readonly'] != 'on' or settings['isolation'] != 'repeatable read':
+                raise ValueError('READ_ONLY_REPEATABLE_SNAPSHOT_REQUIRED')
+
+        def _runtimeBillingRepository(self):
+            return SnapshotBilling(self.connectionFactory)
+
+    class SnapshotBilling(ManualBillingRepository):
+        def _modelRepository(self):
+            return model
+
+    model = SnapshotModel(connectionFactory)
+    return model
+
+
 def collectState(connectionFactory):
     """One read-only repeatable snapshot; only aggregate output leaves main()."""
     from psycopg2.extras import RealDictCursor
     from api.services.subscriptions.subscriptionModel import SubscriptionAuthorityUnavailable, evaluateSubscription
-    from api.services.subscriptions.subscriptionModelRepository import SubscriptionModelRepository
     from api.services.userErasureRetention import retentionAvailable
     with closing(connectionFactory()) as db:
         db.set_session(isolation_level='REPEATABLE READ', readonly=True)
@@ -305,7 +330,7 @@ def collectState(connectionFactory):
             cursor.execute("""SELECT EXISTS(SELECT 1 FROM pg_trigger WHERE tgrelid='public.subscriptions'::regclass
                 AND tgname='trg_subscriptions_updated_at' AND NOT tgisinternal AND tgenabled IN ('O','A')) AS present""")
             trigger = cursor.fetchone()['present']
-            model, failures = SubscriptionModelRepository(connectionFactory), 0
+            model, failures = _snapshotRepository(connectionFactory), 0
             now = model._now(cursor)
             for row in rows:
                 if row.get('is_canonical') is True:

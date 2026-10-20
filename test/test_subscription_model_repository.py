@@ -31,6 +31,112 @@ def test_missing_finalized_capture_cannot_grant_paid_access(account):
         repo.getCoverageSnapshot(intent.userId, NOW)
 
 
+def test_runtime_accepts_owner_scoped_usage_audit_without_changing_paid_service(account):
+    repo, _, initial, url = account
+    query(url, '''INSERT INTO billing_events(user_id,event_category,event_type,event_status)
+        VALUES(%s,'audit','credit.usage_reported','SETTLED')''', (initial.userId,))
+    snapshot = repo.getCoverageSnapshot(initial.userId, NOW)
+    assert snapshot.accessAllowed and snapshot.currentPeriod.invoiceId == initial.invoiceId
+    assert snapshot.currentPeriod.domains == ('banking', 'manufacturing')
+
+
+@pytest.mark.parametrize('closed', [False, True])
+def test_runtime_historical_money_blocks_renewal_without_transferring_service(account, closed):
+    from uuid import uuid4
+    from psycopg2.extras import Json
+    repo, _, initial, url = account
+    old, invoice, attempt = [str(uuid4()) for _ in range(3)]
+    query(url, 'INSERT INTO subscriptions(id,user_id,is_canonical) VALUES(%s,%s,false)', (old, initial.userId))
+    query(url, '''INSERT INTO "Invoices"(id,"userId",subscription_id,status,total_amount,currency)
+        VALUES(%s,%s,%s,'PAYMENT_PENDING',100,'INR')''', (invoice, initial.userId, old))
+    metadata = {'manualBilling': {'closedAt': NOW.isoformat(), 'closureReconciledAt': NOW.isoformat()}} if closed else {}
+    query(url, '''INSERT INTO billing_events(id,user_id,subscription_id,invoice_id,event_category,event_type,
+        payment_attempt_type,payment_status,attempted_at,provider_order_id,amount,currency,metadata_json)
+        VALUES(%s,%s,%s,%s,'payment_attempt','checkout','checkout',%s,%s,%s,100,'INR',%s)''',
+        (attempt, initial.userId, old, invoice, 'cancelled' if closed else 'authorized', NOW, 'history-'+attempt, Json(metadata)))
+    from api.services.subscriptions.subscriptionSnapshotService import SubscriptionSnapshotService
+    snapshot = SubscriptionSnapshotService(repo.runtimeSnapshotFactsLoader).get(initial.userId, NOW)
+    assert snapshot.status == 'active' and snapshot.currentPeriod.invoiceId == initial.invoiceId
+    assert snapshot.renewalAvailable is closed
+    assert snapshot.purchaseBlockReason == ('current_coverage' if closed else 'recovery_required')
+
+
+def test_changed_next_selection_does_not_open_a_second_order_with_unresolved_money(account):
+    repo, _, initial, url = account
+    original = renewal(account)
+    attempt = repo.reserveCheckout(CheckoutRequest(initial.userId, 'renewal', 'monthly_prepaid',
+        {'invoiceId': str(original['id'])}, 'original-browser', expectedCatalogRevision=1))
+    repo.bindProviderOrder(attempt.attemptId, {'id': 'original-authorized-order'})
+    query(url, "UPDATE billing_events SET payment_status='authorized' WHERE id=%s", (attempt.attemptId,))
+    selection(account, ['banking'])
+    revised = renewal(account)
+    assert str(revised['id']) != str(original['id'])
+    with pytest.raises(ValueError, match='RECOVERY_REQUIRED'):
+        repo.reserveCheckout(CheckoutRequest(initial.userId, 'renewal', 'monthly_prepaid',
+            {'invoiceId': str(revised['id'])}, 'another-browser', expectedCatalogRevision=1))
+
+
+def test_safely_expired_v2_renewal_replays_original_key_and_replaces_with_fresh_key(account):
+    from datetime import timedelta
+    from dataclasses import replace
+    from psycopg2.extras import Json
+    from api.services.billing.manualBillingContracts import CheckoutProviderSnapshot
+    repo, _, initial, url = account
+    invoice = renewal(account)
+    request = CheckoutRequest(initial.userId, 'renewal', 'monthly_prepaid',
+        {'invoiceId': str(invoice['id'])}, 'clean-expired-original', expectedCatalogRevision=1)
+    original = repo.reserveCheckout(request)
+    order = 'clean-expired-order-' + original.attemptId
+    repo.bindProviderOrder(original.attemptId, {'id': order})
+    observed = query(url, 'SELECT clock_timestamp() AS now', one=True)['now']
+    attempt = repo.attemptById(initial.userId, original.attemptId)
+    metadata = repo._json(attempt['metadata_json'])
+    metadata['manualBilling']['expiresAt'] = (observed - timedelta(seconds=1)).isoformat()
+    query(url, 'UPDATE billing_events SET metadata_json=%s WHERE id=%s',
+        (Json(metadata), original.attemptId))
+    repo.recordProviderObservation(original.attemptId, CheckoutProviderSnapshot(
+        original.attemptId, order, 'unpaid', observed, True, original.amount, original.currency, ()))
+    before = query(url, 'SELECT * FROM credit_balances WHERE user_id=%s', (initial.userId,), one=True)
+    paid = repo.getCoverageSnapshot(initial.userId, observed)
+    count = len(query(url, "SELECT id FROM billing_events WHERE user_id=%s AND event_category='payment_attempt'",
+        (initial.userId,)))
+
+    replay = repo.reserveCheckout(request)
+    assert replay.attemptId == original.attemptId and replay.razorpayOrderId == order
+    assert len(query(url, "SELECT id FROM billing_events WHERE user_id=%s AND event_category='payment_attempt'",
+        (initial.userId,))) == count
+
+    replacement = repo.reserveCheckout(replace(request, requestKey='clean-expired-fresh'))
+    assert replacement.attemptId != original.attemptId and replacement.invoiceId == original.invoiceId
+    assert replacement.state == 'created' and replacement.razorpayOrderId is None
+    closed = repo.attemptById(initial.userId, original.attemptId)
+    closure = repo._json(closed['metadata_json'])['manualBilling']
+    assert closed['payment_status'] == 'expired'
+    assert closure['closedReason'] == 'CHECKOUT_EXPIRED'
+    assert closure['closureReconciledAt'] >= closure['closedAt']
+    replay = repo.reserveCheckout(request)
+    assert replay.attemptId == original.attemptId and replay.state == 'expired'
+    assert repo.reserveCheckout(replace(request, requestKey='clean-expired-fresh')).attemptId == replacement.attemptId
+    assert len(query(url, "SELECT id FROM billing_events WHERE user_id=%s AND event_category='payment_attempt'",
+        (initial.userId,))) == count + 1
+    assert repo.getCoverageSnapshot(initial.userId, observed).currentPeriod == paid.currentPeriod
+    assert query(url, 'SELECT * FROM credit_balances WHERE user_id=%s', (initial.userId,), one=True) == before
+
+
+def test_committed_trial_proof_cannot_become_new_trial_eligibility_when_core_is_missing(account):
+    from uuid import uuid4
+    from api.services.subscriptions.subscriptionSnapshotService import SubscriptionSnapshotService
+    repo, _, _, url = account
+    user = 'trial-core-review-' + str(uuid4())
+    query(url, 'INSERT INTO "Users"("userId") VALUES(%s)', (user,))
+    repo.ensureCanonicalSubscription(user)
+    repo.activateTrial(user, ('banking',))
+    query(url, '''UPDATE subscriptions SET plan_code=NULL,trial_started_at=NULL,
+        trial_ends_at=NULL,trial_closed_at=NULL WHERE user_id=%s''', (user,))
+    with pytest.raises(SubscriptionAuthorityUnavailable):
+        SubscriptionSnapshotService(repo.runtimeSnapshotFactsLoader).get(user, NOW)
+
+
 def test_quote_freezes_selection_created_before_invoice_and_ignores_array_tampering(account):
     repo, model, intent, url = account
     selected = selection(account, ['banking'])

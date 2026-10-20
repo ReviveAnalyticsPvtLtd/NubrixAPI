@@ -21,12 +21,24 @@ class SubscriptionWorkerService:
             snapshotService = SubscriptionSnapshotService(repository.runtimeSnapshotFactsLoader)
         self.snapshots = snapshotService
 
+    def _owners(self):
+        after = None
+        while True:
+            page = self.client.table('subscriptions').select('id, user_id, erasure_pending').eq('is_canonical',True).order('id').limit(500)
+            if after is not None:
+                page = page.gt('id', after)
+            rows = page.execute().data or []
+            if not rows:
+                return
+            yield from rows
+            after = rows[-1]['id']
+
     def execute(self, *, interval=None, reminders=False, trialWarnings=False, now=None):
         now = now or utcNow()
-        rows = self.client.table('subscriptions').select('id, user_id, erasure_pending').eq('is_canonical',True).execute().data or []
-        result = dict(scanned=len(rows), materialized=0, prepared=0, enqueued=0,
+        result = dict(scanned=0, materialized=0, prepared=0, enqueued=0,
             expired=0, duplicates=0, skipped=0, errors=0)
-        for row in rows:
+        for row in self._owners():
+            result['scanned'] += 1
             try:
                 if row.get('erasure_pending'):
                     result['skipped'] += 1
