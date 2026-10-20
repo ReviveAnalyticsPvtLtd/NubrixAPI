@@ -25,6 +25,8 @@ def checkoutDb(erasureDb):
     for _ in range(2):
         with psycopg2.connect(erasureDb) as db, db.cursor() as cursor:
             cursor.execute(paths[0].read_text())
+            for recovery in (ROOT / 'supabase/migrations').glob('*_recover_cancelled_purchase.sql'):
+                cursor.execute(recovery.read_text())
     return erasureDb
 
 
@@ -40,6 +42,7 @@ def drafts(checkoutDb, monkeypatch):
     billing = ManualBillingRepository(lambda: psycopg2.connect(checkoutDb))
     billing.ensureCanonicalSubscription(user)
     repo = importlib.import_module(name).PurchaseCheckoutRepository(lambda: psycopg2.connect(checkoutDb))
+    repo.recordPurchaseWorkerHeartbeat()
     return repo, billing, user, checkoutDb
 
 
@@ -693,7 +696,7 @@ def test_capture_does_not_charge_with_conflicting_or_unknown_order_evidence(draf
     evidence = authorization(repo, provider, intent)
     operation = repo.reserveCapture(intent.userId, intent.attemptId, evidence.providerPaymentId)
     if condition == 'order_outage':
-        def unavailable(_):
+        def unavailable(_,**options):
             raise TimeoutError('synthetic Order read unavailable')
         provider.order.fetch = unavailable
     else:

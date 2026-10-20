@@ -13,6 +13,7 @@ from nubrix.triggers.tasks.generateForecasts import GenerateForecasts
 from nubrix.triggers.tasks.renewalLifecycleTask import RenewalLifecycleTask
 from nubrix.triggers.tasks.annualRenewalTask import AnnualRenewalTask
 from nubrix.triggers.tasks.reconciliationTask import ReconciliationTask
+from nubrix.triggers.tasks.purchaseOperationTask import PurchaseOperationTask
 from nubrix.triggers.tasks.billingMetricsTask import BillingMetricsTask
 from nubrix.triggers.tasks.entitlementBoundaryTask import EntitlementBoundaryTask
 from nubrix.triggers.tasks.subscriptionExpiryTask import SubscriptionExpiryTask
@@ -69,6 +70,10 @@ def runReconciliation():
 def runBillingMetrics():
     return BillingMetricsTask().execute()
 
+@celeryApp.task(name=f"{APP_NAME}.purchaseOperations")
+def runPurchaseOperations():
+    return PurchaseOperationTask().execute()
+
 @celeryApp.task(name=f"{APP_NAME}.subscriptionExpiry")
 def runSubscriptionExpiry():
     return SubscriptionExpiryTask().execute()
@@ -112,6 +117,7 @@ def runNotificationCleanup():
 
 
 celeryApp.conf.beat_schedule = {
+    "purchase-operations-every-minute": {"task": f"{APP_NAME}.purchaseOperations", "schedule": crontab(minute="*")},
     "monthly-renewal-hourly": {"task": f"{APP_NAME}.monthlyRenewal", "schedule": crontab(minute=0)},
     "annual-renewal-daily": {"task": f"{APP_NAME}.annualRenewal", "schedule": crontab(minute=30, hour=0)},
     "renewal-reminders-daily": {"task": f"{APP_NAME}.renewalLifecycle", "schedule": crontab(minute=0, hour=2)},

@@ -1,18 +1,18 @@
-"""Owned draft transactions and durable purchase-operation inventory; no provider I/O."""
-from dataclasses import replace
+"""Owned draft transactions, financial bindings and durable recovery inventory."""
 from uuid import UUID
 
 from psycopg2.extras import Json, RealDictCursor
 
 from api.models import SavePurchaseDraftRequest
 from api.services.billing.manualBillingRepository import ManualBillingRepository, _now, _utc
-from api.services.billing.purchaseCheckoutContracts import PurchaseDraft, PurchaseEditorState, PurchaseCheckoutCapabilities
+from api.services.billing.purchaseCheckoutContracts import PurchaseDraft, PurchaseEditorState
 from api.services.billing.purchaseDraftService import editableCheckoutEnabled
+from api.services.billing.purchaseOperationRepository import PurchaseOperationRepositoryMixin
 
 TABLES = ('subscription_purchase_drafts', 'subscription_purchase_checkout_controls', 'subscription_purchase_operations')
 
 
-class PurchaseCheckoutRepository(ManualBillingRepository):
+class PurchaseCheckoutRepository(PurchaseOperationRepositoryMixin, ManualBillingRepository):
     @staticmethod
     def _requireStorage(cursor):
         for table in TABLES:
@@ -62,10 +62,9 @@ class PurchaseCheckoutRepository(ManualBillingRepository):
                     if not frozen.get('closedAt') and intent.state not in ('cancelled', 'expired', 'superseded', 'captured'):
                         draft = PurchaseDraft(userId, domains=tuple(frozen.get('domains', [])),
                             billingInterval='year' if frozen.get('billingMode') == 'annual_prepaid' else 'month')
-                capabilities = PurchaseCheckoutCapabilities(mayEditDraft=bool(allowed and editableCheckoutEnabled()))
-                if checkout:
-                    checkout = replace(checkout, capabilities=capabilities)
-                return PurchaseEditorState(userId, self._draft(userId, stored) if stored else draft,
+                draft = self._draft(userId, stored) if stored else draft
+                checkout,capabilities = self._purchasePresentation(cursor,checkout,draft,allowed)
+                return PurchaseEditorState(userId, draft,
                     enabled=editableCheckoutEnabled(), checkout=checkout, capabilities=capabilities)
         return self._run(operation)
 
@@ -185,6 +184,8 @@ class PurchaseCheckoutRepository(ManualBillingRepository):
         def operation(connection):
             with connection.cursor(cursor_factory=RealDictCursor) as cursor:
                 subscription, invoice, attempt, control = self._ownedPurchaseLocked(cursor, userId, attemptId)
+                if not self._purchaseRecoveryReady(cursor):
+                    raise ValueError('PURCHASE_ACTIONS_UNAVAILABLE')
                 if self._cancelReplayLocked(cursor, userId, attemptId, expectedOperationRevision, requestKey):
                     return
                 if invoice['status'] == 'PAID' or attempt['payment_status'] == 'captured':
@@ -438,6 +439,8 @@ def guardInitialPurchaseLocked(billing, cursor, request, subscription, now):
         return
     requirePurchaseActions()
     requireManualCaptureCurrency(request.currency)
+    if not PurchaseCheckoutRepository._purchaseRecoveryReady(cursor):
+        raise ValueError('PURCHASE_ACTIONS_UNAVAILABLE')
     cursor.execute('SELECT * FROM public.subscription_purchase_drafts WHERE user_id=%s', (request.userId,))
     draft = cursor.fetchone()
     if not draft or type(request.purchaseDraftRevision) is not int or draft['revision'] != request.purchaseDraftRevision:

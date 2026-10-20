@@ -22,6 +22,7 @@ EXPAND=(
     '20261007194402_allow_inactive_credit_domains.sql',
     '20261007194411_restrict_financial_data_access.sql',
     '20261020172948_add_editable_purchase_checkout.sql',
+    '20261021001500_recover_cancelled_purchase.sql',
 )
 CONTRACT='20261005195626_contract_recurring_billing_fields.sql'
 RETIREMENT_EVIDENCE=(

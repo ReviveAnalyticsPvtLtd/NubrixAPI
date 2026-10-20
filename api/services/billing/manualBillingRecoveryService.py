@@ -7,9 +7,10 @@ from api.services.billing.checkoutRecoveryPolicy import classifyCheckoutProvider
 
 
 class ManualBillingRecoveryService:
-    def __init__(self, repository, provider):
+    def __init__(self, repository, provider, requestOptions=None):
         self.repository = repository
         self.provider = provider
+        self.requestOptions = dict(requestOptions or {})
 
     @staticmethod
     def _pages(fetch, parameters=None):
@@ -33,12 +34,12 @@ class ManualBillingRecoveryService:
         complete = False
         outcome = 'unknown'
         try:
-            order = self.provider.order.fetch(orderId)
+            order = self.provider.order.fetch(orderId,**self.requestOptions)
             if (not isinstance(order, dict) or order.get('id') != orderId
                     or int(order.get('amount', -1)) != int(attempt['amount'])
                     or order.get('currency') != attempt['currency']):
                 raise ValueError('RECOVERY_ORDER_EVIDENCE_MISMATCH')
-            payments = tuple(self._pages(lambda params: self.provider.order.payments(orderId, params)))
+            payments = tuple(self._pages(lambda params: self.provider.order.payments(orderId, params,**self.requestOptions)))
             if any(not payment.get('id') or payment.get('order_id') != orderId
                     or int(payment.get('amount', -1)) != int(attempt['amount'])
                     or payment.get('currency') != attempt['currency'] for payment in payments):
@@ -56,7 +57,7 @@ class ManualBillingRecoveryService:
         if not orderId:
             matches = []
             listed = False
-            for order in self._pages(self.provider.order.all, {'receipt':str(attempt['id'])}):
+            for order in self._pages(lambda params:self.provider.order.all(params,**self.requestOptions), {'receipt':str(attempt['id'])}):
                 listed = True
                 notes = order.get('notes') or {}
                 if (order.get('receipt') == str(attempt['id'])
@@ -112,6 +113,9 @@ class ManualBillingRecoveryService:
                 'captured','server_observation',int(payment['amount']),snapshot.observedAt,
                 None,None,False)
             result = self.repository.finalizeCapturedPayment(evidence)
+            if evidence.purpose=='initial_purchase' and result.state=='requires_reconciliation':
+                from api.services.billing.purchaseCheckoutRepository import PurchaseCheckoutRepository
+                PurchaseCheckoutRepository(self.repository.connectionFactory).reserveCompensation(evidence)
             results.append(result)
         if frozen.get('closedAt') and snapshot.outcome == 'unpaid' and not snapshot.payments:
             # A successful complete provider listing settles cancellation wording;

@@ -88,6 +88,14 @@ def listObligations(repository, limit=100, cursor=None):
         pages = []
         totals = Counter()
         with connection.cursor(cursor_factory=RealDictCursor) as sql:
+            sql.execute("SELECT to_regclass('public.subscription_purchase_operations') AS relation")
+            hasPurchase=bool(sql.fetchone()['relation'])
+            if hasPurchase:
+                table,alias,classification,condition,parameters,timeField=classifications[0]
+                condition='where ('+_EVENT_FILTER+''') AND NOT (a.event_type='payment.capture' AND EXISTS(
+                    SELECT 1 FROM public.subscription_purchase_operations o WHERE o.kind='compensation'
+                    AND o.provider_payment_id=a.provider_payment_id AND o.invoice_id=a.invoice_id AND o.state='succeeded'))'''
+                classifications[0]=(table,alias,classification,condition,parameters,timeField)
             for table, alias, classification, condition, parameters, timeField in classifications:
                 classified = 'select a.*, ' + classification + ' as obligation_category from public.' + table + ' a ' + condition
                 sql.execute('select obligation_category,count(*) as count from (' + classified + ') classified where obligation_category is not null group by obligation_category', parameters)
@@ -99,9 +107,26 @@ def listObligations(repository, limit=100, cursor=None):
                 sql.execute('select * from (' + classified + ') classified where obligation_category is not null' + afterFilter + ' order by ' + timestamp + ',' + key + ' limit %s',
                     parameters + (list(after) if after else []) + [limit+1])
                 pages.append(sql.fetchall())
-        return pages[0], pages[1], totals
+            purchase=[]
+            if hasPurchase:
+                sources=[('subscription_purchase_operations','id',
+                    "state NOT IN ('succeeded','cancelled')", "'purchase_'||kind"),
+                    ('subscription_purchase_checkout_controls','attempt_id',
+                    "cancellation_requested_at IS NOT NULL AND EXISTS(SELECT 1 FROM public.billing_events b WHERE b.id=a.attempt_id AND b.payment_status<>'captured' AND b.metadata_json->'manualBilling'->>'closureReconciledAt' IS NULL)",
+                    "'purchase_cancellation'")]
+                for table,identity,condition,category in sources:
+                    sql.execute(f'SELECT {category} AS category,count(*) AS count FROM public.{table} a WHERE {condition} GROUP BY category')
+                    totals.update({r['category']:int(r['count']) for r in sql.fetchall()})
+                    source='purchase_operation' if identity=='id' else 'purchase_cancellation'
+                    key="'"+source+":'||"+identity+'::text'
+                    afterFilter=f' AND (created_at,{key})>(%s,%s)' if after else ''
+                    sql.execute(f'''SELECT a.*,{identity} AS id,{category} AS obligation_category FROM public.{table} a
+                        WHERE {condition}{afterFilter} ORDER BY created_at,{identity} LIMIT %s''',
+                        (list(after) if after else [])+[limit+1])
+                    purchase.extend((source,r) for r in sql.fetchall())
+        return pages[0], pages[1], totals,purchase
     try:
-        events,deliveries,totals = repository._run(load)
+        events,deliveries,totals,purchase = repository._run(load)
     except Exception:
         return {'generatedAt':now.isoformat(),'available':False,'items':[],
                 'total':None,'totals':None,'nextCursor':None,'errors':['billing_database_unavailable']}
@@ -131,6 +156,10 @@ def listObligations(repository, limit=100, cursor=None):
     for row in deliveries:
         category = 'delivery_ambiguous' if row.get('last_error_code') in ('AMBIGUOUS_SEND','AMBIGUOUS_SEND_UNRESOLVED') or (row['status']=='SENDING' and row.get('submission_started_at')) else 'delivery_unresolved'
         project('delivery',row,category,'reconcile_original_tracking_tag' if category=='delivery_ambiguous' else 'dispatch_or_reconcile_original_delivery')
+    for source,row in purchase:
+        project(source,row,row['obligation_category'],'reconcile_original_purchase_operation')
+        rows[-1].update(state=row.get('state') or 'cancellation_pending',
+            reasonCode=row.get('error_code'),caseReference=row.get('escalation_reference'))
     from api.services.credits.creditUsageSpool import spoolDirectory
     spoolPaths = sorted(spoolDirectory().glob('*.json'), key=lambda path:(path.stat().st_mtime,path.stem))
     totals['usage_spooled'] += len(spoolPaths)

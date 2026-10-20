@@ -41,7 +41,11 @@ class PurchaseCheckoutStatusService:
         from dataclasses import replace
         status = replace(status, capabilities=PurchaseCheckoutCapabilities(mayResumeOriginal=bool(payable)))
         from api.services.billing.purchaseCheckoutRepository import storedPurchaseControl
-        return applyPurchaseControl(status, storedPurchaseControl(self.repository, userId, attemptId))
+        status = applyPurchaseControl(status, storedPurchaseControl(self.repository, userId, attemptId))
+        if purpose == 'initial_purchase':
+            from api.services.billing.purchaseCheckoutRepository import PurchaseCheckoutRepository
+            status = PurchaseCheckoutRepository(self.repository.connectionFactory).projectPurchaseStatus(status)
+        return status
 
 
 def applyPurchaseControl(status, control):

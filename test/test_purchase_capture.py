@@ -12,10 +12,10 @@ class SyntheticPurchaseProvider:
         self.orders, self.payments, self.orderCalls, self.captureCalls = {}, {}, [], []
         self.captureFault = None
         self.onCapture = None
-        self.order = SimpleNamespace(create=self.createOrder, fetch=lambda key: dict(self.orders[key]),
-            payments=self.orderPayments, all=lambda params: {'items': [dict(o) for o in self.orders.values()
+        self.order = SimpleNamespace(create=self.createOrder, fetch=lambda key,**options: dict(self.orders[key]),
+            payments=self.orderPayments, all=lambda params,**options: {'items': [dict(o) for o in self.orders.values()
                 if o['receipt'] == params['receipt']][params['skip']:params['skip']+params['count']]})
-        self.payment = SimpleNamespace(fetch=lambda key: dict(self.payments[key]), capture=self.capture)
+        self.payment = SimpleNamespace(fetch=lambda key,**options: dict(self.payments[key]), capture=self.capture)
 
     def createOrder(self, payload):
         self.orderCalls.append(payload)
@@ -23,7 +23,7 @@ class SyntheticPurchaseProvider:
         self.orders[key] = {**payload, 'id': key, 'status': 'created'}
         return dict(self.orders[key])
 
-    def orderPayments(self, key, params):
+    def orderPayments(self, key, params, **options):
         return {'items': [dict(p) for p in self.payments.values() if p['order_id'] == key]
             [params['skip']:params['skip']+params['count']]}
 
@@ -33,7 +33,7 @@ class SyntheticPurchaseProvider:
             'amount': intent.amount, 'currency': intent.currency}
         return dict(self.payments[key])
 
-    def capture(self, paymentId, amount, data):
+    def capture(self, paymentId, amount, data, **options):
         self.captureCalls.append((paymentId, {'amount': amount, **data}))
         if self.onCapture:
             self.onCapture()

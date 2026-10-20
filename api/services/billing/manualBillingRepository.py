@@ -2016,7 +2016,8 @@ class ManualBillingRepository:
                 provider_order_id,provider_payment_id,amount,currency,idempotency_key,failure_reason,metadata_json,occurred_at)
                 values(%s,%s,'reconciliation','payment.capture','REQUIRES_RECONCILIATION',%s,%s,%s,%s,%s,'ERASED_ACCOUNT',%s,%s)''',
                 (anomalyId,evidence.invoiceId,evidence.providerOrderId,evidence.providerPaymentId,evidence.amount,
-                 evidence.currency,'capture:'+evidence.providerPaymentId,Json({}),evidence.observedAt))
+                 evidence.currency,'capture:'+evidence.providerPaymentId,
+                 Json({'erasureRequestId':self._json(attempt.get('metadata_json')).get('erasureRequestId')}),evidence.observedAt))
         return FinalizationResult(evidence.invoiceId,evidence.attemptId,'requires_reconciliation','unchanged',
             False,False,True,None,None,anomalyId)
 

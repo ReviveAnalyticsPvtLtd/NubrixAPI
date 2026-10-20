@@ -318,6 +318,10 @@ class ManualPaymentService:
         """
         if self.repository is not None:
             result = self.repository.finalizeCapturedPayment(evidence)
+            if (evidence.financialStatus == 'captured' and evidence.purpose == 'initial_purchase'
+                    and result.state == 'requires_reconciliation' and hasattr(self.repository,'connectionFactory')):
+                from api.services.billing.purchaseCheckoutRepository import PurchaseCheckoutRepository
+                PurchaseCheckoutRepository(self.repository.connectionFactory).reserveCompensation(evidence)
             if evidence.financialStatus == 'authorized' and evidence.purpose == 'initial_purchase':
                 from api.services.billing.purchaseCheckoutService import purchaseActionsReady
                 if purchaseActionsReady():

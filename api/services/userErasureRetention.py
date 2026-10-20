@@ -97,13 +97,18 @@ def purchaseErasureInventory(cursor, userId):
     cursor.execute('''SELECT count(*) FROM public.subscription_purchase_operations
         WHERE user_id=%s AND state NOT IN ('succeeded','cancelled')''', (userId,))
     counts['unresolvedPurchaseOperations'] = int(scalar(cursor.fetchone()))
+    cursor.execute('''SELECT count(*) FROM public.subscription_purchase_checkout_controls c
+        JOIN public.billing_events b ON b.id=c.attempt_id WHERE c.user_id=%s
+        AND c.cancellation_requested_at IS NOT NULL AND b.payment_status<>'captured'
+        AND b.metadata_json->'manualBilling'->>'closureReconciledAt' IS NULL''',(userId,))
+    counts['unresolvedPurchaseCancellations'] = int(scalar(cursor.fetchone()))
     return counts
 
 
 def archivePurchaseOriginals(cursor, requestId, userId):
     counts = {}
     inventory = purchaseErasureInventory(cursor, userId)
-    if inventory.get('unresolvedPurchaseOperations'):
+    if inventory.get('unresolvedPurchaseOperations') or inventory.get('unresolvedPurchaseCancellations'):
         raise RuntimeError('PURCHASE_OPERATIONS_UNRESOLVED')
     for table, identity in (('subscription_purchase_checkout_controls', 'attempt_id'), ('subscription_purchase_operations', 'id')):
         if table not in inventory:

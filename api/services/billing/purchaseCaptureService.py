@@ -1,6 +1,7 @@
 """One durable capture submission; ambiguous outcomes are lookup-only."""
 from api.services.billing.manualBillingContracts import VerifiedPaymentEvidence
 from api.services.billing.manualBillingRepository import _now
+from api.services.billing.purchaseProvider import purchaseProviderOptions
 
 
 class PurchaseCaptureService:
@@ -34,13 +35,16 @@ class PurchaseCaptureService:
             return operation
         if operation['state'] != 'queued':
             return self.recover(operationId)
-        payment = self.provider.payment.fetch(operation['provider_payment_id'])
+        if getattr(self.provider,'retry_enabled',False) is True:
+            self.repository.failPurchaseOperation(operationId,'PURCHASE_PROVIDER_RETRIES_ENABLED')
+            return self.repository.captureOperation(operationId)
+        payment = self.provider.payment.fetch(operation['provider_payment_id'],**purchaseProviderOptions())
         self._validate(operation, payment)
         if payment['status'] != 'authorized':
             return self._observed(operation, payment)
         from api.services.billing.manualBillingRecoveryService import ManualBillingRecoveryService
         attempt = self.repository.attemptById(operation['user_id'], str(operation['attempt_id']))
-        recovery = ManualBillingRecoveryService(self.repository, self.provider)
+        recovery = ManualBillingRecoveryService(self.repository, self.provider,requestOptions=purchaseProviderOptions())
         observation = recovery.inspectAttempt(attempt)
         if not observation.complete or observation.outcome == 'unknown':
             self.repository.recordProviderObservation(str(operation['attempt_id']), observation)
@@ -60,7 +64,7 @@ class PurchaseCaptureService:
             return self.repository.captureOperation(operationId)
         try:
             response = self.provider.payment.capture(operation['provider_payment_id'], operation['amount'],
-                {'currency': operation['currency']})
+                {'currency': operation['currency']},**purchaseProviderOptions())
             self._validate(operation, response)
             if response['status'] != 'captured':
                 return self.repository.markCaptureUnknown(operationId)
@@ -75,7 +79,7 @@ class PurchaseCaptureService:
         if operation['state'] in ('succeeded', 'cancelled'):
             return operation
         try:
-            payment = self.provider.payment.fetch(operation['provider_payment_id'])
+            payment = self.provider.payment.fetch(operation['provider_payment_id'],**purchaseProviderOptions())
             return self._observed(operation, payment)
         except Exception:
             return self.repository.markCaptureUnknown(operationId)
