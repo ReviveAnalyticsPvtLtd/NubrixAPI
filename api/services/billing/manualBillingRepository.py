@@ -1772,7 +1772,6 @@ class ManualBillingRepository:
                         if previous.get('outcome') != 'captured' and (not frozen.get('closedAt') or frozen.get('purchaseCancellationAcceptedAt')):
                             attemptMetadata = self._json(attempt.get('metadata_json'))
                             attemptBilling = attemptMetadata.setdefault('manualBilling', {})
-                            attemptBilling.setdefault('authorizedPaymentId', evidence.providerPaymentId)
                             if frozen.get('purchaseCancellationAcceptedAt'):
                                 attemptBilling.pop('closureReconciledAt', None)
                                 invoiceMetadata = self._json(invoice.get('metadata_json'))

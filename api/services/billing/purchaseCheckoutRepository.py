@@ -108,7 +108,7 @@ class PurchaseCheckoutRepository(PurchaseOperationRepositoryMixin, ManualBilling
         return self._run(operation)
 
     def listDueOperations(self, kind, afterId=None, limit=100):
-        if kind not in ('capture', 'compensation') or type(limit) is not int or not 1 <= limit <= 100:
+        if kind != 'compensation' or type(limit) is not int or not 1 <= limit <= 100:
             raise ValueError('INVALID_PURCHASE_OPERATION_SCAN')
         if afterId is not None:
             UUID(str(afterId))
@@ -202,16 +202,8 @@ class PurchaseCheckoutRepository(PurchaseOperationRepositoryMixin, ManualBilling
                 coverage = self._coverageSnapshotLocked(cursor, subscription, _now(), materialize=False)
                 if coverage.currentPeriod or coverage.denialReason not in (None, 'no_paid_coverage', 'no_subscription', 'expired'):
                     raise ValueError('PURCHASE_DRAFT_NOT_ALLOWED')
-                cursor.execute('''SELECT * FROM public.subscription_purchase_operations WHERE attempt_id=%s
-                    AND kind='capture' ORDER BY id FOR UPDATE''', (attemptId,))
-                captures = list(cursor.fetchall())
-                inFlight = any(row['state'] in ('submission_started', 'outcome_unknown', 'submitted')
-                    or row['state'] in ('needs_attention', 'failed') and self._json(row['submission_evidence']).get('startedAt') for row in captures)
-                for row in captures:
-                    if row['state'] == 'queued' or row['state'] in ('needs_attention','failed') and not self._json(row['submission_evidence']).get('startedAt'):
-                        cursor.execute("UPDATE public.subscription_purchase_operations SET state='cancelled',updated_at=clock_timestamp() WHERE id=%s", (row['id'],))
                 now = _now()
-                accepted = control['cancellation_accepted_at'] or (None if inFlight else now)
+                accepted = control['cancellation_accepted_at'] or now
                 cursor.execute('''UPDATE public.subscription_purchase_checkout_controls SET
                     operation_revision=operation_revision+1,cancellation_requested_at=coalesce(cancellation_requested_at,%s),
                     cancellation_accepted_at=%s,updated_at=%s WHERE attempt_id=%s''', (now, accepted, now, attemptId))
@@ -241,151 +233,6 @@ class PurchaseCheckoutRepository(PurchaseOperationRepositoryMixin, ManualBilling
         self._run(operation)
         return self.readEditor(userId)
 
-    def reserveCapture(self, userId, attemptId, paymentId):
-        from api.services.billing.purchaseCheckoutService import requirePurchaseActions
-        requirePurchaseActions()
-        def operation(connection):
-            with connection.cursor(cursor_factory=RealDictCursor) as cursor:
-                subscription, invoice, attempt, control = self._ownedPurchaseLocked(cursor, userId, attemptId)
-                if not control or control['capture_policy'] != 'manual':
-                    return None
-                coverage = self._coverageSnapshotLocked(cursor, subscription, _now(), materialize=False)
-                frozen = self._json(attempt['metadata_json'])['manualBilling']
-                if (control['cancellation_requested_at'] or frozen.get('closedAt') or invoice['status'] != 'PAYMENT_PENDING'
-                        or frozen.get('providerObservation', {}).get('outcome') == 'captured'
-                        or attempt['payment_status'] != 'authorized' or not _utc(frozen.get('expiresAt'))
-                        or _utc(frozen['expiresAt']) <= _now() or coverage.currentPeriod
-                        or coverage.denialReason not in (None, 'no_paid_coverage', 'no_subscription', 'expired')):
-                    return None
-                if frozen.get('authorizedPaymentId') != paymentId:
-                    return None
-                cursor.execute("SELECT * FROM public.subscription_purchase_operations WHERE attempt_id=%s AND kind='capture' ORDER BY id FOR UPDATE", (attemptId,))
-                existing = list(cursor.fetchall())
-                if existing:
-                    if any(row['provider_payment_id'] != paymentId for row in existing):
-                        raise ValueError('CAPTURE_PAYMENT_IDENTITY_MISMATCH')
-                    return dict(existing[0])
-                cursor.execute('''INSERT INTO public.subscription_purchase_operations
-                    (user_id,attempt_id,invoice_id,provider_payment_id,kind,amount,currency,dedupe_key)
-                    VALUES(%s,%s,%s,%s,'capture',%s,%s,%s) RETURNING *''',
-                    (userId, attemptId, invoice['id'], paymentId, attempt['amount'], attempt['currency'], 'purchase:capture:' + paymentId))
-                return dict(cursor.fetchone())
-        return self._run(operation)
-
-    def captureOperation(self, operationId):
-        UUID(str(operationId))
-        def operation(connection):
-            with connection.cursor(cursor_factory=RealDictCursor) as cursor:
-                cursor.execute('''SELECT o.*,c.operation_revision,c.capture_policy,c.cancellation_requested_at,
-                    c.cancellation_accepted_at,c.provider_order_id FROM public.subscription_purchase_operations o
-                    JOIN public.subscription_purchase_checkout_controls c ON c.attempt_id=o.attempt_id
-                    WHERE o.id=%s AND o.kind='capture' ''', (operationId,))
-                row = cursor.fetchone()
-                if not row:
-                    raise ValueError('PURCHASE_OPERATION_MISSING')
-                return dict(row)
-        return self._run(operation)
-
-    def beginCaptureSubmission(self, operationId, expectedRevision):
-        from api.services.billing.purchaseCheckoutService import requirePurchaseActions
-        requirePurchaseActions()
-        observed = self.captureOperation(operationId)
-        def operation(connection):
-            with connection.cursor(cursor_factory=RealDictCursor) as cursor:
-                subscription, invoice, attempt, control = self._ownedPurchaseLocked(cursor, observed['user_id'], str(observed['attempt_id']))
-                cursor.execute('SELECT * FROM public.subscription_purchase_operations WHERE id=%s FOR UPDATE', (operationId,))
-                op = cursor.fetchone()
-                frozen = self._json(attempt['metadata_json'])['manualBilling']
-                observation = frozen.get('providerObservation', {})
-                checkedAt = _utc(observation.get('checkedAt'))
-                if (op['state'] != 'queued' or control['operation_revision'] != expectedRevision or control['capture_policy'] != 'manual'
-                        or control['cancellation_requested_at'] or frozen.get('closedAt') or invoice['status'] != 'PAYMENT_PENDING'
-                        or attempt['payment_status'] != 'authorized' or _utc(frozen.get('expiresAt')) is None
-                        or _utc(frozen['expiresAt']) <= _now() or observation.get('outcome') != 'authorized'
-                        or checkedAt is None or not 0 <= (_now()-checkedAt).total_seconds() <= 60):
-                    return None
-                coverage = self._coverageSnapshotLocked(cursor, subscription, _now(), materialize=False)
-                if coverage.currentPeriod or coverage.denialReason not in (None, 'no_paid_coverage', 'no_subscription', 'expired'):
-                    return None
-                cursor.execute('''UPDATE public.subscription_purchase_checkout_controls SET operation_revision=operation_revision+1,
-                    updated_at=clock_timestamp() WHERE attempt_id=%s''', (attempt['id'],))
-                cursor.execute('''UPDATE public.subscription_purchase_operations SET state='submission_started',
-                    submission_evidence=%s,updated_at=clock_timestamp() WHERE id=%s RETURNING *''',
-                    (Json({'controlRevision': expectedRevision+1, 'startedAt': _now().isoformat()}), operationId))
-                return dict(cursor.fetchone())
-        return self._run(operation)
-
-    def markCaptureUnknown(self, operationId):
-        observed = self.captureOperation(operationId)
-        def operation(connection):
-            with connection.cursor() as cursor:
-                self._lockUser(cursor, observed['user_id'])
-                cursor.execute('''UPDATE public.subscription_purchase_operations SET state='outcome_unknown',
-                    error_code='CAPTURE_OUTCOME_UNKNOWN',updated_at=clock_timestamp()
-                    WHERE id=%s AND state IN ('submission_started','submitted','outcome_unknown')''', (operationId,))
-        self._run(operation)
-        return self.captureOperation(operationId)
-
-    def recordReleasedCapture(self, operationId):
-        observed = self.captureOperation(operationId)
-        def operation(connection):
-            with connection.cursor() as cursor:
-                self._lockUser(cursor, observed['user_id'])
-                cursor.execute('''UPDATE public.subscription_purchase_operations SET state='failed',
-                    error_code='PAYMENT_RELEASED',updated_at=clock_timestamp() WHERE id=%s
-                    AND state IN ('submission_started','submitted','outcome_unknown','needs_attention')''', (operationId,))
-                cursor.execute('''UPDATE public.subscription_purchase_operations SET state='cancelled',
-                    error_code='PAYMENT_RELEASED',updated_at=clock_timestamp() WHERE id=%s AND state IN ('queued','failed')''', (operationId,))
-        self._run(operation)
-        return self.captureOperation(operationId)
-
-    def captureNeedsAttention(self, operationId):
-        observed = self.captureOperation(operationId)
-        def operation(connection):
-            with connection.cursor() as cursor:
-                self._lockUser(cursor, observed['user_id'])
-                cursor.execute('''UPDATE public.subscription_purchase_operations SET state='needs_attention',
-                    error_code='CONFLICTING_PROVIDER_PAYMENTS',updated_at=clock_timestamp() WHERE id=%s AND state='queued' ''', (operationId,))
-        self._run(operation)
-        return self.captureOperation(operationId)
-
-    def stopCaptureForSettledOrder(self, operationId):
-        observed = self.captureOperation(operationId)
-        def operation(connection):
-            with connection.cursor(cursor_factory=RealDictCursor) as cursor:
-                _, invoice, _, _ = self._ownedPurchaseLocked(cursor, observed['user_id'], str(observed['attempt_id']))
-                cursor.execute('''UPDATE public.subscription_purchase_operations SET state=%s,
-                    error_code='OTHER_PROVIDER_CAPTURE',updated_at=clock_timestamp() WHERE id=%s AND state='queued' ''',
-                    ('cancelled' if invoice['status'] == 'PAID' else 'needs_attention', operationId))
-        self._run(operation)
-        return self.captureOperation(operationId)
-
-    def recordCaptureOutcome(self, operationId, evidence):
-        observed = self.captureOperation(operationId)
-        if (str(observed['attempt_id']) != evidence.attemptId or str(observed['invoice_id']) != evidence.invoiceId
-                or observed['user_id'] != evidence.userId or observed['provider_order_id'] != evidence.providerOrderId
-                or observed['provider_payment_id'] != evidence.providerPaymentId or observed['amount'] != evidence.amount
-                or observed['currency'] != evidence.currency or evidence.financialStatus != 'captured'):
-            raise ValueError('CAPTURE_EVIDENCE_MISMATCH')
-        def startObservation(connection):
-            with connection.cursor() as cursor:
-                self._lockUser(cursor, observed['user_id'])
-                cursor.execute("UPDATE public.subscription_purchase_operations SET state='submission_started' WHERE id=%s AND state='queued'", (operationId,))
-        self._run(startObservation)
-        # The durable in-flight fence survives a failure before or after the
-        # existing idempotent financial finalizer commits. Never post again.
-        result = self.finalizeCapturedPayment(evidence)
-        def complete(connection):
-            with connection.cursor() as cursor:
-                self._lockUser(cursor, observed['user_id'])
-                cursor.execute('''UPDATE public.subscription_purchase_operations SET state=%s,result=%s,
-                    updated_at=clock_timestamp() WHERE id=%s AND state IN
-                    ('submission_started','outcome_unknown','submitted','needs_attention')''',
-                    ('succeeded' if result.finalized or result.state == 'already_finalized' else 'needs_attention',
-                     Json({'finalizationState': result.state}), operationId))
-        self._run(complete)
-        return {**self.captureOperation(operationId), 'finalizationResult': result}
-
 
 def storedPurchaseControl(repository, userId, attemptId):
     def operation(connection):
@@ -403,7 +250,7 @@ def storedPurchaseControl(repository, userId, attemptId):
 
 def guardInitialPurchaseLocked(billing, cursor, request, subscription, now):
     """Runs inside the original invoice reservation transaction, including old clients."""
-    from api.services.billing.purchaseCheckoutService import purchaseActionsReady, requirePurchaseActions, requireManualCaptureCurrency
+    from api.services.billing.purchaseCheckoutService import purchaseActionsReady, requirePurchaseActions
     cursor.execute("SELECT to_regclass('public.subscription_purchase_checkout_controls') AS relation")
     present = cursor.fetchone()['relation']
     if not present:
@@ -438,7 +285,6 @@ def guardInitialPurchaseLocked(billing, cursor, request, subscription, now):
             raise ValueError('PURCHASE_DRAFT_REQUIRED')
         return
     requirePurchaseActions()
-    requireManualCaptureCurrency(request.currency)
     if not PurchaseCheckoutRepository._purchaseRecoveryReady(cursor):
         raise ValueError('PURCHASE_ACTIONS_UNAVAILABLE')
     cursor.execute('SELECT * FROM public.subscription_purchase_drafts WHERE user_id=%s', (request.userId,))
@@ -473,7 +319,7 @@ def bindPurchaseControlLocked(cursor, request, intent):
     predecessor = cursor.fetchone()
     cursor.execute('''INSERT INTO public.subscription_purchase_checkout_controls
         (attempt_id,invoice_id,user_id,draft_revision,capture_policy,predecessor_attempt_id)
-        VALUES(%s,%s,%s,%s,'manual',%s) ON CONFLICT(attempt_id) DO NOTHING''',
+        VALUES(%s,%s,%s,%s,'automatic',%s) ON CONFLICT(attempt_id) DO NOTHING''',
         (intent.attemptId, intent.invoiceId, request.userId, request.purchaseDraftRevision,
          predecessor['attempt_id'] if predecessor else None))
 

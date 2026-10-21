@@ -1,5 +1,4 @@
 """Machine correction of a confirmed-cancelled initial purchase, never proration."""
-import os
 from api.services.billing.purchaseProvider import purchaseProviderOptions
 
 
@@ -11,9 +10,7 @@ def compensationReady():
         purchaseProviderOptions()
     except (ValueError,TypeError):
         return False
-    currencies = os.environ.get('SUBSCRIPTION_MANUAL_CAPTURE_CURRENCIES', '').split(',')
-    return (HANDLER_VERSION == 1 and bool(set(currencies) & {'INR','USD'})
-        and set(currencies) <= {'INR','USD'})
+    return HANDLER_VERSION == 1
 
 
 class PurchaseCompensationService:

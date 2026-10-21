@@ -46,7 +46,7 @@ class PurchaseOperationWorker:
         if hasattr(self.repository,'recordPurchaseWorkerHeartbeat') and not self.repository.recordPurchaseWorkerHeartbeat():
             return summary
         highWater={source:self.repository.purchaseScanHighWater(source)
-            for source in ('cancellation','capture','compensation')}
+            for source in ('cancellation','compensation')}
         for source,upper in highWater.items():
             if upper is None:
                 continue

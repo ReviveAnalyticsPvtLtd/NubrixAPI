@@ -102,7 +102,7 @@ def _purchaseActionResponse(action, token, request, key, attemptId=None):
         code = str(exc)
         if code == 'OWNED_PAYMENT_ATTEMPT_MISSING':
             return ORJSONResponse({'message': 'Checkout was not found.', 'errorCode': 'PURCHASE_CHECKOUT_NOT_FOUND'}, status_code=404, headers=headers)
-        if code in ('PURCHASE_ACTIONS_UNAVAILABLE', 'PURCHASE_CAPTURE_NOT_ELIGIBLE', 'PURCHASE_ALREADY_COMPLETED',
+        if code in ('PURCHASE_ACTIONS_UNAVAILABLE', 'PURCHASE_ALREADY_COMPLETED',
                     'PURCHASE_DRAFT_STALE', 'PURCHASE_CHECKOUT_STALE', 'PURCHASE_DRAFT_NOT_ALLOWED',
                     'PURCHASE_REPLACEMENT_CONFIRMATION_REQUIRED', 'PURCHASE_FUNDS_PENDING', 'IDEMPOTENCY_CONFLICT',
                     'PRICING_CHANGED', 'PRICING_CONTEXT_REQUIRED', 'PRICING_CONTEXT_EXPIRED', 'PRICING_CONTEXT_INVALID',

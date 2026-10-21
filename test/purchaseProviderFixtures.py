@@ -1,10 +1,6 @@
-"""Synthetic provider faults exercise capture orchestration without real money."""
-import importlib
-import importlib.util
+"""Synthetic Razorpay provider stub shared by purchase checkout tests; never real money."""
 from types import SimpleNamespace
 from uuid import uuid4
-
-import pytest
 
 
 class SyntheticPurchaseProvider:
@@ -43,10 +39,3 @@ class SyntheticPurchaseProvider:
         if self.captureFault == 'after':
             raise TimeoutError('Synthetic response lost after acceptance')
         return dict(self.payments[paymentId])
-
-
-def test_capture_implementation_exposes_execute_and_lookup_recovery():
-    name = 'api.services.billing.purchaseCaptureService'
-    assert importlib.util.find_spec(name), 'Durable capture service must exist'
-    service = importlib.import_module(name).PurchaseCaptureService
-    assert callable(service.execute) and callable(service.recover)

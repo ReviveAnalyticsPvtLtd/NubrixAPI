@@ -329,17 +329,6 @@ class ManualPaymentService:
                     and result.state == 'requires_reconciliation' and hasattr(self.repository,'connectionFactory')):
                 from api.services.billing.purchaseCheckoutRepository import PurchaseCheckoutRepository
                 PurchaseCheckoutRepository(self.repository.connectionFactory).reserveCompensation(evidence)
-            if evidence.financialStatus == 'authorized' and evidence.purpose == 'initial_purchase':
-                from api.services.billing.purchaseCheckoutService import purchaseActionsReady
-                if purchaseActionsReady():
-                    from api.services.billing.purchaseCheckoutRepository import PurchaseCheckoutRepository
-                    from api.services.billing.purchaseCaptureService import PurchaseCaptureService
-                    repository = PurchaseCheckoutRepository(self.repository.connectionFactory)
-                    operation = repository.reserveCapture(evidence.userId, evidence.attemptId, evidence.providerPaymentId)
-                    if operation:
-                        outcome = PurchaseCaptureService(repository, self.razorpayClient).execute(str(operation['id']))
-                        if isinstance(outcome.get('finalizationResult'), FinalizationResult):
-                            return outcome['finalizationResult']
             return result
         invoiceId = evidence.invoiceId
         operationKey = f"finalize:{invoiceId}"

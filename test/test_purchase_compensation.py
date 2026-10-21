@@ -8,7 +8,7 @@ from uuid import uuid4
 import pytest
 from psycopg2.extras import Json
 
-from test.test_purchase_capture import SyntheticPurchaseProvider
+from test.purchaseProviderFixtures import SyntheticPurchaseProvider
 from test.test_purchase_checkout_postgres import checkoutDb, drafts, controlledPurchase, authorization
 from test.test_subscription_erasure_postgres import erasureDb
 from test.subscriptionRuntimeFixtures import postgres, runtimeDb, query
@@ -171,19 +171,16 @@ def test_verified_late_capture_transport_reserves_and_worker_completes_after_tab
     assert len(provider.refundCalls)==1
 
 
-def test_failed_authorization_allows_pending_cancellation_to_finish_without_feature_gate(drafts,monkeypatch):
+def test_cancellation_of_authorized_purchase_is_accepted_immediately_and_never_captures(drafts,monkeypatch):
     from api.services.billing.purchaseOperationWorker import PurchaseOperationWorker
     repo,provider,intent,cancel=controlledPurchase(drafts,monkeypatch)
     evidence=authorization(repo,provider,intent)
-    op=repo.reserveCapture(intent.userId,intent.attemptId,evidence.providerPaymentId)
-    repo.beginCaptureSubmission(str(op['id']),1)
-    cancel.cancel(intent.userId,intent.attemptId,2,'pending-cancel')
+    cancel.cancel(intent.userId,intent.attemptId,1,'authorized-cancel')
     provider.payments[evidence.providerPaymentId]['status']='failed'
     monkeypatch.setattr('api.services.billing.purchaseCheckoutService.purchaseActionsReady',lambda:False)
     PurchaseOperationWorker(repo,provider).execute()
     status=repo.readEditor(intent.userId).checkout
     assert status.cancellationAcceptedAt and status.state=='cancelled'
-    assert repo.captureOperation(str(op['id']))['state']=='cancelled'
     frozen=repo._json(repo.purchaseAttempt(intent.attemptId)['metadata_json'])['manualBilling']
     assert frozen['closureReconciledAt']
     assert not provider.captureCalls
@@ -294,20 +291,20 @@ def test_sql_keyset_scan_pages_1001_rows_with_fixed_highwater(drafts,monkeypatch
     repo,provider,intent,evidence,service=closedCapture(drafts,monkeypatch)
     query(drafts[3],'''INSERT INTO subscription_purchase_operations
         (id,user_id,attempt_id,invoice_id,provider_payment_id,kind,amount,currency,dedupe_key)
-        SELECT lpad(to_hex(n),32,'0')::uuid,%s,%s,%s,'pay-page-'||n,'capture',%s,%s,'purchase:capture:pay-page-'||n
+        SELECT lpad(to_hex(n),32,'0')::uuid,%s,%s,%s,'pay-page-'||n,'compensation',%s,%s,'purchase:compensation:pay-page-'||n
         FROM generate_series(1,1001) n''',(intent.userId,intent.attemptId,intent.invoiceId,intent.amount,intent.currency))
     from api.services.billing.manualBillingRepository import _now
     cutoff=_now()
-    high=repo.purchaseScanHighWater('capture')
+    high=repo.purchaseScanHighWater('compensation')
     later=str(UUID(int=UUID(str(high)).int+1))
     query(drafts[3],'''INSERT INTO subscription_purchase_operations
         (id,user_id,attempt_id,invoice_id,provider_payment_id,kind,amount,currency,dedupe_key)
-        VALUES(%s,%s,%s,%s,'pay-after-highwater','capture',%s,%s,'purchase:capture:pay-after-highwater')''',
+        VALUES(%s,%s,%s,%s,'pay-after-highwater','compensation',%s,%s,'purchase:compensation:pay-after-highwater')''',
         (later,intent.userId,intent.attemptId,intent.invoiceId,intent.amount,intent.currency))
     after=None
     seen=[]
     while True:
-        page=repo.purchaseScanPage('capture',high,after,cutoff,limit=100)
+        page=repo.purchaseScanPage('compensation',high,after,cutoff,limit=100)
         if not page:
             break
         seen.extend(str(r['id']) for r in page if r['user_id']==intent.userId)
@@ -315,7 +312,7 @@ def test_sql_keyset_scan_pages_1001_rows_with_fixed_highwater(drafts,monkeypatch
     assert len(seen)==1001 and later not in seen
     # These inventory-only identities have no synthetic provider payments.
     # Do not make later functional sweeps contact 1,002 deliberate phantoms.
-    query(drafts[3],"UPDATE subscription_purchase_operations SET state='cancelled' WHERE user_id=%s AND kind='capture' AND state='queued'",(intent.userId,))
+    query(drafts[3],"UPDATE subscription_purchase_operations SET state='cancelled' WHERE user_id=%s AND kind='compensation' AND state='queued'",(intent.userId,))
 
 
 def test_worker_scan_excludes_new_rows_with_uuid_below_highwater(drafts,monkeypatch):

@@ -21,12 +21,6 @@ def requirePurchaseActions():
         raise ValueError('PURCHASE_ACTIONS_UNAVAILABLE')
 
 
-def requireManualCaptureCurrency(currency):
-    eligible = set(os.environ.get('SUBSCRIPTION_MANUAL_CAPTURE_CURRENCIES', '').split(','))
-    if currency not in {'INR', 'USD'} or currency not in eligible:
-        raise ValueError('PURCHASE_CAPTURE_NOT_ELIGIBLE')
-
-
 def validatePurchaseKey(key):
     if not isinstance(key, str) or not key.strip() or len(key) > 128:
         raise ValueError('INVALID_REQUEST_KEY')
@@ -70,7 +64,6 @@ class PurchaseCheckoutService:
         claims = verifyPricingContext(pricingContext, userId)
         if claims.get('catalogRevision') != expectedCatalogRevision:
             raise ValueError('PRICING_CHANGED')
-        requireManualCaptureCurrency(claims['currency'])
         editor = self.repository.readEditor(userId)
         if editor.draft.revision != draftRevision:
             raise ValueError('PURCHASE_DRAFT_STALE')

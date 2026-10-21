@@ -341,7 +341,7 @@ class PurchaseOperationRepositoryMixin:
     def _purchaseScanSource(source):
         if source=='cancellation':
             return 'subscription_purchase_checkout_controls','attempt_id'
-        if source in ('capture','compensation'):
+        if source=='compensation':
             return 'subscription_purchase_operations','id'
         raise ValueError('INVALID_PURCHASE_OPERATION_SCAN')
 
@@ -384,12 +384,8 @@ class PurchaseOperationRepositoryMixin:
             resolved=reconcileCancelledCheckout(self,provider,identity)
             escalated=False if resolved else self.scheduleCancellationRetry(identity,now)
         else:
-            if source=='capture':
-                from api.services.billing.purchaseCaptureService import PurchaseCaptureService
-                service=PurchaseCaptureService(self,provider)
-            else:
-                from api.services.billing.purchaseCompensationService import PurchaseCompensationService
-                service=PurchaseCompensationService(self,provider)
+            from api.services.billing.purchaseCompensationService import PurchaseCompensationService
+            service=PurchaseCompensationService(self,provider)
             result=service.execute(identity)
             if source=='compensation' and result['state']=='needs_attention' and result.get('error_code')=='PURCHASE_REFUND_FAILED':
                 self.prepareFailedCompensationRetry(identity)
@@ -414,16 +410,11 @@ class PurchaseOperationRepositoryMixin:
                     return False
                 # Each actual payment must have terminal no-funds or full-return proof.
                 for payment in snapshot.payments:
-                    if payment['status']=='failed':
-                        cursor.execute("SELECT id FROM public.subscription_purchase_operations WHERE attempt_id=%s AND kind='capture' AND provider_payment_id=%s",(attemptId,payment['id']))
-                        for op in cursor.fetchall():
-                            cursor.execute("UPDATE public.subscription_purchase_operations SET state='failed' WHERE id=%s AND state IN ('submission_started','outcome_unknown','submitted','needs_attention')",(op['id'],))
-                            cursor.execute("UPDATE public.subscription_purchase_operations SET state='cancelled' WHERE id=%s AND state IN ('failed','queued')",(op['id'],))
-                    elif payment['status']=='captured':
+                    if payment['status']=='captured':
                         cursor.execute("SELECT 1 FROM public.subscription_purchase_operations WHERE attempt_id=%s AND kind='compensation' AND provider_payment_id=%s AND state='succeeded'",(attemptId,payment['id']))
                         if not cursor.fetchone():
                             return False
-                    else:
+                    elif payment['status']!='failed':
                         return False
                 cursor.execute("SELECT 1 FROM public.subscription_purchase_operations WHERE attempt_id=%s AND state NOT IN ('succeeded','cancelled') LIMIT 1",(attemptId,))
                 if cursor.fetchone():

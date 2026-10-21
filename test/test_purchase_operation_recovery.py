@@ -27,11 +27,11 @@ def test_worker_scans_past_1000_and_does_not_chase_new_highwater_rows():
     assert result == {'checked':1001,'resolved':1001,'noProgress':0,'errors':0,'escalated':0}
 
 
-def test_readiness_does_not_enable_from_flags_without_verified_capture_configuration(monkeypatch):
+def test_readiness_depends_only_on_handler_and_valid_provider_timeout(monkeypatch):
     name = 'api.services.billing.purchaseCompensationService'
     assert importlib.util.find_spec(name), 'Compensation readiness must be explicit'
     module = importlib.import_module(name)
-    monkeypatch.setenv('SUBSCRIPTION_EDITABLE_CHECKOUT_ENABLED','true')
-    monkeypatch.setenv('SUBSCRIPTION_CANCELLATION_COMPENSATION_ENABLED','true')
-    monkeypatch.delenv('SUBSCRIPTION_MANUAL_CAPTURE_CURRENCIES',raising=False)
+    monkeypatch.delenv('PURCHASE_PROVIDER_TIMEOUT_SECONDS',raising=False)
+    assert module.compensationReady()
+    monkeypatch.setenv('PURCHASE_PROVIDER_TIMEOUT_SECONDS','0')
     assert not module.compensationReady()
