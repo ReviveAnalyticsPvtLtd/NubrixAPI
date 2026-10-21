@@ -36,7 +36,7 @@ class PurchaseCheckoutRepository(PurchaseOperationRepositoryMixin, ManualBilling
 
     def readEditor(self, userId):
         def operation(connection):
-            from api.services.billing.purchaseCheckoutStatusService import reducePurchaseCheckoutStatus, applyPurchaseControl
+            from api.services.billing.purchaseCheckoutStatusService import reducePurchaseCheckoutStatus
             with connection.cursor(cursor_factory=RealDictCursor) as cursor:
                 subscription, allowed = self._editorContext(cursor, userId)
                 cursor.execute('SELECT * FROM public.subscription_purchase_drafts WHERE user_id=%s', (userId,))
@@ -55,10 +55,6 @@ class PurchaseCheckoutRepository(PurchaseOperationRepositoryMixin, ManualBilling
                     fresh = checked and 0 <= (_now() - checked).total_seconds() <= 60
                     providerState = observation.get('outcome', 'unknown') if fresh and observation.get('complete') else 'unknown'
                     checkout = reducePurchaseCheckoutStatus(attempt, intent, providerState)
-                    cursor.execute('SELECT * FROM public.payment_slot_controls WHERE attempt_id=%s AND user_id=%s',
-                                   (attempt['id'], userId))
-                    control = cursor.fetchone()
-                    checkout = applyPurchaseControl(checkout, control)
                     if not frozen.get('closedAt') and intent.state not in ('cancelled', 'expired', 'superseded', 'captured'):
                         draft = PurchaseDraft(userId, domains=tuple(frozen.get('domains', [])),
                             billingInterval='year' if frozen.get('billingMode') == 'annual_prepaid' else 'month')
@@ -131,124 +127,21 @@ class PurchaseCheckoutRepository(PurchaseOperationRepositoryMixin, ManualBilling
                 return cursor.fetchone() is not None
         return self._run(operation)
 
-    def reserveDraftCheckout(self, userId, draftRevision, pricing, requestKey):
+    def draftCheckoutRequest(self, userId, draftRevision, pricing, requestKey):
+        """The saved-draft Pay request; the caller reserves it through the shared reservation path."""
         from api.services.billing.purchaseCheckoutService import requirePurchaseActions, validatePurchaseKey
         from api.services.billing.manualBillingContracts import CheckoutRequest
         requirePurchaseActions()
         validatePurchaseKey(requestKey)
         if pricing.get('userId') != userId or set(pricing) != {'userId', 'currency', 'catalogRevision', 'domains', 'billingMode'}:
             raise ValueError('PURCHASE_PRICING_INVALID')
-        return self.reserveCheckout(CheckoutRequest(userId, 'initial_purchase', pricing['billingMode'],
+        return CheckoutRequest(userId, 'initial_purchase', pricing['billingMode'],
             {'domains': pricing['domains']}, requestKey, currency=pricing['currency'],
-            expectedCatalogRevision=pricing['catalogRevision'], purchaseDraftRevision=draftRevision))
+            expectedCatalogRevision=pricing['catalogRevision'], purchaseDraftRevision=draftRevision)
 
-    def _ownedPurchaseLocked(self, cursor, userId, attemptId):
-        self._requireStorage(cursor)
-        self._lockUser(cursor, userId)
-        subscription = self._canonical(cursor, userId)
-        cursor.execute('SELECT invoice_id FROM public.billing_events WHERE id=%s AND user_id=%s', (attemptId, userId))
-        row = cursor.fetchone()
-        if not row:
-            raise ValueError('OWNED_PAYMENT_ATTEMPT_MISSING')
-        cursor.execute('SELECT * FROM public."Invoices" WHERE id=%s AND "userId"=%s FOR UPDATE', (row['invoice_id'], userId))
-        invoice = cursor.fetchone()
-        cursor.execute('SELECT * FROM public.billing_events WHERE id=%s AND user_id=%s FOR UPDATE', (attemptId, userId))
-        attempt = cursor.fetchone()
-        frozen = self._json(attempt.get('metadata_json')).get('manualBilling', {})
-        if not invoice or str(attempt['subscription_id']) != str(subscription['id']) or frozen.get('purpose') != 'initial_purchase':
-            raise ValueError('OWNED_PAYMENT_ATTEMPT_MISSING')
-        cursor.execute('SELECT * FROM public.payment_slot_controls WHERE attempt_id=%s AND user_id=%s FOR UPDATE', (attemptId, userId))
-        return subscription, invoice, attempt, cursor.fetchone()
-
-    def _cancelReplayLocked(self, cursor, userId, attemptId, revision, key):
-        cursor.execute('SELECT metadata_json FROM public.billing_events WHERE idempotency_key=%s AND user_id=%s',
-                       ('purchase-cancel:' + userId + ':' + key, userId))
-        existing = cursor.fetchone()
-        if not existing:
-            return False
-        if self._json(existing['metadata_json']) != {'attemptId': attemptId, 'expectedOperationRevision': revision}:
-            raise ValueError('IDEMPOTENCY_CONFLICT')
-        return True
-
-    def cancellationReplay(self, userId, attemptId, revision, key):
-        def operation(connection):
-            with connection.cursor(cursor_factory=RealDictCursor) as cursor:
-                self._lockUser(cursor, userId)
-                return self._cancelReplayLocked(cursor, userId, attemptId, revision, key)
-        return self._run(operation)
-
-    def acceptCancellation(self, userId, attemptId, expectedOperationRevision, requestKey, observation):
-        from api.services.billing.purchaseCheckoutService import requirePurchaseActions, validatePurchaseKey
-        requirePurchaseActions()
-        validatePurchaseKey(requestKey)
-        def operation(connection):
-            with connection.cursor(cursor_factory=RealDictCursor) as cursor:
-                subscription, invoice, attempt, control = self._ownedPurchaseLocked(cursor, userId, attemptId)
-                if not self._purchaseRecoveryReady(cursor):
-                    raise ValueError('PURCHASE_ACTIONS_UNAVAILABLE')
-                if self._cancelReplayLocked(cursor, userId, attemptId, expectedOperationRevision, requestKey):
-                    return
-                if invoice['status'] == 'PAID' or attempt['payment_status'] == 'captured':
-                    raise ValueError('PURCHASE_ALREADY_COMPLETED')
-                if not control:
-                    if expectedOperationRevision != 0:
-                        raise ValueError('PURCHASE_CHECKOUT_STALE')
-                    # A pre-rollout Order was sent without a per-Order payment field.
-                    slotId = openSlotLocked(cursor, userId, 'pro_term', 'open')
-                    cursor.execute('''INSERT INTO public.payment_slot_controls
-                        (attempt_id,slot_id,invoice_id,user_id,purpose,capture_policy,provider_order_id)
-                        VALUES(%s,%s,%s,%s,'initial_purchase','account_default',%s) RETURNING *''',
-                        (attemptId, slotId, invoice['id'], userId, attempt['provider_order_id']))
-                    control = cursor.fetchone()
-                if int(control['operation_revision']) != expectedOperationRevision:
-                    raise ValueError('PURCHASE_CHECKOUT_STALE')
-                coverage = self._coverageSnapshotLocked(cursor, subscription, _now(), materialize=False)
-                if coverage.currentPeriod or coverage.denialReason not in (None, 'no_paid_coverage', 'no_subscription', 'expired'):
-                    raise ValueError('PURCHASE_DRAFT_NOT_ALLOWED')
-                now = _now()
-                accepted = control['cancellation_accepted_at'] or now
-                cursor.execute('''UPDATE public.payment_slot_controls SET
-                    operation_revision=operation_revision+1,cancellation_requested_at=coalesce(cancellation_requested_at,%s),
-                    cancellation_accepted_at=%s,updated_at=%s WHERE attempt_id=%s''', (now, accepted, now, attemptId))
-                if accepted:
-                    self._closeInvoice(cursor, invoice, 'PURCHASE_CANCELLED', now=accepted, preserveAuthorization=True)
-                    for table, identity in (('billing_events', 'id'), ('Invoices', 'id')):
-                        rowId = attemptId if table == 'billing_events' else invoice['id']
-                        cursor.execute(f'SELECT metadata_json FROM public."{table}" WHERE {identity}=%s', (rowId,))
-                        metadata = self._json(cursor.fetchone()['metadata_json'])
-                        frozen = metadata.setdefault('manualBilling', {})
-                        frozen['purchaseCancellationAcceptedAt'] = accepted.isoformat()
-                        stored = self._json(attempt.get('metadata_json')).get('manualBilling', {}).get('providerObservation', {})
-                        if (observation and observation.complete and observation.outcome == 'unpaid' and not observation.payments
-                                and attempt['payment_status'] != 'authorized'
-                                and stored.get('complete') and stored.get('outcome') == 'unpaid' and not stored.get('hasPayments')
-                                and _utc(stored.get('checkedAt')) == observation.observedAt
-                                and observation.attemptId == attemptId and observation.providerOrderId == attempt['provider_order_id']
-                                and observation.amount == int(attempt['amount']) and observation.currency == attempt['currency']
-                                and 0 <= (now-observation.observedAt).total_seconds() <= 60):
-                            frozen['closureReconciledAt'] = now.isoformat()
-                        cursor.execute(f'UPDATE public."{table}" SET metadata_json=%s WHERE {identity}=%s', (Json(metadata), rowId))
-                cursor.execute('''INSERT INTO public.billing_events(user_id,subscription_id,invoice_id,event_category,
-                    event_type,event_status,idempotency_key,metadata_json) VALUES(%s,%s,%s,'system',
-                    'purchase.cancellation.requested','COMMITTED',%s,%s)''',
-                    (userId, subscription['id'], invoice['id'], 'purchase-cancel:' + userId + ':' + requestKey,
-                     Json({'attemptId': attemptId, 'expectedOperationRevision': expectedOperationRevision})))
-        self._run(operation)
-        return self.readEditor(userId)
-
-
-def storedPurchaseControl(repository, userId, attemptId):
-    def operation(connection):
-        with connection.cursor(cursor_factory=RealDictCursor) as cursor:
-            repository._lockUser(cursor, userId)
-            cursor.execute("SELECT to_regclass('public.payment_slot_controls') AS relation")
-            if not cursor.fetchone()['relation']:
-                return None
-            cursor.execute('''SELECT c.* FROM public.payment_slot_controls c
-                JOIN public.billing_events b ON b.id=c.attempt_id AND b.user_id=c.user_id
-                WHERE c.user_id=%s AND c.attempt_id=%s''', (userId, attemptId))
-            return cursor.fetchone()
-    return repository._run(operation)
+    def reserveDraftCheckout(self, userId, draftRevision, pricing, requestKey, inspection=None):
+        return self.reserveCheckout(self.draftCheckoutRequest(userId, draftRevision, pricing, requestKey),
+                                    inspection=inspection)
 
 
 def guardInitialPurchaseLocked(billing, cursor, request, subscription, now):
@@ -267,29 +160,11 @@ def guardInitialPurchaseLocked(billing, cursor, request, subscription, now):
         replay = cursor.fetchone()
         if replay and billing._json(replay['metadata_json']).get('manualBilling', {}).get('closedReason') != 'ORDER_NOT_CREATED':
             return  # Historical-key identity is observable, never a new purchase.
-    cursor.execute('''SELECT 1 FROM public.payment_operations WHERE user_id=%s
-        AND state NOT IN ('succeeded','cancelled') LIMIT 1''', (request.userId,))
-    if cursor.fetchone():
-        raise ValueError('PURCHASE_FUNDS_PENDING')
-    cursor.execute('''SELECT b.*,c.cancellation_accepted_at FROM public.payment_slot_controls c
-        JOIN public.billing_events b ON b.id=c.attempt_id WHERE c.user_id=%s ORDER BY b.id''', (request.userId,))
-    for row in cursor.fetchall():
-        frozen = billing._json(row['metadata_json']).get('manualBilling', {})
-        exact = row.get('idempotency_key') == f'initial_purchase:{request.userId}:{request.requestKey}'
-        if row.get('payment_status') == 'captured':
-            continue
-        if row['cancellation_accepted_at']:
-            if not frozen.get('closureReconciledAt'):
-                raise ValueError('PURCHASE_FUNDS_PENDING')
-        elif not exact:
-            raise ValueError('PURCHASE_REPLACEMENT_CONFIRMATION_REQUIRED')
     if request.purchaseDraftRevision is None:
         if purchaseActionsReady():
             raise ValueError('PURCHASE_DRAFT_REQUIRED')
         return
     requirePurchaseActions()
-    if not PurchaseCheckoutRepository._purchaseRecoveryReady(cursor):
-        raise ValueError('PURCHASE_ACTIONS_UNAVAILABLE')
     cursor.execute('SELECT * FROM public.subscription_purchase_drafts WHERE user_id=%s', (request.userId,))
     draft = cursor.fetchone()
     if not draft or type(request.purchaseDraftRevision) is not int or draft['revision'] != request.purchaseDraftRevision:
@@ -301,17 +176,12 @@ def guardInitialPurchaseLocked(billing, cursor, request, subscription, now):
     currencies = {row['currency'] for row in cursor.fetchall()}
     if currencies and currencies != {request.currency}:
         raise ValueError('BILLING_CURRENCY_CONFLICT')
-    # Uncontrolled original Orders also require explicit cancellation. Do not
-    # let the legacy implicit-replacement policy bypass the editor confirmation.
-    cursor.execute('''SELECT * FROM public.billing_events WHERE user_id=%s AND event_category='payment_attempt'
-        AND metadata_json->'manualBilling'->>'purpose'='initial_purchase' ORDER BY id''', (request.userId,))
-    for row in cursor.fetchall():
-        frozen = billing._json(row['metadata_json'])['manualBilling']
-        exact = row.get('idempotency_key') == f'initial_purchase:{request.userId}:{request.requestKey}'
-        if not exact and row['payment_status'] != 'captured' and not frozen.get('closedAt'):
-            raise ValueError('PURCHASE_REPLACEMENT_CONFIRMATION_REQUIRED')
-        if not exact and frozen.get('closedAt') and not frozen.get('closureReconciledAt') and row['payment_status'] != 'captured':
-            raise ValueError('PURCHASE_FUNDS_PENDING')
+
+
+def requirePaymentWorkerLocked(cursor):
+    """No new Order opens while nobody can recover or refund it."""
+    if _storagePresent(cursor) and not PurchaseCheckoutRepository._paymentWorkerFresh(cursor):
+        raise RuntimeError('PAYMENT_ACTIONS_UNAVAILABLE')
 
 
 def openSlotLocked(cursor, userId: str, kind: str, slotKey: str) -> str:
@@ -327,12 +197,112 @@ def openSlotLocked(cursor, userId: str, kind: str, slotKey: str) -> str:
     return str(row['slot_id'] if isinstance(row, dict) else row[0])
 
 
+def _storagePresent(cursor):
+    cursor.execute("SELECT to_regclass('public.payment_slot_controls') AS relation")
+    row = cursor.fetchone()
+    return bool(row['relation'] if isinstance(row, dict) else row[0])
+
+
 def bindPurchaseControlLocked(cursor, request, intent):
+    """Bind a new initial attempt to the Pro term slot; an existing control is never rebound."""
+    if not _storagePresent(cursor):
+        return
+    cursor.execute('SELECT 1 FROM public.payment_slot_controls WHERE attempt_id=%s', (intent.attemptId,))
+    if cursor.fetchone():
+        return  # Idempotent replay: discover the control before opening any slot.
     slotId = openSlotLocked(cursor, request.userId, 'pro_term', 'open')
     cursor.execute('''INSERT INTO public.payment_slot_controls
         (attempt_id,slot_id,invoice_id,user_id,purpose,draft_revision,capture_policy)
-        VALUES(%s,%s,%s,%s,'initial_purchase',%s,'automatic') ON CONFLICT(attempt_id) DO NOTHING''',
+        VALUES(%s,%s,%s,%s,'initial_purchase',%s,'automatic')''',
         (intent.attemptId, slotId, intent.invoiceId, request.userId, request.purchaseDraftRevision))
+
+
+_LIVE = ('created', 'pending_provider_ack', 'authorized')
+
+
+def retireSupersededAttemptLocked(cursor, attempt, now, replacementInvoiceId=None):
+    """Close the attempt (and its non-renewal invoice) so a replacement may become the live attempt."""
+    frozen = ManualBillingRepository._json(attempt.get('metadata_json')).get('manualBilling', {})
+    if frozen.get('closedAt'):
+        if frozen.get('closedReason') != 'SUPERSEDED':
+            raise ValueError('PAYMENT_SUPERSESSION_INVALID')
+        return
+    closure = {'closedAt': now.isoformat(), 'closedReason': 'SUPERSEDED'}
+    if frozen.get('purpose') != 'renewal':
+        cursor.execute('SELECT * FROM public."Invoices" WHERE id=%s FOR UPDATE', (attempt['invoice_id'],))
+        invoice = cursor.fetchone()
+        if not invoice or str(invoice['status']).upper() not in ('UPCOMING', 'PAYMENT_PENDING'):
+            raise ValueError('PAYMENT_SUPERSESSION_INVALID')
+        metadata = ManualBillingRepository._json(invoice.get('metadata_json'))
+        metadata.setdefault('manualBilling', {}).update(closure)
+        if replacementInvoiceId is not None:
+            metadata['manualBilling']['supersededByInvoiceId'] = str(replacementInvoiceId)
+        cursor.execute('UPDATE public."Invoices" SET status=\'VOID\',metadata_json=%s WHERE id=%s',
+                       (Json(metadata), invoice['id']))
+        cursor.execute('''SELECT id,metadata_json FROM public.billing_events WHERE invoice_id=%s
+            AND event_category='payment_attempt' AND payment_status IN ('created','pending_provider_ack','authorized')
+            ORDER BY id FOR UPDATE''', (invoice['id'],))
+        rows = cursor.fetchall()
+    else:
+        rows = [attempt]
+    for row in rows:
+        metadata = ManualBillingRepository._json(row.get('metadata_json'))
+        metadata.setdefault('manualBilling', {}).update(closure)
+        # Not reconciled: late provider money on this Order stays in the recovery scan.
+        metadata['manualBilling'].pop('closureReconciledAt', None)
+        cursor.execute('''UPDATE public.billing_events SET payment_status='cancelled',event_status='cancelled',
+            metadata_json=%s WHERE id=%s''', (Json(metadata), row['id']))
+
+
+def supersedeAttemptLocked(cursor, attemptId: str, supersededBy: str, now) -> None:
+    """Close one attempt in favour of a newer open attempt in the same slot. Runs under the owner lock."""
+    from datetime import timedelta
+    from api.services.billing.paymentPolicy import captureWindowMinutes
+    from api.services.billing.paymentSlots import slotKind
+    if str(attemptId) == str(supersededBy):
+        raise ValueError('PAYMENT_SUPERSESSION_INVALID')
+    cursor.execute('''SELECT * FROM public.billing_events WHERE id IN (%s,%s)
+        AND event_category='payment_attempt' FOR UPDATE''', (attemptId, supersededBy))
+    rows = {str(row['id']): row for row in cursor.fetchall()}
+    source, target = rows.get(str(attemptId)), rows.get(str(supersededBy))
+    if not source or not target:
+        raise ValueError('PAYMENT_SUPERSESSION_INVALID')
+    sourceFrozen = ManualBillingRepository._json(source.get('metadata_json')).get('manualBilling', {})
+    targetFrozen = ManualBillingRepository._json(target.get('metadata_json')).get('manualBilling', {})
+    sourceAt, targetAt = _utc(source.get('attempted_at')), _utc(target.get('attempted_at'))
+    if (source['user_id'] is None or source['user_id'] != target['user_id']
+            or slotKind(sourceFrozen.get('purpose')) != slotKind(targetFrozen.get('purpose'))
+            or source.get('payment_status') == 'captured'
+            or target.get('payment_status') not in _LIVE or targetFrozen.get('closedAt')
+            or not sourceAt or not targetAt or targetAt < sourceAt):
+        raise ValueError('PAYMENT_SUPERSESSION_INVALID')
+    storage = _storagePresent(cursor)
+    sourceControl = targetControl = None
+    if storage:
+        cursor.execute('SELECT * FROM public.payment_slot_controls WHERE attempt_id IN (%s,%s) FOR UPDATE',
+                       (attemptId, supersededBy))
+        controls = {str(row['attempt_id']): row for row in cursor.fetchall()}
+        targetControl, sourceControl = controls.get(str(supersededBy)), controls.get(str(attemptId))
+        if not targetControl or targetControl['closed_at'] is not None or (sourceControl and (
+                sourceControl['closed_at'] is not None or sourceControl['slot_id'] != targetControl['slot_id'])):
+            raise ValueError('PAYMENT_SUPERSESSION_INVALID')
+    retireSupersededAttemptLocked(cursor, source, now, target.get('invoice_id'))
+    if not storage:
+        return
+    if not sourceControl:
+        # A pre-rollout Order joins the replacement's slot when it is superseded.
+        policy = 'automatic' if sourceFrozen.get('capturePolicy') == 'automatic' else 'account_default'
+        cursor.execute('''INSERT INTO public.payment_slot_controls
+            (attempt_id,slot_id,invoice_id,user_id,purpose,draft_revision,provider_order_id,capture_policy)
+            VALUES(%s,%s,%s,%s,%s,%s,%s,%s)''', (attemptId, targetControl['slot_id'], source['invoice_id'],
+            source['user_id'], sourceFrozen.get('purpose'),
+            sourceFrozen.get('purchaseDraftRevision') if sourceFrozen.get('purpose') == 'initial_purchase' else None,
+            source.get('provider_order_id'), policy))
+    window = timedelta(minutes=int(sourceFrozen.get('captureWindowMinutes') or captureWindowMinutes()))
+    latest = _utc(sourceFrozen.get('providerObservation', {}).get('latestPaymentCreatedAt'))
+    cursor.execute('''UPDATE public.payment_slot_controls SET operation_revision=operation_revision+1,
+        closed_at=%s,closed_reason='SUPERSEDED',superseded_by=%s,recover_until=%s,updated_at=clock_timestamp()
+        WHERE attempt_id=%s''', (now, supersededBy, (latest or now) + window, attemptId))
 
 
 def bindControlledOrderLocked(cursor, attemptId, orderId):

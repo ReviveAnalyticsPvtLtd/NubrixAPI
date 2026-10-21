@@ -1,8 +1,9 @@
-"""IR-20: replace an abandoned unpaid checkout without losing money history."""
+"""Pay replaces an earlier initial checkout automatically when its Order shows no moving money."""
 import hashlib
 import hmac
 import json
 import os
+from datetime import timedelta
 from unittest.mock import patch
 
 import pytest
@@ -12,6 +13,12 @@ from test.test_customer_free_payments import StrictFakeRazorpayClient
 from test.test_manual_billing_runtime import database, USER, NOW, sqlTransaction
 from test.test_manual_checkout_http import checkout_database, checkout_client, counts, request
 from test.test_manual_payment_entrypoints import evidence
+
+
+def empty(intent, order, observed=NOW):
+    """A complete, fresh provider listing of an Order with no payments, taken before the owner lock."""
+    from api.services.billing.manualBillingContracts import CheckoutProviderSnapshot
+    return CheckoutProviderSnapshot(intent.attemptId, order, 'unpaid', observed, True, intent.amount, intent.currency, ())
 
 
 def invoice(path, invoice_id):
@@ -46,7 +53,7 @@ def test_http_changed_selection_replaces_unpaid_checkout(checkout_client, mode, 
     assert closed['total_amount'] == original_invoice['total_amount']
     old_metadata = json.loads(closed['metadata_json'])
     assert old_metadata['domains'] == ['banking']
-    assert old_metadata['manualBilling']['closedReason'] == 'SUPERSEDED_BY_REQUEST'
+    assert old_metadata['manualBilling']['closedReason'] == 'SUPERSEDED'
     assert old_metadata['manualBilling']['closedAt']
     assert old_metadata['manualBilling']['supersededByInvoiceId'] == changed['invoiceId']
     assert json.loads(invoice(path, changed['invoiceId'])['metadata_json'])['manualBilling']['replacesInvoiceIds'] == [first['invoiceId']]
@@ -115,7 +122,7 @@ def test_replacement_failure_rolls_back_old_checkout_closure(checkout_database):
     with sqlTransaction(path) as db:
         db.execute("CREATE TRIGGER fail_replacement BEFORE INSERT ON billing_events BEGIN SELECT RAISE(ABORT,'replacement insert failed'); END")
     with pytest.raises(Exception, match='replacement insert failed'):
-        repo.reserveCheckout(request('replacement', ('telecom',)))
+        repo.reserveCheckout(request('replacement', ('telecom',)), inspection=empty(first, 'original-order'))
     assert counts(path) == (1, 1)
     assert invoice(path, first.invoiceId)['status'] == 'PAYMENT_PENDING'
     old = repo.attemptById(USER, first.attemptId)
@@ -130,7 +137,7 @@ def test_replacement_price_outage_preserves_original(checkout_database):
     with patch('api.services.billing.pricingCatalogRepository.getPricingCatalogRepository') as catalog_factory:
         catalog_factory.return_value.loadCurrent.side_effect = RuntimeError('price unavailable')
         with pytest.raises(RuntimeError, match='price unavailable'):
-            repo.reserveCheckout(request('replacement', ('telecom',)))
+            repo.reserveCheckout(request('replacement', ('telecom',)), inspection=empty(first, 'original-order'))
     assert invoice(path, first.invoiceId)['status'] == 'PAYMENT_PENDING'
     assert counts(path) == (1, 1)
 
@@ -183,7 +190,8 @@ def test_replacement_can_switch_initial_billing_mode(checkout_database):
     repo, path = checkout_database
     first = repo.reserveCheckout(request('first', mode='annual_prepaid'))
     repo.bindProviderOrder(first.attemptId, {'id': 'annual-order'})
-    changed = repo.reserveCheckout(request('replacement', ('telecom',), mode='monthly_prepaid'))
+    changed = repo.reserveCheckout(request('replacement', ('telecom',), mode='monthly_prepaid'),
+                                   inspection=empty(first, 'annual-order'))
     assert invoice(path, first.invoiceId)['status'] == 'VOID'
     assert changed.billingMode == 'monthly_prepaid'
 
@@ -227,54 +235,64 @@ def test_old_key_identity_precedes_unrelated_replacement_recovery(checkout_datab
     assert len(provider.order.createdPayloads) == 2
 
 
-@pytest.mark.parametrize('payment_status', ['created', 'authorized', 'captured'])
+def test_order_backed_live_attempt_without_provider_evidence_is_busy(checkout_database):
+    repo, path = checkout_database
+    first = repo.reserveCheckout(request('first'))
+    repo.bindProviderOrder(first.attemptId, {'id': 'original-order'})
+    with pytest.raises(RuntimeError, match='PAYMENT_SERVICE_BUSY'):
+        repo.reserveCheckout(request('replacement', ('telecom',)))
+    stale = empty(first, 'original-order', NOW - timedelta(seconds=61))
+    with pytest.raises(RuntimeError, match='PAYMENT_SERVICE_BUSY'):
+        repo.reserveCheckout(request('replacement', ('telecom',)), inspection=stale)
+    assert counts(path) == (1, 1) and invoice(path, first.invoiceId)['status'] == 'PAYMENT_PENDING'
+
+
+@pytest.mark.parametrize('payment_status,outcome', [
+    ('created', 'replaced'), ('failed', 'replaced'), ('authorized', 'confirming'), ('captured', 'replaced')])
 @pytest.mark.parametrize('domains', [('banking',), ('telecom',)])
-def test_lapsed_annual_purchase_with_money_cannot_open_another_order(checkout_database, payment_status, domains):
-    from datetime import timedelta
+def test_lapsed_annual_purchase_money_decides_pay(checkout_database, payment_status, outcome, domains):
     from api.services.billing.manualBillingRecoveryService import ManualBillingRecoveryService
     from test.test_manual_payment_entrypoints import RecoverableProvider
     repo, path = checkout_database
     provider = RecoverableProvider(path)
     service = ManualPaymentService.forProduction(provider, repo)
     original = service.createCheckout(request('original', mode='annual_prepaid'))
+    later = NOW + timedelta(hours=1)
     provider.order.orders[original.razorpayOrderId]['status'] = 'paid' if payment_status == 'captured' else 'attempted'
     provider.paymentsByOrder[original.razorpayOrderId] = [{
-        'id': 'pending-annual-payment', 'order_id': original.razorpayOrderId,
+        'id': 'pending-annual-payment', 'order_id': original.razorpayOrderId, 'created_at': int((later - timedelta(minutes=5)).timestamp()),
         'status': payment_status, 'amount': original.amount, 'currency': original.currency}]
-    with patch('api.services.billing.manualBillingRepository._now', return_value=NOW + timedelta(hours=1)):
+    with patch('api.services.billing.manualBillingRepository._now', return_value=later):
         ManualBillingRecoveryService(repo, provider).recoverAttempt(repo.attemptById(USER, original.attemptId))
-        with pytest.raises(ValueError, match='LIVE_INITIAL_CHECKOUT_CONFLICT'):
-            service.createCheckout(request('another-browser', domains, mode='annual_prepaid'))
-    assert counts(path) == (1, 1)
-    assert invoice(path, original.invoiceId)['status'] == 'PAYMENT_PENDING'
+        result = service.createCheckout(request('another-browser', domains, mode='annual_prepaid'))
+    if outcome == 'confirming':
+        # A payment the bank approved is seconds from capture: nothing new opens.
+        assert result.state == 'confirming_earlier_payment' and result.attemptId == original.attemptId
+        assert counts(path) == (1, 1) and len(provider.order.createdPayloads) == 1
+        assert invoice(path, original.invoiceId)['status'] == 'PAYMENT_PENDING'
+        return
+    # A started-but-unapproved, failed or already-finalized payment never holds Pay.
+    assert result.attemptId != original.attemptId and result.razorpayOrderId != original.razorpayOrderId
+    assert counts(path) == (2, 2) and len(provider.order.createdPayloads) == 2
+    assert invoice(path, original.invoiceId)['status'] == 'VOID'
     retained = repo.attemptById(USER, original.attemptId)
     assert retained['provider_order_id'] == original.razorpayOrderId
-    assert retained['payment_status'] == ('authorized' if payment_status == 'authorized' else 'pending_provider_ack')
-    assert len(provider.order.createdPayloads) == 1
+    assert repo._json(retained['metadata_json'])['manualBilling']['closedReason'] == 'SUPERSEDED'
+    if payment_status == 'captured':
+        with sqlTransaction(path) as db:
+            assert db.execute("SELECT event_status FROM billing_events WHERE provider_payment_id='pending-annual-payment'").fetchall() == [
+                ('REQUIRES_RECONCILIATION',)]
 
 
-@pytest.mark.parametrize('observed', [False, True])
-def test_lapsed_annual_purchase_requires_fresh_absence_before_replacement(checkout_database, observed):
-    from datetime import timedelta
-    from api.services.billing.manualBillingRecoveryService import ManualBillingRecoveryService
+def test_lapsed_annual_purchase_with_empty_order_is_replaced_from_a_fresh_listing(checkout_database):
     from test.test_manual_payment_entrypoints import RecoverableProvider
     repo, path = checkout_database
     provider = RecoverableProvider(path)
     service = ManualPaymentService.forProduction(provider, repo)
     original = service.createCheckout(request('original', mode='annual_prepaid'))
-    recovery = ManualBillingRecoveryService(repo, provider)
-    later = NOW + timedelta(hours=1)
-    if observed:
-        with patch('api.services.billing.manualBillingRepository._now', return_value=later):
-            recovery.recoverAttempt(repo.attemptById(USER, original.attemptId))
-    with patch('api.services.billing.manualBillingRepository._now', return_value=later + timedelta(seconds=61)):
-        fresh = request('another-browser', mode='annual_prepaid')
-        with pytest.raises(RuntimeError, match='PROVIDER_STATUS_UNKNOWN'):
-            service.createCheckout(fresh)
-        assert counts(path) == (1, 1)
-        recovery.recoverAttempt(repo.attemptById(USER, original.attemptId))
-        replacement = service.createCheckout(fresh)
+    with patch('api.services.billing.manualBillingRepository._now', return_value=NOW + timedelta(hours=1)):
+        replacement = service.createCheckout(request('another-browser', mode='annual_prepaid'))
     assert replacement.attemptId != original.attemptId and replacement.razorpayOrderId != original.razorpayOrderId
-    assert repo.attemptById(USER, original.attemptId)['payment_status'] == 'expired'
-    assert invoice(path, original.invoiceId)['status'] == 'EXPIRED'
+    assert repo.attemptById(USER, original.attemptId)['payment_status'] == 'cancelled'
+    assert invoice(path, original.invoiceId)['status'] == 'VOID'
     assert counts(path) == (2, 2) and len(provider.order.createdPayloads) == 2

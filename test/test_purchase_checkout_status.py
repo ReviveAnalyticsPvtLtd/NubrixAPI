@@ -81,9 +81,9 @@ def test_status_refresh_never_creates_invoice_order_or_key(status_checkout, chec
     body = response.json()
     assert body['schemaVersion'] == 1 and body['userId'] == USER
     assert body['invoiceId'] == intent['invoiceId'] and body['attemptId'] == intent['attemptId']
-    assert body['state'] == 'awaiting_capture' and body['providerState'] == 'authorized'
-    assert body['capabilities'] == {'mayEditDraft': False, 'mayResumeOriginal': False,
-        'maySubmitLatestDraft': False, 'mayRequestCancellation': False}
+    assert body['state'] == 'confirming_earlier_payment' and body['providerState'] == 'authorized'
+    assert body['capabilities'] == {'mayEditDraft': False, 'maySubmitLatestDraft': False}
+    assert not {'operationRevision', 'cancellationAcceptedAt'} & body.keys()
     assert not {'razorpayKey', 'razorpaySignature', 'requestKey', 'orderId'} & body.keys()
     assert (counts(path), event_count(path), len(provider.order.createdPayloads)) == before
     assert provider.forbiddenCalls == []
@@ -136,9 +136,9 @@ def test_unknown_provider_never_returns_payable(status_checkout):
     provider.order.fetch = Mock(side_effect=TimeoutError('private provider diagnostic'))
     response = status(client, intent)
     assert response.status_code == 200
-    assert response.json()['state'] == 'status_unknown'
+    assert response.json()['state'] == 'ready'
+    assert response.json()['pendingReason'] == 'PROVIDER_STATUS_UNKNOWN'
     assert response.json()['providerState'] == 'unknown'
-    assert not response.json()['capabilities']['mayResumeOriginal']
     assert 'private provider diagnostic' not in response.text
 
 
@@ -146,8 +146,7 @@ def test_status_without_browser_key(status_checkout):
     client, _, _, intent = status_checkout
     response = status(client, intent)
     assert response.status_code == 200
-    assert response.json()['state'] == 'unpaid'
-    assert response.json()['capabilities']['mayResumeOriginal']
+    assert response.json()['state'] == 'ready' and response.json()['pendingReason'] is None
 
 
 def test_existing_exact_key_replay_exposes_recorded_authorization(status_checkout):
@@ -160,7 +159,7 @@ def test_existing_exact_key_replay_exposes_recorded_authorization(status_checkou
     assert len(provider.order.createdPayloads) == 1
 
 
-def test_expired_unpaid_status_cannot_resume_original(status_checkout, checkout_database):
+def test_expired_unpaid_status_is_ready_for_a_replacing_pay(status_checkout, checkout_database):
     client, _, path, intent = status_checkout
     repository, _ = checkout_database
     attempt = repository.attemptById(USER, intent['attemptId'])
@@ -170,7 +169,7 @@ def test_expired_unpaid_status_cannot_resume_original(status_checkout, checkout_
         db.execute('UPDATE billing_events SET metadata_json=? WHERE id=?', (json.dumps(metadata), intent['attemptId']))
     response = status(client, intent)
     assert response.status_code == 200
-    assert not response.json()['capabilities']['mayResumeOriginal']
+    assert response.json()['state'] == 'ready'
 
 
 def test_status_unknown_order_ack_does_not_create_replacement(status_checkout):
@@ -178,7 +177,8 @@ def test_status_unknown_order_ack_does_not_create_replacement(status_checkout):
     with sqlTransaction(path) as db:
         db.execute('UPDATE billing_events SET provider_order_id=NULL WHERE id=?', (intent['attemptId'],))
     response = status(client, intent)
-    assert response.status_code == 200 and response.json()['state'] == 'status_unknown'
+    assert response.status_code == 200 and response.json()['state'] == 'ready'
+    assert response.json()['pendingReason'] == 'PROVIDER_STATUS_UNKNOWN'
     assert len(provider.order.createdPayloads) == 1 and counts(path) == (1, 1)
 
 
@@ -210,8 +210,8 @@ def test_mismatched_provider_payment_never_finalizes(status_checkout, checkout_d
     item = payment(provider, intent, 'captured')
     item[field] = value
     response = status(client, intent)
-    assert response.status_code == 200 and response.json()['state'] == 'status_unknown'
-    assert not response.json()['capabilities']['mayResumeOriginal']
+    assert response.status_code == 200 and response.json()['state'] == 'ready'
+    assert response.json()['pendingReason'] == 'PROVIDER_STATUS_UNKNOWN'
     assert not checkout_database[0].getCoverageSnapshot(USER).accessAllowed
     assert counts(path) == (1, 1)
 
@@ -225,18 +225,19 @@ def test_incomplete_provider_listing_never_finalizes_partial_capture(status_chec
         return {'items': [dict(item, id=f'payment-{index}') for index in range(100)]}
     provider.order.payments = lambda order, params: truncated(params)
     response = status(client, intent)
-    assert response.status_code == 200 and response.json()['state'] == 'status_unknown'
+    assert response.status_code == 200 and response.json()['state'] == 'ready'
+    assert response.json()['pendingReason'] == 'PROVIDER_STATUS_UNKNOWN'
     assert not checkout_database[0].getCoverageSnapshot(USER).accessAllowed
 
 
-def test_status_does_not_resume_closed_original(status_checkout):
+def test_status_of_replaced_original_is_closed(status_checkout):
     client, provider, _, original = status_checkout
     replacement = client.post('/createSubscription', json={'domains': ['telecom'], 'contact': ''},
         headers={'Idempotency-Key': 'replacement'})
     assert replacement.status_code == 200
     response = status(client, original)
-    assert response.status_code == 200 and response.json()['state'] == 'cancelled'
-    assert not response.json()['capabilities']['mayResumeOriginal']
+    assert response.status_code == 200 and response.json()['state'] == 'ready'
+    assert response.json()['pendingReason'] == 'ORIGINAL_CHECKOUT_CLOSED'
     assert len(provider.order.createdPayloads) == 2
 
 
@@ -246,8 +247,8 @@ def test_late_capture_on_closed_original_reports_attention(status_checkout, chec
         headers={'Idempotency-Key': 'replacement'}).status_code == 200
     payment(provider, original, 'captured')
     response = status(client, original)
-    assert response.status_code == 200 and response.json()['state'] == 'needs_attention'
-    assert not response.json()['capabilities']['mayResumeOriginal']
+    assert response.status_code == 200 and response.json()['state'] == 'ready'
+    assert response.json()['pendingReason'] == 'PAYMENT_REQUIRES_RECONCILIATION'
     assert not checkout_database[0].getCoverageSnapshot(USER).accessAllowed
 
 
@@ -273,7 +274,7 @@ def test_status_response_is_not_cacheable(status_checkout):
 
 
 @pytest.mark.parametrize('restriction', ['erasure', 'banned'])
-def test_status_never_offers_resume_for_restricted_owner(status_checkout, restriction):
+def test_status_never_offers_pay_for_restricted_owner(status_checkout, restriction):
     client, _, path, intent = status_checkout
     with sqlTransaction(path) as db:
         if restriction == 'erasure':
@@ -282,16 +283,4 @@ def test_status_never_offers_resume_for_restricted_owner(status_checkout, restri
             db.execute('UPDATE "Users" SET "isBanned"=1 WHERE "userId"=?', (USER,))
     response = status(client, intent)
     assert response.status_code == 200
-    assert not response.json()['capabilities']['mayResumeOriginal']
-
-
-@pytest.mark.parametrize('denial,trial', [('no_subscription', False), ('expired', False), (None, True)])
-def test_unpaid_resume_uses_v2_none_expired_and_trial_coverage_facts(status_checkout, checkout_database, monkeypatch, denial, trial):
-    client, _, _, intent = status_checkout
-    repository, _ = checkout_database
-    coverage = repository.getCoverageSnapshot(USER)
-    monkeypatch.setattr(repository, '_coverageSnapshotLocked', lambda *args, **kwargs:
-        replace(coverage, denialReason=denial, accessAllowed=trial, currentPeriod=None))
-    response = status(client, intent)
-    assert response.status_code == 200 and response.json()['state'] == 'unpaid'
-    assert response.json()['capabilities']['mayResumeOriginal']
+    assert response.json()['capabilities'] == {'mayEditDraft': False, 'maySubmitLatestDraft': False}

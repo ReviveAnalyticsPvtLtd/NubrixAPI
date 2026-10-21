@@ -169,10 +169,13 @@ def test_draft_is_removed_by_complete_erasure(drafts):
 
 
 def seedAttempt(drafts, purpose='initial_purchase', domains=('banking',), bind=True):
+    from unittest.mock import patch
     from api.services.billing.manualBillingContracts import CheckoutRequest
     _, billing, user, url = drafts
-    intent = billing.reserveCheckout(CheckoutRequest(user, 'initial_purchase', 'monthly_prepaid',
-        {'domains': list(domains)}, expectedCatalogRevision=1))
+    # These SQL-level cases insert the control row themselves, with the purpose and slot under test.
+    with patch('api.services.billing.purchaseCheckoutRepository.bindPurchaseControlLocked', lambda *args: None):
+        intent = billing.reserveCheckout(CheckoutRequest(user, 'initial_purchase', 'monthly_prepaid',
+            {'domains': list(domains)}, expectedCatalogRevision=1))
     order = 'order-' + str(uuid4()) if bind else None
     if bind:
         billing.bindProviderOrder(intent.attemptId, {'id': order})
@@ -396,11 +399,9 @@ def test_trigger_blocks_delete_truncate_and_identity_changes(drafts):
         closed_reason='SUPERSEDED' WHERE attempt_id=%s""", (foreign.attemptId, intent.attemptId),
         'payment supersession owner or slot mismatch')
     query(url, f"""UPDATE payment_slot_controls SET {bump}superseded_by=%s,closed_at=clock_timestamp(),
-        closed_reason='SUPERSEDED',cancellation_requested_at=clock_timestamp() WHERE attempt_id=%s""",
-        (other.attemptId, intent.attemptId))
+        closed_reason='SUPERSEDED' WHERE attempt_id=%s""", (other.attemptId, intent.attemptId))
     for change in ('superseded_by=NULL', f"superseded_by='{foreign.attemptId}'", 'closed_at=clock_timestamp()',
-                   "closed_reason='EXPIRED'", 'closed_at=NULL,closed_reason=NULL,superseded_by=NULL',
-                   'cancellation_requested_at=clock_timestamp()'):
+                   "closed_reason='EXPIRED'", 'closed_at=NULL,closed_reason=NULL,superseded_by=NULL'):
         assertStatementRejected(url, f'UPDATE payment_slot_controls SET {bump}{change} WHERE attempt_id=%s',
                                 (intent.attemptId,), CONTROL_FROZEN)
     for change, message in (('amount=1', OPERATION_MONEY), ("currency='USD'", OPERATION_MONEY), ("user_id='foreign'", OWNERSHIP),
@@ -588,51 +589,6 @@ def authorization(repo, provider, intent):
     return evidence
 
 
-def test_cancel_idempotency_and_stale_revision_are_not_new_mutations(drafts, monkeypatch):
-    repo, provider, intent, service = controlledPurchase(drafts, monkeypatch)
-    first = service.cancel(intent.userId, intent.attemptId, 1, 'cancel-key')
-    replay = service.cancel(intent.userId, intent.attemptId, 1, 'cancel-key')
-    assert replay.checkout.operationRevision == first.checkout.operationRevision
-    with pytest.raises(ValueError, match='IDEMPOTENCY_CONFLICT'):
-        service.cancel(intent.userId, intent.attemptId, 2, 'cancel-key')
-    with pytest.raises(ValueError, match='PURCHASE_CHECKOUT_STALE'):
-        service.cancel(intent.userId, intent.attemptId, 1, 'another-key')
-
-
-@pytest.mark.parametrize('currency', ['INR', 'USD'])
-@pytest.mark.parametrize('interval', ['month', 'year'])
-@pytest.mark.parametrize('original,changed', [(('banking',), ['banking', 'telecom']), (('banking', 'telecom'), ['banking'])])
-def test_explicit_cancel_then_latest_draft_replaces_frozen_selection(drafts, monkeypatch, currency, interval, original, changed):
-    repo, provider, intent, service = controlledPurchase(drafts, monkeypatch, original, interval, currency)
-    assert provider.orderCalls[0]['payment']['capture'] == 'automatic'
-    old = query(drafts[3], 'SELECT amount,total_amount,currency FROM "Invoices" WHERE id=%s', (intent.invoiceId,), one=True)
-    repo.saveDraft(intent.userId, 1, changed, interval)
-    pricing = {'userId': intent.userId, 'domains': changed, 'billingMode': intent.billingMode, 'currency': currency, 'catalogRevision': 1}
-    with pytest.raises(ValueError, match='PURCHASE_REPLACEMENT_CONFIRMATION_REQUIRED'):
-        repo.reserveDraftCheckout(intent.userId, 2, pricing, 'replace')
-    service.cancel(intent.userId, intent.attemptId, 1, 'cancel-old')
-    new = repo.reserveDraftCheckout(intent.userId, 2, pricing, 'replace')
-    assert new.attemptId != intent.attemptId and new.snapshot['domains'] == sorted(changed)
-    assert repo.getControl(intent.userId, new.attemptId)['draft_revision'] == 2
-    replacement, original = repo.getControl(intent.userId, new.attemptId), repo.getControl(intent.userId, intent.attemptId)
-    assert replacement['slot_id'] == original['slot_id'] and replacement['capture_policy'] == 'automatic'
-    assert query(drafts[3], 'SELECT kind,slot_key,settled_payment_id FROM payment_slots WHERE slot_id=%s',
-                 (replacement['slot_id'],), one=True) == {'kind': 'pro_term', 'slot_key': 'open', 'settled_payment_id': None}
-    assert query(drafts[3], 'SELECT amount,total_amount,currency FROM "Invoices" WHERE id=%s', (intent.invoiceId,), one=True) == old
-    assert len(provider.orderCalls) == 1
-
-
-def test_legacy_purchase_cannot_bypass_unresolved_control_when_gate_is_off(drafts, monkeypatch):
-    from api.services.billing.manualBillingContracts import CheckoutRequest
-    repo, provider, intent, service = controlledPurchase(drafts, monkeypatch)
-    authorization(repo, provider, intent)
-    service.cancel(intent.userId, intent.attemptId, 1, 'cancel')
-    monkeypatch.delenv('SUBSCRIPTION_EDITABLE_CHECKOUT_ENABLED')
-    with pytest.raises(ValueError, match='PURCHASE_FUNDS_PENDING'):
-        drafts[1].reserveCheckout(CheckoutRequest(intent.userId, 'initial_purchase', intent.billingMode,
-            {'domains': ['telecom']}, 'old-client', expectedCatalogRevision=1))
-
-
 @pytest.mark.parametrize('source', ['browser', 'webhook', 'recovery'])
 def test_authorized_evidence_never_submits_capture(drafts, monkeypatch, source):
     from api.services.billing.manualPaymentService import ManualPaymentService
@@ -640,7 +596,7 @@ def test_authorized_evidence_never_submits_capture(drafts, monkeypatch, source):
     from api.services.billing.manualBillingRecoveryService import ManualBillingRecoveryService
     repo, provider, intent, _ = controlledPurchase(drafts, monkeypatch)
     payment = provider.authorize(intent)
-    assert PurchaseCheckoutStatusService(repo, provider).refresh(intent.userId, intent.attemptId).state == 'awaiting_capture'
+    assert PurchaseCheckoutStatusService(repo, provider).refresh(intent.userId, intent.attemptId).state == 'confirming_earlier_payment'
     assert not provider.captureCalls
     if source == 'browser':
         from api.services.billing.manualBillingRepository import _now
@@ -674,54 +630,49 @@ def test_authorized_evidence_never_submits_capture(drafts, monkeypatch, source):
     assert repo.attemptById(intent.userId, intent.attemptId)['payment_status'] == 'authorized'
 
 
-def test_late_authorization_records_money_without_reviving_cancelled_purchase(drafts, monkeypatch):
+def supersede(repo, provider, intent, domains=('banking',), key='replace'):
+    """Pay a changed saved draft; the server replaces the earlier empty Order."""
+    from api.services.billing.manualPaymentService import ManualPaymentService
+    revision = repo.readEditor(intent.userId).draft.revision
+    repo.saveDraft(intent.userId, revision, list(domains), 'year' if intent.billingMode == 'annual_prepaid' else 'month')
+    pricing = {'userId': intent.userId, 'domains': list(domains), 'billingMode': intent.billingMode,
+               'currency': intent.currency, 'catalogRevision': 1}
+    replacement = ManualPaymentService.forProduction(provider, repo).createCheckout(
+        repo.draftCheckoutRequest(intent.userId, revision + 1, pricing, key))
+    assert replacement.attemptId != intent.attemptId
+    return replacement
+
+
+def test_late_authorization_records_money_without_reviving_superseded_purchase(drafts, monkeypatch):
     from api.services.billing.manualPaymentService import ManualPaymentService
     from api.services.billing.manualBillingRepository import _now
-    repo, provider, intent, service = controlledPurchase(drafts, monkeypatch)
-    service.cancel(intent.userId, intent.attemptId, 1, 'cancel-unpaid')
+    repo, provider, intent, _ = controlledPurchase(drafts, monkeypatch)
+    replacement = supersede(repo, provider, intent)
     payment = provider.authorize(intent)
     evidence = ManualPaymentService.buildPaymentEvidence(payment, attemptId=intent.attemptId, invoiceId=intent.invoiceId,
         userId=intent.userId, purpose='initial_purchase', observedAt=_now())
     ManualPaymentService.forProduction(provider, repo).finalizeCapturedPayment(evidence)
     attempt = repo.attemptById(intent.userId, intent.attemptId)
-    assert attempt['payment_status'] == 'authorized'
+    assert attempt['payment_status'] == 'cancelled'
     assert not repo._json(attempt['metadata_json'])['manualBilling'].get('closureReconciledAt')
+    assert repo.attemptById(intent.userId, replacement.attemptId)['payment_status'] == 'pending_provider_ack'
     assert not provider.captureCalls and not repo.getCoverageSnapshot(intent.userId).accessAllowed
 
 
-def test_cancelled_order_acknowledgement_is_recovered_without_new_order(drafts, monkeypatch):
-    from api.services.billing.manualPaymentService import ManualPaymentService
-    from api.services.billing.manualBillingRecoveryService import ManualBillingRecoveryService
-    repo, provider, first, service = controlledPurchase(drafts, monkeypatch)
-    service.cancel(first.userId, first.attemptId, 1, 'close-first')
-    repo.saveDraft(first.userId, 1, ['telecom'], 'month')
-    pricing = {'userId': first.userId, 'domains': ['telecom'], 'billingMode': 'monthly_prepaid', 'currency': 'INR', 'catalogRevision': 1}
-    intent = repo.reserveDraftCheckout(first.userId, 2, pricing, 'second')
-    def lostAcknowledgement(payload, **options):
-        provider.createOrder(payload)
-        raise TimeoutError('synthetic order accepted before lost reply')
-    provider.order.create = lostAcknowledgement
-    with pytest.raises(RuntimeError, match='ORDER_ACK_UNKNOWN'):
-        ManualPaymentService.forProduction(provider, repo).openReservedCheckout(intent)
-    service.cancel(first.userId, intent.attemptId, 0, 'close-second')
-    ManualBillingRecoveryService(repo, provider).recoverAttempt(repo.attemptById(first.userId, intent.attemptId))
-    recovered = repo.attemptById(first.userId, intent.attemptId)
-    assert recovered['provider_order_id'] and repo._json(recovered['metadata_json'])['manualBilling']['closedAt']
-    assert repo.getControl(first.userId, intent.attemptId)['cancellation_accepted_at'] is not None
-    assert len(provider.orderCalls) == 2 and not provider.captureCalls
-
-
 def test_stale_draft_and_changed_catalog_reserve_nothing(drafts, monkeypatch):
-    repo, provider, first, service = controlledPurchase(drafts, monkeypatch)
-    service.cancel(first.userId, first.attemptId, 1, 'cancel')
+    from api.services.billing.manualPaymentService import ManualPaymentService
+    repo, provider, first, _ = controlledPurchase(drafts, monkeypatch)
     repo.saveDraft(first.userId, 1, ['telecom'], 'year')
     pricing = {'userId': first.userId, 'domains': ['telecom'], 'billingMode': 'annual_prepaid', 'currency': 'INR', 'catalogRevision': 999}
-    before = query(drafts[3], 'SELECT id FROM "Invoices" WHERE "userId"=%s', (first.userId,))
+    before = query(drafts[3], 'SELECT to_jsonb(i) AS row FROM "Invoices" i WHERE "userId"=%s ORDER BY id', (first.userId,))
+    service = ManualPaymentService.forProduction(provider, repo)
     with pytest.raises(ValueError, match='PURCHASE_DRAFT_STALE'):
-        repo.reserveDraftCheckout(first.userId, 1, pricing, 'new')
+        service.createCheckout(repo.draftCheckoutRequest(first.userId, 1, pricing, 'new'))
     with pytest.raises(ValueError, match='PRICING_CHANGED'):
-        repo.reserveDraftCheckout(first.userId, 2, pricing, 'new')
-    assert query(drafts[3], 'SELECT id FROM "Invoices" WHERE "userId"=%s', (first.userId,)) == before
+        service.createCheckout(repo.draftCheckoutRequest(first.userId, 2, pricing, 'new'))
+    # A replacement that fails pricing rolls back: the earlier attempt stays live.
+    assert query(drafts[3], 'SELECT to_jsonb(i) AS row FROM "Invoices" i WHERE "userId"=%s ORDER BY id', (first.userId,)) == before
+    assert repo.attemptById(first.userId, first.attemptId)['payment_status'] == 'pending_provider_ack'
     assert len(provider.orderCalls) == 1
 
 
@@ -729,21 +680,23 @@ def test_same_closed_legacy_key_returns_old_identity_and_no_gateway_call(drafts,
     from api.services.billing.manualBillingContracts import CheckoutRequest
     from api.services.billing.manualPaymentService import ManualPaymentService
     from test.purchaseProviderFixtures import SyntheticPurchaseProvider
-    from api.services.billing.purchaseCheckoutService import PurchaseCheckoutService
     repo, billing, user, _ = drafts
+    monkeypatch.delenv('SUBSCRIPTION_EDITABLE_CHECKOUT_ENABLED')
     request = CheckoutRequest(user, 'initial_purchase', 'monthly_prepaid', {'domains': ['banking']}, 'legacy', expectedCatalogRevision=1)
     provider = SyntheticPurchaseProvider()
     intent = ManualPaymentService.forProduction(provider, billing).createCheckout(request)
     assert provider.orderCalls[0]['payment']['capture'] == 'automatic'
-    monkeypatch.setattr('api.services.billing.purchaseCheckoutService.purchaseActionsReady', lambda: True)
-    PurchaseCheckoutService(repo, provider).cancel(user, intent.attemptId, 0, 'cancel-legacy')
+    ManualPaymentService.forProduction(provider, billing).createCheckout(CheckoutRequest(
+        user, 'initial_purchase', 'monthly_prepaid', {'domains': ['telecom']}, 'legacy-changed', expectedCatalogRevision=1))
+    assert len(provider.orderCalls) == 2
     replay = ManualPaymentService.forProduction(provider, billing).createCheckout(request)
     assert replay.attemptId == intent.attemptId and replay.state == 'cancelled'
     control = repo.getControl(user, intent.attemptId)
-    assert control['capture_policy'] == 'account_default' and control['draft_revision'] is None
+    assert control['capture_policy'] == 'automatic' and control['draft_revision'] is None
+    assert control['closed_reason'] == 'SUPERSEDED'
     assert query(drafts[3], 'SELECT kind,slot_key FROM payment_slots WHERE slot_id=%s', (control['slot_id'],), one=True) == {
         'kind': 'pro_term', 'slot_key': 'open'}
-    assert len(provider.orderCalls) == 1
+    assert len(provider.orderCalls) == 2
 
 
 def test_submit_http_verifies_signed_pricing_and_keeps_contact_out_of_storage(drafts, monkeypatch):
@@ -782,15 +735,3 @@ def test_submit_http_verifies_signed_pricing_and_keeps_contact_out_of_storage(dr
     assert len(provider.orderCalls) == 1
 
 
-def test_newer_unknown_observation_invalidates_old_unpaid_cancellation_proof(drafts, monkeypatch):
-    from dataclasses import replace
-    from datetime import timedelta
-    from api.services.billing.manualBillingRecoveryService import ManualBillingRecoveryService
-    repo, provider, intent, _ = controlledPurchase(drafts, monkeypatch)
-    old = ManualBillingRecoveryService(repo, provider).inspectAttempt(repo.attemptById(intent.userId, intent.attemptId))
-    repo.recordProviderObservation(intent.attemptId, old)
-    repo.recordProviderObservation(intent.attemptId, replace(old, outcome='unknown', complete=False, observedAt=old.observedAt+timedelta(seconds=1)))
-    repo.acceptCancellation(intent.userId, intent.attemptId, 1, 'cancel-stale-read', old)
-    frozen = repo._json(repo.attemptById(intent.userId, intent.attemptId)['metadata_json'])['manualBilling']
-    assert frozen['purchaseCancellationAcceptedAt']
-    assert not frozen.get('closureReconciledAt')

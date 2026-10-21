@@ -101,7 +101,9 @@ class ManualPaymentService:
                 return replay
         from api.services.billing.manualBillingRecoveryService import ManualBillingRecoveryService
         recovery = ManualBillingRecoveryService(self.repository, self.razorpayClient)
-        pendingRows = self.repository.orderlessRecoveryRows(request.userId, request.purpose, request.billingMode)
+        # The initial purchase slot spans billing modes.
+        pendingRows = self.repository.orderlessRecoveryRows(request.userId, request.purpose,
+            None if request.purpose == 'initial_purchase' else request.billingMode)
         if request.purpose == 'renewal':
             pendingRows = self.repository.renewalRecoveryRows(request.userId, request.billingMode,
                 request.payload.get('invoiceId'))
@@ -118,7 +120,25 @@ class ManualPaymentService:
                 if frozen.get('closedAt') and observation.get('hasPayments') and updated.get('payment_status') != 'captured':
                     original = self.repository._intentFromAttemptRow(updated, metadata, request.userId, request.purpose)
                     return replace(original, state='requires_reconciliation')
-        intent = self.repository.reserveCheckout(request)
+        inspection = None
+        if request.purpose == 'initial_purchase':
+            # Provider reads happen before the owner lock; the reservation re-reads the
+            # live attempt under the lock and is busy if it changed since this snapshot.
+            live = self.repository.liveSlotAttempt(request.userId, request.purpose)
+            if live is not None and live.get('provider_order_id'):
+                inspection = recovery.inspectAttempt(live)
+                if not inspection.complete:
+                    raise RuntimeError('PAYMENT_SERVICE_BUSY')  # Nothing closed, nothing opened.
+                try:
+                    # Finalize captured money first; a granted payment settles the slot.
+                    recovery.applyObservation(live, inspection)
+                except RuntimeError as exc:
+                    if str(exc) != 'PROVIDER_STATUS_UNKNOWN':
+                        raise
+                    # Recorded; the slot decision treats an unclassified Order as busy,
+                    # or refunded money on it as finalize-first.
+        evidence = {} if inspection is None else {'inspection': inspection}
+        intent = self.repository.reserveCheckout(request, **evidence)
         return self.openReservedCheckout(intent)
 
     def openReservedCheckout(self, intent):
@@ -132,11 +152,15 @@ class ManualPaymentService:
         from api.services.billing.paymentPolicy import orderPaymentOptions, paymentRulesEffectiveAt
         from api.services.billing.purchaseProvider import purchaseProviderOptions
         paymentRulesEffectiveAt()  # unset or invalid cutoff: no new Order may open
-        options = orderPaymentOptions()
+        # The Order is told exactly the window recorded on the attempt at reservation.
+        options = orderPaymentOptions(intent.snapshot.get('captureWindowMinutes'))
         providerOptions = purchaseProviderOptions()
         if not self.repository.claimProviderOrderCreation(intent.attemptId):
             from api.services.billing.manualBillingRecoveryService import ManualBillingRecoveryService
             attempt = self.repository.attemptById(intent.userId, intent.attemptId)
+            if not attempt.get('provider_order_id') and attempt.get('payment_status') not in ('created', 'pending_provider_ack', 'authorized'):
+                # Replaced by a concurrent Pay before this Order was requested: nothing was sent.
+                raise RuntimeError('PAYMENT_SERVICE_BUSY')
             ManualBillingRecoveryService(self.repository, self.razorpayClient).recoverAttempt(attempt)
             attempt = self.repository.attemptById(intent.userId, intent.attemptId)
             intent = self.repository._intentFromAttemptRow(attempt,

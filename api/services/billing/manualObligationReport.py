@@ -110,14 +110,11 @@ def listObligations(repository, limit=100, cursor=None):
             purchase=[]
             if hasPurchase:
                 sources=[('payment_operations','id',
-                    "state NOT IN ('succeeded','cancelled')", "'purchase_'||kind"),
-                    ('payment_slot_controls','attempt_id',
-                    "cancellation_requested_at IS NOT NULL AND EXISTS(SELECT 1 FROM public.billing_events b WHERE b.id=a.attempt_id AND b.payment_status<>'captured' AND b.metadata_json->'manualBilling'->>'closureReconciledAt' IS NULL)",
-                    "'purchase_cancellation'")]
+                    "state NOT IN ('succeeded','cancelled')", "'purchase_'||kind")]
                 for table,identity,condition,category in sources:
                     sql.execute(f'SELECT {category} AS category,count(*) AS count FROM public.{table} a WHERE {condition} GROUP BY category')
                     totals.update({r['category']:int(r['count']) for r in sql.fetchall()})
-                    source='purchase_operation' if identity=='id' else 'purchase_cancellation'
+                    source='purchase_operation'
                     key="'"+source+":'||"+identity+'::text'
                     afterFilter=f' AND (created_at,{key})>(%s,%s)' if after else ''
                     sql.execute(f'''SELECT a.*,{identity} AS id,{category} AS obligation_category FROM public.{table} a
@@ -158,7 +155,7 @@ def listObligations(repository, limit=100, cursor=None):
         project('delivery',row,category,'reconcile_original_tracking_tag' if category=='delivery_ambiguous' else 'dispatch_or_reconcile_original_delivery')
     for source,row in purchase:
         project(source,row,row['obligation_category'],'reconcile_original_purchase_operation')
-        rows[-1].update(state=row.get('state') or 'cancellation_pending',
+        rows[-1].update(state=row.get('state'),
             reasonCode=row.get('error_code'),caseReference=row.get('escalation_reference'))
     from api.services.credits.creditUsageSpool import spoolDirectory
     spoolPaths = sorted(spoolDirectory().glob('*.json'), key=lambda path:(path.stat().st_mtime,path.stem))

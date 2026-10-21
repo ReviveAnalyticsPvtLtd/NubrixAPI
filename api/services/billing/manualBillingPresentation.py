@@ -50,12 +50,27 @@ def serializePeriod(period):
 HIDDEN_CHECKOUT_METHODS = ('emi', 'cardless_emi', 'paylater')
 
 
+_EXPERT_NAMES = {'banking': 'Banking', 'manufacturing': 'Manufacturing', 'supplychain': 'Supply Chain', 'telecom': 'Telecom'}
+
+
+def purchaseSelectionLabel(snapshot):
+    """Customer wording for a frozen selection; never an invoice or attempt identity."""
+    names = [_EXPERT_NAMES.get(domain, str(domain)) for domain in snapshot.get('domains') or []]
+    interval = 'annual' if snapshot.get('billingMode') == 'annual_prepaid' else 'monthly'
+    if not names:
+        return 'Pro ' + interval
+    experts = names[0] if len(names) == 1 else ', '.join(names[:-1]) + ' and ' + names[-1]
+    return 'Pro ' + interval + ' with ' + experts
+
+
 def serializeCheckoutIntent(intent, publicKey, identity=None):
     state = {'created':'payment_pending', 'pending_provider_ack':'payment_pending',
         'authorized':'awaiting_capture', 'provider_processing':'awaiting_capture', 'captured':'already_finalized',
-        'expired':'expired', 'cancelled':'cancelled', 'superseded':'superseded'}.get(intent.state,'requires_reconciliation')
+        'expired':'expired', 'cancelled':'cancelled', 'superseded':'superseded',
+        'confirming_earlier_payment':'confirming_earlier_payment'}.get(intent.state,'requires_reconciliation')
     deadline = None if intent.billingMode == 'annual_prepaid' and intent.expiresAt.year == 9999 else intent.expiresAt.isoformat()
-    return {**(identity or {}), 'userId':intent.userId, 'invoiceId':intent.invoiceId,
+    earlier = {'earlierPayment': dict(intent.earlierPayment)} if intent.earlierPayment else {}
+    return {**(identity or {}), **earlier, 'userId':intent.userId, 'invoiceId':intent.invoiceId,
         'attemptId':intent.attemptId, 'razorpayOrderId':intent.razorpayOrderId, 'orderId':intent.razorpayOrderId,
         'razorpayKeyId':publicKey, 'razorpayKey':publicKey, 'amount':intent.amount,
         'currency':intent.currency, 'expiresAt':deadline, 'state':state, 'billingMode':intent.billingMode,

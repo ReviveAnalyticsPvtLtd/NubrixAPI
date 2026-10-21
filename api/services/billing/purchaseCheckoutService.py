@@ -1,7 +1,6 @@
-"""Explicit purchase actions; no cancellation is enabled before compensation readiness."""
+"""Saved-draft Pay; the server decides open, reuse, replace or wait. No user cancellation exists."""
 import os
 from dataclasses import asdict
-from uuid import UUID
 
 from api.services.billing.purchaseDraftService import editableCheckoutEnabled
 
@@ -30,33 +29,6 @@ class PurchaseCheckoutService:
     def __init__(self, repository, provider):
         self.repository, self.provider = repository, provider
 
-    def cancel(self, userId, attemptId, expectedOperationRevision, requestKey):
-        validatePurchaseKey(requestKey)
-        UUID(attemptId)
-        if not purchaseActionsReady():
-            # Gate-off replay is observational. New cancellations remain denied.
-            import psycopg2
-            try:
-                replay = self.repository.cancellationReplay(userId, attemptId, expectedOperationRevision, requestKey)
-            except (psycopg2.Error, RuntimeError, OSError):
-                replay = False
-            if not replay:
-                raise ValueError('PURCHASE_ACTIONS_UNAVAILABLE')
-            return self.repository.readEditor(userId)
-        if self.repository.cancellationReplay(userId, attemptId, expectedOperationRevision, requestKey):
-            return self.repository.readEditor(userId)
-        from api.services.billing.manualBillingRecoveryService import ManualBillingRecoveryService
-        attempt = self.repository.attemptById(userId, attemptId)
-        recovery = ManualBillingRecoveryService(self.repository, self.provider)
-        observation = recovery.inspectAttempt(attempt) if attempt.get('provider_order_id') else None
-        if observation is not None:
-            try:
-                recovery.applyObservation(attempt, observation)
-            except RuntimeError as exc:
-                if str(exc) != 'PROVIDER_STATUS_UNKNOWN':
-                    raise
-        return self.repository.acceptCancellation(userId, attemptId, expectedOperationRevision, requestKey, observation)
-
     def submit(self, userId, draftRevision, contact, pricingContext, expectedCatalogRevision, requestKey):
         requirePurchaseActions()
         validatePurchaseKey(requestKey)
@@ -70,9 +42,9 @@ class PurchaseCheckoutService:
         pricing = {'userId': userId, 'currency': claims['currency'], 'catalogRevision': expectedCatalogRevision,
             'domains': list(editor.draft.domains),
             'billingMode': 'annual_prepaid' if editor.draft.billingInterval == 'year' else 'monthly_prepaid'}
-        intent = self.repository.reserveDraftCheckout(userId, draftRevision, pricing, requestKey)
         from api.services.billing.manualPaymentService import ManualPaymentService
-        intent = ManualPaymentService.forProduction(self.provider, self.repository).openReservedCheckout(intent)
+        request = self.repository.draftCheckoutRequest(userId, draftRevision, pricing, requestKey)
+        intent = ManualPaymentService.forProduction(self.provider, self.repository).createCheckout(request)
         from api.services.billing.manualBillingPresentation import serializeCheckoutIntent
         return {'editor': {'schemaVersion': 1, **asdict(self.repository.readEditor(userId))},
             'checkout': serializeCheckoutIntent(intent, os.environ.get('RAZORPAY_KEY_ID'), {'userContact': contact})}

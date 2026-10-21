@@ -28,50 +28,34 @@ class PurchaseOperationRepositoryMixin:
         return cursor.fetchone()['count']==6
 
     @staticmethod
-    def _purchaseRecoveryReady(cursor):
-        from api.services.billing.purchaseCheckoutService import purchaseActionsReady
-        if not purchaseActionsReady():
-            return False
+    def _paymentWorkerFresh(cursor):
+        """Guarded storage plus a recent recovery/refund worker heartbeat."""
         if not PurchaseOperationRepositoryMixin._purchaseSchemaReady(cursor):
             return False
         cursor.execute('''SELECT 1 FROM private.payment_recovery_runtime
             WHERE worker_seen_at BETWEEN clock_timestamp()-interval '5 minutes' AND clock_timestamp()''')
         return cursor.fetchone() is not None
 
+    @staticmethod
+    def _purchaseRecoveryReady(cursor):
+        from api.services.billing.purchaseCheckoutService import purchaseActionsReady
+        return purchaseActionsReady() and PurchaseOperationRepositoryMixin._paymentWorkerFresh(cursor)
+
     def _purchasePresentation(self,cursor,checkout,draft,allowed):
         from api.services.billing.purchaseCheckoutContracts import PurchaseCheckoutCapabilities
         from api.services.billing.purchaseDraftService import editableCheckoutEnabled
-        userId=draft.userId
         ready=self._purchaseRecoveryReady(cursor)
-        cursor.execute("SELECT * FROM public.payment_operations WHERE user_id=%s AND kind='refund' ORDER BY created_at,id",(userId,))
-        operations=list(cursor.fetchall())
         if checkout:
-            own=[r for r in operations if str(r['attempt_id'])==checkout.attemptId]
-            if own and checkout.cancellationAcceptedAt:
-                states={r['state'] for r in own}
+            cursor.execute("SELECT state FROM public.payment_operations WHERE attempt_id=%s AND kind='refund'",(checkout.attemptId,))
+            states={r['state'] for r in cursor.fetchall()}
+            if states:
                 refund='completed' if states=={'succeeded'} else 'needs_attention' if 'needs_attention' in states else 'submitted' if 'submitted' in states else 'pending'
-                checkout=replace(checkout,refundState=refund,state='refunded' if refund=='completed' else 'needs_attention' if refund=='needs_attention' else 'refund_pending',
+                checkout=replace(checkout,refundState=refund,
                     pendingReason=None if refund=='completed' else 'PURCHASE_CORRECTION_PENDING')
-        cursor.execute("SELECT 1 FROM public.payment_operations WHERE user_id=%s AND state NOT IN ('succeeded','cancelled') LIMIT 1",(userId,))
-        unresolved=bool(cursor.fetchone())
-        cursor.execute('''SELECT 1 FROM public.billing_events WHERE user_id=%s AND event_category='payment_attempt'
-            AND metadata_json->'manualBilling'->>'purpose'='initial_purchase' AND payment_status<>'captured'
-            AND (metadata_json->'manualBilling'->>'closedAt' IS NULL OR metadata_json->'manualBilling'->>'closureReconciledAt' IS NULL) LIMIT 1''',(userId,))
-        openPurchase=bool(cursor.fetchone())
-        resume=False
-        if checkout and checkout.state=='unpaid' and not checkout.cancellationAcceptedAt:
-            cursor.execute('SELECT * FROM public.billing_events WHERE id=%s AND user_id=%s',(checkout.attemptId,userId))
-            attempt=cursor.fetchone()
-            frozen=self._json(attempt['metadata_json']).get('manualBilling',{}) if attempt else {}
-            expires=_utc(frozen.get('expiresAt'))
-            resume=bool(attempt and attempt['provider_order_id'] and expires and expires>_now()
-                and not frozen.get('closedAt') and attempt['payment_status'] in ('created','pending_provider_ack'))
+        # Owed refunds and other money never block Pay; the server decides open, reuse or replace.
         capabilities=PurchaseCheckoutCapabilities(
             mayEditDraft=bool(allowed and editableCheckoutEnabled()),
-            maySubmitLatestDraft=bool(ready and allowed and draft.revision>0 and not unresolved and not openPurchase),
-            mayRequestCancellation=bool(ready and allowed and checkout and checkout.state not in ('completed','refunded')
-                and not checkout.cancellationAcceptedAt and checkout.state!='cancellation_pending'),
-            mayResumeOriginal=bool(ready and allowed and resume and not unresolved))
+            maySubmitLatestDraft=bool(ready and allowed and draft.revision>0))
         return replace(checkout,capabilities=capabilities) if checkout else None,capabilities
 
     def projectPurchaseStatus(self,status):
@@ -85,11 +69,7 @@ class PurchaseOperationRepositoryMixin:
                 cursor.execute('SELECT * FROM public.subscription_purchase_drafts WHERE user_id=%s',(status.userId,))
                 stored=cursor.fetchone()
                 draft=self._draft(status.userId,stored) if stored else PurchaseDraft(status.userId)
-                projected,_=self._purchasePresentation(cursor,status,draft,allowed)
-                # Retain the pre-existing legacy resume guard when rollout is off.
-                from api.services.billing.purchaseCheckoutService import purchaseActionsReady
-                return projected if purchaseActionsReady() else replace(projected,
-                    capabilities=replace(projected.capabilities,mayResumeOriginal=status.capabilities.mayResumeOriginal))
+                return self._purchasePresentation(cursor,status,draft,allowed)[0]
         return self._run(operation)
 
     def _operationContext(self,cursor,attemptId):
@@ -116,7 +96,7 @@ class PurchaseOperationRepositoryMixin:
                     return None
                 self._requireStorage(cursor)
                 attempt,invoice,control = self._operationContext(cursor,evidence.attemptId)
-                if not control or not control['cancellation_accepted_at'] or invoice['status']=='PAID':
+                if not control or control['closed_reason']!='SUPERSEDED' or invoice['status']=='PAID':
                     return None
                 if (str(attempt['invoice_id'])!=evidence.invoiceId or attempt['provider_order_id']!=evidence.providerOrderId
                         or attempt['amount']!=evidence.amount or attempt['currency']!=evidence.currency
@@ -130,9 +110,10 @@ class PurchaseOperationRepositoryMixin:
                         (control['erasure_request_id'],evidence.userId))
                     if evidence.userId is not None and not cursor.fetchone():
                         raise ValueError('PURCHASE_COMPENSATION_OWNER_MISMATCH')
-                if (invoice['status']!='VOID' or _utc(self._json(attempt['metadata_json']).get('manualBilling',{}).get('purchaseCancellationAcceptedAt'))
-                        !=control['cancellation_accepted_at']):
-                    raise ValueError('PURCHASE_CANCELLATION_PROOF_INVALID')
+                frozen=self._json(attempt['metadata_json']).get('manualBilling',{})
+                if (invoice['status']!='VOID' or frozen.get('closedReason')!='SUPERSEDED' or not control['closed_at']
+                        or _utc(frozen.get('closedAt'))!=control['closed_at']):
+                    raise ValueError('PURCHASE_SUPERSESSION_PROOF_INVALID')
                 cursor.execute('''SELECT * FROM public.billing_events WHERE provider_payment_id=%s
                     AND event_type='payment.capture' FOR UPDATE''',(evidence.providerPaymentId,))
                 capture=cursor.fetchone()
@@ -182,7 +163,7 @@ class PurchaseOperationRepositoryMixin:
                 op=cursor.fetchone()
                 facts=self._json(op['result'])
                 if (op['kind']!='refund' or op['state']!='queued' or self._json(op['submission_evidence']).get('startedAt')
-                        or control['operation_revision']!=expectedRevision or not control['cancellation_accepted_at']
+                        or control['operation_revision']!=expectedRevision or control['closed_reason']!='SUPERSEDED'
                         or invoice['status']=='PAID' or facts.get('pending')!=0 or not facts.get('checkedAt')
                         or not 0<=(_now()-_utc(facts['checkedAt'])).total_seconds()<=60):
                     return None
@@ -339,8 +320,6 @@ class PurchaseOperationRepositoryMixin:
 
     @staticmethod
     def _purchaseScanSource(source):
-        if source=='cancellation':
-            return 'payment_slot_controls','attempt_id'
         if source=='refund':
             return 'payment_operations','id'
         raise ValueError('INVALID_PURCHASE_OPERATION_SCAN')
@@ -349,13 +328,12 @@ class PurchaseOperationRepositoryMixin:
         table,key=self._purchaseScanSource(source)
         if type(limit) is not int or not 1<=limit<=100:
             raise ValueError('INVALID_PURCHASE_OPERATION_SCAN')
-        condition=("cancellation_requested_at IS NOT NULL AND next_retry_at<=%s AND EXISTS(SELECT 1 FROM public.billing_events b WHERE b.id=attempt_id AND b.payment_status<>'captured' AND b.metadata_json->'manualBilling'->>'closureReconciledAt' IS NULL)" if source=='cancellation'
-            else "kind=%s AND state NOT IN ('succeeded','cancelled') AND next_retry_at<=%s")
-        params=([now] if source=='cancellation' else [source,now])+[highWater,afterId,afterId,limit]
         def operation(connection):
             with connection.cursor(cursor_factory=RealDictCursor) as cursor:
-                cursor.execute(f'''SELECT *,{key} AS id FROM public.{table} WHERE {condition}
-                    AND {key}<=%s AND (%s::uuid IS NULL OR {key}>%s::uuid) ORDER BY {key} LIMIT %s''',params)
+                cursor.execute(f'''SELECT *,{key} AS id FROM public.{table} WHERE kind=%s
+                    AND state NOT IN ('succeeded','cancelled') AND next_retry_at<=%s
+                    AND {key}<=%s AND (%s::uuid IS NULL OR {key}>%s::uuid) ORDER BY {key} LIMIT %s''',
+                    [source,now,highWater,afterId,afterId,limit])
                 return list(cursor.fetchall())
         return self._run(operation)
 
@@ -379,83 +357,11 @@ class PurchaseOperationRepositoryMixin:
 
     def recoverPurchaseItem(self,source,row,provider,now):
         identity=str(row['id'])
-        if source=='cancellation':
-            from api.services.billing.purchaseOperationWorker import reconcileCancelledCheckout
-            resolved=reconcileCancelledCheckout(self,provider,identity)
-            escalated=False if resolved else self.scheduleCancellationRetry(identity,now)
-        else:
-            from api.services.billing.purchaseCompensationService import PurchaseCompensationService
-            service=PurchaseCompensationService(self,provider)
-            result=service.execute(identity)
-            if source=='refund' and result['state']=='needs_attention' and result.get('error_code')=='PURCHASE_REFUND_FAILED':
-                self.prepareFailedCompensationRetry(identity)
-            resolved=result['state'] in ('succeeded','cancelled')
-            escalated=False if resolved else self.schedulePurchaseRetry(identity,now)
+        self._purchaseScanSource(source)
+        from api.services.billing.purchaseCompensationService import PurchaseCompensationService
+        result=PurchaseCompensationService(self,provider).execute(identity)
+        if result['state']=='needs_attention' and result.get('error_code')=='PURCHASE_REFUND_FAILED':
+            self.prepareFailedCompensationRetry(identity)
+        resolved=result['state'] in ('succeeded','cancelled')
+        escalated=False if resolved else self.schedulePurchaseRetry(identity,now)
         return {'resolved':resolved,'escalated':escalated}
-
-    def resolvePurchaseCancellation(self,attemptId,snapshot):
-        def operation(connection):
-            with connection.cursor(cursor_factory=RealDictCursor) as cursor:
-                attempt,invoice,control=self._operationContext(cursor,attemptId)
-                if not control or not control['cancellation_requested_at']:
-                    return False
-                if invoice['status']=='PAID':
-                    return True  # Capture won before cancellation was accepted.
-                frozen=self._json(attempt['metadata_json']).get('manualBilling',{})
-                stored=frozen.get('providerObservation',{})
-                if (not snapshot.complete or snapshot.outcome=='unknown'
-                        or snapshot.providerOrderId!=attempt['provider_order_id'] or snapshot.attemptId!=attemptId
-                        or not stored.get('complete') or _utc(stored.get('checkedAt'))!=snapshot.observedAt
-                        or not 0<=(_now()-snapshot.observedAt).total_seconds()<=60):
-                    return False
-                # Each actual payment must have terminal no-funds or full-return proof.
-                for payment in snapshot.payments:
-                    if payment['status']=='captured':
-                        cursor.execute("SELECT 1 FROM public.payment_operations WHERE attempt_id=%s AND kind='refund' AND provider_payment_id=%s AND state='succeeded'",(attemptId,payment['id']))
-                        if not cursor.fetchone():
-                            return False
-                    elif payment['status']!='failed':
-                        return False
-                cursor.execute("SELECT 1 FROM public.payment_operations WHERE attempt_id=%s AND state NOT IN ('succeeded','cancelled') LIMIT 1",(attemptId,))
-                if cursor.fetchone():
-                    return False
-                accepted=control['cancellation_accepted_at'] or _now()
-                if not control['cancellation_accepted_at']:
-                    self._closeInvoice(cursor,invoice,'PURCHASE_CANCELLED',now=accepted,preserveAuthorization=True)
-                    cursor.execute('''UPDATE public.payment_slot_controls SET operation_revision=operation_revision+1,
-                        cancellation_accepted_at=%s,updated_at=clock_timestamp() WHERE attempt_id=%s''',(accepted,attemptId))
-                for table,rowId in (('billing_events',attemptId),('Invoices',invoice['id'])):
-                    cursor.execute(f'SELECT metadata_json FROM public."{table}" WHERE id=%s',(rowId,))
-                    metadata=self._json(cursor.fetchone()['metadata_json'])
-                    metadata.setdefault('manualBilling',{}).update(purchaseCancellationAcceptedAt=accepted.isoformat(),closureReconciledAt=_now().isoformat())
-                    cursor.execute(f'UPDATE public."{table}" SET metadata_json=%s WHERE id=%s',(Json(metadata),rowId))
-                cursor.execute("UPDATE public.billing_events SET payment_status='cancelled',event_status='cancelled' WHERE id=%s AND payment_status<>'captured'",(attemptId,))
-                return True
-        return self._run(operation)
-
-    def scheduleCancellationRetry(self,attemptId,now):
-        def operation(connection):
-            with connection.cursor(cursor_factory=RealDictCursor) as cursor:
-                attempt,invoice,control=self._operationContext(cursor,attemptId)
-                if not control or invoice['status']=='PAID':
-                    return False
-                metadata=self._json(attempt['metadata_json']).get('manualBilling',{})
-                if metadata.get('closureReconciledAt'):
-                    return False
-                elapsed=(now-control['cancellation_requested_at']).total_seconds()
-                escalated=elapsed>=max(0,int(os.environ.get('PURCHASE_RESOLUTION_ESCALATION_SECONDS','1800'))) and not control['escalation_reference']
-                reference=control['escalation_reference'] or ('purchase:'+attemptId if escalated else None)
-                cursor.execute('''UPDATE public.payment_slot_controls SET operation_revision=operation_revision+1,
-                    retry_count=retry_count+1,next_retry_at=%s,escalation_reference=%s,updated_at=clock_timestamp() WHERE attempt_id=%s''',
-                    (now+timedelta(seconds=min(30*2**min(control['retry_count'],7),3600)),reference,attemptId))
-                if escalated:
-                    cursor.execute('''INSERT INTO public.billing_events(user_id,invoice_id,event_category,event_type,event_status,idempotency_key,metadata_json)
-                        VALUES(%s,%s,'system','purchase.operation_escalated','OPEN',%s,%s) ON CONFLICT(idempotency_key) DO NOTHING''',
-                        (attempt['user_id'],invoice['id'],'purchase:cancellation-escalation:'+attemptId,
-                         Json({'attemptId':attemptId,'caseReference':reference,'reasonCode':'PURCHASE_CANCELLATION_OVERDUE'})))
-                return escalated
-        escalated=bool(self._run(operation))
-        if escalated:
-            from utils.logger import logger
-            logger.bind(attemptId=attemptId,caseReference='purchase:'+attemptId).error('Purchase cancellation resolution requires attention')
-        return escalated

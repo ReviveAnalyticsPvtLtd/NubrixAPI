@@ -1,4 +1,4 @@
-"""Real SQL compensation with a synthetic payment/refund boundary."""
+"""Real SQL refund of a capture on a superseded purchase, with a synthetic payment/refund boundary."""
 from dataclasses import replace
 import importlib
 import importlib.util
@@ -9,7 +9,7 @@ import pytest
 from psycopg2.extras import Json
 
 from test.purchaseProviderFixtures import SyntheticPurchaseProvider
-from test.test_purchase_checkout_postgres import checkoutDb, drafts, controlledPurchase, authorization
+from test.test_purchase_checkout_postgres import checkoutDb, drafts, controlledPurchase, authorization, supersede
 from test.test_subscription_erasure_postgres import erasureDb
 from test.subscriptionRuntimeFixtures import postgres, runtimeDb, query
 
@@ -51,11 +51,10 @@ class SyntheticRefundProvider(SyntheticPurchaseProvider):
 
 
 def closedCapture(drafts, monkeypatch, **selection):
-    repo, original, intent, cancel = controlledPurchase(drafts, monkeypatch, **selection)
+    repo, original, intent, _ = controlledPurchase(drafts, monkeypatch, **selection)
     provider = SyntheticRefundProvider()
     provider.orders = original.orders
-    cancel.provider = provider
-    cancel.cancel(intent.userId, intent.attemptId, 1, 'cancel-for-correction')
+    supersede(repo, provider, intent)  # Pay with a changed selection replaced the empty Order.
     evidence = replace(authorization(repo, provider, intent), financialStatus='captured')
     provider.payments[evidence.providerPaymentId]['status'] = 'captured'
     provider.payments[evidence.providerPaymentId]['amount_refunded'] = 0
@@ -83,7 +82,7 @@ def test_duplicate_late_capture_reserves_one_full_compensation(drafts, monkeypat
     assert len(provider.refundCalls) == 1
     assert provider.refundCalls[0][1]['amount'] == intent.amount
     assert provider.refundCalls[0][1]['notes']['purchaseOperationId'] == str(first['id'])
-    assert not repo.readEditor(intent.userId).capabilities.maySubmitLatestDraft
+    assert repo.readEditor(intent.userId).capabilities.maySubmitLatestDraft
 
 
 @pytest.mark.parametrize('external,status,expected,calls', [
@@ -103,8 +102,8 @@ def test_complete_refund_history_prevents_duplicate_customer_returns(drafts, mon
         assert provider.refundCalls[0][1]['amount'] == intent.amount-(100 if external == 'partial' else 0)
     if expected == 'succeeded':
         frozen = repo._json(repo.attemptById(intent.userId, intent.attemptId)['metadata_json'])['manualBilling']
-        assert frozen['closureReconciledAt']
-        assert repo.readEditor(intent.userId).checkout.refundState == 'completed'
+        # A superseded Order stays in the recovery scan until its capture window passes.
+        assert frozen['closedReason'] == 'SUPERSEDED' and not frozen.get('closureReconciledAt')
         assert repo.readEditor(intent.userId).capabilities.maySubmitLatestDraft
 
 
@@ -133,10 +132,10 @@ def test_inconsistent_refund_history_holds_liability_and_escalates_once(drafts, 
     assert len(events) == 1 and events[0]['metadata_json']['caseReference'] == 'purchase:'+str(op['id'])
 
 
-@pytest.mark.parametrize('mutation', ['owner','order','amount','purpose','no_cancellation'])
+@pytest.mark.parametrize('mutation', ['owner','order','amount','purpose','not_superseded'])
 def test_unrelated_or_invalid_capture_has_no_compensation_authority(drafts, monkeypatch, mutation):
     repo, provider, intent, evidence, service = closedCapture(drafts, monkeypatch)
-    if mutation == 'no_cancellation':
+    if mutation == 'not_superseded':
         otherRepo, otherProvider, otherIntent, _ = controlledPurchaseForOtherOwner(drafts, monkeypatch)
         otherEvidence = replace(authorization(otherRepo, otherProvider, otherIntent), financialStatus='captured')
         otherRepo.finalizeCapturedPayment(otherEvidence)
@@ -173,30 +172,14 @@ def test_verified_late_capture_transport_reserves_and_worker_completes_after_tab
     assert len(provider.refundCalls)==1
 
 
-def test_cancellation_of_authorized_purchase_is_accepted_immediately_and_never_captures(drafts,monkeypatch):
-    from api.services.billing.purchaseOperationWorker import PurchaseOperationWorker
-    repo,provider,intent,cancel=controlledPurchase(drafts,monkeypatch)
-    evidence=authorization(repo,provider,intent)
-    cancel.cancel(intent.userId,intent.attemptId,1,'authorized-cancel')
-    provider.payments[evidence.providerPaymentId]['status']='failed'
-    monkeypatch.setattr('api.services.billing.purchaseCheckoutService.purchaseActionsReady',lambda:False)
-    PurchaseOperationWorker(repo,provider).execute()
-    status=repo.readEditor(intent.userId).checkout
-    assert status.cancellationAcceptedAt and status.state=='cancelled'
-    frozen=repo._json(repo.purchaseAttempt(intent.attemptId)['metadata_json'])['manualBilling']
-    assert frozen['closureReconciledAt']
-    assert not provider.captureCalls
-
-
-def test_late_capture_after_erasure_uses_retained_cancellation_without_recreating_account(drafts,monkeypatch):
+def test_late_capture_after_erasure_uses_retained_supersession_without_recreating_account(drafts,monkeypatch):
     from test.test_subscription_erasure_postgres import runErasure
     from api.services.billing.manualBillingContracts import VerifiedPaymentEvidence
     from api.services.billing.manualBillingRepository import _now
-    repo,oldProvider,intent,cancel=controlledPurchase(drafts,monkeypatch)
+    repo,oldProvider,intent,_=controlledPurchase(drafts,monkeypatch)
     provider=SyntheticRefundProvider()
     provider.orders=oldProvider.orders
-    cancel.provider=provider
-    cancel.cancel(intent.userId,intent.attemptId,1,'before-erasure')
+    supersede(repo,provider,intent,key='before-erasure')
     _,request=runErasure(drafts[3],intent.userId)
     payment=provider.authorize(intent)
     provider.payments[payment['id']].update(status='captured',amount_refunded=0)
@@ -242,27 +225,15 @@ def test_worker_backoff_and_escalation_never_release_liability(drafts,monkeypatc
     updated=repo.operationById(str(op['id']))
     assert updated['retry_count']==2 and updated['next_retry_at']==when+timedelta(seconds=60)
     assert updated['state']=='queued'
-    assert not repo.readEditor(intent.userId).capabilities.maySubmitLatestDraft
+    assert repo.readEditor(intent.userId).capabilities.maySubmitLatestDraft
 
 
-def test_worker_heartbeat_required_before_new_purchase_actions(drafts,monkeypatch):
-    repo,provider,intent,cancel=controlledPurchase(drafts,monkeypatch)
-    query(drafts[3],"UPDATE private.payment_recovery_runtime SET worker_seen_at=clock_timestamp()-interval '10 minutes'")
-    with pytest.raises(ValueError,match='PURCHASE_ACTIONS_UNAVAILABLE'):
-        cancel.cancel(intent.userId,intent.attemptId,1,'stale-worker')
-    assert not repo.readEditor(intent.userId).capabilities.mayRequestCancellation
-    repo.recordPurchaseWorkerHeartbeat()
-    assert repo.readEditor(intent.userId).capabilities.mayRequestCancellation
-
-
-def test_fully_refunded_payment_entity_resolves_cancellation_without_new_charge(drafts,monkeypatch):
+def test_fully_refunded_payment_entity_settles_refund_without_new_charge(drafts,monkeypatch):
     repo,provider,intent,evidence,service=closedCapture(drafts,monkeypatch)
     op=service.reserveForClosedCapture(evidence)
     provider.externalRefund(evidence.providerPaymentId,intent.amount,'processed')
     provider.payments[evidence.providerPaymentId]['status']='refunded'
     assert service.execute(str(op['id']))['state']=='succeeded'
-    frozen=repo._json(repo.purchaseAttempt(intent.attemptId)['metadata_json'])['manualBilling']
-    assert frozen.get('closureReconciledAt')
     assert not provider.refundCalls
 
 
@@ -280,7 +251,7 @@ def test_concurrent_refund_executors_send_once_without_holding_owner_lock(drafts
         first=pool.submit(service.execute,str(op['id']))
         assert entered.wait(5)
         try:
-            assert pool.submit(repo.readEditor,intent.userId).result(timeout=5).draft.revision==1
+            assert pool.submit(repo.readEditor,intent.userId).result(timeout=5).draft.revision==2
             second=pool.submit(service.execute,str(op['id'])).result(timeout=5)
             assert second['state'] in ('submission_started','outcome_unknown','submitted')
         finally:
@@ -335,7 +306,8 @@ def test_worker_scan_excludes_new_rows_with_uuid_below_highwater(drafts,monkeypa
 
 @pytest.mark.parametrize('breakage',['trigger','rls','public_write'])
 def test_broken_storage_protection_disables_purchase_actions(drafts,monkeypatch,breakage):
-    repo,provider,intent,cancel=controlledPurchase(drafts,monkeypatch)
+    repo,provider,intent,_=controlledPurchase(drafts,monkeypatch)
+    assert repo.readEditor(intent.userId).capabilities.maySubmitLatestDraft
     statements={
         'trigger':('ALTER TABLE payment_operations DISABLE TRIGGER payment_storage_guard',
                    'ALTER TABLE payment_operations ENABLE TRIGGER payment_storage_guard'),
@@ -346,9 +318,10 @@ def test_broken_storage_protection_disables_purchase_actions(drafts,monkeypatch,
     change,restore=statements[breakage]
     try:
         query(drafts[3],change)
-        assert not repo.readEditor(intent.userId).capabilities.mayRequestCancellation
+        assert not repo.readEditor(intent.userId).capabilities.maySubmitLatestDraft
     finally:
         query(drafts[3],restore)
+    assert repo.readEditor(intent.userId).capabilities.maySubmitLatestDraft
 
 
 def test_completed_correction_is_no_longer_reported_as_a_financial_obligation(drafts,monkeypatch):
@@ -366,7 +339,12 @@ def test_completed_correction_is_no_longer_reported_as_a_financial_obligation(dr
         cursor=report['nextCursor']
         if not cursor:
             break
-    assert unresolved==[]
+    # The returned money is settled. Only attempt-level facts remain: the live replacement and the
+    # superseded Order, which stays scanned until its capture window passes.
+    assert not [row for row in unresolved if row['providerPaymentId']==evidence.providerPaymentId or row['id']==str(op['id'])]
+    assert sorted((row['category'],row['id']) for row in unresolved)==sorted([
+        ('closed_attempt_unreconciled',intent.attemptId),
+        ('capture_pending',repo.readEditor(intent.userId).checkout.attemptId)])
 
 
 def test_failed_provider_refund_stays_owed_and_creates_one_case(drafts,monkeypatch):
@@ -377,7 +355,7 @@ def test_failed_provider_refund_stays_owed_and_creates_one_case(drafts,monkeypat
     service.recover(str(op['id']))
     row=repo.operationById(str(op['id']))
     assert row['state']=='needs_attention' and row['escalation_reference']=='purchase:'+str(op['id'])
-    assert not repo.readEditor(intent.userId).capabilities.maySubmitLatestDraft
+    assert repo.readEditor(intent.userId).capabilities.maySubmitLatestDraft
     assert len(provider.refundCalls)==1
 
 
@@ -397,18 +375,6 @@ def test_worker_retries_only_a_verified_terminal_failed_refund_with_new_submissi
     assert len(provider.refundCalls)==2
     assert provider.refundCalls[0][2]['headers']!=provider.refundCalls[1][2]['headers']
     assert all(call[1]['amount']==intent.amount for call in provider.refundCalls)
-
-
-def test_ready_editor_never_reenables_an_expired_original_payment(drafts,monkeypatch):
-    from datetime import timedelta
-    from api.services.billing.purchaseCheckoutStatusService import PurchaseCheckoutStatusService
-    repo,provider,intent,_=controlledPurchase(drafts,monkeypatch)
-    later=intent.expiresAt+timedelta(seconds=1)
-    for module in ('manualBillingRepository','purchaseCheckoutRepository','purchaseOperationRepository'):
-        monkeypatch.setattr('api.services.billing.'+module+'._now',lambda:later)
-    status=PurchaseCheckoutStatusService(repo,provider).refresh(intent.userId,intent.attemptId)
-    assert not status.capabilities.mayResumeOriginal
-    assert not repo.readEditor(intent.userId).capabilities.mayResumeOriginal
 
 
 def test_installed_sdk_receives_timeout_and_cannot_repost_unknown_refund(drafts,monkeypatch):
@@ -499,27 +465,7 @@ def test_pending_return_in_payment_aggregate_never_means_refund_completed(drafts
     op=service.reserveForClosedCapture(evidence)
     assert service.execute(str(op['id']))['state']=='submitted'
     assert not provider.refundCalls
-    assert not repo.readEditor(intent.userId).capabilities.maySubmitLatestDraft
-
-
-def test_provider_capture_timestamp_before_confirmed_cancellation_cannot_break_the_promise(drafts,monkeypatch):
-    from datetime import timedelta
-    from api.services.billing.purchaseCompensationService import PurchaseCompensationService
-    repo,original,intent,cancel=controlledPurchase(drafts,monkeypatch)
-    provider=SyntheticRefundProvider()
-    provider.orders=original.orders
-    cancel.provider=provider
-    authorizationEvidence=authorization(repo,provider,intent)
-    cancel.cancel(intent.userId,intent.attemptId,1,'cancel-authorized')
-    evidence=replace(authorizationEvidence,financialStatus='captured',timingVerified=True,
-        provenCaptureAt=authorizationEvidence.observedAt-timedelta(seconds=1))
-    provider.payments[evidence.providerPaymentId].update(status='captured',amount_refunded=0)
-    assert repo.finalizeCapturedPayment(evidence).state=='requires_reconciliation'
-    service=PurchaseCompensationService(repo,provider)
-    op=service.reserveForClosedCapture(evidence)
-    provider.refundStatus='processed'
-    assert service.execute(str(op['id']))['state']=='succeeded'
-    assert not repo.getCoverageSnapshot(intent.userId).accessAllowed
+    assert repo.readEditor(intent.userId).capabilities.maySubmitLatestDraft
 
 
 def test_concurrent_retry_scheduling_uses_the_locked_retry_count(drafts,monkeypatch):
@@ -546,21 +492,14 @@ def test_concurrent_retry_scheduling_uses_the_locked_retry_count(drafts,monkeypa
 
 def test_replacement_late_capture_after_erasure_preserves_slot_ownership(drafts,monkeypatch):
     from test.test_subscription_erasure_postgres import runErasure
-    from api.services.billing.manualPaymentService import ManualPaymentService
     from api.services.billing.manualBillingContracts import VerifiedPaymentEvidence
     from api.services.billing.manualBillingRepository import _now
     from api.services.billing.purchaseCompensationService import PurchaseCompensationService
-    repo,original,first,cancel=controlledPurchase(drafts,monkeypatch)
+    repo,original,first,_=controlledPurchase(drafts,monkeypatch)
     provider=SyntheticRefundProvider()
     provider.orders=original.orders
-    cancel.provider=provider
-    cancel.cancel(first.userId,first.attemptId,1,'first-cancel')
-    repo.saveDraft(first.userId,1,['banking'],'month')
-    pricing={'userId':first.userId,'currency':first.currency,'catalogRevision':1,
-        'domains':['banking'],'billingMode':'monthly_prepaid'}
-    second=repo.reserveDraftCheckout(first.userId,2,pricing,'replacement-before-erasure')
-    second=ManualPaymentService.forProduction(provider,repo).openReservedCheckout(second)
-    cancel.cancel(first.userId,second.attemptId,1,'replacement-cancel')
+    second=supersede(repo,provider,first,('banking',),'replacement-before-erasure')
+    third=supersede(repo,provider,second,('telecom',),'second-replacement-before-erasure')
     runErasure(drafts[3],first.userId)
     payment=provider.authorize(second)
     provider.payments[payment['id']].update(status='captured',amount_refunded=0)
@@ -582,7 +521,7 @@ def test_replacement_late_capture_after_erasure_preserves_slot_ownership(drafts,
     result=service.execute(str(op['id']))
     assert result['state']=='succeeded', failures
     assert not repo.purchaseControl(second.attemptId)['user_id']
-    slots={str(repo.purchaseControl(a)['slot_id']) for a in (first.attemptId,second.attemptId)}
+    slots={str(repo.purchaseControl(a)['slot_id']) for a in (first.attemptId,second.attemptId,third.attemptId)}
     assert len(slots)==1
     assert query(drafts[3],'SELECT user_id FROM payment_slots WHERE slot_id=%s',(slots.pop(),),one=True)['user_id'] is None
     assert len(provider.refundCalls)==1

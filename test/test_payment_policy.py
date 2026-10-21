@@ -55,6 +55,16 @@ def test_order_options_use_refund_speed(monkeypatch):
         orderPaymentOptions()
 
 
+def test_order_options_use_the_reserved_window(monkeypatch):
+    from api.services.billing.paymentPolicy import orderPaymentOptions
+    monkeypatch.setenv('PAYMENT_CAPTURE_WINDOW_MINUTES', '60')
+    options = orderPaymentOptions(45)['capture_options']
+    assert options['automatic_expiry_period'] == options['manual_expiry_period'] == 45
+    for bad in (11, 7201, True, '45'):
+        with pytest.raises(ValueError, match='PAYMENT_CAPTURE_WINDOW_INVALID'):
+            orderPaymentOptions(bad)
+
+
 @pytest.mark.parametrize('purpose', ['initial_purchase', 'renewal', 'expert_addition', 'topup'])
 def test_every_purpose_order_is_automatic(checkout_database, purpose):
     repository, path = checkout_database

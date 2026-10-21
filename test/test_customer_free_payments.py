@@ -37,11 +37,14 @@ class _FakeOrderAPI:
         self.orders[orderId] = order
         return order
 
-    def fetch(self, orderId):
+    def fetch(self, orderId, **options):
         return self.orders.get(orderId)
 
-    def payments(self, orderId):
-        return {"items": list(self.provider.paymentsByOrder.get(orderId, []))}
+    def payments(self, orderId, params=None, **options):
+        items = list(self.provider.paymentsByOrder.get(orderId, []))
+        if params:
+            items = items[params['skip']:params['skip'] + params['count']]
+        return {"items": items}
 
 
 class _FakePaymentAPI:

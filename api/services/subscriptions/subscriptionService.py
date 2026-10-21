@@ -1194,6 +1194,12 @@ class SubscriptionService:
                     CheckoutRequest(userId, purpose, mode, payload, requestKey, currency=currency,
                                     requiresExistingAttempt=requiresExistingAttempt, expectedCatalogRevision=expectedCatalogRevision))
             except (RuntimeError, TimeoutError, ConnectionError) as exc:
+                if str(exc) == 'PAYMENT_SERVICE_BUSY':
+                    raise CustomException(exc, statusCode=503, errorCode='PAYMENT_SERVICE_BUSY',
+                        uiMessage='Payment service is busy. Please try again in a moment.') from exc
+                if str(exc) == 'PAYMENT_ACTIONS_UNAVAILABLE':
+                    raise CustomException(exc, statusCode=503, errorCode='PAYMENT_ACTIONS_UNAVAILABLE',
+                        uiMessage='Payments are temporarily unavailable. Please try again in a moment.') from exc
                 raise CustomException(exc, statusCode=503,
                     uiMessage='Checkout creation is being reconciled. Please try again later.') from exc
             identity = self._resolveCheckoutIdentity(userId, decoded.get('email'))

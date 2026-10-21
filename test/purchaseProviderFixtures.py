@@ -1,4 +1,5 @@
 """Synthetic Razorpay provider stub shared by purchase checkout tests; never real money."""
+import time
 from types import SimpleNamespace
 from uuid import uuid4
 
@@ -26,7 +27,7 @@ class SyntheticPurchaseProvider:
     def authorize(self, intent, key=None):
         key = key or 'pay-synthetic-' + str(uuid4())
         self.payments[key] = {'id': key, 'order_id': intent.razorpayOrderId, 'status': 'authorized',
-            'amount': intent.amount, 'currency': intent.currency}
+            'amount': intent.amount, 'currency': intent.currency, 'created_at': int(time.time())}
         return dict(self.payments[key])
 
     def capture(self, paymentId, amount, data, **options):

@@ -1,4 +1,4 @@
-"""Machine correction of a confirmed-cancelled initial purchase, never proration."""
+"""Full refund of a capture on a superseded initial purchase, never proration."""
 from api.services.billing.purchaseProvider import purchaseProviderOptions
 
 
@@ -66,7 +66,6 @@ class PurchaseCompensationService:
             facts = self._inspect(operation)
             result = self.repository.recordRefundEvidence(operationId,facts)
             if result['state']=='succeeded':
-                self._reconcile(result)
                 return result
             if operation['state'] != 'queued' or facts['pending']:
                 return result
@@ -101,8 +100,6 @@ class PurchaseCompensationService:
             if result['state']=='needs_attention' and result.get('error_code')=='PURCHASE_REFUND_FAILED':
                 self.repository.escalateOperationOnce(operationId,'PURCHASE_REFUND_FAILED')
                 result=self.repository.operationById(operationId)
-            if result['state']=='succeeded':
-                self._reconcile(result)
             return result
         except ValueError:
             self.repository.failPurchaseOperation(operationId,'PURCHASE_REFUND_HISTORY_INVALID')
@@ -110,7 +107,3 @@ class PurchaseCompensationService:
         except Exception:
             self.repository.markCompensationUnknown(operationId)
         return self.repository.operationById(operationId)
-
-    def _reconcile(self, operation):
-        from api.services.billing.purchaseOperationWorker import reconcileCancelledCheckout
-        reconcileCancelledCheckout(self.repository,self.provider,str(operation['attempt_id']))

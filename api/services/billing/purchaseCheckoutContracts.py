@@ -6,9 +6,7 @@ from typing import Literal
 @dataclass(frozen=True)
 class PurchaseCheckoutCapabilities:
     mayEditDraft: bool = False
-    mayResumeOriginal: bool = False
     maySubmitLatestDraft: bool = False
-    mayRequestCancellation: bool = False
 
 
 @dataclass(frozen=True)
@@ -17,13 +15,10 @@ class PurchaseCheckoutStatus:
     invoiceId: str
     attemptId: str
     purpose: str
-    state: Literal['unpaid', 'awaiting_capture', 'processing', 'status_unknown',
-                   'cancellation_pending', 'cancelled', 'refund_pending', 'refunded',
-                   'completed', 'needs_attention']
+    # Pay is always the action; the server waits only while an earlier payment is confirming.
+    state: Literal['ready', 'confirming_earlier_payment', 'completed']
     providerState: Literal['unpaid', 'authorized', 'processing', 'captured', 'unknown', 'released']
     pendingReason: str | None = None
-    operationRevision: int = 0
-    cancellationAcceptedAt: str | None = None
     refundState: str = 'none'
     capabilities: PurchaseCheckoutCapabilities = field(default_factory=PurchaseCheckoutCapabilities)
 

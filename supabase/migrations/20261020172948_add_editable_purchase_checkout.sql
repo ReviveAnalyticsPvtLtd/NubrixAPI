@@ -55,8 +55,6 @@ CREATE TABLE IF NOT EXISTS public.payment_slot_controls (
  closed_at timestamptz,
  closed_reason text CHECK(closed_reason ~ '^[A-Z][A-Z0-9_]{0,63}$'),
  recover_until timestamptz,
- cancellation_requested_at timestamptz,
- cancellation_accepted_at timestamptz,
  retry_count integer NOT NULL DEFAULT 0 CHECK(retry_count>=0),
  next_retry_at timestamptz NOT NULL DEFAULT clock_timestamp(),
  escalation_reference text,
@@ -67,9 +65,7 @@ CREATE TABLE IF NOT EXISTS public.payment_slot_controls (
  CONSTRAINT payment_slot_controls_draft_initial_check CHECK(draft_revision IS NULL OR purpose='initial_purchase'),
  CHECK((closed_at IS NULL) = (closed_reason IS NULL)),
  CONSTRAINT payment_slot_controls_superseded_reason_check CHECK(superseded_by IS NULL OR closed_reason IS NOT DISTINCT FROM 'SUPERSEDED'),
- CHECK(superseded_by IS DISTINCT FROM attempt_id),
- CHECK(cancellation_accepted_at IS NULL OR
-       (cancellation_requested_at IS NOT NULL AND cancellation_accepted_at>=cancellation_requested_at))
+ CHECK(superseded_by IS DISTINCT FROM attempt_id)
 );
 CREATE INDEX IF NOT EXISTS payment_slot_controls_owner_idx ON public.payment_slot_controls(user_id,attempt_id);
 CREATE INDEX IF NOT EXISTS payment_slot_controls_slot_idx ON public.payment_slot_controls(slot_id,attempt_id);
@@ -117,11 +113,11 @@ BEGIN
  WHERE c.attempt_id=authorized_erased_payment.attempt_id AND c.invoice_id=authorized_erased_payment.invoice_id
    AND c.erasure_request_id=authorized_erased_payment.request_id
    AND c.user_id IS NULL AND a.user_id IS NULL AND i."userId" IS NULL
-   AND c.cancellation_accepted_at IS NOT NULL
+   AND c.closed_reason='SUPERSEDED'
    AND a.metadata_json->>'erasureRequestId'=c.erasure_request_id::text
    AND r.original_record->>'user_id'=s.original_user_id
    AND r.original_record->>'invoice_id'=c.invoice_id::text
-   AND r.original_record->>'cancellation_accepted_at' IS NOT NULL
+   AND r.original_record->>'closed_reason'='SUPERSEDED'
    AND e.status='COMPLETED');
 END $$;
 REVOKE ALL ON FUNCTION private.authorized_erased_payment(uuid,uuid,uuid) FROM PUBLIC,anon,authenticated;
@@ -132,6 +128,7 @@ CREATE OR REPLACE FUNCTION private.guard_payment_storage() RETURNS trigger
 LANGUAGE plpgsql SET search_path='' AS $$
 DECLARE attempt public.billing_events%ROWTYPE; control public.payment_slot_controls%ROWTYPE;
         slot public.payment_slots%ROWTYPE; storage_source_id uuid; original jsonb; slot_kind text;
+        supersession_changed boolean;
 BEGIN
  IF TG_OP IN ('DELETE','TRUNCATE') THEN RAISE EXCEPTION 'payment financial controls cannot be deleted'; END IF;
  IF TG_TABLE_NAME='payment_slots' THEN storage_source_id=NEW.slot_id;
@@ -204,15 +201,16 @@ BEGIN
     OR NEW.operation_revision<>OLD.operation_revision+1
     OR (OLD.superseded_by IS NOT NULL AND NEW.superseded_by IS DISTINCT FROM OLD.superseded_by)
     OR (OLD.closed_at IS NOT NULL AND (NEW.closed_at IS DISTINCT FROM OLD.closed_at
-        OR NEW.closed_reason IS DISTINCT FROM OLD.closed_reason))
-    OR (OLD.cancellation_requested_at IS NOT NULL AND NEW.cancellation_requested_at IS DISTINCT FROM OLD.cancellation_requested_at)
-    OR (OLD.cancellation_accepted_at IS NOT NULL AND NEW.cancellation_accepted_at IS DISTINCT FROM OLD.cancellation_accepted_at)) THEN
+        OR NEW.closed_reason IS DISTINCT FROM OLD.closed_reason))) THEN
    RAISE EXCEPTION 'payment control revision or frozen identity mismatch';
   END IF;
   IF NEW.provider_order_id IS DISTINCT FROM attempt.provider_order_id THEN RAISE EXCEPTION 'payment order mismatch'; END IF;
-  IF NEW.superseded_by IS NOT NULL AND NOT EXISTS(SELECT 1 FROM public.payment_slot_controls p
+  -- Only an open attempt can replace another, so supersession can never form a cycle.
+  supersession_changed=NEW.superseded_by IS NOT NULL;
+  IF supersession_changed AND TG_OP='UPDATE' THEN supersession_changed=NEW.superseded_by IS DISTINCT FROM OLD.superseded_by; END IF;
+  IF supersession_changed AND NOT EXISTS(SELECT 1 FROM public.payment_slot_controls p
      WHERE p.attempt_id=NEW.superseded_by AND p.slot_id=NEW.slot_id AND p.user_id IS NOT DISTINCT FROM NEW.user_id
-       AND p.erasure_request_id IS NOT DISTINCT FROM NEW.erasure_request_id) THEN
+       AND p.erasure_request_id IS NOT DISTINCT FROM NEW.erasure_request_id AND p.closed_at IS NULL) THEN
    RAISE EXCEPTION 'payment supersession owner or slot mismatch';
   END IF;
  ELSE

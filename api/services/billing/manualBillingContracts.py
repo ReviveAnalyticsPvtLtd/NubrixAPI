@@ -103,6 +103,8 @@ class CheckoutIntent:
     expiresAt: datetime
     razorpayOrderId: str | None
     snapshot: dict
+    # Set only with state 'confirming_earlier_payment': {selectionLabel, amount, currency}.
+    earlierPayment: dict | None = None
 
 
 @dataclass(frozen=True)

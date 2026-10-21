@@ -40,8 +40,14 @@ def paymentRulesEffectiveAt() -> datetime:
     return value.astimezone(timezone.utc)
 
 
-def orderPaymentOptions() -> dict:
-    window = captureWindowMinutes()
+def orderPaymentOptions(windowMinutes: int | None = None) -> dict:
+    """Order capture options; pass the attempt's reserved window so the Order matches its record."""
+    if windowMinutes is None:
+        window = captureWindowMinutes()
+    elif type(windowMinutes) is not int or not _MIN_WINDOW_MINUTES <= windowMinutes <= _MAX_WINDOW_MINUTES:
+        raise ValueError('PAYMENT_CAPTURE_WINDOW_INVALID')
+    else:
+        window = windowMinutes
     return {'capture': 'automatic', 'capture_options': {
         'automatic_expiry_period': window, 'manual_expiry_period': window, 'refund_speed': refundSpeed()}}
 

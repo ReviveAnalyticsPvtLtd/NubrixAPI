@@ -21,11 +21,6 @@ class SignUp(BaseModel):
     password: str
 
 
-class CancelPurchaseCheckoutRequest(BaseModel):
-    model_config = {'extra': 'forbid'}
-    expectedOperationRevision: StrictInt = Field(ge=0, le=9007199254740991)
-
-
 class SubmitPurchaseDraftRequest(BaseModel):
     model_config = {'extra': 'forbid'}
     draftRevision: StrictInt = Field(ge=1, le=9007199254740991)

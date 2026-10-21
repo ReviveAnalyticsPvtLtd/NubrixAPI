@@ -40,7 +40,6 @@ def test_verified_authorization_is_durable_without_paid_coverage(postgres):
     observation = repository._json(attempt['metadata_json'])['manualBilling']['providerObservation']
     assert observation['outcome'] == 'authorized' and not observation['complete']
     assert not repository.getCoverageSnapshot(user).accessAllowed
-    assert not repository.mayResumeInitialCheckout(user, intent.attemptId)
     captured = repository.finalizeCapturedPayment(replace(evidence, financialStatus='captured'))
     assert captured.finalized
     repository.finalizeCapturedPayment(evidence)
@@ -118,6 +117,10 @@ def postgres():
             cursor.execute("DO $$ BEGIN IF NOT EXISTS (SELECT 1 FROM pg_publication WHERE pubname='supabase_realtime') THEN CREATE PUBLICATION supabase_realtime; END IF; END $$")
             catalogMigration = next((ROOT/'supabase/migrations').glob('*_create_pricing_catalog.sql'))
             cursor.execute(catalogMigration.read_text(encoding='utf-8'))
+            # The recovery/refund worker deploys with the backend; Pay requires its fresh heartbeat.
+            cursor.execute('''DO $$ BEGIN IF to_regclass('private.payment_recovery_runtime') IS NOT NULL THEN
+                INSERT INTO private.payment_recovery_runtime(singleton,worker_seen_at) VALUES(true,clock_timestamp())
+                ON CONFLICT(singleton) DO UPDATE SET worker_seen_at=EXCLUDED.worker_seen_at; END IF; END $$''')
         connection.commit()
     finally: connection.close()
     return url
