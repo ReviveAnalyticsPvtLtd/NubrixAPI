@@ -581,7 +581,7 @@ class WebhookService:
             from api.services.subscriptions.subscriptionService import subscriptionService
             repository = getPurchaseCheckoutRepository()
             operation = repository.operationById(operationId)
-            if (operation['kind'] != 'compensation' or operation['provider_payment_id'] != refundEntity.get('payment_id')
+            if (operation['kind'] != 'refund' or operation['provider_payment_id'] != refundEntity.get('payment_id')
                     or operation['currency'] != refundEntity.get('currency')):
                 raise ValueError('PURCHASE_REFUND_WEBHOOK_BINDING_INVALID')
             # Signed callbacks can be stale. Recover fetched financial truth;

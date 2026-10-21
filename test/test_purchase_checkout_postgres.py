@@ -112,14 +112,28 @@ def test_restricted_or_current_paid_accounts_cannot_write_drafts(drafts, restric
     assert query(url, 'SELECT * FROM subscription_purchase_drafts WHERE user_id=%s', (user,)) == []
 
 
-@pytest.mark.parametrize('role', ['anon', 'authenticated'])
-@pytest.mark.parametrize('table', ['subscription_purchase_drafts', 'subscription_purchase_checkout_controls', 'subscription_purchase_operations'])
-def test_direct_data_api_access_is_revoked(checkoutDb, role, table):
-    for verb in ('SELECT', 'INSERT', 'UPDATE', 'DELETE', 'TRUNCATE'):
-        assert not query(checkoutDb, 'SELECT has_table_privilege(%s,%s,%s) AS allowed',
-                         (role, 'public.' + table, verb), one=True)['allowed']
+STORAGE_TABLES = ['subscription_purchase_drafts', 'payment_slots', 'payment_slot_controls', 'payment_operations']
+SLOT_KIND = {'initial_purchase': 'pro_term', 'renewal': 'pro_term', 'expert_addition': 'expert_addition', 'topup': 'topup'}
+REFUND_REASONS = ('duplicate', 'paid_after_close', 'not_deliverable', 'account_closed')
+VERBS = ('SELECT', 'INSERT', 'UPDATE', 'DELETE', 'TRUNCATE', 'REFERENCES', 'TRIGGER')
+
+
+@pytest.mark.parametrize('table', STORAGE_TABLES + ['private.payment_recovery_runtime'])
+def test_storage_rls_and_privileges(checkoutDb, table):
+    relation = table if '.' in table else 'public.' + table
+    def allowed(role, verb):
+        return query(checkoutDb, 'SELECT has_table_privilege(%s,%s,%s) AS allowed', (role, relation, verb), one=True)['allowed']
+    for role in ('anon', 'authenticated'):
+        assert not any(allowed(role, verb) for verb in VERBS), role
+    assert query(checkoutDb, '''SELECT count(*) AS grants FROM pg_class c, aclexplode(c.relacl) a
+        WHERE c.oid=%s::regclass AND a.grantee=0''', (relation,), one=True)['grants'] == 0
+    expected = {'SELECT', 'INSERT', 'UPDATE'} | ({'DELETE'} if table == 'subscription_purchase_drafts' else set())
+    assert {verb for verb in VERBS if allowed('service_role', verb)} == expected
     assert query(checkoutDb, 'SELECT relrowsecurity AS enabled FROM pg_class WHERE oid=%s::regclass',
-                 ('public.' + table,), one=True)['enabled']
+                 (relation,), one=True)['enabled']
+    for retired in ('public.subscription_purchase_' + 'checkout_controls', 'public.subscription_purchase_' + 'operations',
+                    'private.purchase_recovery_runtime'):
+        assert query(checkoutDb, 'SELECT to_regclass(%s) AS relation', (retired,), one=True)['relation'] is None
 
 
 @pytest.mark.parametrize('domains,interval', [([], 'month'), (['banking', 'banking'], 'month'),
@@ -146,22 +160,194 @@ def test_draft_is_removed_by_complete_erasure(drafts):
     assert query(url, 'SELECT * FROM subscription_purchase_drafts WHERE user_id=%s', (user,)) == []
 
 
-def seedOperation(drafts, kind='compensation'):
+def seedAttempt(drafts, purpose='initial_purchase', domains=('banking',)):
     from api.services.billing.manualBillingContracts import CheckoutRequest
-    repo, billing, user, url = drafts
+    _, billing, user, url = drafts
     intent = billing.reserveCheckout(CheckoutRequest(user, 'initial_purchase', 'monthly_prepaid',
-        {'domains': ['banking']}, expectedCatalogRevision=1))
-    order, payment = 'order-' + str(uuid4()), 'pay-' + str(uuid4())
+        {'domains': list(domains)}, expectedCatalogRevision=1))
+    order = 'order-' + str(uuid4())
     billing.bindProviderOrder(intent.attemptId, {'id': order})
-    query(url, '''INSERT INTO subscription_purchase_checkout_controls
-        (attempt_id,invoice_id,user_id,draft_revision,provider_order_id)
-        VALUES(%s,%s,%s,1,%s)''', (intent.attemptId, intent.invoiceId, user, order))
-    operation = query(url, '''INSERT INTO subscription_purchase_operations
-        (user_id,attempt_id,invoice_id,provider_payment_id,kind,amount,currency,dedupe_key)
-        VALUES(%s,%s,%s,%s,%s,%s,%s,%s) RETURNING id''',
-        (user, intent.attemptId, intent.invoiceId, payment, kind, intent.amount, intent.currency,
-         'purchase:' + kind + ':' + payment), one=True)['id']
-    return intent, operation
+    if purpose != 'initial_purchase':
+        query(url, '''UPDATE billing_events SET metadata_json=jsonb_set(metadata_json,'{manualBilling,purpose}',to_jsonb(%s::text))
+            WHERE id=%s''', (purpose, intent.attemptId))
+    return intent, order
+
+
+def proveClosed(url, attemptId):
+    # Reconciled closure lets the same owner reserve another synthetic attempt.
+    query(url, """UPDATE billing_events SET payment_status='cancelled',metadata_json=jsonb_set(metadata_json,'{manualBilling}',
+        metadata_json->'manualBilling'||jsonb_build_object('closedAt',clock_timestamp(),'closureReconciledAt',clock_timestamp()))
+        WHERE id=%s""", (attemptId,))
+
+
+def slotFor(url, user, kind='pro_term', key='open'):
+    query(url, '''INSERT INTO payment_slots(user_id,kind,slot_key) VALUES(%s,%s,%s)
+        ON CONFLICT(user_id,kind,slot_key) WHERE settled_payment_id IS NULL DO NOTHING''', (user, kind, key))
+    return query(url, '''SELECT slot_id FROM payment_slots WHERE user_id=%s AND kind=%s AND slot_key=%s
+        AND settled_payment_id IS NULL''', (user, kind, key), one=True)['slot_id']
+
+
+def seedControl(url, user, intent, order, purpose='initial_purchase', slot=None, policy='automatic'):
+    slot = slot or slotFor(url, user, SLOT_KIND[purpose])
+    query(url, '''INSERT INTO payment_slot_controls
+        (attempt_id,slot_id,invoice_id,user_id,purpose,draft_revision,provider_order_id,capture_policy)
+        VALUES(%s,%s,%s,%s,%s,%s,%s,%s)''', (intent.attemptId, slot, intent.invoiceId, user, purpose,
+        1 if purpose == 'initial_purchase' else None, order, policy))
+    return slot
+
+
+def insertRefund(url, user, intent, payment, reason='paid_after_close', kind='refund', dedupe=None):
+    return query(url, '''INSERT INTO payment_operations
+        (user_id,attempt_id,invoice_id,provider_payment_id,kind,reason,amount,currency,dedupe_key)
+        VALUES(%s,%s,%s,%s,%s,%s,%s,%s,%s) RETURNING id''',
+        (user, intent.attemptId, intent.invoiceId, payment, kind, reason, intent.amount, intent.currency,
+         dedupe or 'payment:' + kind + ':' + payment), one=True)['id']
+
+
+def seedOperation(drafts, kind='refund'):
+    _, _, user, url = drafts
+    intent, order = seedAttempt(drafts)
+    seedControl(url, user, intent, order)
+    return intent, insertRefund(url, user, intent, 'pay-' + str(uuid4()), kind=kind)
+
+
+def test_slot_unique_while_unsettled(drafts):
+    from psycopg2.extras import RealDictCursor
+    from api.services.billing.purchaseCheckoutRepository import openSlotLocked
+    _, _, user, url = drafts
+    insert = 'INSERT INTO payment_slots(user_id,kind,slot_key) VALUES(%s,%s,%s) RETURNING slot_id'
+    first = query(url, insert, (user, 'pro_term', 'open'), one=True)['slot_id']
+    with pytest.raises(psycopg2.IntegrityError):
+        query(url, insert, (user, 'pro_term', 'open'))
+    query(url, insert, (user, 'topup', 'open'))
+    query(url, insert, (user, 'pro_term', 'term-2'))
+    def opened():
+        with psycopg2.connect(url) as db, db.cursor(cursor_factory=RealDictCursor) as cursor:
+            return openSlotLocked(cursor, user, 'pro_term', 'open')
+    assert opened() == str(first) == opened()
+    payment = 'pay-' + str(uuid4())
+    query(url, 'UPDATE payment_slots SET settled_payment_id=%s,settled_at=clock_timestamp() WHERE slot_id=%s', (payment, first))
+    for change in ("settled_payment_id='pay-other'", 'settled_at=clock_timestamp()', 'settled_payment_id=NULL,settled_at=NULL'):
+        with pytest.raises(psycopg2.Error):
+            query(url, f'UPDATE payment_slots SET {change} WHERE slot_id=%s', (first,))
+    second = opened()
+    assert second != str(first) and opened() == second
+    with pytest.raises(psycopg2.IntegrityError):
+        query(url, 'UPDATE payment_slots SET settled_payment_id=%s,settled_at=clock_timestamp() WHERE slot_id=%s', (payment, second))
+    with pytest.raises(psycopg2.Error):
+        query(url, '''INSERT INTO payment_slots(user_id,kind,slot_key,settled_payment_id,settled_at)
+            VALUES(%s,'topup','settled-at-birth',%s,clock_timestamp())''', (user, 'pay-' + str(uuid4())))
+    with pytest.raises(psycopg2.IntegrityError):
+        query(url, insert, (user, 'renewal', 'open'))
+    with pytest.raises(psycopg2.Error, match='slot must open unsettled'):
+        query(url, """INSERT INTO payment_slots(user_id,kind,slot_key,erasure_request_id)
+            VALUES(NULL,'topup','detached-at-birth',%s)""", (str(uuid4()),))
+
+
+@pytest.mark.parametrize('policy', ['automatic', 'account_default'])
+@pytest.mark.parametrize('purpose', ['initial_purchase', 'renewal', 'expert_addition', 'topup'])
+def test_controls_accept_every_purpose_with_automatic_policy_only(drafts, purpose, policy):
+    _, _, user, url = drafts
+    intent, order = seedAttempt(drafts, purpose)
+    stranger = 'stranger-' + str(uuid4())
+    query(url, 'INSERT INTO "Users"("userId") VALUES(%s)', (stranger,))
+    otherKind = 'topup' if SLOT_KIND[purpose] != 'topup' else 'pro_term'
+    otherPurpose = 'topup' if purpose != 'topup' else 'renewal'
+    rejected = [dict(policy='manual'), dict(policy='legacy'),
+                dict(purpose=otherPurpose, slot=slotFor(url, user, SLOT_KIND[otherPurpose])),
+                dict(slot=slotFor(url, user, otherKind)), dict(slot=slotFor(url, stranger, SLOT_KIND[purpose]))]
+    for change in rejected:
+        with pytest.raises(psycopg2.Error):
+            seedControl(url, user, intent, order, **{'purpose': purpose, 'policy': policy, **change})
+    if purpose != 'initial_purchase':
+        with pytest.raises(psycopg2.Error):
+            query(url, '''INSERT INTO payment_slot_controls
+                (attempt_id,slot_id,invoice_id,user_id,purpose,draft_revision,provider_order_id,capture_policy)
+                VALUES(%s,%s,%s,%s,%s,1,%s,'automatic')''', (intent.attemptId, slotFor(url, user, SLOT_KIND[purpose]),
+                intent.invoiceId, user, purpose, order))
+    with pytest.raises(psycopg2.Error, match='retained payment authority required'):
+        query(url, """INSERT INTO payment_slot_controls
+            (attempt_id,slot_id,invoice_id,user_id,purpose,provider_order_id,capture_policy,erasure_request_id)
+            VALUES(%s,%s,%s,NULL,%s,%s,'automatic',%s)""", (intent.attemptId, slotFor(url, user, SLOT_KIND[purpose]),
+            intent.invoiceId, purpose, order, str(uuid4())))
+    slot = seedControl(url, user, intent, order, purpose, policy=policy)
+    row = query(url, 'SELECT slot_id,purpose,capture_policy FROM payment_slot_controls WHERE attempt_id=%s',
+                (intent.attemptId,), one=True)
+    assert row == {'slot_id': slot, 'purpose': purpose, 'capture_policy': policy}
+    insertRefund(url, user, intent, 'pay-' + str(uuid4()))
+
+
+def test_refund_operation_reason_and_dedupe(drafts):
+    _, _, user, url = drafts
+    intent, order = seedAttempt(drafts)
+    seedControl(url, user, intent, order)
+    payment = 'pay-' + str(uuid4())
+    for change in (dict(kind='compensation'), dict(kind='capture'), dict(reason='expert_selection_changed'),
+                   dict(reason=None), dict(dedupe='purchase:refund:' + payment), dict(dedupe='payment:refund:other')):
+        with pytest.raises(psycopg2.Error):
+            insertRefund(url, user, intent, payment, **change)
+    op = insertRefund(url, user, intent, payment, 'duplicate')
+    assert query(url, 'SELECT dedupe_key FROM payment_operations WHERE id=%s', (op,), one=True)['dedupe_key'] == 'payment:refund:' + payment
+    with pytest.raises(psycopg2.IntegrityError):
+        insertRefund(url, user, intent, payment, 'account_closed')
+    for reason in REFUND_REASONS:
+        insertRefund(url, user, intent, 'pay-' + str(uuid4()), reason)
+    for change in ("reason='account_closed'", "dedupe_key='payment:refund:changed',provider_payment_id='changed'"):
+        with pytest.raises(psycopg2.Error):
+            query(url, f'UPDATE payment_operations SET {change} WHERE id=%s', (op,))
+
+
+def rejected(url, statement, args):
+    try:
+        query(url, statement, args)
+    except psycopg2.Error:
+        return True
+    return False
+
+
+def test_trigger_blocks_delete_truncate_and_identity_changes(drafts):
+    _, _, user, url = drafts
+    other, otherOrder = seedAttempt(drafts, domains=('telecom',))
+    proveClosed(url, other.attemptId)
+    intent, order = seedAttempt(drafts)
+    proveClosed(url, intent.attemptId)
+    foreign, foreignOrder = seedAttempt(drafts, 'topup', domains=('supplychain',))
+    slot = seedControl(url, user, intent, order)
+    seedControl(url, user, other, otherOrder, slot=slot)
+    seedControl(url, user, foreign, foreignOrder, 'topup')
+    op = insertRefund(url, user, intent, 'pay-' + str(uuid4()))
+    for table, key, value in (('payment_slots', 'slot_id', slot), ('payment_slot_controls', 'attempt_id', intent.attemptId),
+                              ('payment_operations', 'id', op)):
+        with pytest.raises(psycopg2.Error, match='cannot be deleted'):
+            query(url, f'DELETE FROM {table} WHERE {key}=%s', (value,))
+    with pytest.raises(psycopg2.Error, match='cannot be deleted'):
+        query(url, 'TRUNCATE payment_operations')
+    with pytest.raises(psycopg2.Error, match='cannot be deleted'):
+        query(url, 'TRUNCATE payment_operations,payment_slot_controls,payment_slots')
+    elsewhere = slotFor(url, user, 'pro_term', 'elsewhere')
+    for change in ("kind='topup'", "slot_key='moved'", 'created_at=clock_timestamp()', "user_id='foreign'"):
+        assert rejected(url, f'UPDATE payment_slots SET {change} WHERE slot_id=%s', (slot,)), change
+    bump = 'operation_revision=operation_revision+1,'
+    for change in (f"{bump}slot_id='{elsewhere}'", f"{bump}purpose='renewal'", f"{bump}capture_policy='account_default'",
+                   f'{bump}draft_revision=NULL', f'{bump}draft_revision=2', f"{bump}provider_order_id='order-moved'",
+                   f'{bump}created_at=clock_timestamp()', f"{bump}user_id='foreign'", f"{bump}invoice_id='{other.invoiceId}'",
+                   'recover_until=clock_timestamp()', 'operation_revision=operation_revision+2',
+                   f"{bump}superseded_by='{other.attemptId}'"):
+        assert rejected(url, f'UPDATE payment_slot_controls SET {change} WHERE attempt_id=%s', (intent.attemptId,)), change
+    query(url, f'UPDATE payment_slot_controls SET {bump}recover_until=clock_timestamp() WHERE attempt_id=%s', (intent.attemptId,))
+    with pytest.raises(psycopg2.Error):
+        query(url, f"""UPDATE payment_slot_controls SET {bump}superseded_by=%s,closed_at=clock_timestamp(),
+            closed_reason='SUPERSEDED' WHERE attempt_id=%s""", (foreign.attemptId, intent.attemptId))
+    query(url, f"""UPDATE payment_slot_controls SET {bump}superseded_by=%s,closed_at=clock_timestamp(),
+        closed_reason='SUPERSEDED',cancellation_requested_at=clock_timestamp() WHERE attempt_id=%s""",
+        (other.attemptId, intent.attemptId))
+    for change in ('superseded_by=NULL', f"superseded_by='{foreign.attemptId}'", 'closed_at=clock_timestamp()',
+                   "closed_reason='EXPIRED'", 'closed_at=NULL,closed_reason=NULL,superseded_by=NULL',
+                   'cancellation_requested_at=clock_timestamp()'):
+        assert rejected(url, f'UPDATE payment_slot_controls SET {bump}{change} WHERE attempt_id=%s', (intent.attemptId,)), change
+    for change in ('amount=1', "currency='USD'", "user_id='foreign'", f"id='{uuid4()}'", f"attempt_id='{other.attemptId}'",
+                   f"invoice_id='{other.invoiceId}'", "kind='capture'", 'created_at=clock_timestamp()'):
+        assert rejected(url, f'UPDATE payment_operations SET {change} WHERE id=%s', (op,)), change
 
 
 def test_operation_binding_dedupe_and_terminal_state_are_enforced(drafts):
@@ -172,30 +358,30 @@ def test_operation_binding_dedupe_and_terminal_state_are_enforced(drafts):
     with pytest.raises(ValueError, match='OWNED_PAYMENT_ATTEMPT_MISSING'):
         repo.getControl('foreign', intent.attemptId)
     with pytest.raises(psycopg2.IntegrityError):
-        query(url, '''INSERT INTO subscription_purchase_operations
-            (user_id,attempt_id,invoice_id,provider_payment_id,kind,amount,currency,dedupe_key)
-            SELECT user_id,attempt_id,invoice_id,provider_payment_id,kind,amount,currency,dedupe_key
-            FROM subscription_purchase_operations WHERE id=%s''', (op,))
+        query(url, '''INSERT INTO payment_operations
+            (user_id,attempt_id,invoice_id,provider_payment_id,kind,reason,amount,currency,dedupe_key)
+            SELECT user_id,attempt_id,invoice_id,provider_payment_id,kind,reason,amount,currency,dedupe_key
+            FROM payment_operations WHERE id=%s''', (op,))
     for column, value in [('amount', 1), ('currency', 'USD'), ('user_id', 'foreign'), ('id', str(uuid4()))]:
         with pytest.raises(psycopg2.Error):
-            query(url, f'UPDATE subscription_purchase_operations SET {column}=%s WHERE id=%s', (value, op))
+            query(url, f'UPDATE payment_operations SET {column}=%s WHERE id=%s', (value, op))
     with pytest.raises(psycopg2.Error):
-        query(url, "UPDATE subscription_purchase_operations SET state='succeeded' WHERE id=%s", (op,))
-    query(url, "UPDATE subscription_purchase_operations SET state='submission_started' WHERE id=%s", (op,))
-    query(url, "UPDATE subscription_purchase_operations SET state='succeeded' WHERE id=%s", (op,))
+        query(url, "UPDATE payment_operations SET state='succeeded' WHERE id=%s", (op,))
+    query(url, "UPDATE payment_operations SET state='submission_started' WHERE id=%s", (op,))
+    query(url, "UPDATE payment_operations SET state='succeeded' WHERE id=%s", (op,))
     assert not repo.hasUnresolvedPurchaseOperations(user)
     with pytest.raises(psycopg2.Error):
-        query(url, "UPDATE subscription_purchase_operations SET state='queued' WHERE id=%s", (op,))
+        query(url, "UPDATE payment_operations SET state='queued' WHERE id=%s", (op,))
 
 
-@pytest.mark.parametrize('kind', ['compensation'])
+@pytest.mark.parametrize('kind', ['refund'])
 def test_unresolved_operations_block_erasure_atomically_then_resolved_originals_are_retained(drafts, kind):
     from nubrix.triggers.tasks.userErasureTask import UserErasureTask
     from test.test_user_erasure_task import FakeExternalCleanup, FakeAudit
     repo, _, user, url = drafts
     repo.saveDraft(user, 0, ['telecom'], 'year')
     intent, op = seedOperation(drafts, kind)
-    original = query(url, 'SELECT to_jsonb(o) AS row FROM subscription_purchase_operations o WHERE id=%s', (op,), one=True)['row']
+    original = query(url, 'SELECT to_jsonb(o) AS row FROM payment_operations o WHERE id=%s', (op,), one=True)['row']
     repository, request = startErasure(url, user)
     failures = []
     delete = repository.deleteDatabaseData
@@ -210,27 +396,34 @@ def test_unresolved_operations_block_erasure_atomically_then_resolved_originals_
     assert result['status'] != 'COMPLETED'
     assert query(url, 'SELECT * FROM subscription_purchase_drafts WHERE user_id=%s', (user,))
     assert query(url, 'SELECT * FROM "Users" WHERE "userId"=%s', (user,))
-    assert query(url, 'SELECT to_jsonb(o) AS row FROM subscription_purchase_operations o WHERE id=%s', (op,), one=True)['row'] == original
-    query(url, "UPDATE subscription_purchase_operations SET state='cancelled' WHERE id=%s", (op,))
+    assert query(url, 'SELECT to_jsonb(o) AS row FROM payment_operations o WHERE id=%s', (op,), one=True)['row'] == original
+    query(url, "UPDATE payment_operations SET state='cancelled' WHERE id=%s", (op,))
     # Retry the same durable erasure request, never create a second one.
     query(url, "UPDATE user_erasure_requests SET next_retry_at=now()-interval '1 second',lease_expires_at=NULL WHERE id=%s", (request,))
     outcome = UserErasureTask(repository, FakeExternalCleanup(), FakeAudit()).execute(request)
     assert outcome['status'] == 'COMPLETED', failures
     assert repository.verifyDatabaseErasure(user) == {}
-    for table, identity in [('subscription_purchase_operations', op), ('subscription_purchase_checkout_controls', intent.attemptId)]:
+    slot = query(url, 'SELECT slot_id FROM payment_slot_controls WHERE attempt_id=%s', (intent.attemptId,), one=True)['slot_id']
+    for table, key, identity in [('payment_operations', 'id', op), ('payment_slot_controls', 'attempt_id', intent.attemptId),
+                                 ('payment_slots', 'slot_id', slot)]:
         retained = query(url, 'SELECT original_record FROM private.retained_user_records WHERE source_table=%s AND source_id=%s',
                          (table, identity), one=True)
         assert retained['original_record']['user_id'] == user
-    assert repository.getRequest(request)['retention_manifest']['retainedRecordCounts']['subscription_purchase_operations'] == 1
+        detached = query(url, f'SELECT user_id,erasure_request_id FROM {table} WHERE {key}=%s', (identity,), one=True)
+        assert detached['user_id'] is None and str(detached['erasure_request_id']) == request
+    counts = repository.getRequest(request)['retention_manifest']['retainedRecordCounts']
+    assert counts['payment_operations'] == 1 and counts['payment_slot_controls'] == 1 and counts['payment_slots'] == 1
 
 
 def test_due_operation_scan_uses_keyset_and_kind(drafts):
     repo, _, user, _ = drafts
     _, operation = seedOperation(drafts)
-    rows = repo.listDueOperations('compensation', None, 100)
+    rows = repo.listDueOperations('refund', None, 100)
     assert str(operation) in [str(row['id']) for row in rows]
-    assert all(row['kind'] == 'compensation' for row in rows)
-    assert all(str(row['id']) > str(operation) for row in repo.listDueOperations('compensation', str(operation), 100))
+    assert all(row['kind'] == 'refund' for row in rows)
+    assert all(str(row['id']) > str(operation) for row in repo.listDueOperations('refund', str(operation), 100))
+    with pytest.raises(ValueError):
+        repo.listDueOperations('compensation', None, 100)
     with pytest.raises(ValueError):
         repo.listDueOperations('foreign', None, 100)
 
@@ -242,10 +435,10 @@ def test_operation_requires_existing_order_and_amount_authority(drafts, missing)
     query(url, f'UPDATE billing_events SET {missing}=NULL WHERE id=%s', (intent.attemptId,))
     payment = 'pay-' + str(uuid4())
     with pytest.raises(psycopg2.Error):
-        query(url, '''INSERT INTO subscription_purchase_operations
-            (user_id,attempt_id,invoice_id,provider_payment_id,kind,amount,currency,dedupe_key)
-            SELECT user_id,attempt_id,invoice_id,%s,kind,amount,currency,%s
-            FROM subscription_purchase_operations WHERE id=%s''', (payment, 'purchase:capture:' + payment, op))
+        query(url, '''INSERT INTO payment_operations
+            (user_id,attempt_id,invoice_id,provider_payment_id,kind,reason,amount,currency,dedupe_key)
+            SELECT user_id,attempt_id,invoice_id,%s,kind,reason,amount,currency,%s
+            FROM payment_operations WHERE id=%s''', (payment, 'payment:refund:' + payment, op))
 
 
 def test_enabled_draft_http_cas_returns_current_owned_editor(drafts, monkeypatch):
@@ -361,7 +554,10 @@ def test_explicit_cancel_then_latest_draft_replaces_frozen_selection(drafts, mon
     new = repo.reserveDraftCheckout(intent.userId, 2, pricing, 'replace')
     assert new.attemptId != intent.attemptId and new.snapshot['domains'] == sorted(changed)
     assert repo.getControl(intent.userId, new.attemptId)['draft_revision'] == 2
-    assert str(repo.getControl(intent.userId, new.attemptId)['predecessor_attempt_id']) == intent.attemptId
+    replacement, original = repo.getControl(intent.userId, new.attemptId), repo.getControl(intent.userId, intent.attemptId)
+    assert replacement['slot_id'] == original['slot_id'] and replacement['capture_policy'] == 'automatic'
+    assert query(drafts[3], 'SELECT kind,slot_key,settled_payment_id FROM payment_slots WHERE slot_id=%s',
+                 (replacement['slot_id'],), one=True) == {'kind': 'pro_term', 'slot_key': 'open', 'settled_payment_id': None}
     assert query(drafts[3], 'SELECT amount,total_amount,currency FROM "Invoices" WHERE id=%s', (intent.invoiceId,), one=True) == old
     assert len(provider.orderCalls) == 1
 
@@ -483,6 +679,10 @@ def test_same_closed_legacy_key_returns_old_identity_and_no_gateway_call(drafts,
     PurchaseCheckoutService(repo, provider).cancel(user, intent.attemptId, 0, 'cancel-legacy')
     replay = ManualPaymentService.forProduction(provider, billing).createCheckout(request)
     assert replay.attemptId == intent.attemptId and replay.state == 'cancelled'
+    control = repo.getControl(user, intent.attemptId)
+    assert control['capture_policy'] == 'account_default' and control['draft_revision'] is None
+    assert query(drafts[3], 'SELECT kind,slot_key FROM payment_slots WHERE slot_id=%s', (control['slot_id'],), one=True) == {
+        'kind': 'pro_term', 'slot_key': 'open'}
     assert len(provider.orderCalls) == 1
 
 

@@ -9,7 +9,7 @@ from api.services.billing.purchaseCheckoutContracts import PurchaseDraft, Purcha
 from api.services.billing.purchaseDraftService import editableCheckoutEnabled
 from api.services.billing.purchaseOperationRepository import PurchaseOperationRepositoryMixin
 
-TABLES = ('subscription_purchase_drafts', 'subscription_purchase_checkout_controls', 'subscription_purchase_operations')
+TABLES = ('subscription_purchase_drafts', 'payment_slots', 'payment_slot_controls', 'payment_operations')
 
 
 class PurchaseCheckoutRepository(PurchaseOperationRepositoryMixin, ManualBillingRepository):
@@ -55,7 +55,7 @@ class PurchaseCheckoutRepository(PurchaseOperationRepositoryMixin, ManualBilling
                     fresh = checked and 0 <= (_now() - checked).total_seconds() <= 60
                     providerState = observation.get('outcome', 'unknown') if fresh and observation.get('complete') else 'unknown'
                     checkout = reducePurchaseCheckoutStatus(attempt, intent, providerState)
-                    cursor.execute('SELECT * FROM public.subscription_purchase_checkout_controls WHERE attempt_id=%s AND user_id=%s',
+                    cursor.execute('SELECT * FROM public.payment_slot_controls WHERE attempt_id=%s AND user_id=%s',
                                    (attempt['id'], userId))
                     control = cursor.fetchone()
                     checkout = applyPurchaseControl(checkout, control)
@@ -98,7 +98,7 @@ class PurchaseCheckoutRepository(PurchaseOperationRepositoryMixin, ManualBilling
             with connection.cursor(cursor_factory=RealDictCursor) as cursor:
                 self._requireStorage(cursor)
                 self._lockUser(cursor, userId)
-                cursor.execute('''SELECT c.* FROM public.subscription_purchase_checkout_controls c
+                cursor.execute('''SELECT c.* FROM public.payment_slot_controls c
                     JOIN public.billing_events b ON b.id=c.attempt_id AND b.invoice_id=c.invoice_id AND b.user_id=c.user_id
                     WHERE c.user_id=%s AND c.attempt_id=%s''', (userId, attemptId))
                 row = cursor.fetchone()
@@ -108,14 +108,14 @@ class PurchaseCheckoutRepository(PurchaseOperationRepositoryMixin, ManualBilling
         return self._run(operation)
 
     def listDueOperations(self, kind, afterId=None, limit=100):
-        if kind != 'compensation' or type(limit) is not int or not 1 <= limit <= 100:
+        if kind != 'refund' or type(limit) is not int or not 1 <= limit <= 100:
             raise ValueError('INVALID_PURCHASE_OPERATION_SCAN')
         if afterId is not None:
             UUID(str(afterId))
         def operation(connection):
             with connection.cursor(cursor_factory=RealDictCursor) as cursor:
                 self._requireStorage(cursor)
-                cursor.execute('''SELECT * FROM public.subscription_purchase_operations WHERE kind=%s
+                cursor.execute('''SELECT * FROM public.payment_operations WHERE kind=%s
                     AND state NOT IN ('succeeded','cancelled') AND next_retry_at<=clock_timestamp()
                     AND (%s::uuid IS NULL OR id>%s::uuid) ORDER BY id LIMIT %s''', (kind, afterId, afterId, limit))
                 return list(cursor.fetchall())
@@ -126,7 +126,7 @@ class PurchaseCheckoutRepository(PurchaseOperationRepositoryMixin, ManualBilling
             with connection.cursor(cursor_factory=RealDictCursor) as cursor:
                 self._requireStorage(cursor)
                 self._lockUser(cursor, userId)
-                cursor.execute('''SELECT 1 FROM public.subscription_purchase_operations
+                cursor.execute('''SELECT 1 FROM public.payment_operations
                     WHERE user_id=%s AND state NOT IN ('succeeded','cancelled') LIMIT 1''', (userId,))
                 return cursor.fetchone() is not None
         return self._run(operation)
@@ -157,7 +157,7 @@ class PurchaseCheckoutRepository(PurchaseOperationRepositoryMixin, ManualBilling
         frozen = self._json(attempt.get('metadata_json')).get('manualBilling', {})
         if not invoice or str(attempt['subscription_id']) != str(subscription['id']) or frozen.get('purpose') != 'initial_purchase':
             raise ValueError('OWNED_PAYMENT_ATTEMPT_MISSING')
-        cursor.execute('SELECT * FROM public.subscription_purchase_checkout_controls WHERE attempt_id=%s AND user_id=%s FOR UPDATE', (attemptId, userId))
+        cursor.execute('SELECT * FROM public.payment_slot_controls WHERE attempt_id=%s AND user_id=%s FOR UPDATE', (attemptId, userId))
         return subscription, invoice, attempt, cursor.fetchone()
 
     def _cancelReplayLocked(self, cursor, userId, attemptId, revision, key):
@@ -193,9 +193,12 @@ class PurchaseCheckoutRepository(PurchaseOperationRepositoryMixin, ManualBilling
                 if not control:
                     if expectedOperationRevision != 0:
                         raise ValueError('PURCHASE_CHECKOUT_STALE')
-                    cursor.execute('''INSERT INTO public.subscription_purchase_checkout_controls
-                        (attempt_id,invoice_id,user_id,draft_revision,provider_order_id)
-                        VALUES(%s,%s,%s,1,%s) RETURNING *''', (attemptId, invoice['id'], userId, attempt['provider_order_id']))
+                    # A pre-rollout Order was sent without a per-Order payment field.
+                    slotId = openSlotLocked(cursor, userId, 'pro_term', 'open')
+                    cursor.execute('''INSERT INTO public.payment_slot_controls
+                        (attempt_id,slot_id,invoice_id,user_id,purpose,capture_policy,provider_order_id)
+                        VALUES(%s,%s,%s,%s,'initial_purchase','account_default',%s) RETURNING *''',
+                        (attemptId, slotId, invoice['id'], userId, attempt['provider_order_id']))
                     control = cursor.fetchone()
                 if int(control['operation_revision']) != expectedOperationRevision:
                     raise ValueError('PURCHASE_CHECKOUT_STALE')
@@ -204,7 +207,7 @@ class PurchaseCheckoutRepository(PurchaseOperationRepositoryMixin, ManualBilling
                     raise ValueError('PURCHASE_DRAFT_NOT_ALLOWED')
                 now = _now()
                 accepted = control['cancellation_accepted_at'] or now
-                cursor.execute('''UPDATE public.subscription_purchase_checkout_controls SET
+                cursor.execute('''UPDATE public.payment_slot_controls SET
                     operation_revision=operation_revision+1,cancellation_requested_at=coalesce(cancellation_requested_at,%s),
                     cancellation_accepted_at=%s,updated_at=%s WHERE attempt_id=%s''', (now, accepted, now, attemptId))
                 if accepted:
@@ -238,10 +241,10 @@ def storedPurchaseControl(repository, userId, attemptId):
     def operation(connection):
         with connection.cursor(cursor_factory=RealDictCursor) as cursor:
             repository._lockUser(cursor, userId)
-            cursor.execute("SELECT to_regclass('public.subscription_purchase_checkout_controls') AS relation")
+            cursor.execute("SELECT to_regclass('public.payment_slot_controls') AS relation")
             if not cursor.fetchone()['relation']:
                 return None
-            cursor.execute('''SELECT c.* FROM public.subscription_purchase_checkout_controls c
+            cursor.execute('''SELECT c.* FROM public.payment_slot_controls c
                 JOIN public.billing_events b ON b.id=c.attempt_id AND b.user_id=c.user_id
                 WHERE c.user_id=%s AND c.attempt_id=%s''', (userId, attemptId))
             return cursor.fetchone()
@@ -251,7 +254,7 @@ def storedPurchaseControl(repository, userId, attemptId):
 def guardInitialPurchaseLocked(billing, cursor, request, subscription, now):
     """Runs inside the original invoice reservation transaction, including old clients."""
     from api.services.billing.purchaseCheckoutService import purchaseActionsReady, requirePurchaseActions
-    cursor.execute("SELECT to_regclass('public.subscription_purchase_checkout_controls') AS relation")
+    cursor.execute("SELECT to_regclass('public.payment_slot_controls') AS relation")
     present = cursor.fetchone()['relation']
     if not present:
         if request.purchaseDraftRevision is not None:
@@ -264,11 +267,11 @@ def guardInitialPurchaseLocked(billing, cursor, request, subscription, now):
         replay = cursor.fetchone()
         if replay and billing._json(replay['metadata_json']).get('manualBilling', {}).get('closedReason') != 'ORDER_NOT_CREATED':
             return  # Historical-key identity is observable, never a new purchase.
-    cursor.execute('''SELECT 1 FROM public.subscription_purchase_operations WHERE user_id=%s
+    cursor.execute('''SELECT 1 FROM public.payment_operations WHERE user_id=%s
         AND state NOT IN ('succeeded','cancelled') LIMIT 1''', (request.userId,))
     if cursor.fetchone():
         raise ValueError('PURCHASE_FUNDS_PENDING')
-    cursor.execute('''SELECT b.*,c.cancellation_accepted_at FROM public.subscription_purchase_checkout_controls c
+    cursor.execute('''SELECT b.*,c.cancellation_accepted_at FROM public.payment_slot_controls c
         JOIN public.billing_events b ON b.id=c.attempt_id WHERE c.user_id=%s ORDER BY b.id''', (request.userId,))
     for row in cursor.fetchall():
         frozen = billing._json(row['metadata_json']).get('manualBilling', {})
@@ -311,24 +314,32 @@ def guardInitialPurchaseLocked(billing, cursor, request, subscription, now):
             raise ValueError('PURCHASE_FUNDS_PENDING')
 
 
+def openSlotLocked(cursor, userId: str, kind: str, slotKey: str) -> str:
+    """Reuse the owner's unsettled slot for this kind and key, or open one. Runs under the owner lock."""
+    cursor.execute('''INSERT INTO public.payment_slots(user_id,kind,slot_key) VALUES(%s,%s,%s)
+        ON CONFLICT(user_id,kind,slot_key) WHERE settled_payment_id IS NULL DO NOTHING RETURNING slot_id''',
+        (userId, kind, slotKey))
+    row = cursor.fetchone()
+    if not row:
+        cursor.execute('''SELECT slot_id FROM public.payment_slots WHERE user_id=%s AND kind=%s AND slot_key=%s
+            AND settled_payment_id IS NULL''', (userId, kind, slotKey))
+        row = cursor.fetchone()
+    return str(row['slot_id'] if isinstance(row, dict) else row[0])
+
+
 def bindPurchaseControlLocked(cursor, request, intent):
-    cursor.execute('''SELECT c.attempt_id FROM public.subscription_purchase_checkout_controls c
-        JOIN public.billing_events b ON b.id=c.attempt_id WHERE c.user_id=%s AND c.attempt_id<>%s
-        AND c.cancellation_accepted_at IS NOT NULL ORDER BY c.created_at DESC,c.attempt_id DESC LIMIT 1''',
-        (request.userId, intent.attemptId))
-    predecessor = cursor.fetchone()
-    cursor.execute('''INSERT INTO public.subscription_purchase_checkout_controls
-        (attempt_id,invoice_id,user_id,draft_revision,capture_policy,predecessor_attempt_id)
-        VALUES(%s,%s,%s,%s,'automatic',%s) ON CONFLICT(attempt_id) DO NOTHING''',
-        (intent.attemptId, intent.invoiceId, request.userId, request.purchaseDraftRevision,
-         predecessor['attempt_id'] if predecessor else None))
+    slotId = openSlotLocked(cursor, request.userId, 'pro_term', 'open')
+    cursor.execute('''INSERT INTO public.payment_slot_controls
+        (attempt_id,slot_id,invoice_id,user_id,purpose,draft_revision,capture_policy)
+        VALUES(%s,%s,%s,%s,'initial_purchase',%s,'automatic') ON CONFLICT(attempt_id) DO NOTHING''',
+        (intent.attemptId, slotId, intent.invoiceId, request.userId, request.purchaseDraftRevision))
 
 
 def bindControlledOrderLocked(cursor, attemptId, orderId):
-    cursor.execute("SELECT to_regclass('public.subscription_purchase_checkout_controls') AS relation")
+    cursor.execute("SELECT to_regclass('public.payment_slot_controls') AS relation")
     if not cursor.fetchone()['relation']:
         return
-    cursor.execute('''UPDATE public.subscription_purchase_checkout_controls SET provider_order_id=%s,
+    cursor.execute('''UPDATE public.payment_slot_controls SET provider_order_id=%s,
         operation_revision=operation_revision+1,updated_at=clock_timestamp()
         WHERE attempt_id=%s AND provider_order_id IS NULL''', (orderId, attemptId))
 

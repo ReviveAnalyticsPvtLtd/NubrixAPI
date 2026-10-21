@@ -73,6 +73,8 @@ def test_duplicate_late_capture_reserves_one_full_compensation(drafts, monkeypat
     second = service.reserveForClosedCapture(replace(evidence, provenCaptureAt=evidence.observedAt,
         timingVerified=True))
     assert str(first['id']) == str(second['id'])
+    assert first['kind'] == 'refund' and first['reason'] == 'paid_after_close'
+    assert first['dedupe_key'] == 'payment:refund:' + evidence.providerPaymentId
     assert first['amount'] == intent.amount and first['currency'] == 'INR'
     assert not repo.getCoverageSnapshot(intent.userId).accessAllowed
     result = service.execute(str(first['id']))
@@ -162,7 +164,7 @@ def test_verified_late_capture_transport_reserves_and_worker_completes_after_tab
     repo,provider,intent,evidence,_=closedCapture(drafts,monkeypatch)
     provider.refundStatus='processed'
     ManualPaymentService.forProduction(provider,repo).finalizeCapturedPayment(evidence)
-    ops=query(drafts[3],"SELECT id FROM subscription_purchase_operations WHERE attempt_id=%s AND kind='compensation'",(intent.attemptId,))
+    ops=query(drafts[3],"SELECT id FROM payment_operations WHERE attempt_id=%s AND kind='refund'",(intent.attemptId,))
     assert len(ops)==1
     assert not provider.refundCalls
     monkeypatch.setattr('api.services.billing.purchaseCheckoutService.purchaseActionsReady',lambda:False)
@@ -205,6 +207,7 @@ def test_late_capture_after_erasure_uses_retained_cancellation_without_recreatin
     service=PurchaseCompensationService(repo,provider)
     op=service.reserveForClosedCapture(evidence)
     assert op['user_id'] is None and str(op['erasure_request_id'])==request
+    assert op['kind']=='refund' and op['reason']=='paid_after_close' and op['dedupe_key']=='payment:refund:'+payment['id']
     provider.refundStatus='processed'
     assert service.execute(str(op['id']))['state']=='succeeded'
     assert query(drafts[3],'SELECT * FROM "Users" WHERE "userId"=%s',(intent.userId,))==[]
@@ -223,7 +226,7 @@ def test_obligation_report_exposes_operation_and_one_actionable_case(drafts,monk
     report=listObligations(repo,limit=500)
     assert report['available']
     items=[r for r in report['items'] if r['id']==str(op['id'])]
-    assert len(items)==1 and items[0]['category']=='purchase_compensation'
+    assert len(items)==1 and items[0]['category']=='purchase_refund'
     assert items[0]['caseReference']=='purchase:'+str(op['id'])
 
 
@@ -244,7 +247,7 @@ def test_worker_backoff_and_escalation_never_release_liability(drafts,monkeypatc
 
 def test_worker_heartbeat_required_before_new_purchase_actions(drafts,monkeypatch):
     repo,provider,intent,cancel=controlledPurchase(drafts,monkeypatch)
-    query(drafts[3],"UPDATE private.purchase_recovery_runtime SET worker_seen_at=clock_timestamp()-interval '10 minutes'")
+    query(drafts[3],"UPDATE private.payment_recovery_runtime SET worker_seen_at=clock_timestamp()-interval '10 minutes'")
     with pytest.raises(ValueError,match='PURCHASE_ACTIONS_UNAVAILABLE'):
         cancel.cancel(intent.userId,intent.attemptId,1,'stale-worker')
     assert not repo.readEditor(intent.userId).capabilities.mayRequestCancellation
@@ -289,22 +292,22 @@ def test_concurrent_refund_executors_send_once_without_holding_owner_lock(drafts
 def test_sql_keyset_scan_pages_1001_rows_with_fixed_highwater(drafts,monkeypatch):
     from uuid import UUID
     repo,provider,intent,evidence,service=closedCapture(drafts,monkeypatch)
-    query(drafts[3],'''INSERT INTO subscription_purchase_operations
-        (id,user_id,attempt_id,invoice_id,provider_payment_id,kind,amount,currency,dedupe_key)
-        SELECT lpad(to_hex(n),32,'0')::uuid,%s,%s,%s,'pay-page-'||n,'compensation',%s,%s,'purchase:compensation:pay-page-'||n
+    query(drafts[3],'''INSERT INTO payment_operations
+        (id,user_id,attempt_id,invoice_id,provider_payment_id,kind,reason,amount,currency,dedupe_key)
+        SELECT lpad(to_hex(n),32,'0')::uuid,%s,%s,%s,'pay-page-'||n,'refund','paid_after_close',%s,%s,'payment:refund:pay-page-'||n
         FROM generate_series(1,1001) n''',(intent.userId,intent.attemptId,intent.invoiceId,intent.amount,intent.currency))
     from api.services.billing.manualBillingRepository import _now
     cutoff=_now()
-    high=repo.purchaseScanHighWater('compensation')
+    high=repo.purchaseScanHighWater('refund')
     later=str(UUID(int=UUID(str(high)).int+1))
-    query(drafts[3],'''INSERT INTO subscription_purchase_operations
-        (id,user_id,attempt_id,invoice_id,provider_payment_id,kind,amount,currency,dedupe_key)
-        VALUES(%s,%s,%s,%s,'pay-after-highwater','compensation',%s,%s,'purchase:compensation:pay-after-highwater')''',
+    query(drafts[3],'''INSERT INTO payment_operations
+        (id,user_id,attempt_id,invoice_id,provider_payment_id,kind,reason,amount,currency,dedupe_key)
+        VALUES(%s,%s,%s,%s,'pay-after-highwater','refund','paid_after_close',%s,%s,'payment:refund:pay-after-highwater')''',
         (later,intent.userId,intent.attemptId,intent.invoiceId,intent.amount,intent.currency))
     after=None
     seen=[]
     while True:
-        page=repo.purchaseScanPage('compensation',high,after,cutoff,limit=100)
+        page=repo.purchaseScanPage('refund',high,after,cutoff,limit=100)
         if not page:
             break
         seen.extend(str(r['id']) for r in page if r['user_id']==intent.userId)
@@ -312,7 +315,7 @@ def test_sql_keyset_scan_pages_1001_rows_with_fixed_highwater(drafts,monkeypatch
     assert len(seen)==1001 and later not in seen
     # These inventory-only identities have no synthetic provider payments.
     # Do not make later functional sweeps contact 1,002 deliberate phantoms.
-    query(drafts[3],"UPDATE subscription_purchase_operations SET state='cancelled' WHERE user_id=%s AND kind='compensation' AND state='queued'",(intent.userId,))
+    query(drafts[3],"UPDATE payment_operations SET state='cancelled' WHERE user_id=%s AND kind='refund' AND state='queued'",(intent.userId,))
 
 
 def test_worker_scan_excludes_new_rows_with_uuid_below_highwater(drafts,monkeypatch):
@@ -320,13 +323,13 @@ def test_worker_scan_excludes_new_rows_with_uuid_below_highwater(drafts,monkeypa
     repo,provider,intent,evidence,service=closedCapture(drafts,monkeypatch)
     op=service.reserveForClosedCapture(evidence)
     cutoff=_now()
-    high=repo.purchaseScanHighWater('compensation')
+    high=repo.purchaseScanHighWater('refund')
     newId='00000000-0000-0000-0000-000000002001'
-    query(drafts[3],'''INSERT INTO subscription_purchase_operations
-        (id,user_id,attempt_id,invoice_id,provider_payment_id,kind,amount,currency,dedupe_key)
-        VALUES(%s,%s,%s,%s,'pay-after-start','compensation',%s,%s,'purchase:compensation:pay-after-start')''',
+    query(drafts[3],'''INSERT INTO payment_operations
+        (id,user_id,attempt_id,invoice_id,provider_payment_id,kind,reason,amount,currency,dedupe_key)
+        VALUES(%s,%s,%s,%s,'pay-after-start','refund','paid_after_close',%s,%s,'payment:refund:pay-after-start')''',
         (newId,intent.userId,intent.attemptId,intent.invoiceId,intent.amount,intent.currency))
-    page=repo.purchaseScanPage('compensation',high,None,cutoff,limit=100)
+    page=repo.purchaseScanPage('refund',high,None,cutoff,limit=100)
     assert newId not in {str(r['id']) for r in page}
 
 
@@ -334,12 +337,12 @@ def test_worker_scan_excludes_new_rows_with_uuid_below_highwater(drafts,monkeypa
 def test_broken_storage_protection_disables_purchase_actions(drafts,monkeypatch,breakage):
     repo,provider,intent,cancel=controlledPurchase(drafts,monkeypatch)
     statements={
-        'trigger':('ALTER TABLE subscription_purchase_operations DISABLE TRIGGER purchase_storage_guard',
-                   'ALTER TABLE subscription_purchase_operations ENABLE TRIGGER purchase_storage_guard'),
-        'rls':('ALTER TABLE subscription_purchase_operations DISABLE ROW LEVEL SECURITY',
-               'ALTER TABLE subscription_purchase_operations ENABLE ROW LEVEL SECURITY'),
-        'public_write':('GRANT INSERT ON subscription_purchase_operations TO anon',
-                        'REVOKE INSERT ON subscription_purchase_operations FROM anon')}
+        'trigger':('ALTER TABLE payment_operations DISABLE TRIGGER payment_storage_guard',
+                   'ALTER TABLE payment_operations ENABLE TRIGGER payment_storage_guard'),
+        'rls':('ALTER TABLE payment_operations DISABLE ROW LEVEL SECURITY',
+               'ALTER TABLE payment_operations ENABLE ROW LEVEL SECURITY'),
+        'public_write':('GRANT INSERT ON payment_operations TO anon',
+                        'REVOKE INSERT ON payment_operations FROM anon')}
     change,restore=statements[breakage]
     try:
         query(drafts[3],change)
@@ -541,7 +544,7 @@ def test_concurrent_retry_scheduling_uses_the_locked_retry_count(drafts,monkeypa
     assert row['next_retry_at']==now+timedelta(seconds=60)
 
 
-def test_replacement_late_capture_after_erasure_preserves_predecessor_ownership(drafts,monkeypatch):
+def test_replacement_late_capture_after_erasure_preserves_slot_ownership(drafts,monkeypatch):
     from test.test_subscription_erasure_postgres import runErasure
     from api.services.billing.manualPaymentService import ManualPaymentService
     from api.services.billing.manualBillingContracts import VerifiedPaymentEvidence
@@ -579,6 +582,9 @@ def test_replacement_late_capture_after_erasure_preserves_predecessor_ownership(
     result=service.execute(str(op['id']))
     assert result['state']=='succeeded', failures
     assert not repo.purchaseControl(second.attemptId)['user_id']
+    slots={str(repo.purchaseControl(a)['slot_id']) for a in (first.attemptId,second.attemptId)}
+    assert len(slots)==1
+    assert query(drafts[3],'SELECT user_id FROM payment_slots WHERE slot_id=%s',(slots.pop(),),one=True)['user_id'] is None
     assert len(provider.refundCalls)==1
 
 

@@ -88,12 +88,12 @@ def listObligations(repository, limit=100, cursor=None):
         pages = []
         totals = Counter()
         with connection.cursor(cursor_factory=RealDictCursor) as sql:
-            sql.execute("SELECT to_regclass('public.subscription_purchase_operations') AS relation")
+            sql.execute("SELECT to_regclass('public.payment_operations') AS relation")
             hasPurchase=bool(sql.fetchone()['relation'])
             if hasPurchase:
                 table,alias,classification,condition,parameters,timeField=classifications[0]
                 condition='where ('+_EVENT_FILTER+''') AND NOT (a.event_type='payment.capture' AND EXISTS(
-                    SELECT 1 FROM public.subscription_purchase_operations o WHERE o.kind='compensation'
+                    SELECT 1 FROM public.payment_operations o WHERE o.kind='refund'
                     AND o.provider_payment_id=a.provider_payment_id AND o.invoice_id=a.invoice_id AND o.state='succeeded'))'''
                 classifications[0]=(table,alias,classification,condition,parameters,timeField)
             for table, alias, classification, condition, parameters, timeField in classifications:
@@ -109,9 +109,9 @@ def listObligations(repository, limit=100, cursor=None):
                 pages.append(sql.fetchall())
             purchase=[]
             if hasPurchase:
-                sources=[('subscription_purchase_operations','id',
+                sources=[('payment_operations','id',
                     "state NOT IN ('succeeded','cancelled')", "'purchase_'||kind"),
-                    ('subscription_purchase_checkout_controls','attempt_id',
+                    ('payment_slot_controls','attempt_id',
                     "cancellation_requested_at IS NOT NULL AND EXISTS(SELECT 1 FROM public.billing_events b WHERE b.id=a.attempt_id AND b.payment_status<>'captured' AND b.metadata_json->'manualBilling'->>'closureReconciledAt' IS NULL)",
                     "'purchase_cancellation'")]
                 for table,identity,condition,category in sources:

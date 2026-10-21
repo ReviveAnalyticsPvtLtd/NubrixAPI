@@ -78,7 +78,7 @@ def retentionManifest(counts, obligations=None):
         'retentionExpiresAt':None,'purgeScheduled':False}
 
 
-PURCHASE_TABLES = ('subscription_purchase_drafts', 'subscription_purchase_checkout_controls', 'subscription_purchase_operations')
+PURCHASE_TABLES = ('subscription_purchase_drafts', 'payment_slots', 'payment_slot_controls', 'payment_operations')
 
 
 def purchaseErasureInventory(cursor, userId):
@@ -94,10 +94,10 @@ def purchaseErasureInventory(cursor, userId):
     for table in PURCHASE_TABLES:
         cursor.execute(f'SELECT count(*) FROM public.{table} WHERE user_id=%s', (userId,))
         counts[table] = int(scalar(cursor.fetchone()))
-    cursor.execute('''SELECT count(*) FROM public.subscription_purchase_operations
+    cursor.execute('''SELECT count(*) FROM public.payment_operations
         WHERE user_id=%s AND state NOT IN ('succeeded','cancelled')''', (userId,))
     counts['unresolvedPurchaseOperations'] = int(scalar(cursor.fetchone()))
-    cursor.execute('''SELECT count(*) FROM public.subscription_purchase_checkout_controls c
+    cursor.execute('''SELECT count(*) FROM public.payment_slot_controls c
         JOIN public.billing_events b ON b.id=c.attempt_id WHERE c.user_id=%s
         AND c.cancellation_requested_at IS NOT NULL AND b.payment_status<>'captured'
         AND b.metadata_json->'manualBilling'->>'closureReconciledAt' IS NULL''',(userId,))
@@ -110,7 +110,7 @@ def archivePurchaseOriginals(cursor, requestId, userId):
     inventory = purchaseErasureInventory(cursor, userId)
     if inventory.get('unresolvedPurchaseOperations') or inventory.get('unresolvedPurchaseCancellations'):
         raise RuntimeError('PURCHASE_OPERATIONS_UNRESOLVED')
-    for table, identity in (('subscription_purchase_checkout_controls', 'attempt_id'), ('subscription_purchase_operations', 'id')):
+    for table, identity in (('payment_slots', 'slot_id'), ('payment_slot_controls', 'attempt_id'), ('payment_operations', 'id')):
         if table not in inventory:
             continue
         cursor.execute(f'''INSERT INTO private.retained_user_records

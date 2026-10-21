@@ -35,6 +35,15 @@ def erasureDb(runtimeDb):
     return runtimeDb
 
 
+def test_retained_sources_are_the_payment_storage_tables(erasureDb):
+    definition = query(erasureDb,"""SELECT pg_get_constraintdef(oid) AS definition FROM pg_constraint
+        WHERE conname='retained_user_records_source_table_check'""",one=True)['definition']
+    for table in ('billing_events','Invoices','payment_slots','payment_slot_controls','payment_operations'):
+        assert "'"+table+"'" in definition
+    for retired in ('subscription_purchase_checkout_controls','subscription_purchase_operations'):
+        assert retired not in definition
+
+
 def startErasure(url,user):
     admin = query(url,'''INSERT INTO admin_users(email,name,password_hash) VALUES(%s,'Synthetic','not-a-real-password') RETURNING id''',
         (str(uuid4())+'@example.test',),one=True)['id']

@@ -559,12 +559,12 @@ class UserErasureRepository:
                 if purchases.get('unresolvedPurchaseOperations'):
                     raise AdminApiError(409, 'PURCHASE_OPERATIONS_UNRESOLVED')
                 if not retained and any(purchases.get(table) for table in
-                        ('subscription_purchase_checkout_controls', 'subscription_purchase_operations')):
+                        ('payment_slots', 'payment_slot_controls', 'payment_operations')):
                     raise AdminApiError(409, 'SUBSCRIPTION_ERASURE_RETENTION_PENDING')
                 if retained:
                     assertErasureLease(cursor,requestId,workerId,userId)
                     archiveOriginals(cursor,requestId,userId)
-                    for table in ('subscription_purchase_operations', 'subscription_purchase_checkout_controls'):
+                    for table in ('payment_operations', 'payment_slot_controls', 'payment_slots'):
                         if table in purchases:
                             cursor.execute(f'''UPDATE public.{table} SET user_id=NULL,erasure_request_id=%s
                                 WHERE user_id=%s''', (requestId, userId))
@@ -708,8 +708,9 @@ class UserErasureRepository:
             ("admin_free_trial_extensions", "user_id"),
             ("admin_free_trial_reductions", "user_id"),
             ('subscription_purchase_drafts', 'user_id'),
-            ('subscription_purchase_checkout_controls', 'user_id'),
-            ('subscription_purchase_operations', 'user_id'),
+            ('payment_slots', 'user_id'),
+            ('payment_slot_controls', 'user_id'),
+            ('payment_operations', 'user_id'),
         )
         residuals = {}
         connection = self.connectionFactory()

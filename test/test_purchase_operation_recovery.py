@@ -13,9 +13,9 @@ def test_worker_scans_past_1000_and_does_not_chase_new_highwater_rows():
             self.ids = list(range(1,1003))
             self.seen = []
         def purchaseScanHighWater(self, source):
-            return 1001 if source == 'compensation' else None
+            return 1001 if source == 'refund' else None
         def purchaseScanPage(self, source, highWater, afterId, now, limit=100):
-            assert source == 'compensation' and limit == 100
+            assert source == 'refund' and limit == 100
             return [{'id':n,'state':'succeeded','kind':source} for n in self.ids
                 if (afterId is None or n>afterId) and n<=highWater][:limit]
         def recoverPurchaseItem(self, source, row, provider, now):
