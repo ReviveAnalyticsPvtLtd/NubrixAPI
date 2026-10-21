@@ -23,8 +23,8 @@ def payment(status, ageMinutes=1):
             'created_at': int((NOW - timedelta(minutes=ageMinutes)).timestamp())}
 
 
-def snap(payments=(), observedAgo=5, complete=True):
-    return CheckoutProviderSnapshot('att_1', 'order_1', 'unpaid', NOW - timedelta(seconds=observedAgo),
+def snap(payments=(), observedAgo=5, complete=True, outcome='unpaid', attemptId='att_1', order='order_1'):
+    return CheckoutProviderSnapshot(attemptId, order, outcome, NOW - timedelta(seconds=observedAgo),
                                     complete, 100, 'INR', tuple(payments))
 
 
@@ -62,7 +62,9 @@ def test_authorized_payment_alive_confirms(hash_):
 
 def test_authorized_payment_past_window_replaces():
     assert decidePay(live(), 'h2', snap([payment('authorized', 45)]), NOW) == PayDecision('replace', 'att_1')
-    assert decidePay(live(), 'h1', snap([payment('authorized', 45)]), NOW).action == 'reuse'
+    assert decidePay(live(), 'h1', snap([payment('authorized', 45)]), NOW) == PayDecision('replace', 'att_1')
+    mixed = snap([payment('authorized', 45), payment('authorized', 1)])
+    assert decidePay(live(), 'h1', mixed, NOW).action == 'confirming'
 
 
 def test_captured_payment_finalizes_first():
@@ -105,3 +107,36 @@ def test_slot_key_errors():
         slotKey('expert_addition', currentTermEnd=None, renewalPeriodStart=None)
     with pytest.raises(ValueError, match='PAYMENT_SLOT_KEY_INVALID'):
         slotKey('renewal', currentTermEnd=None, renewalPeriodStart=None)
+
+
+def test_refunded_payment_or_paid_order_finalizes_first():
+    assert decidePay(live(), 'h1', snap([payment('refunded')], outcome='unknown'), NOW) == PayDecision('finalize_first', 'att_1')
+    assert decidePay(live(), 'h2', snap([payment('refunded'), payment('failed')]), NOW).action == 'finalize_first'
+    assert decidePay(live(), 'h1', snap(outcome='captured'), NOW) == PayDecision('finalize_first', 'att_1')
+
+
+def test_unknown_outcome_is_busy():
+    assert decidePay(live(), 'h1', snap(outcome='unknown'), NOW).action == 'busy'
+
+
+@pytest.mark.parametrize('created', [None, 'x', True])
+def test_authorized_payment_with_bad_created_at_busy(created):
+    bad = {'id': 'p', 'status': 'authorized', 'created_at': created}
+    assert decidePay(live(), 'h1', snap([bad]), NOW) == PayDecision('busy', 'att_1')
+    missing = {'id': 'p', 'status': 'authorized'}
+    assert decidePay(live(), 'h1', snap([missing]), NOW).action == 'busy'
+
+
+def test_snapshot_for_other_attempt_or_order_busy():
+    assert decidePay(live(), 'h1', snap(attemptId='att_2'), NOW).action == 'busy'
+    assert decidePay(live(), 'h1', snap(order='order_2'), NOW).action == 'busy'
+
+
+def test_slot_key_naive_datetime_rejected_and_renewal_ignores_period_start_with_term():
+    naive = datetime(2026, 12, 1)
+    with pytest.raises(ValueError, match='PAYMENT_SLOT_KEY_INVALID'):
+        slotKey('expert_addition', currentTermEnd=naive, renewalPeriodStart=None)
+    with pytest.raises(ValueError, match='PAYMENT_SLOT_KEY_INVALID'):
+        slotKey('renewal', currentTermEnd=None, renewalPeriodStart=naive)
+    end = datetime(2026, 12, 1, tzinfo=timezone.utc)
+    assert slotKey('renewal', currentTermEnd=end, renewalPeriodStart=None) == end.isoformat()

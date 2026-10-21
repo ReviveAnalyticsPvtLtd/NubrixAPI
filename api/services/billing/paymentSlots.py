@@ -34,7 +34,7 @@ def slotKind(purpose: str) -> Literal['pro_term', 'expert_addition', 'topup']:
 
 
 def _iso(value: datetime | None) -> str:
-    if value is None:
+    if value is None or value.tzinfo is None:
         raise ValueError('PAYMENT_SLOT_KEY_INVALID')
     return value.astimezone(timezone.utc).isoformat()
 
@@ -73,8 +73,12 @@ def decidePay(live: LiveAttempt | None, payloadHash: str, snapshot: CheckoutProv
             or not timedelta(0) <= now - snapshot.observedAt <= _FRESHNESS:
         return PayDecision('busy', attemptId)
     statuses = [payment.get('status') for payment in snapshot.payments]
-    if 'captured' in statuses:
+    # 'refunded' was captured earlier; outcome 'captured' also carries an Order the provider shows as paid.
+    if snapshot.outcome == 'captured' or 'captured' in statuses or 'refunded' in statuses:
         return PayDecision('finalize_first', attemptId)
+    if snapshot.outcome == 'unknown':
+        return PayDecision('busy', attemptId)
+    heldDead = False
     for payment in snapshot.payments:
         if payment.get('status') == 'authorized':
             createdAt = _paymentCreatedAt(payment)
@@ -82,4 +86,8 @@ def decidePay(live: LiveAttempt | None, payloadHash: str, snapshot: CheckoutProv
                 return PayDecision('busy', attemptId)
             if not paymentIsDead(createdAt, now):
                 return PayDecision('confirming', attemptId)
+            heldDead = True
+    # Razorpay rejects new payments on an Order holding an authorized payment until it auto-refunds.
+    if heldDead:
+        return PayDecision('replace', attemptId)
     return PayDecision('reuse' if sameInsideTtl else 'replace', attemptId)
