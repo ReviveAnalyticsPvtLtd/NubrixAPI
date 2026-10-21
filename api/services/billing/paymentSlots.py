@@ -1,0 +1,85 @@
+"""Pure purchase slot keys and the Pay decision (open, reuse, replace, confirm, finalize)."""
+from dataclasses import dataclass
+from datetime import datetime, timedelta, timezone
+from typing import Literal
+
+from api.services.billing.manualBillingContracts import CheckoutProviderSnapshot
+from api.services.billing.paymentPolicy import paymentIsDead
+
+_KINDS = {'initial_purchase': 'pro_term', 'renewal': 'pro_term',
+          'expert_addition': 'expert_addition', 'topup': 'topup'}
+_FRESHNESS = timedelta(seconds=60)
+
+
+@dataclass(frozen=True)
+class LiveAttempt:
+    attemptId: str
+    payloadHash: str
+    expiresAt: datetime
+    providerOrderId: str | None
+    invoiceRevision: int | None
+
+
+@dataclass(frozen=True)
+class PayDecision:
+    action: Literal['open', 'reuse', 'replace', 'confirming', 'finalize_first', 'busy']
+    attemptId: str | None
+
+
+def slotKind(purpose: str) -> Literal['pro_term', 'expert_addition', 'topup']:
+    try:
+        return _KINDS[purpose]
+    except KeyError:
+        raise ValueError('PAYMENT_SLOT_UNKNOWN_PURPOSE') from None
+
+
+def _iso(value: datetime | None) -> str:
+    if value is None:
+        raise ValueError('PAYMENT_SLOT_KEY_INVALID')
+    return value.astimezone(timezone.utc).isoformat()
+
+
+def slotKey(purpose: str, *, currentTermEnd: datetime | None, renewalPeriodStart: datetime | None) -> str:
+    kind = slotKind(purpose)
+    if kind == 'topup':
+        return 'topup'
+    if kind == 'expert_addition':
+        return 'current:' + _iso(currentTermEnd)
+    if purpose == 'initial_purchase':
+        return 'open'
+    if currentTermEnd is None:
+        _iso(renewalPeriodStart)  # an ended-term renewal must name its period
+        return 'open'
+    return _iso(currentTermEnd)
+
+
+def _paymentCreatedAt(payment: dict) -> datetime | None:
+    raw = payment.get('created_at')
+    if isinstance(raw, bool) or not isinstance(raw, (int, float)):
+        return None
+    return datetime.fromtimestamp(raw, tz=timezone.utc)
+
+
+def decidePay(live: LiveAttempt | None, payloadHash: str, snapshot: CheckoutProviderSnapshot | None,
+              now: datetime) -> PayDecision:
+    if live is None:
+        return PayDecision('open', None)
+    attemptId = live.attemptId
+    sameInsideTtl = live.payloadHash == payloadHash and now < live.expiresAt
+    if live.providerOrderId is None:
+        return PayDecision('reuse' if sameInsideTtl else 'busy', attemptId)
+    if snapshot is None or not snapshot.complete or snapshot.attemptId != attemptId \
+            or snapshot.providerOrderId != live.providerOrderId \
+            or not timedelta(0) <= now - snapshot.observedAt <= _FRESHNESS:
+        return PayDecision('busy', attemptId)
+    statuses = [payment.get('status') for payment in snapshot.payments]
+    if 'captured' in statuses:
+        return PayDecision('finalize_first', attemptId)
+    for payment in snapshot.payments:
+        if payment.get('status') == 'authorized':
+            createdAt = _paymentCreatedAt(payment)
+            if createdAt is None:
+                return PayDecision('busy', attemptId)
+            if not paymentIsDead(createdAt, now):
+                return PayDecision('confirming', attemptId)
+    return PayDecision('reuse' if sameInsideTtl else 'replace', attemptId)
