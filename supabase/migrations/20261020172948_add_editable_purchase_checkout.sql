@@ -64,9 +64,9 @@ CREATE TABLE IF NOT EXISTS public.payment_slot_controls (
  created_at timestamptz NOT NULL DEFAULT clock_timestamp(),
  updated_at timestamptz NOT NULL DEFAULT clock_timestamp(),
  CHECK((user_id IS NULL) = (erasure_request_id IS NOT NULL)),
- CHECK(draft_revision IS NULL OR purpose='initial_purchase'),
+ CONSTRAINT payment_slot_controls_draft_initial_check CHECK(draft_revision IS NULL OR purpose='initial_purchase'),
  CHECK((closed_at IS NULL) = (closed_reason IS NULL)),
- CHECK(superseded_by IS NULL OR closed_reason IS NOT DISTINCT FROM 'SUPERSEDED'),
+ CONSTRAINT payment_slot_controls_superseded_reason_check CHECK(superseded_by IS NULL OR closed_reason IS NOT DISTINCT FROM 'SUPERSEDED'),
  CHECK(superseded_by IS DISTINCT FROM attempt_id),
  CHECK(cancellation_accepted_at IS NULL OR
        (cancellation_requested_at IS NOT NULL AND cancellation_accepted_at>=cancellation_requested_at))
@@ -86,7 +86,7 @@ CREATE TABLE IF NOT EXISTS public.payment_operations (
    ('queued','submission_started','outcome_unknown','submitted','succeeded','failed','cancelled','needs_attention')),
  amount bigint NOT NULL CHECK(amount>0),
  currency text NOT NULL CHECK(currency IN ('INR','USD')),
- dedupe_key text NOT NULL UNIQUE CHECK(dedupe_key='payment:'||kind||':'||provider_payment_id),
+ dedupe_key text NOT NULL UNIQUE CONSTRAINT payment_operations_dedupe_key_check CHECK(dedupe_key='payment:'||kind||':'||provider_payment_id),
  submission_evidence jsonb NOT NULL DEFAULT '{}'::jsonb CHECK(jsonb_typeof(submission_evidence)='object'),
  result jsonb NOT NULL DEFAULT '{}'::jsonb CHECK(jsonb_typeof(result)='object'),
  error_code text,

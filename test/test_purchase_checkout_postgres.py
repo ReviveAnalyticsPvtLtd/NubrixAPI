@@ -2,6 +2,7 @@
 import importlib
 import importlib.util
 import os
+import re
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from uuid import uuid4
@@ -116,6 +117,13 @@ STORAGE_TABLES = ['subscription_purchase_drafts', 'payment_slots', 'payment_slot
 SLOT_KIND = {'initial_purchase': 'pro_term', 'renewal': 'pro_term', 'expert_addition': 'expert_addition', 'topup': 'topup'}
 REFUND_REASONS = ('duplicate', 'paid_after_close', 'not_deliverable', 'account_closed')
 VERBS = ('SELECT', 'INSERT', 'UPDATE', 'DELETE', 'TRUNCATE', 'REFERENCES', 'TRIGGER')
+OWNERSHIP = 'payment ownership is immutable'
+SLOT_FROZEN = 'payment slot identity or settlement is immutable'
+CONTROL_FROZEN = 'payment control revision or frozen identity mismatch'
+CONTROL_BINDING = 'payment owner, purpose, invoice or slot mismatch'
+OPERATION_OWNER = 'payment owner, purpose or invoice mismatch'
+OPERATION_BINDING = 'payment operation binding mismatch'
+OPERATION_MONEY = 'payment operation money is immutable'
 
 
 @pytest.mark.parametrize('table', STORAGE_TABLES + ['private.payment_recovery_runtime'])
@@ -160,13 +168,14 @@ def test_draft_is_removed_by_complete_erasure(drafts):
     assert query(url, 'SELECT * FROM subscription_purchase_drafts WHERE user_id=%s', (user,)) == []
 
 
-def seedAttempt(drafts, purpose='initial_purchase', domains=('banking',)):
+def seedAttempt(drafts, purpose='initial_purchase', domains=('banking',), bind=True):
     from api.services.billing.manualBillingContracts import CheckoutRequest
     _, billing, user, url = drafts
     intent = billing.reserveCheckout(CheckoutRequest(user, 'initial_purchase', 'monthly_prepaid',
         {'domains': list(domains)}, expectedCatalogRevision=1))
-    order = 'order-' + str(uuid4())
-    billing.bindProviderOrder(intent.attemptId, {'id': order})
+    order = 'order-' + str(uuid4()) if bind else None
+    if bind:
+        billing.bindProviderOrder(intent.attemptId, {'id': order})
     if purpose != 'initial_purchase':
         query(url, '''UPDATE billing_events SET metadata_json=jsonb_set(metadata_json,'{manualBilling,purpose}',to_jsonb(%s::text))
             WHERE id=%s''', (purpose, intent.attemptId))
@@ -196,12 +205,27 @@ def seedControl(url, user, intent, order, purpose='initial_purchase', slot=None,
     return slot
 
 
-def insertRefund(url, user, intent, payment, reason='paid_after_close', kind='refund', dedupe=None):
+def insertRefund(url, user, intent, payment, reason='paid_after_close', kind='refund', dedupe=None,
+                 amount=None, currency=None, erasure=None):
     return query(url, '''INSERT INTO payment_operations
-        (user_id,attempt_id,invoice_id,provider_payment_id,kind,reason,amount,currency,dedupe_key)
-        VALUES(%s,%s,%s,%s,%s,%s,%s,%s,%s) RETURNING id''',
-        (user, intent.attemptId, intent.invoiceId, payment, kind, reason, intent.amount, intent.currency,
-         dedupe or 'payment:' + kind + ':' + payment), one=True)['id']
+        (user_id,attempt_id,invoice_id,provider_payment_id,kind,reason,amount,currency,dedupe_key,erasure_request_id)
+        VALUES(%s,%s,%s,%s,%s,%s,%s,%s,%s,%s) RETURNING id''',
+        (user, intent.attemptId, intent.invoiceId, payment, kind, reason, amount or intent.amount,
+         currency or intent.currency, dedupe or 'payment:' + kind + ':' + payment, erasure), one=True)['id']
+
+
+def assertRejected(message, action, label=None):
+    """Proves the named guard fired, never an unrelated CHECK, FK or syntax error."""
+    try:
+        action()
+    except psycopg2.Error as error:
+        assert re.search(message, str(error)), (label, message, str(error))
+        return
+    pytest.fail(f'not rejected: {label}')
+
+
+def assertStatementRejected(url, statement, args, message):
+    assertRejected(message, lambda: query(url, statement, args), statement)
 
 
 def seedOperation(drafts, kind='refund'):
@@ -217,8 +241,7 @@ def test_slot_unique_while_unsettled(drafts):
     _, _, user, url = drafts
     insert = 'INSERT INTO payment_slots(user_id,kind,slot_key) VALUES(%s,%s,%s) RETURNING slot_id'
     first = query(url, insert, (user, 'pro_term', 'open'), one=True)['slot_id']
-    with pytest.raises(psycopg2.IntegrityError):
-        query(url, insert, (user, 'pro_term', 'open'))
+    assertStatementRejected(url, insert, (user, 'pro_term', 'open'), 'payment_slots_open_key_idx')
     query(url, insert, (user, 'topup', 'open'))
     query(url, insert, (user, 'pro_term', 'term-2'))
     def opened():
@@ -228,17 +251,14 @@ def test_slot_unique_while_unsettled(drafts):
     payment = 'pay-' + str(uuid4())
     query(url, 'UPDATE payment_slots SET settled_payment_id=%s,settled_at=clock_timestamp() WHERE slot_id=%s', (payment, first))
     for change in ("settled_payment_id='pay-other'", 'settled_at=clock_timestamp()', 'settled_payment_id=NULL,settled_at=NULL'):
-        with pytest.raises(psycopg2.Error):
-            query(url, f'UPDATE payment_slots SET {change} WHERE slot_id=%s', (first,))
+        assertStatementRejected(url, f'UPDATE payment_slots SET {change} WHERE slot_id=%s', (first,), SLOT_FROZEN)
     second = opened()
     assert second != str(first) and opened() == second
-    with pytest.raises(psycopg2.IntegrityError):
-        query(url, 'UPDATE payment_slots SET settled_payment_id=%s,settled_at=clock_timestamp() WHERE slot_id=%s', (payment, second))
-    with pytest.raises(psycopg2.Error):
-        query(url, '''INSERT INTO payment_slots(user_id,kind,slot_key,settled_payment_id,settled_at)
-            VALUES(%s,'topup','settled-at-birth',%s,clock_timestamp())''', (user, 'pay-' + str(uuid4())))
-    with pytest.raises(psycopg2.IntegrityError):
-        query(url, insert, (user, 'renewal', 'open'))
+    assertStatementRejected(url, 'UPDATE payment_slots SET settled_payment_id=%s,settled_at=clock_timestamp() WHERE slot_id=%s',
+                            (payment, second), 'payment_slots_settled_payment_idx')
+    assertStatementRejected(url, '''INSERT INTO payment_slots(user_id,kind,slot_key,settled_payment_id,settled_at)
+        VALUES(%s,'topup','settled-at-birth',%s,clock_timestamp())''', (user, 'pay-' + str(uuid4())), 'slot must open unsettled')
+    assertStatementRejected(url, insert, (user, 'renewal', 'open'), 'payment_slots_kind_check')
     with pytest.raises(psycopg2.Error, match='slot must open unsettled'):
         query(url, """INSERT INTO payment_slots(user_id,kind,slot_key,erasure_request_id)
             VALUES(NULL,'topup','detached-at-birth',%s)""", (str(uuid4()),))
@@ -253,18 +273,19 @@ def test_controls_accept_every_purpose_with_automatic_policy_only(drafts, purpos
     query(url, 'INSERT INTO "Users"("userId") VALUES(%s)', (stranger,))
     otherKind = 'topup' if SLOT_KIND[purpose] != 'topup' else 'pro_term'
     otherPurpose = 'topup' if purpose != 'topup' else 'renewal'
-    rejected = [dict(policy='manual'), dict(policy='legacy'),
-                dict(purpose=otherPurpose, slot=slotFor(url, user, SLOT_KIND[otherPurpose])),
-                dict(slot=slotFor(url, user, otherKind)), dict(slot=slotFor(url, stranger, SLOT_KIND[purpose]))]
-    for change in rejected:
-        with pytest.raises(psycopg2.Error):
-            seedControl(url, user, intent, order, **{'purpose': purpose, 'policy': policy, **change})
+    rejected = [(dict(policy='manual'), 'payment_slot_controls_capture_policy_check'),
+                (dict(policy='legacy'), 'payment_slot_controls_capture_policy_check'),
+                (dict(purpose=otherPurpose, slot=slotFor(url, user, SLOT_KIND[otherPurpose])), CONTROL_BINDING),
+                (dict(slot=slotFor(url, user, otherKind)), CONTROL_BINDING),
+                (dict(slot=slotFor(url, stranger, SLOT_KIND[purpose])), CONTROL_BINDING)]
+    for change, message in rejected:
+        assertRejected(message, lambda: seedControl(url, user, intent, order, **{'purpose': purpose, 'policy': policy, **change}),
+                       change)
     if purpose != 'initial_purchase':
-        with pytest.raises(psycopg2.Error):
-            query(url, '''INSERT INTO payment_slot_controls
-                (attempt_id,slot_id,invoice_id,user_id,purpose,draft_revision,provider_order_id,capture_policy)
-                VALUES(%s,%s,%s,%s,%s,1,%s,'automatic')''', (intent.attemptId, slotFor(url, user, SLOT_KIND[purpose]),
-                intent.invoiceId, user, purpose, order))
+        assertStatementRejected(url, '''INSERT INTO payment_slot_controls
+            (attempt_id,slot_id,invoice_id,user_id,purpose,draft_revision,provider_order_id,capture_policy)
+            VALUES(%s,%s,%s,%s,%s,1,%s,'automatic')''', (intent.attemptId, slotFor(url, user, SLOT_KIND[purpose]),
+            intent.invoiceId, user, purpose, order), 'payment_slot_controls_draft_initial_check')
     with pytest.raises(psycopg2.Error, match='retained payment authority required'):
         query(url, """INSERT INTO payment_slot_controls
             (attempt_id,slot_id,invoice_id,user_id,purpose,provider_order_id,capture_policy,erasure_request_id)
@@ -282,27 +303,58 @@ def test_refund_operation_reason_and_dedupe(drafts):
     intent, order = seedAttempt(drafts)
     seedControl(url, user, intent, order)
     payment = 'pay-' + str(uuid4())
-    for change in (dict(kind='compensation'), dict(kind='capture'), dict(reason='expert_selection_changed'),
-                   dict(reason=None), dict(dedupe='purchase:refund:' + payment), dict(dedupe='payment:refund:other')):
-        with pytest.raises(psycopg2.Error):
-            insertRefund(url, user, intent, payment, **change)
+    for change, message in ((dict(kind='compensation'), 'payment_operations_kind_check'),
+                            (dict(kind='capture'), 'payment_operations_kind_check'),
+                            (dict(reason='expert_selection_changed'), 'payment_operations_reason_check'),
+                            (dict(reason=None), 'null value in column "reason"'),
+                            (dict(dedupe='purchase:refund:' + payment), 'payment_operations_dedupe_key_check'),
+                            (dict(dedupe='payment:refund:other'), 'payment_operations_dedupe_key_check')):
+        assertRejected(message, lambda: insertRefund(url, user, intent, payment, **change), change)
     op = insertRefund(url, user, intent, payment, 'duplicate')
     assert query(url, 'SELECT dedupe_key FROM payment_operations WHERE id=%s', (op,), one=True)['dedupe_key'] == 'payment:refund:' + payment
-    with pytest.raises(psycopg2.IntegrityError):
-        insertRefund(url, user, intent, payment, 'account_closed')
+    assertRejected('duplicate key value violates unique constraint',
+                   lambda: insertRefund(url, user, intent, payment, 'account_closed'), 'duplicate payment')
     for reason in REFUND_REASONS:
         insertRefund(url, user, intent, 'pay-' + str(uuid4()), reason)
     for change in ("reason='account_closed'", "dedupe_key='payment:refund:changed',provider_payment_id='changed'"):
-        with pytest.raises(psycopg2.Error):
-            query(url, f'UPDATE payment_operations SET {change} WHERE id=%s', (op,))
+        assertStatementRejected(url, f'UPDATE payment_operations SET {change} WHERE id=%s', (op,), OPERATION_MONEY)
 
 
-def rejected(url, statement, args):
-    try:
-        query(url, statement, args)
-    except psycopg2.Error:
-        return True
-    return False
+@pytest.mark.parametrize('case,message', [
+    ('amount_above_attempt', OPERATION_BINDING), ('currency_differs', OPERATION_BINDING),
+    ('foreign_owner', OPERATION_OWNER), ('attempt_purpose_differs', OPERATION_OWNER),
+    ('erasure_differs', OPERATION_BINDING), ('order_unbound', OPERATION_BINDING),
+    ('control_in_settled_slot', CONTROL_BINDING)])
+def test_refund_and_control_inserts_enforce_money_binding(drafts, case, message):
+    _, _, user, url = drafts
+    intent, order = seedAttempt(drafts, bind=case != 'order_unbound')
+    payment = 'pay-' + str(uuid4())
+    if case == 'control_in_settled_slot':
+        slot = slotFor(url, user)
+        query(url, 'UPDATE payment_slots SET settled_payment_id=%s,settled_at=clock_timestamp() WHERE slot_id=%s',
+              ('pay-' + str(uuid4()), slot))
+        assertRejected(message, lambda: seedControl(url, user, intent, order, slot=slot), case)
+        assert query(url, 'SELECT * FROM payment_slot_controls WHERE attempt_id=%s', (intent.attemptId,)) == []
+        seedControl(url, user, intent, order)  # The same control is valid in an unsettled slot.
+        return
+    seedControl(url, user, intent, order)
+    owner, changes = user, {}
+    if case == 'amount_above_attempt':
+        changes = dict(amount=intent.amount + 1)
+    elif case == 'currency_differs':
+        changes = dict(currency='USD' if intent.currency == 'INR' else 'INR')
+    elif case == 'foreign_owner':
+        owner = 'stranger-' + str(uuid4())
+        query(url, 'INSERT INTO "Users"("userId") VALUES(%s)', (owner,))
+    elif case == 'attempt_purpose_differs':
+        query(url, '''UPDATE billing_events SET metadata_json=jsonb_set(metadata_json,'{manualBilling,purpose}','"renewal"')
+            WHERE id=%s''', (intent.attemptId,))
+    elif case == 'erasure_differs':
+        changes = dict(erasure=str(uuid4()))
+    assertRejected(message, lambda: insertRefund(url, owner, intent, payment, **changes), case)
+    assert query(url, 'SELECT * FROM payment_operations WHERE attempt_id=%s', (intent.attemptId,)) == []
+    if case in ('amount_above_attempt', 'currency_differs', 'foreign_owner', 'erasure_differs'):
+        insertRefund(url, user, intent, payment)  # Only the broken condition made the insert fail.
 
 
 def test_trigger_blocks_delete_truncate_and_identity_changes(drafts):
@@ -325,29 +377,37 @@ def test_trigger_blocks_delete_truncate_and_identity_changes(drafts):
     with pytest.raises(psycopg2.Error, match='cannot be deleted'):
         query(url, 'TRUNCATE payment_operations,payment_slot_controls,payment_slots')
     elsewhere = slotFor(url, user, 'pro_term', 'elsewhere')
-    for change in ("kind='topup'", "slot_key='moved'", 'created_at=clock_timestamp()', "user_id='foreign'"):
-        assert rejected(url, f'UPDATE payment_slots SET {change} WHERE slot_id=%s', (slot,)), change
+    for change, message in (("kind='topup'", SLOT_FROZEN), ("slot_key='moved'", SLOT_FROZEN),
+                            ('created_at=clock_timestamp()', SLOT_FROZEN), ("user_id='foreign'", OWNERSHIP)):
+        assertStatementRejected(url, f'UPDATE payment_slots SET {change} WHERE slot_id=%s', (slot,), message)
     bump = 'operation_revision=operation_revision+1,'
-    for change in (f"{bump}slot_id='{elsewhere}'", f"{bump}purpose='renewal'", f"{bump}capture_policy='account_default'",
-                   f'{bump}draft_revision=NULL', f'{bump}draft_revision=2', f"{bump}provider_order_id='order-moved'",
-                   f'{bump}created_at=clock_timestamp()', f"{bump}user_id='foreign'", f"{bump}invoice_id='{other.invoiceId}'",
-                   'recover_until=clock_timestamp()', 'operation_revision=operation_revision+2',
-                   f"{bump}superseded_by='{other.attemptId}'"):
-        assert rejected(url, f'UPDATE payment_slot_controls SET {change} WHERE attempt_id=%s', (intent.attemptId,)), change
+    for change, message in ((f"{bump}slot_id='{elsewhere}'", CONTROL_FROZEN), (f"{bump}purpose='renewal'", CONTROL_FROZEN),
+                            (f"{bump}capture_policy='account_default'", CONTROL_FROZEN),
+                            (f'{bump}draft_revision=NULL', CONTROL_FROZEN), (f'{bump}draft_revision=2', CONTROL_FROZEN),
+                            (f"{bump}provider_order_id='order-moved'", CONTROL_FROZEN),
+                            (f'{bump}created_at=clock_timestamp()', CONTROL_FROZEN), (f"{bump}user_id='foreign'", OWNERSHIP),
+                            (f"{bump}invoice_id='{other.invoiceId}'", OWNERSHIP),
+                            ('recover_until=clock_timestamp()', CONTROL_FROZEN),
+                            ('operation_revision=operation_revision+2', CONTROL_FROZEN),
+                            (f"{bump}superseded_by='{other.attemptId}'", 'payment_slot_controls_superseded_reason_check')):
+        assertStatementRejected(url, f'UPDATE payment_slot_controls SET {change} WHERE attempt_id=%s', (intent.attemptId,), message)
     query(url, f'UPDATE payment_slot_controls SET {bump}recover_until=clock_timestamp() WHERE attempt_id=%s', (intent.attemptId,))
-    with pytest.raises(psycopg2.Error):
-        query(url, f"""UPDATE payment_slot_controls SET {bump}superseded_by=%s,closed_at=clock_timestamp(),
-            closed_reason='SUPERSEDED' WHERE attempt_id=%s""", (foreign.attemptId, intent.attemptId))
+    assertStatementRejected(url, f"""UPDATE payment_slot_controls SET {bump}superseded_by=%s,closed_at=clock_timestamp(),
+        closed_reason='SUPERSEDED' WHERE attempt_id=%s""", (foreign.attemptId, intent.attemptId),
+        'payment supersession owner or slot mismatch')
     query(url, f"""UPDATE payment_slot_controls SET {bump}superseded_by=%s,closed_at=clock_timestamp(),
         closed_reason='SUPERSEDED',cancellation_requested_at=clock_timestamp() WHERE attempt_id=%s""",
         (other.attemptId, intent.attemptId))
     for change in ('superseded_by=NULL', f"superseded_by='{foreign.attemptId}'", 'closed_at=clock_timestamp()',
                    "closed_reason='EXPIRED'", 'closed_at=NULL,closed_reason=NULL,superseded_by=NULL',
                    'cancellation_requested_at=clock_timestamp()'):
-        assert rejected(url, f'UPDATE payment_slot_controls SET {bump}{change} WHERE attempt_id=%s', (intent.attemptId,)), change
-    for change in ('amount=1', "currency='USD'", "user_id='foreign'", f"id='{uuid4()}'", f"attempt_id='{other.attemptId}'",
-                   f"invoice_id='{other.invoiceId}'", "kind='capture'", 'created_at=clock_timestamp()'):
-        assert rejected(url, f'UPDATE payment_operations SET {change} WHERE id=%s', (op,)), change
+        assertStatementRejected(url, f'UPDATE payment_slot_controls SET {bump}{change} WHERE attempt_id=%s',
+                                (intent.attemptId,), CONTROL_FROZEN)
+    for change, message in (('amount=1', OPERATION_MONEY), ("currency='USD'", OPERATION_MONEY), ("user_id='foreign'", OWNERSHIP),
+                            (f"id='{uuid4()}'", OPERATION_MONEY), (f"attempt_id='{other.attemptId}'", OWNERSHIP),
+                            (f"invoice_id='{other.invoiceId}'", OWNERSHIP), ("kind='capture'", OPERATION_MONEY),
+                            ('created_at=clock_timestamp()', OPERATION_MONEY)):
+        assertStatementRejected(url, f'UPDATE payment_operations SET {change} WHERE id=%s', (op,), message)
 
 
 def test_operation_binding_dedupe_and_terminal_state_are_enforced(drafts):
