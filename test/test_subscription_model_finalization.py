@@ -895,7 +895,7 @@ def test_expired_session_can_create_and_verify_fresh_purchase_through_http(accou
     provider = StrictFakeRazorpayClient()
     service = SubscriptionService.__new__(SubscriptionService)
     createOrder = provider.order.create
-    def uniqueOrder(payload):
+    def uniqueOrder(payload, **options):
         order = createOrder(payload)
         provider.order.orders.pop(order['id'])
         order['id'] = 'order-http-' + original.userId + '-' + order['id']

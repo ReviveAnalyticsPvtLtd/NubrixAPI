@@ -90,7 +90,7 @@ class OrderProvider:
     def __init__(self):
         self.orders={};self.lock=Lock();self.fail=True
         self.order=SimpleNamespace(create=self.create,all=self.list,payments=lambda *args:{'items':[]})
-    def create(self,payload):
+    def create(self,payload,**options):
         with self.lock:
             if self.fail:
                 self.fail=False

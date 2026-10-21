@@ -17,7 +17,7 @@ class SyntheticPurchaseProvider:
                 if o['receipt'] == params['receipt']][params['skip']:params['skip']+params['count']]})
         self.payment = SimpleNamespace(fetch=lambda key,**options: dict(self.payments[key]), capture=self.capture)
 
-    def createOrder(self, payload):
+    def createOrder(self, payload, **options):
         self.orderCalls.append(payload)
         key = 'order-synthetic-' + str(uuid4())
         self.orders[key] = {**payload, 'id': key, 'status': 'created'}

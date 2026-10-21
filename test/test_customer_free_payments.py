@@ -29,7 +29,7 @@ class _FakeOrderAPI:
         self.orders = {}
         self.createdPayloads = []
 
-    def create(self, payload):
+    def create(self, payload, **options):
         self.provider.forbiddenFieldCheck(payload, context="order.create")
         self.createdPayloads.append(payload)
         orderId = f"order_{len(self.createdPayloads)}"

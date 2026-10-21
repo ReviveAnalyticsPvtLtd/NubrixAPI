@@ -17,3 +17,6 @@ os.environ.setdefault("REDIS_PORT", "6379")
 os.environ.setdefault("REDIS_PASSWORD", "")
 os.environ.setdefault("GEMINI_API_KEY", "test-key")
 os.environ.setdefault("GROQ_API_KEY", "test-key")
+
+# Automatic-capture rules cutover; unset blocks new Orders by design.
+os.environ.setdefault("PAYMENT_RULES_EFFECTIVE_AT", "2026-01-01T00:00:00+00:00")

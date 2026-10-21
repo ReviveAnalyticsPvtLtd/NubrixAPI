@@ -403,7 +403,7 @@ def test_cancel_idempotency_and_stale_revision_are_not_new_mutations(drafts, mon
 @pytest.mark.parametrize('original,changed', [(('banking',), ['banking', 'telecom']), (('banking', 'telecom'), ['banking'])])
 def test_explicit_cancel_then_latest_draft_replaces_frozen_selection(drafts, monkeypatch, currency, interval, original, changed):
     repo, provider, intent, service = controlledPurchase(drafts, monkeypatch, original, interval, currency)
-    assert provider.orderCalls[0]['payment'] == {'capture': 'manual'}
+    assert provider.orderCalls[0]['payment']['capture'] == 'automatic'
     old = query(drafts[3], 'SELECT amount,total_amount,currency FROM "Invoices" WHERE id=%s', (intent.invoiceId,), one=True)
     repo.saveDraft(intent.userId, 1, changed, interval)
     pricing = {'userId': intent.userId, 'domains': changed, 'billingMode': intent.billingMode, 'currency': currency, 'catalogRevision': 1}
@@ -527,7 +527,7 @@ def test_cancelled_order_acknowledgement_is_recovered_without_new_order(drafts, 
     repo.saveDraft(first.userId, 1, ['telecom'], 'month')
     pricing = {'userId': first.userId, 'domains': ['telecom'], 'billingMode': 'monthly_prepaid', 'currency': 'INR', 'catalogRevision': 1}
     intent = repo.reserveDraftCheckout(first.userId, 2, pricing, 'second')
-    def lostAcknowledgement(payload):
+    def lostAcknowledgement(payload, **options):
         provider.createOrder(payload)
         raise TimeoutError('synthetic order accepted before lost reply')
     provider.order.create = lostAcknowledgement
@@ -564,7 +564,7 @@ def test_same_closed_legacy_key_returns_old_identity_and_no_gateway_call(drafts,
     request = CheckoutRequest(user, 'initial_purchase', 'monthly_prepaid', {'domains': ['banking']}, 'legacy', expectedCatalogRevision=1)
     provider = SyntheticPurchaseProvider()
     intent = ManualPaymentService.forProduction(provider, billing).createCheckout(request)
-    assert 'payment' not in provider.orderCalls[0]
+    assert provider.orderCalls[0]['payment']['capture'] == 'automatic'
     monkeypatch.setattr('api.services.billing.purchaseCheckoutService.purchaseActionsReady', lambda: True)
     PurchaseCheckoutService(repo, provider).cancel(user, intent.attemptId, 0, 'cancel-legacy')
     replay = ManualPaymentService.forProduction(provider, billing).createCheckout(request)
@@ -683,7 +683,7 @@ def test_submit_http_verifies_signed_pricing_and_keeps_contact_out_of_storage(dr
     assert response.status_code == 200, response.text
     assert response.json()['checkout']['currency'] == 'USD'
     assert response.headers['cache-control'] == 'private, no-store'
-    assert provider.orderCalls[0]['payment'] == {'capture': 'manual'}
+    assert provider.orderCalls[0]['payment']['capture'] == 'automatic'
     frozen = query(url, 'SELECT metadata_json FROM "Invoices" WHERE "userId"=%s', (user,), one=True)['metadata_json']
     assert '+919999999999' not in str(frozen)
     assert len(provider.orderCalls) == 1

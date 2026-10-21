@@ -25,6 +25,8 @@ from api.services.billing.manualBillingContracts import (
     FinalizationResult,
     VerifiedPaymentEvidence,
 )
+from razorpay.errors import BadRequestError
+
 from utils.logger import logger
 
 
@@ -127,6 +129,11 @@ class ManualPaymentService:
             return intent
         if self.razorpayClient is None:
             raise RuntimeError('PAYMENT_PROVIDER_NOT_CONFIGURED')
+        from api.services.billing.paymentPolicy import orderPaymentOptions, paymentRulesEffectiveAt
+        from api.services.billing.purchaseProvider import purchaseProviderOptions
+        paymentRulesEffectiveAt()  # unset or invalid cutoff: no new Order may open
+        options = orderPaymentOptions()
+        providerOptions = purchaseProviderOptions()
         if not self.repository.claimProviderOrderCreation(intent.attemptId):
             from api.services.billing.manualBillingRecoveryService import ManualBillingRecoveryService
             attempt = self.repository.attemptById(intent.userId, intent.attemptId)
@@ -146,17 +153,17 @@ class ManualPaymentService:
         if intent.purpose == 'topup':
             notes.update(packId=intent.snapshot['packId'], tokens=str(intent.snapshot['tokens']))
         payload = {'amount': intent.amount, 'currency': intent.currency, 'receipt': intent.attemptId, 'notes': notes}
-        if intent.snapshot.get('purchaseCapturePolicy') == 'manual':
-            from api.services.billing.purchaseCheckoutService import requirePurchaseActions, requireManualCaptureCurrency
-            requirePurchaseActions()
-            requireManualCaptureCurrency(intent.currency)
-            payload['payment'] = {'capture': 'manual'}
+        payload['payment'] = options
         try:
-            order = self.razorpayClient.order.create(payload)
+            order = self.razorpayClient.order.create(payload, **providerOptions)
             if (not order.get('id') or int(order.get('amount', -1)) != intent.amount
                     or order.get('currency') != intent.currency):
                 raise ValueError('PROVIDER_ORDER_EVIDENCE_MISMATCH')
             return self.repository.bindProviderOrder(intent.attemptId, order)
+        except BadRequestError as exc:
+            # A provider 4xx proves no Order exists: close now, no recovery wait.
+            self.repository.closeUncreatedOrder(intent.attemptId, providerRejected=True)
+            raise RuntimeError('PAYMENT_SERVICE_BUSY') from exc
         except Exception as exc:
             raise RuntimeError('ORDER_ACK_UNKNOWN') from exc
 

@@ -24,6 +24,7 @@ from datetime import datetime, timedelta, timezone
 import psycopg2
 from psycopg2.extras import Json, RealDictCursor
 
+from api.services.billing.paymentPolicy import captureWindowMinutes
 from api.services.billing.manualBillingContracts import (
     CheckoutIntent,
     CheckoutProviderSnapshot,
@@ -317,12 +318,14 @@ class ManualBillingRepository:
                     (Json(metadata), status, attemptId))
         return self._run(operation)
 
-    def closeUncreatedOrder(self, attemptId):
+    def closeUncreatedOrder(self, attemptId, providerRejected=False):
         """Close after a complete zero-match receipt lookup and a grace period.
 
         This is operational absence evidence, never capture-timing proof.
         Retain the receipt: subsequently discovered money is an anomaly on
         this closed attempt, not a grant on the replacement checkout.
+        ``providerRejected`` is a provider 4xx on creation, which proves no
+        Order exists, so the grace period is skipped.
         """
         def operation(connection):
             with connection.cursor(cursor_factory=RealDictCursor) as cursor:
@@ -343,7 +346,7 @@ class ManualBillingRepository:
                 now = _utc(cursor.fetchone()['current_time'])
                 claimed = _utc(billing.get('orderCreationClaimedAt') or attempt.get('attempted_at'))
                 if (attempt.get('provider_order_id') or attempt['payment_status'] == 'captured'
-                        or not claimed or now < claimed + timedelta(minutes=32) or invoice['status'] == 'PAID'):
+                        or not claimed or (not providerRejected and now < claimed + timedelta(minutes=32)) or invoice['status'] == 'PAID'):
                     return False
                 if billing.get('closedAt'):
                     billing['closureReconciledAt'] = now.isoformat()
@@ -800,8 +803,9 @@ class ManualBillingRepository:
                         'billingMode': request.billingMode, 'domains': selected, 'revision': revision,
                         'catalogRevision': catalog.revision,
                         'coverageState': 'estimated', 'expiresAt': deadline.isoformat()}
+                    billing.update(capturePolicy='automatic', captureWindowMinutes=captureWindowMinutes())
                     if request.purchaseDraftRevision is not None:
-                        billing.update(purchaseDraftRevision=request.purchaseDraftRevision, purchaseCapturePolicy='manual')
+                        billing.update(purchaseDraftRevision=request.purchaseDraftRevision)
                     if self._usesPurchaseAuthority() and request.purpose == 'expert_addition':
                         billing['servicePeriodId'] = coverage.currentPeriod.invoiceId
                     if request.purpose == 'topup':
@@ -843,8 +847,9 @@ class ManualBillingRepository:
                 if self._usesPurchaseAuthority():
                     snapshot.update(servicePeriodId=frozen.get('servicePeriodId'),
                         selectionEventId=frozen.get('selectionEventId'), selectionVersion=frozen.get('selectionVersion'))
+                snapshot.update(capturePolicy='automatic', captureWindowMinutes=captureWindowMinutes())
                 if request.purchaseDraftRevision is not None:
-                    snapshot.update(purchaseDraftRevision=request.purchaseDraftRevision, purchaseCapturePolicy='manual')
+                    snapshot.update(purchaseDraftRevision=request.purchaseDraftRevision)
                 intent = self._reserveCheckoutIntentLocked(cursor, subscription, request.userId, request.purpose,
                     snapshot['requestKey'], payload_hash, snapshot, now)
                 if request.purchaseDraftRevision is not None:
@@ -1372,8 +1377,10 @@ class ManualBillingRepository:
         }
         if self._usesPurchaseAuthority():
             manualBilling.update({k: snapshot.get(k) for k in ('servicePeriodId', 'selectionEventId', 'selectionVersion')})
+        manualBilling.update(capturePolicy=snapshot.get('capturePolicy', 'automatic'),
+            captureWindowMinutes=snapshot.get('captureWindowMinutes') or captureWindowMinutes())
         if snapshot.get('purchaseDraftRevision') is not None:
-            manualBilling.update({k: snapshot[k] for k in ('purchaseDraftRevision','purchaseCapturePolicy')})
+            manualBilling['purchaseDraftRevision'] = snapshot['purchaseDraftRevision']
 
         namespaceKey = f"{purpose}:{userId}:{requestKey}"
         if str(subscription['id']) != str(snapshot.get('subscriptionId')) or subscription.get('erasure_pending'):

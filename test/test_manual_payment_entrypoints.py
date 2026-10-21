@@ -126,7 +126,7 @@ class RecoverableProvider(StrictFakeRazorpayClient):
         self.path = path
         self.loseAck = False
         original = self.order.create
-        def create(payload):
+        def create(payload, **options):
             with sqlTransaction(path) as connection:
                 row = connection.execute('SELECT payment_status FROM billing_events WHERE id=?', (payload['receipt'],)).fetchone()
             assert row == ('pending_provider_ack',)
