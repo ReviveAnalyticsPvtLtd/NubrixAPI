@@ -198,18 +198,20 @@ def _storagePresent(cursor):
     return bool(row['relation'] if isinstance(row, dict) else row[0])
 
 
-def bindPurchaseControlLocked(cursor, request, intent):
-    """Bind a new initial attempt to the Pro term slot; an existing control is never rebound."""
+def bindPurchaseControlLocked(cursor, request, intent, slotKey):
+    """Bind a new attempt of any purpose to its slot; an existing control is never rebound."""
+    from api.services.billing.paymentSlots import slotKind
     if not _storagePresent(cursor):
         return
     cursor.execute('SELECT 1 FROM public.payment_slot_controls WHERE attempt_id=%s', (intent.attemptId,))
     if cursor.fetchone():
         return  # Idempotent replay: discover the control before opening any slot.
-    slotId = openSlotLocked(cursor, request.userId, 'pro_term', 'open')
+    slotId = openSlotLocked(cursor, request.userId, slotKind(request.purpose), slotKey)
     cursor.execute('''INSERT INTO public.payment_slot_controls
         (attempt_id,slot_id,invoice_id,user_id,purpose,draft_revision,capture_policy)
-        VALUES(%s,%s,%s,%s,'initial_purchase',%s,'automatic')''',
-        (intent.attemptId, slotId, intent.invoiceId, request.userId, request.purchaseDraftRevision))
+        VALUES(%s,%s,%s,%s,%s,%s,'automatic')''',
+        (intent.attemptId, slotId, intent.invoiceId, request.userId, request.purpose,
+         request.purchaseDraftRevision if request.purpose == 'initial_purchase' else None))
 
 
 _LIVE = ('created', 'pending_provider_ack', 'authorized')

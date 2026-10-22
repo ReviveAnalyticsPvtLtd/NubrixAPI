@@ -54,10 +54,8 @@ CREATE TABLE IF NOT EXISTS public.payment_slot_controls (
  superseded_by uuid REFERENCES public.payment_slot_controls(attempt_id),
  closed_at timestamptz,
  closed_reason text CHECK(closed_reason ~ '^[A-Z][A-Z0-9_]{0,63}$'),
+ -- A superseded attempt stays in the recovery scan until this instant (newest payment created_at + window).
  recover_until timestamptz,
- retry_count integer NOT NULL DEFAULT 0 CHECK(retry_count>=0),
- next_retry_at timestamptz NOT NULL DEFAULT clock_timestamp(),
- escalation_reference text,
  erasure_request_id uuid,
  created_at timestamptz NOT NULL DEFAULT clock_timestamp(),
  updated_at timestamptz NOT NULL DEFAULT clock_timestamp(),

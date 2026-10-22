@@ -793,27 +793,23 @@ def test_topup_clawback_races_usage_without_losing_the_unfunded_obligation(payme
             assert cursor.fetchone()[0]==100
 
 
-def test_distinct_expert_captures_respect_the_catalogue_limit(payment):
+def test_one_expert_addition_carries_the_full_set_within_the_catalogue_limit(payment):
     from api.services.billing.manualBillingContracts import CheckoutRequest
     repository,evidence,url=payment
     repository.finalizeCapturedPayment(evidence)
-    def reserve(domain):
-        return repository.reserveCheckout(CheckoutRequest(evidence.userId,'expert_addition','monthly_prepaid',
-            {'domains':[domain]},'add-'+domain,expectedCatalogRevision=1))
+    # One attempt per checkout carries every expert being added together (spec 4.1).
+    attempt=repository.reserveCheckout(CheckoutRequest(evidence.userId,'expert_addition','monthly_prepaid',
+        {'domains':['telecom','manufacturing','supplychain']},'add-all',expectedCatalogRevision=1))
+    order='expert-order-'+str(uuid.uuid4())
+    repository.bindProviderOrder(attempt.attemptId,{'id':order})
+    capture=VerifiedPaymentEvidence(attempt.attemptId,attempt.invoiceId,evidence.userId,
+        order,'expert-pay-'+str(uuid.uuid4()),'expert_addition','INR','captured',
+        'server_observation',attempt.amount,NOW+timedelta(minutes=1),None,None,False)
     with ThreadPoolExecutor(max_workers=2) as pool:
-        attempts=list(pool.map(reserve,['telecom','manufacturing','supplychain']))
-    captures=[]
-    for attempt in attempts:
-        order='expert-order-'+str(uuid.uuid4())
-        repository.bindProviderOrder(attempt.attemptId,{'id':order})
-        captures.append(VerifiedPaymentEvidence(attempt.attemptId,attempt.invoiceId,evidence.userId,
-            order,'expert-pay-'+str(uuid.uuid4()),'expert_addition','INR','captured',
-            'server_observation',attempt.amount,NOW+timedelta(minutes=1),None,None,False))
-    with ThreadPoolExecutor(max_workers=3) as pool:
-        results=list(pool.map(repository.finalizeCapturedPayment,captures))
-    assert all(result.finalized for result in results)
+        results=list(pool.map(repository.finalizeCapturedPayment,[capture,capture]))
+    assert sorted(result.state for result in results)==['already_finalized','expert_activated']
     assert set(repository.getCoverageSnapshot(evidence.userId).currentPeriod.domains)=={'banking','telecom','manufacturing','supplychain'}
-    with pytest.raises(ValueError,match='EXPERT_SELECTION_CONFLICT'):
+    with pytest.raises(ValueError,match='INVALID_EXPERT_SELECTION'):
         repository.reserveCheckout(CheckoutRequest(evidence.userId,'expert_addition','monthly_prepaid',
             {'domains':['telecom']},'duplicate-new-key',expectedCatalogRevision=1))
 

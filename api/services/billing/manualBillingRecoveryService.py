@@ -103,10 +103,10 @@ class ManualBillingRecoveryService:
                 from api.services.billing.purchaseCheckoutRepository import PurchaseCheckoutRepository
                 PurchaseCheckoutRepository(self.repository.connectionFactory).reserveCompensation(evidence)
             results.append(result)
-        if frozen.get('closedAt') and snapshot.outcome == 'unpaid' and not snapshot.payments:
-            # A successful complete provider listing settles cancellation wording;
-            # a later capture is still audited against the original cutoff.
-            self.repository.markClosedAttemptReconciled(str(attempt['id']))
+        if frozen.get('closedAt'):
+            # A complete listing may end the closed attempt's scan: an empty one for an ordinary
+            # closure, recover_until for a superseded one (a later capture is still finalized).
+            self.repository.recordClosedAttemptScan(str(attempt['id']), snapshot)
         return tuple(results)
 
     def recoverRefund(self, intent):

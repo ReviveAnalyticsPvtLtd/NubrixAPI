@@ -100,7 +100,9 @@ class TestTopupEligibilityAndOrder(unittest.TestCase):
         svc.razorpayClient = MagicMock()
         from api.services.billing.manualBillingContracts import CheckoutIntent
         from datetime import datetime,timezone,timedelta
-        def reserve(request):
+        def reserve(request, replayOnly=False, **evidence):
+            if replayOnly:
+                return None
             from api.services.billing.billingEngine import computeTopupSnapshot
             snap = computeTopupSnapshot(request.payload['packId'], request.billingMode)
             payload = {'invoiceId': 'inv_1', 'lifecycleId': 'test-life',
@@ -111,6 +113,8 @@ class TestTopupEligibilityAndOrder(unittest.TestCase):
             return repository.intent
         repository=MagicMock()
         repository.reserveCheckout.side_effect=reserve
+        repository.orderlessRecoveryRows.return_value=[]
+        repository.liveSlotAttempt.return_value=None
         repository.claimProviderOrderCreation.return_value=True
         from dataclasses import replace
         repository.bindProviderOrder.side_effect = lambda attempt, order: replace(repository.intent, razorpayOrderId=order['id'])
@@ -221,7 +225,7 @@ class TestTopupEligibilityAndOrder(unittest.TestCase):
         self.assertEqual(result["credits"], 500.0)
         self.assertEqual(result["invoiceId"], "inv_1")
         mkInv.assert_not_called()
-        svc.reservationRepository.reserveCheckout.assert_called_once()
+        self.assertEqual(svc.reservationRepository.reserveCheckout.call_args_list[-1].kwargs, {})
         attach.assert_not_called()
 
         notes = svc.razorpayClient.order.create.call_args[0][0]["notes"]

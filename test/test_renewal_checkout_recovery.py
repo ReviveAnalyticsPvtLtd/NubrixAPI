@@ -29,18 +29,22 @@ def test_new_annual_renewal_has_configured_deadline(checkout_database, monkeypat
     assert service.createCheckout(request).expiresAt == NOW + timedelta(seconds=600)
 
 
-def test_authorized_renewal_is_pending_even_after_session_deadline(checkout_database):
+def test_authorized_renewal_confirms_even_after_session_deadline(checkout_database):
     service, request = paid_then_request(checkout_database, 'monthly_prepaid', 'renewal')
     first = service.createCheckout(request)
     provider = service.razorpayClient
     provider.order.orders[first.razorpayOrderId]['status'] = 'attempted'
+    # Started 30 minutes after the attempt opened: still inside its 45-minute capture window an hour in.
     provider.paymentsByOrder[first.razorpayOrderId] = [{
         'id': 'pay_pending', 'order_id': first.razorpayOrderId, 'status': 'authorized',
-        'amount': first.amount, 'currency': first.currency}]
+        'amount': first.amount, 'currency': first.currency,
+        'created_at': int((NOW + timedelta(minutes=30)).timestamp())}]
     with patch('api.services.billing.manualBillingRepository._now', return_value=NOW + timedelta(hours=1)):
         recovered = service.createCheckout(replace(request, requestKey='second-browser'))
-        assert recovered.state == 'authorized'
+        assert recovered.state == 'confirming_earlier_payment'
         assert recovered.attemptId == first.attemptId
+        assert recovered.earlierPayment == {'selectionLabel': 'Pro monthly renewal with Banking',
+                                            'amount': first.amount, 'currency': first.currency}
         assert service.repository.expireStaleCheckouts()['attemptsExpired'] == 0
     assert len(provider.order.createdPayloads) == 2
 
@@ -80,18 +84,24 @@ def test_legacy_unbounded_renewal_keeps_original_deadline(checkout_database):
     assert len(service.razorpayClient.order.createdPayloads) == 2
 
 
-def test_failed_payment_history_after_deadline_requires_review(checkout_database):
+def test_failed_payment_after_deadline_is_replaced_on_the_same_invoice(checkout_database):
     service, request = paid_then_request(checkout_database, 'monthly_prepaid', 'renewal')
     first = service.createCheckout(request)
     provider = service.razorpayClient
     provider.order.orders[first.razorpayOrderId]['status'] = 'attempted'
     provider.paymentsByOrder[first.razorpayOrderId] = [{
         'id': 'pay_failed', 'order_id': first.razorpayOrderId, 'status': 'failed',
-        'amount': first.amount, 'currency': first.currency}]
+        'amount': first.amount, 'currency': first.currency, 'created_at': int(NOW.timestamp())}]
     with patch('api.services.billing.manualBillingRepository._now', return_value=NOW + timedelta(hours=1)):
-        recovered = service.createCheckout(replace(request, requestKey='second-browser'))
-    assert recovered.state == 'requires_reconciliation' and recovered.attemptId == first.attemptId
-    assert len(provider.order.createdPayloads) == 2
+        replacement = service.createCheckout(replace(request, requestKey='second-browser'))
+        old = service.repository.attemptById(request.userId, first.attemptId)
+    assert replacement.attemptId != first.attemptId and replacement.invoiceId == first.invoiceId
+    assert replacement.razorpayOrderId and len(provider.order.createdPayloads) == 3
+    frozen = service.repository._json(old['metadata_json'])['manualBilling']
+    assert old['payment_status'] == 'cancelled' and frozen['closedReason'] == 'SUPERSEDED'
+    assert not frozen.get('closureReconciledAt')
+    with sqlTransaction(checkout_database[1]) as connection:
+        assert connection.execute("SELECT status FROM \"Invoices\" WHERE id='renewal'").fetchone()[0] == 'UPCOMING'
 
 
 def test_lapsed_renewal_requires_provider_evidence_before_replacement(checkout_database):
@@ -101,7 +111,8 @@ def test_lapsed_renewal_requires_provider_evidence_before_replacement(checkout_d
         assert service.repository.expireStaleCheckouts()['attemptsExpired'] == 0
         replacement = service.createCheckout(replace(request, requestKey='fresh-review'))
         assert replacement.attemptId != first.attemptId and replacement.invoiceId == first.invoiceId
-        assert service.repository.attemptById(request.userId, first.attemptId)['payment_status'] == 'expired'
+        # Only the attempt is replaced; it stays in the recovery scan for its capture window.
+        assert service.repository.attemptById(request.userId, first.attemptId)['payment_status'] == 'cancelled'
     assert len(service.razorpayClient.order.createdPayloads) == 3
 
 
@@ -131,12 +142,15 @@ def test_cancellation_during_provider_read_cannot_reopen_renewal(checkout_databa
         service.repository.setRenewalOptOut(request.userId, True, None, 'cancel')
         return originalFetch(order)
     with patch.object(service.razorpayClient.order, 'fetch', side_effect=fetch):
-        with pytest.raises(ValueError):
+        # The opt-out landed after inspection: the evidence is stale, so nothing is decided.
+        with pytest.raises(RuntimeError, match='PAYMENT_SERVICE_BUSY'):
             service.createCheckout(replace(request, requestKey='second-browser'))
+    with pytest.raises(ValueError):
+        service.createCheckout(replace(request, requestKey='third-browser'))
     assert len(service.razorpayClient.order.createdPayloads) == 2
 
 
-def test_closed_attempt_with_received_money_cannot_offer_replacement(checkout_database):
+def test_late_capture_on_a_closed_attempt_does_not_hold_the_slot(checkout_database):
     service, request = paid_then_request(checkout_database, 'monthly_prepaid', 'renewal')
     first = service.createCheckout(request)
     attempt = service.repository.attemptById(request.userId, first.attemptId)
@@ -151,9 +165,11 @@ def test_closed_attempt_with_received_money_cannot_offer_replacement(checkout_da
     provider.paymentsByOrder[first.razorpayOrderId] = [{
         'id': 'pay_late', 'order_id': first.razorpayOrderId, 'status': 'captured',
         'amount': first.amount, 'currency': first.currency}]
-    recovered = service.createCheckout(replace(request, requestKey='second-browser'))
-    assert recovered.state == 'requires_reconciliation' and recovered.attemptId == first.attemptId
-    assert len(provider.order.createdPayloads) == 2
+    # Captured money is not in flight; the recovery scan finalizes it (spec 4.3 step 3, 4.4).
+    renewed = service.createCheckout(replace(request, requestKey='second-browser'))
+    assert renewed.attemptId != first.attemptId and renewed.invoiceId == first.invoiceId and renewed.razorpayOrderId
+    assert len(provider.order.createdPayloads) == 3
+    assert service.repository.attemptById(request.userId, first.attemptId)['payment_status'] == 'expired'
 
 
 def test_provider_read_failure_never_opens_another_renewal(checkout_database):
@@ -226,7 +242,7 @@ def test_stale_provider_observation_cannot_reserve_another_renewal(checkout_data
             service.repository.attemptById(request.userId, first.attemptId))
     # Provider evidence can age while reservation waits for the owner lock.
     with patch('api.services.billing.manualBillingRepository._now', return_value=later + timedelta(seconds=61)):
-        with pytest.raises(RuntimeError, match='PROVIDER_STATUS_UNKNOWN'):
+        with pytest.raises(RuntimeError, match='PAYMENT_SERVICE_BUSY'):
             service.repository.reserveCheckout(replace(request, requestKey='second-browser'))
     assert service.repository.attemptById(request.userId, first.attemptId)['payment_status'] == 'pending_provider_ack'
     with sqlTransaction(checkout_database[1]) as connection:

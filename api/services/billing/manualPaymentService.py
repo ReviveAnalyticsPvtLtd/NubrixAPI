@@ -16,7 +16,6 @@ __all__ = ["ManualPaymentService", "manualPaymentService"]
 import hashlib
 import json
 import os
-from dataclasses import replace
 from datetime import datetime, timedelta, timezone
 
 from api.services.billing.manualBillingContracts import (
@@ -94,53 +93,40 @@ class ManualPaymentService:
 
     def _createDurableCheckout(self, request):
         self.repository.ensureCanonicalSubscription(request.userId)
-        if request.purpose in ('initial_purchase', 'renewal'):
-            replay = self.repository.reserveCheckout(request, replayOnly=True)
-            if replay is not None and (replay.state in ('captured', 'expired', 'cancelled', 'superseded', 'failed')
-                    or request.purpose == 'initial_purchase' and replay.razorpayOrderId):
-                return replay
+        replay = self.repository.reserveCheckout(request, replayOnly=True)
+        if replay is not None and (replay.state in ('captured', 'expired', 'cancelled', 'superseded', 'failed')
+                or request.purpose != 'renewal' and replay.razorpayOrderId):
+            # A renewal replay with an Order is refreshed by inspecting the slot's live attempt below.
+            return replay
         from api.services.billing.manualBillingRecoveryService import ManualBillingRecoveryService
         recovery = ManualBillingRecoveryService(self.repository, self.razorpayClient)
         # The initial purchase slot spans billing modes.
         pendingRows = self.repository.orderlessRecoveryRows(request.userId, request.purpose,
             None if request.purpose == 'initial_purchase' else request.billingMode)
-        if request.purpose == 'renewal':
-            pendingRows = self.repository.renewalRecoveryRows(request.userId, request.billingMode,
-                request.payload.get('invoiceId'))
         for pending in pendingRows:
             try:
                 recovery.recoverAttempt(pending)
             except Exception as exc:
                 raise RuntimeError('PROVIDER_STATUS_UNKNOWN' if pending.get('provider_order_id') else 'ORDER_ACK_UNKNOWN') from exc
-            if request.purpose == 'renewal':
-                updated = self.repository.attemptById(request.userId, str(pending['id']))
-                metadata = self.repository._json(updated.get('metadata_json'))
-                frozen = metadata.get('manualBilling', {})
-                observation = frozen.get('providerObservation', {})
-                if frozen.get('closedAt') and observation.get('hasPayments') and updated.get('payment_status') != 'captured':
-                    original = self.repository._intentFromAttemptRow(updated, metadata, request.userId, request.purpose)
-                    return replace(original, state='requires_reconciliation')
-        inspection = None
-        if request.purpose == 'initial_purchase':
-            # Provider reads happen before the owner lock; the reservation re-reads the
-            # live attempt under the lock and is busy if it changed since this snapshot.
-            live = self.repository.liveSlotAttempt(request.userId, request.purpose)
-            inspected = None
-            if live is not None and live.get('provider_order_id'):
-                inspection = recovery.inspectAttempt(live)
-                if not inspection.complete:
-                    raise RuntimeError('PAYMENT_SERVICE_BUSY')  # Nothing closed, nothing opened.
-                try:
-                    # Finalize captured money first; a granted payment settles the slot.
-                    recovery.applyObservation(live, inspection)
-                except RuntimeError as exc:
-                    if str(exc) != 'PROVIDER_STATUS_UNKNOWN':
-                        raise
-                    # Recorded; the slot decision treats an unclassified Order as busy,
-                    # or refunded money on it as finalize-first.
-                inspected = self.repository.attemptById(request.userId, str(live['id']))
-                if not self._recordedOnlyThisSnapshot(live, inspected, inspection):
-                    raise RuntimeError('PAYMENT_SERVICE_BUSY')  # Other evidence arrived meanwhile: never act on it.
+        # Provider reads happen before the owner lock (spec 4.3); the reservation re-reads the
+        # slot's live attempt under the lock and is busy if it changed since this snapshot.
+        live = self.repository.liveSlotAttempt(request)
+        inspection = inspected = None
+        if live is not None and live.get('provider_order_id'):
+            inspection = recovery.inspectAttempt(live)
+            if not inspection.complete:
+                raise RuntimeError('PAYMENT_SERVICE_BUSY')  # Nothing closed, nothing opened.
+            try:
+                # Finalize captured money first; a granted payment settles the slot.
+                recovery.applyObservation(live, inspection)
+            except RuntimeError as exc:
+                if str(exc) != 'PROVIDER_STATUS_UNKNOWN':
+                    raise
+                # Recorded; the slot decision treats an unclassified Order as busy,
+                # or refunded money on it as finalize-first.
+            inspected = self.repository.attemptById(request.userId, str(live['id']))
+            if not self._recordedOnlyThisSnapshot(live, inspected, inspection):
+                raise RuntimeError('PAYMENT_SERVICE_BUSY')  # Other evidence arrived meanwhile: never act on it.
         evidence = {} if inspection is None else {'inspection': inspection, 'inspectedAttempt': inspected}
         intent = self.repository.reserveCheckout(request, **evidence)
         return self.openReservedCheckout(intent)

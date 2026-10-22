@@ -369,7 +369,8 @@ def test_control_replay_never_opens_an_orphan_slot(drafts, monkeypatch):
     query(url, 'UPDATE payment_slots SET settled_payment_id=%s,settled_at=clock_timestamp() WHERE slot_id=%s',
           ('pay-' + str(uuid4()), slot))
     with psycopg2.connect(url) as db, db.cursor(cursor_factory=RealDictCursor) as cursor:
-        bindPurchaseControlLocked(cursor, SimpleNamespace(userId=intent.userId, purchaseDraftRevision=1), intent)
+        bindPurchaseControlLocked(cursor, SimpleNamespace(userId=intent.userId, purpose='initial_purchase',
+            purchaseDraftRevision=1), intent, 'open')
     assert query(url, 'SELECT count(*) AS n FROM payment_slots WHERE user_id=%s', (intent.userId,), one=True)['n'] == 1
 
 
@@ -509,3 +510,346 @@ def test_refunded_and_fresh_authorization_on_an_authorized_attempt_confirms(draf
     held = pay(repo, provider, old.userId, 2, ['telecom'])
     assert held.state == 'confirming_earlier_payment' and held.attemptId == old.attemptId
     assert len(provider.orderCalls) == 1 and control(drafts[3], old.attemptId)['closed_at'] is None
+
+
+# -- every purpose shares the slot rules (renewal, expert addition, top-up) --
+
+def paidAccount(drafts, monkeypatch, interval='month', domains=('banking',)):
+    """A v2 account whose initial purchase was captured and granted."""
+    from api.services.billing.manualBillingContracts import VerifiedPaymentEvidence
+    from api.services.billing.manualBillingRepository import _now
+    repo, provider, intent, _ = controlledPurchase(drafts, monkeypatch, domains, interval)
+    item = payment(provider, intent, 'captured')
+    evidence = VerifiedPaymentEvidence(intent.attemptId, intent.invoiceId, intent.userId, intent.razorpayOrderId,
+        item['id'], 'initial_purchase', intent.currency, 'captured', 'server_observation', intent.amount, _now(),
+        None, None, False)
+    assert repo.finalizeCapturedPayment(evidence).finalized
+    return repo, provider, intent
+
+
+def monthlyRenewalInvoice(repo, user):
+    from dateutil.relativedelta import relativedelta
+    context = repo.getRenewalContext(user)
+    start = context['current_period_end']
+    return repo.createFrozenRenewalInvoice(dict(userId=user, subscription_id=context['id'], billing_reason='renewal',
+        payment_flow='razorpay_order_checkout', requires_customer_auth=True, period_start=start,
+        period_end=start + relativedelta(months=1), status='UPCOMING',
+        metadata_json={'manualBilling': dict(lifecycleId=context['billing_state']['manualBilling']['lifecycleId'],
+            purpose='renewal', billingMode='monthly_prepaid', domains=context['_verifiedCoverage']['nextExperts'],
+            coverageState='scheduled', revision=1)}), context['version'], expectedCatalogRevision=1)
+
+
+def annualRenewalInvoice(repo, user):
+    invoice = repo.createAnnualRenewalInvoice(user)
+    return repo.prepareAnnualRenewalInvoice(str(invoice['id']))
+
+
+def purposePay(repo, provider, user, purpose, mode, payload, key=None):
+    from api.services.billing.manualBillingContracts import CheckoutRequest
+    from api.services.billing.manualPaymentService import ManualPaymentService
+    return ManualPaymentService.forProduction(provider, repo).createCheckout(CheckoutRequest(
+        user, purpose, mode, payload, key or purpose + '-' + str(uuid4()), expectedCatalogRevision=1))
+
+
+def liveIn(url, user, purposes):
+    return [str(row['id']) for row in query(url, '''SELECT id FROM billing_events WHERE user_id=%s
+        AND event_category='payment_attempt' AND payment_status IN ('created','pending_provider_ack','authorized')
+        AND metadata_json->'manualBilling'->>'purpose' = ANY(%s)
+        AND metadata_json->'manualBilling'->>'closedAt' IS NULL ORDER BY attempted_at''', (user, list(purposes)))]
+
+
+def slotOf(url, attemptId):
+    return query(url, '''SELECT s.kind,s.slot_key FROM payment_slot_controls c JOIN payment_slots s ON s.slot_id=c.slot_id
+        WHERE c.attempt_id=%s''', (attemptId,), one=True)
+
+
+def expireAttempt(url, attemptId):
+    query(url, """UPDATE billing_events SET metadata_json=jsonb_set(metadata_json,'{manualBilling,expiresAt}',
+        to_jsonb((clock_timestamp()-interval '1 second')::text)) WHERE id=%s""", (attemptId,))
+
+
+def test_renewal_retry_after_dismiss_reuses_then_replaces_after_ttl(drafts, monkeypatch):
+    repo, provider, initial = paidAccount(drafts, monkeypatch)
+    url, user = drafts[3], initial.userId
+    invoice = monthlyRenewalInvoice(repo, user)
+    first = purposePay(repo, provider, user, 'renewal', 'monthly_prepaid', {'invoiceId': str(invoice['id'])})
+    assert first.razorpayOrderId and first.invoiceId == str(invoice['id'])
+    issued = query(url, 'SELECT status FROM "Invoices" WHERE id=%s', (first.invoiceId,), one=True)['status']
+    # Dismissed checkout, Pay again from another device: the same Order, no new invoice.
+    again = purposePay(repo, provider, user, 'renewal', 'monthly_prepaid', {'invoiceId': str(invoice['id'])})
+    assert again.attemptId == first.attemptId and again.razorpayOrderId == first.razorpayOrderId
+    orders = len(provider.orderCalls)
+    term = query(url, 'SELECT period_start FROM "Invoices" WHERE id=%s', (str(invoice['id']),), one=True)['period_start']
+    assert slotOf(url, first.attemptId) == {'kind': 'pro_term', 'slot_key': term.isoformat()}
+    expireAttempt(url, first.attemptId)
+    replaced = purposePay(repo, provider, user, 'renewal', 'monthly_prepaid', {'invoiceId': str(invoice['id'])})
+    assert replaced.attemptId != first.attemptId and replaced.razorpayOrderId
+    assert replaced.invoiceId == first.invoiceId and len(provider.orderCalls) == orders + 1
+    # The renewal invoice persists; only the attempt is replaced.
+    assert query(url, 'SELECT status FROM "Invoices" WHERE id=%s', (first.invoiceId,), one=True)['status'] == issued != 'VOID'
+    status, billing = frozen(url, first.attemptId)
+    assert status == 'cancelled' and billing['closedReason'] == 'SUPERSEDED' and not billing.get('closureReconciledAt')
+    closed = control(url, first.attemptId)
+    assert str(closed['superseded_by']) == replaced.attemptId and closed['slot_id'] == control(url, replaced.attemptId)['slot_id']
+    assert liveIn(url, user, ['renewal', 'initial_purchase']) == [replaced.attemptId]
+
+
+def test_renewal_revision_change_replaces_empty_attempt(drafts, monkeypatch):
+    repo, provider, initial = paidAccount(drafts, monkeypatch, 'year')
+    url, user = drafts[3], initial.userId
+    invoice = annualRenewalInvoice(repo, user)
+    old = purposePay(repo, provider, user, 'renewal', 'annual_prepaid', {'invoiceId': str(invoice['id'])})
+    assert old.revision == 1 and old.razorpayOrderId
+    # An expert grant marked the unpaid renewal for repricing; the scheduler re-freezes it in place.
+    query(url, '''UPDATE "Invoices" SET status='EXPIRED',metadata_json=metadata_json||'{"repricingRequired":true}'::jsonb
+        WHERE id=%s''', (str(invoice['id']),))
+    repriced = repo.prepareAnnualRenewalInvoice(str(invoice['id']))
+    assert repriced['status'] == 'PAYMENT_PENDING' and repriced['metadata_json']['manualBilling']['revision'] == 2
+    new = purposePay(repo, provider, user, 'renewal', 'annual_prepaid', {'invoiceId': str(invoice['id'])})
+    assert new.attemptId != old.attemptId and new.revision == 2 and new.invoiceId == old.invoiceId
+    assert new.razorpayOrderId and new.razorpayOrderId != old.razorpayOrderId
+    assert frozen(url, old.attemptId)[1]['closedReason'] == 'SUPERSEDED'
+    assert str(control(url, old.attemptId)['superseded_by']) == new.attemptId
+    assert query(url, 'SELECT status FROM "Invoices" WHERE id=%s', (old.invoiceId,), one=True)['status'] == 'PAYMENT_PENDING'
+    # The same revision again reuses the replacement.
+    assert purposePay(repo, provider, user, 'renewal', 'annual_prepaid', {'invoiceId': str(invoice['id'])}).attemptId == new.attemptId
+
+
+def test_repurchase_and_ended_annual_renewal_share_pro_term_slot(drafts, monkeypatch):
+    from datetime import datetime, timezone
+    from dateutil.relativedelta import relativedelta
+    from api.services.billing.manualBillingContracts import CheckoutRequest, VerifiedPaymentEvidence
+    from api.services.billing.manualBillingRepository import _now
+    from api.services.billing.manualPaymentService import ManualPaymentService
+    repo, billing, user, url = drafts
+    monkeypatch.delenv('SUBSCRIPTION_EDITABLE_CHECKOUT_ENABLED')
+    monkeypatch.setenv('SUBSCRIPTION_MODEL_PHASE', 'legacy')
+    provider = SyntheticPurchaseProvider()
+    service = ManualPaymentService.forProduction(provider, billing)
+    paid = service.createCheckout(CheckoutRequest(user, 'initial_purchase', 'annual_prepaid', {'domains': ['banking']},
+                                                  'annual', expectedCatalogRevision=1))
+    item = payment(provider, paid, 'captured')
+    assert billing.finalizeCapturedPayment(VerifiedPaymentEvidence(paid.attemptId, paid.invoiceId, user,
+        paid.razorpayOrderId, item['id'], 'initial_purchase', 'INR', 'captured', 'server_observation', paid.amount,
+        _now(), None, None, False)).finalized
+    # The annual term ended an hour ago; its renewal invoice is still payable.
+    end = datetime.now(timezone.utc).replace(microsecond=0) - relativedelta(hours=1)
+    query(url, 'UPDATE "Invoices" SET period_start=%s,period_end=%s WHERE id=%s', (end - relativedelta(years=1), end, paid.invoiceId))
+    query(url, 'UPDATE subscriptions SET current_period_start=%s,current_period_end=%s,renewal_due_at=%s WHERE user_id=%s',
+          (end - relativedelta(years=1), end, end, user))
+    renewalInvoice = annualRenewalInvoice(billing, user)
+    assert renewalInvoice['period_start'] == end
+    renewal = service.createCheckout(CheckoutRequest(user, 'renewal', 'annual_prepaid',
+        {'invoiceId': str(renewalInvoice['id'])}, 'renew-ended', expectedCatalogRevision=1))
+    assert renewal.razorpayOrderId and slotOf(url, renewal.attemptId) == {'kind': 'pro_term', 'slot_key': 'open'}
+    repurchase = service.createCheckout(CheckoutRequest(user, 'initial_purchase', 'monthly_prepaid',
+        {'domains': ['telecom']}, 'repurchase', expectedCatalogRevision=1))
+    assert repurchase.razorpayOrderId and repurchase.attemptId != renewal.attemptId
+    assert liveIn(url, user, ['renewal', 'initial_purchase']) == [repurchase.attemptId]
+    assert str(control(url, renewal.attemptId)['superseded_by']) == repurchase.attemptId
+    # Only the renewal attempt closed; its invoice still names the ended term.
+    assert query(url, 'SELECT status FROM "Invoices" WHERE id=%s', (str(renewalInvoice['id']),), one=True)['status'] == 'PAYMENT_PENDING'
+    again = service.createCheckout(CheckoutRequest(user, 'renewal', 'annual_prepaid',
+        {'invoiceId': str(renewalInvoice['id'])}, 'renew-again', expectedCatalogRevision=1))
+    assert again.attemptId not in (renewal.attemptId, repurchase.attemptId) and again.razorpayOrderId
+    assert liveIn(url, user, ['renewal', 'initial_purchase']) == [again.attemptId]
+    assert query(url, 'SELECT status FROM "Invoices" WHERE id=%s', (repurchase.invoiceId,), one=True)['status'] == 'VOID'
+    slots = {control(url, a)['slot_id'] for a in (renewal.attemptId, repurchase.attemptId, again.attemptId)}
+    assert len(slots) == 1
+
+
+def test_expert_addition_single_attempt_replaces_previous_set(drafts, monkeypatch):
+    repo, provider, initial = paidAccount(drafts, monkeypatch)
+    url, user = drafts[3], initial.userId
+    first = purposePay(repo, provider, user, 'expert_addition', 'monthly_prepaid', {'domains': ['telecom']})
+    assert first.razorpayOrderId
+    end = repo.getCoverageSnapshot(user).currentPeriod.end
+    assert slotOf(url, first.attemptId) == {'kind': 'expert_addition', 'slot_key': 'current:' + end.isoformat()}
+    both = purposePay(repo, provider, user, 'expert_addition', 'monthly_prepaid', {'domains': ['telecom', 'supplychain']})
+    assert both.attemptId != first.attemptId and both.razorpayOrderId and both.snapshot['domains'] == ['supplychain', 'telecom']
+    assert query(url, 'SELECT status FROM "Invoices" WHERE id=%s', (first.invoiceId,), one=True)['status'] == 'VOID'
+    assert str(control(url, first.attemptId)['superseded_by']) == both.attemptId
+    assert liveIn(url, user, ['expert_addition']) == [both.attemptId]
+    same = purposePay(repo, provider, user, 'expert_addition', 'monthly_prepaid', {'domains': ['supplychain', 'telecom']})
+    assert same.attemptId == both.attemptId and same.razorpayOrderId == both.razorpayOrderId
+    # An expert already subscribed is an invalid request, never a replacement: the live set stays.
+    with pytest.raises(ValueError, match='INVALID_EXPERT_SELECTION'):
+        purposePay(repo, provider, user, 'expert_addition', 'monthly_prepaid', {'domains': ['banking']})
+    assert liveIn(url, user, ['expert_addition']) == [both.attemptId]
+    payment(provider, both, 'authorized')
+    held = purposePay(repo, provider, user, 'expert_addition', 'monthly_prepaid', {'domains': ['manufacturing']})
+    assert held.state == 'confirming_earlier_payment' and held.attemptId == both.attemptId
+    assert held.earlierPayment == {'selectionLabel': 'adding Supply Chain and Telecom', 'amount': both.amount,
+                                   'currency': 'INR'}
+
+
+def test_topup_second_tab_replaces_unpaid_first(drafts, monkeypatch):
+    repo, provider, initial = paidAccount(drafts, monkeypatch)
+    url, user = drafts[3], initial.userId
+    first = purposePay(repo, provider, user, 'topup', 'monthly_prepaid', {'packId': 'medium'}, 'tab-one')
+    second = purposePay(repo, provider, user, 'topup', 'monthly_prepaid', {'packId': 'medium'}, 'tab-two')
+    assert second.attemptId == first.attemptId and second.razorpayOrderId == first.razorpayOrderId
+    assert slotOf(url, first.attemptId) == {'kind': 'topup', 'slot_key': 'topup'}
+    other = purposePay(repo, provider, user, 'topup', 'monthly_prepaid', {'packId': 'small'}, 'tab-three')
+    assert other.attemptId != first.attemptId and other.snapshot['packId'] == 'small'
+    assert query(url, 'SELECT status FROM "Invoices" WHERE id=%s', (first.invoiceId,), one=True)['status'] == 'VOID'
+    assert str(control(url, first.attemptId)['superseded_by']) == other.attemptId
+    assert liveIn(url, user, ['topup']) == [other.attemptId]
+    # A retry of the first tab replays its own (now closed) attempt; nothing new opens.
+    assert purposePay(repo, provider, user, 'topup', 'monthly_prepaid', {'packId': 'medium'}, 'tab-one').state == 'cancelled'
+    assert len(provider.orderCalls) == 3
+
+
+def test_unrelated_slot_money_does_not_block_renewal(drafts, monkeypatch):
+    repo, provider, initial = paidAccount(drafts, monkeypatch)
+    url, user = drafts[3], initial.userId
+    topup = purposePay(repo, provider, user, 'topup', 'monthly_prepaid', {'packId': 'medium'})
+    late = payment(provider, topup, 'captured')
+    subscription = query(url, 'SELECT id FROM subscriptions WHERE user_id=%s', (user,), one=True)['id']
+    # A top-up refund is owed and a top-up capture awaits reconciliation: neither is in the Pro term slot.
+    query(url, '''INSERT INTO billing_events(id,user_id,subscription_id,invoice_id,event_category,event_type,event_status,
+        provider,provider_order_id,provider_payment_id,amount,currency,idempotency_key,failure_reason,occurred_at)
+        VALUES(%s,%s,%s,%s,'reconciliation','payment.capture','REQUIRES_RECONCILIATION','razorpay',%s,%s,%s,'INR',%s,
+        'CLOSED_ATTEMPT',clock_timestamp())''', (str(uuid4()), user, subscription, topup.invoiceId, topup.razorpayOrderId,
+        late['id'], topup.amount, 'capture:' + late['id']))
+    query(url, '''INSERT INTO billing_events(id,user_id,subscription_id,invoice_id,event_category,event_type,event_status,
+        idempotency_key,metadata_json,occurred_at) VALUES(%s,%s,%s,%s,'reconciliation','refund.intent','reserved',%s,'{}',clock_timestamp())''',
+        (str(uuid4()), user, subscription, topup.invoiceId, 'refund-intent:' + str(uuid4())))
+    invoice = monthlyRenewalInvoice(repo, user)
+    renewal = purposePay(repo, provider, user, 'renewal', 'monthly_prepaid', {'invoiceId': str(invoice['id'])})
+    assert renewal.razorpayOrderId and renewal.state == 'pending_provider_ack'
+    assert repo.runtimeSnapshotFactsLoader(user)[0].moneyUnresolved is False
+
+
+def test_scheduler_skips_repricing_with_authorized_payment(drafts, monkeypatch):
+    from api.services.billing.manualBillingRecoveryService import ManualBillingRecoveryService
+    repo, provider, initial = paidAccount(drafts, monkeypatch, 'year')
+    url, user = drafts[3], initial.userId
+    invoice = annualRenewalInvoice(repo, user)
+    attempt = purposePay(repo, provider, user, 'renewal', 'annual_prepaid', {'invoiceId': str(invoice['id'])})
+    held = payment(provider, attempt, 'authorized')
+    ManualBillingRecoveryService(repo, provider).recoverAttempt(repo.attemptById(user, attempt.attemptId))
+    query(url, '''UPDATE "Invoices" SET status='EXPIRED',metadata_json=metadata_json||'{"repricingRequired":true}'::jsonb
+        WHERE id=%s''', (str(invoice['id']),))
+    before = query(url, 'SELECT to_jsonb(i) AS row FROM "Invoices" i WHERE id=%s', (str(invoice['id']),), one=True)
+    with pytest.raises(RuntimeError, match='RENEWAL_REPRICING_DEFERRED'):
+        repo.prepareAnnualRenewalInvoice(str(invoice['id']))
+    assert query(url, 'SELECT to_jsonb(i) AS row FROM "Invoices" i WHERE id=%s', (str(invoice['id']),), one=True) == before
+    # Once the authorization is past its capture window (Razorpay returns it), the scheduler reprices.
+    provider.payments[held['id']]['created_at'] = int(time.time()) - 46 * 60
+    query(url, """UPDATE billing_events SET metadata_json=jsonb_set(metadata_json,'{manualBilling,providerObservation,latestPaymentCreatedAt}',
+        to_jsonb((clock_timestamp()-interval '46 minutes')::text)) WHERE id=%s""", (attempt.attemptId,))
+    repriced = repo.prepareAnnualRenewalInvoice(str(invoice['id']))
+    assert repriced['metadata_json']['manualBilling']['revision'] == 2
+
+
+def test_superseded_attempt_scanned_until_recover_until(drafts, monkeypatch):
+    from api.services.billing.manualBillingRecoveryService import ManualBillingRecoveryService
+    repo, provider, old, _ = controlledPurchase(drafts, monkeypatch)
+    url = drafts[3]
+    started = time.time() - 40 * 60
+    payment(provider, old, 'failed', created=started)
+    repo.saveDraft(old.userId, 1, ['telecom'], 'month')
+    new = pay(repo, provider, old.userId, 2, ['telecom'])
+    assert new.attemptId != old.attemptId
+    until = control(url, old.attemptId)['recover_until']
+    assert abs(until.timestamp() - (started + 45 * 60)) < 2
+
+    def scan():
+        query(url, "UPDATE billing_events SET updated_at='1990-01-01' WHERE id=%s", (old.attemptId,))
+        due = [str(row['id']) for row in repo.pendingRecoveryRows(limit=500)]
+        assert old.attemptId in due
+        ManualBillingRecoveryService(repo, provider).recoverAttempt(repo.attemptById(old.userId, old.attemptId))
+        return frozen(url, old.attemptId)[1]
+
+    assert not scan().get('closureReconciledAt')
+    # A stale tab started another payment on the superseded Order: the scan window follows it.
+    later = time.time() - 60
+    payment(provider, old, 'failed', created=later)
+    assert not scan().get('closureReconciledAt')
+    extended = control(url, old.attemptId)['recover_until']
+    assert abs(extended.timestamp() - (later + 45 * 60)) < 2
+    # Two hours on: past recover_until a complete listing without money ends the scan.
+    query(url, """UPDATE payment_slot_controls SET operation_revision=operation_revision+1,
+        recover_until=clock_timestamp()-interval '75 minutes' WHERE attempt_id=%s""", (old.attemptId,))
+    query(url, """UPDATE billing_events SET metadata_json=jsonb_set(metadata_json,
+        '{manualBilling,providerObservation,latestPaymentCreatedAt}',to_jsonb((clock_timestamp()-interval '2 hours')::text))
+        WHERE id=%s""", (old.attemptId,))
+    for item in provider.payments.values():
+        item['created_at'] = int(time.time()) - 2 * 3600
+    assert scan().get('closureReconciledAt')
+    query(url, "UPDATE billing_events SET updated_at='1990-01-01' WHERE id=%s", (old.attemptId,))
+    assert old.attemptId not in [str(row['id']) for row in repo.pendingRecoveryRows(limit=500)]
+
+
+def test_renewal_expert_and_topup_routes_map_busy_and_confirming(drafts, monkeypatch):
+    from fastapi import FastAPI
+    from fastapi.testclient import TestClient
+    from jose import jwt
+    from api.commons import verifyToken
+    import api.routers.credits as creditRoutes
+    import api.routers.subscriptions as routes
+    from api.services.credits.topupService import TopupService, topupService
+    from api.services.subscriptions.subscriptionService import SubscriptionService
+    repo, provider, initial = paidAccount(drafts, monkeypatch)
+    url, user = drafts[3], initial.userId
+    invoice = str(monthlyRenewalInvoice(repo, user)['id'])
+    held = {'renewal': purposePay(repo, provider, user, 'renewal', 'monthly_prepaid', {'invoiceId': invoice}),
+            'expert_addition': purposePay(repo, provider, user, 'expert_addition', 'monthly_prepaid', {'domains': ['telecom']}),
+            'topup': purposePay(repo, provider, user, 'topup', 'monthly_prepaid', {'packId': 'medium'})}
+    monkeypatch.setattr('api.services.billing.manualBillingRepository.getManualBillingRepository', lambda: repo)
+    monkeypatch.setattr(routes.subscriptionService, 'razorpayClient', provider)
+    monkeypatch.setattr(routes.subscriptionService, '_getCanonicalSubscription',
+                        lambda userId, required=False: {'billing_mode': 'monthly_prepaid', 'default_currency': 'INR'})
+    monkeypatch.setattr(SubscriptionService, '_resolveCheckoutIdentity',
+                        lambda self, userId, email: {'email': email, 'name': 'Synthetic', 'contact': ''})
+    monkeypatch.setattr(topupService, 'razorpayClient', provider)
+    monkeypatch.setattr(topupService, '_subscription', lambda userId: {'billing_mode': 'monthly_prepaid', 'default_currency': 'INR'})
+    monkeypatch.setattr(TopupService, '_isTopupEligible', staticmethod(lambda subscription: True))
+    token = jwt.encode({'userId': user, 'email': 'synthetic@example.test'}, os.environ['SECRET_KEY'], algorithm='HS256')
+    app = FastAPI()
+    app.include_router(routes.router)
+    app.include_router(creditRoutes.router)
+    app.dependency_overrides[verifyToken] = lambda: token
+    client = TestClient(app)
+    calls = {'renewal': lambda key: client.post('/createRenewalPaymentSession', json={'invoiceId': invoice},
+                                                headers={'Idempotency-Key': key}),
+             'expert_addition': lambda key: client.post('/addDomains', json={'domains': ['supplychain'], 'expectedCatalogRevision': 1},
+                                                        headers={'Idempotency-Key': key}),
+             'topup': lambda key: client.post('/topup/order', json={'packId': 'small', 'expectedCatalogRevision': 1},
+                                              headers={'Idempotency-Key': key})}
+    orders = len(provider.orderCalls)
+    outage = provider.order.payments
+    def unreachable(*args, **kwargs):
+        raise TimeoutError('synthetic provider outage')
+    provider.order.payments = unreachable
+    for purpose, call in calls.items():
+        response = call('busy-' + purpose)
+        assert response.status_code == 503, (purpose, response.text)
+        detail = response.json()['detail']
+        assert detail['message'] == BUSY_COPY and detail['errorCode'] == 'PAYMENT_SERVICE_BUSY', purpose
+    provider.order.payments = outage
+    for purpose, intent in held.items():
+        payment(provider, intent, 'authorized')
+        response = calls[purpose]('confirm-' + purpose)
+        assert response.status_code == 200, (purpose, response.text)
+        data = response.json()['data']
+        assert set(data) == {'state', 'attemptId', 'earlierPayment'}, purpose
+        assert data['state'] == 'confirming_earlier_payment' and data['attemptId'] == intent.attemptId
+        assert data['earlierPayment']['amount'] == intent.amount
+    assert len(provider.orderCalls) == orders
+
+
+def test_expert_cancel_route_and_unused_slot_retry_columns_removed(drafts, monkeypatch):
+    import api.models as models
+    from api.services.billing.manualBillingRepository import ManualBillingRepository
+    from api.services.subscriptions.subscriptionService import SubscriptionService
+    repo, provider, initial = paidAccount(drafts, monkeypatch)
+    response = http(repo, provider, initial.userId, monkeypatch).post('/cancelPendingAddition', json={'domain': 'telecom'})
+    assert response.status_code in (404, 405)
+    assert not hasattr(models, 'CancelPendingAdditionRequest')
+    assert not hasattr(SubscriptionService, 'cancelPendingAddition')
+    assert not hasattr(ManualBillingRepository, 'cancelExpertAddition')
+    columns = {r['column_name'] for r in query(drafts[3], '''SELECT column_name FROM information_schema.columns
+        WHERE table_schema='public' AND table_name='payment_slot_controls' ''')}
+    assert 'recover_until' in columns and not {'retry_count', 'next_retry_at', 'escalation_reference'} & columns

@@ -163,3 +163,19 @@ def test_after_finalizing_the_remaining_payments_decide_again(payments, hash_, e
     snapshot = snap(payments, outcome='unknown')
     assert decidePay(live(), hash_, snapshot, NOW).action == 'finalize_first'
     assert decideAfterFinalize(live(), hash_, snapshot, NOW) == PayDecision(expected, 'att_1')
+
+
+@pytest.mark.parametrize('frozen,attemptedAt,expected', [
+    ({'slotKey': 'current:recorded', 'purpose': 'expert_addition'}, None, 'current:recorded'),
+    ({'purpose': 'initial_purchase'}, NOW, 'open'),
+    ({'purpose': 'topup'}, NOW, 'topup'),
+    ({'purpose': 'expert_addition', 'periodEnd': '2026-12-01T12:00:00+00:00'}, NOW, 'current:2026-12-01T12:00:00+00:00'),
+    # A renewal reserved before its period started holds the next term; after it, the open term.
+    ({'purpose': 'renewal', 'periodStart': '2026-12-01T12:00:00+00:00'}, NOW, '2026-12-01T12:00:00+00:00'),
+    ({'purpose': 'renewal', 'periodStart': '2026-10-01T12:00:00+00:00'}, NOW, 'open'),
+    ({'purpose': 'renewal'}, NOW, None),
+    ({'purpose': 'unknown'}, NOW, None),
+])
+def test_pre_rollout_attempts_derive_the_slot_they_were_reserved_in(frozen, attemptedAt, expected):
+    from api.services.billing.paymentSlots import attemptSlotKey
+    assert attemptSlotKey(frozen, attemptedAt) == expected

@@ -10,7 +10,7 @@ __all__ = ["router"]
 
 
 from utils.exceptionHandler import CustomException, raiseHttpException
-from api.models import VerifySubscriptionRequest, CreateSubscriptionRequest, AddDomainsRequest, VerifyDomainUpgradeRequest, RemoveDomainRequest, CancelPendingAdditionRequest, CancelSubscriptionRequest, RefundRequest, CreateAnnualRenewalSessionRequest, VerifyAnnualRenewalPaymentRequest, PrepareRenewalInvoiceRequest, CreateRenewalSessionRequest, VerifyRenewalPaymentRequest, ResumeRenewalRequest
+from api.models import VerifySubscriptionRequest, CreateSubscriptionRequest, AddDomainsRequest, VerifyDomainUpgradeRequest, RemoveDomainRequest, CancelSubscriptionRequest, RefundRequest, CreateAnnualRenewalSessionRequest, VerifyAnnualRenewalPaymentRequest, PrepareRenewalInvoiceRequest, CreateRenewalSessionRequest, VerifyRenewalPaymentRequest, ResumeRenewalRequest
 from api.services.subscriptions.subscriptionService import subscriptionService
 from fastapi.responses import ORJSONResponse
 from fastapi import APIRouter, Depends, Header, Request, HTTPException
@@ -367,31 +367,6 @@ async def removeDomain(payload: RemoveDomainRequest, token=Depends(verifyToken))
     except CustomException as e:
         raiseHttpException(e)
 
-
-@router.post("/cancelPendingAddition")
-async def cancelPendingAddition(payload: CancelPendingAdditionRequest, token=Depends(verifyToken)):
-    """
-    Cancel a pending domain addition request.
-
-    Args:
-        payload (CancelPendingAdditionRequest): Domain to cancel.
-        token: Authorization token dependency.
-
-    Returns:
-        ORJSONResponse: Cancellation result.
-    """
-    try:
-        result = subscriptionService.cancelPendingAddition(domain=payload.domain, token=token)
-        return ORJSONResponse(
-            status_code=200,
-            content={
-                "status": "SUCCESS",
-                "message": "Pending domain addition cancelled.",
-                "data": result
-            }
-        )
-    except CustomException as e:
-        raiseHttpException(e)
 
 @router.post("/cancelSubscription")
 async def cancelSubscription(payload: CancelSubscriptionRequest, token=Depends(verifyToken)):

@@ -53,6 +53,35 @@ def slotKey(purpose: str, *, currentTermEnd: datetime | None, renewalPeriodStart
     return _iso(currentTermEnd)
 
 
+def _parsed(value) -> datetime | None:
+    if isinstance(value, datetime):
+        return value if value.tzinfo else None
+    try:
+        parsed = datetime.fromisoformat(str(value).replace('Z', '+00:00'))
+    except (TypeError, ValueError):
+        return None
+    return parsed if parsed.tzinfo else None
+
+
+def attemptSlotKey(frozen: dict, attemptedAt: datetime | None) -> str | None:
+    """The slot key an attempt was reserved in; derived for attempts reserved before keys were recorded."""
+    if frozen.get('slotKey'):
+        return str(frozen['slotKey'])
+    purpose = frozen.get('purpose')
+    if purpose not in _KINDS:
+        return None
+    try:
+        if purpose == 'expert_addition':
+            return slotKey(purpose, currentTermEnd=_parsed(frozen.get('periodEnd')), renewalPeriodStart=None)
+        if purpose == 'renewal':
+            start = _parsed(frozen.get('periodStart'))
+            ended = start is not None and attemptedAt is not None and start <= attemptedAt
+            return slotKey(purpose, currentTermEnd=None if ended else start, renewalPeriodStart=start)
+        return slotKey(purpose, currentTermEnd=None, renewalPeriodStart=None)
+    except ValueError:
+        return None
+
+
 def _paymentCreatedAt(payment: dict) -> datetime | None:
     raw = payment.get('created_at')
     if isinstance(raw, bool) or not isinstance(raw, (int, float)):

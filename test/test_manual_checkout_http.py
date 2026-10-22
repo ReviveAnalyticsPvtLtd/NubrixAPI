@@ -162,7 +162,8 @@ def test_provider_order_belongs_to_one_attempt_but_can_have_audit_rows(checkout_
     repository, path = checkout_database
     repository.finalizeCapturedPayment(seed_payment(checkout_database))
     first = repository.reserveCheckout(request('pack-one', purpose='topup', packId='medium'))
-    second = repository.reserveCheckout(request('pack-two', purpose='topup', packId='medium'))
+    # Another pack replaces the unopened first attempt; its Order identity still binds to one attempt.
+    second = repository.reserveCheckout(request('pack-two', purpose='topup', packId='small'))
     repository.bindProviderOrder(first.attemptId, {'id': 'same-order'})
     with pytest.raises(Exception, match='UNIQUE'):
         repository.bindProviderOrder(second.attemptId, {'id': 'same-order'})
@@ -181,7 +182,7 @@ def test_due_activation_uses_new_experts_for_addition_validation(checkout_databa
     evidence = seed_payment(checkout_database, purpose='renewal', invoice='future', order='future-order', domains=['telecom'])
     repository.finalizeCapturedPayment(replace(evidence, providerPaymentId='future-payment'))
     with patch('test.test_manual_billing_runtime.NOW', end):
-        with pytest.raises(ValueError, match='EXPERT_SELECTION_CONFLICT'):
+        with pytest.raises(ValueError, match='INVALID_EXPERT_SELECTION'):
             repository.reserveCheckout(request('addition', ('telecom',), purpose='expert_addition'))
 
 

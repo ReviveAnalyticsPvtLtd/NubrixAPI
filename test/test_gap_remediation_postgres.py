@@ -145,41 +145,6 @@ def test_two_sessions_retry_zero_order_failure_creates_one_replacement(postgres)
             assert dict(sql.fetchall())=={'failed':1,'pending_provider_ack':1}
 
 
-def test_two_sessions_cancel_addition_does_not_lose_other_reservation(payment):
-    repo,initial,url=payment;repo.finalizeCapturedPayment(initial)
-    def reserve(domain,key):
-        return repo.reserveCheckout(CheckoutRequest(initial.userId,'expert_addition','monthly_prepaid',{'domains':[domain]},key,expectedCatalogRevision=1))
-    with patch('api.services.billing.billingEngine._getMonthlyBasePrice',return_value=REFERENCE):
-        first=reserve('telecom','first')
-        with ThreadPoolExecutor(max_workers=2) as pool:
-            cancel=pool.submit(repo.cancelExpertAddition,initial.userId,'telecom')
-            other=pool.submit(reserve,'manufacturing','other')
-            cancel.result();second=other.result()
-    row=canonical_row(url,initial.userId)
-    states={item['attemptId']:item['state'] for item in row['pending_additions']}
-    assert states[first.attemptId]=='cancelled' and states[second.attemptId]=='awaiting_payment'
-
-
-def test_two_sessions_cancel_vs_capture_cannot_overwrite_activated_addition(payment):
-    repo,initial,url=payment;repo.finalizeCapturedPayment(initial)
-    with patch('api.services.billing.billingEngine._getMonthlyBasePrice',return_value=REFERENCE):
-        intent=repo.reserveCheckout(CheckoutRequest(initial.userId,'expert_addition','monthly_prepaid',{'domains':['telecom']},'addition',expectedCatalogRevision=1))
-    order='order-'+str(uuid.uuid4());repo.bindProviderOrder(intent.attemptId,{'id':order})
-    money=VerifiedPaymentEvidence(intent.attemptId,intent.invoiceId,initial.userId,order,'pay-'+str(uuid.uuid4()),'expert_addition','INR','captured','server_observation',intent.amount,NOW,None,None,False)
-    def cancel():
-        try:return repo.cancelExpertAddition(initial.userId,'telecom')
-        except ValueError:return None
-    with ThreadPoolExecutor(max_workers=2) as pool:
-        closed=pool.submit(cancel);captured=pool.submit(repo.finalizeCapturedPayment,money)
-        closed.result();result=captured.result()
-    row=canonical_row(url,initial.userId)
-    state=next(item['state'] for item in row['pending_additions'] if item['attemptId']==intent.attemptId)
-    if result.finalized:
-        assert state=='activated' and 'telecom' in row['subscribed_experts']
-    else:
-        assert result.state=='requires_reconciliation' and state=='cancelled' and 'telecom' not in row['subscribed_experts']
-
-
 def test_two_sessions_refund_replay_after_reserve_submits_once(payment,monkeypatch):
     from api.services.billing.subscriptionRefundService import SubscriptionRefundService,_ProductionRefundStore
     repo,money,url=payment;period=repo.finalizeCapturedPayment(money).currentPeriod

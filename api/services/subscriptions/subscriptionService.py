@@ -521,18 +521,6 @@ class SubscriptionService:
             raise Exception(f"Invalid domains: {', '.join(invalidDomains)}")
         return normalizedDomains
 
-    def _normalizeSingleDomain(self, domain: str) -> str:
-        """
-        Normalize and validate a single domain value.
-
-        Args:
-            domain (str): Raw domain input.
-
-        Returns:
-            str: Normalized domain value.
-        """
-        return self._normalizeAndValidateDomains([domain])[0]
-
     _STALE_ORDER_THRESHOLD_MINUTES = 30
 
     def _reconcilePendingAdditions(self, subscription: dict) -> dict:
@@ -905,45 +893,6 @@ class SubscriptionService:
 
 
 
-
-    def cancelPendingAddition(self, domain: str, token: str) -> dict:
-        """
-        Cancel an unpaid pending domain addition durably.
-
-        The whole shared-order bundle for the original order is closed with
-        a cancelled state (evidence preserved), so a later capture can never
-        activate experts from that attempt. A newly priced attempt may be
-        created for any remaining desired selection.
-
-        Args:
-            domain (str): The domain to cancel.
-            token (str): Authorization token.
-
-        Returns:
-            dict: Cancellation result with the closed bundle evidence.
-        """
-        try:
-            normalizedDomain = self._normalizeSingleDomain(domain)
-            decodedToken = jwt.decode(
-                token,
-                os.environ["SECRET_KEY"],
-                algorithms=["HS256"]
-            )
-            userId = decodedToken.get("userId")
-            userRecord = self.client.table("Users") \
-                .select("userId") \
-                .eq("userId", userId) \
-                .execute()
-            if not userRecord.data:
-                raise Exception("User not found")
-            from api.services.billing.manualBillingRepository import getManualBillingRepository
-            return getManualBillingRepository().cancelExpertAddition(userId, normalizedDomain)
-        except CustomException:
-            raise
-        except ValueError as error:
-            raise CustomException(error, statusCode=409, uiMessage=str(error)) from error
-        except Exception as error:
-            raise CustomException(error) from error
 
     def cancelSubscription(self, reason: str | None, token: str) -> dict:
         """

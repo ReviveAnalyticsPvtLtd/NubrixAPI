@@ -405,17 +405,6 @@ def test_monthly_attempt_ttl_can_replace_known_expired_order(database):
     assert replacement.attemptId != attempt.attemptId and replacement.revision==2
 
 
-def test_expert_cancellation_closes_bundle_under_same_capture_lock(database):
-    repository,path=database
-    repository.finalizeCapturedPayment(seed_payment(database))
-    seed_payment(database,'expert_addition','invoice-two','order-two',['telecom'])
-    result=repository.cancelExpertAddition(USER,'telecom')
-    assert result['closedAttemptDomains']==['telecom']
-    with sqlTransaction(path) as connection:
-        assert connection.execute('SELECT status FROM "Invoices" WHERE id=\'invoice-two\'').fetchone()[0]=='VOID'
-        assert connection.execute('SELECT payment_status FROM billing_events WHERE provider_order_id=\'order-two\'').fetchone()[0]=='cancelled'
-
-
 def test_production_checkout_and_browser_finalizer_use_same_repository(database):
     from datetime import timedelta
     from unittest.mock import Mock

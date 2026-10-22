@@ -41,7 +41,7 @@ def test_runtime_accepts_owner_scoped_usage_audit_without_changing_paid_service(
 
 
 @pytest.mark.parametrize('closed', [False, True])
-def test_runtime_historical_money_blocks_renewal_without_transferring_service(account, closed):
+def test_runtime_historical_money_never_blocks_renewal_nor_transfers_service(account, closed):
     from uuid import uuid4
     from psycopg2.extras import Json
     repo, _, initial, url = account
@@ -57,8 +57,8 @@ def test_runtime_historical_money_blocks_renewal_without_transferring_service(ac
     from api.services.subscriptions.subscriptionSnapshotService import SubscriptionSnapshotService
     snapshot = SubscriptionSnapshotService(repo.runtimeSnapshotFactsLoader).get(initial.userId, NOW)
     assert snapshot.status == 'active' and snapshot.currentPeriod.invoiceId == initial.invoiceId
-    assert snapshot.renewalAvailable is closed
-    assert snapshot.purchaseBlockReason == ('current_coverage' if closed else 'recovery_required')
+    # A historical anomaly on another subscription is never money in flight in this Pro term slot.
+    assert snapshot.renewalAvailable and snapshot.purchaseBlockReason == 'current_coverage'
 
 
 def test_changed_next_selection_does_not_open_a_second_order_with_unresolved_money(account):
@@ -67,7 +67,12 @@ def test_changed_next_selection_does_not_open_a_second_order_with_unresolved_mon
     attempt = repo.reserveCheckout(CheckoutRequest(initial.userId, 'renewal', 'monthly_prepaid',
         {'invoiceId': str(original['id'])}, 'original-browser', expectedCatalogRevision=1))
     repo.bindProviderOrder(attempt.attemptId, {'id': 'original-authorized-order'})
-    query(url, "UPDATE billing_events SET payment_status='authorized' WHERE id=%s", (attempt.attemptId,))
+    # Browser verify recorded an authorized payment: money that may capture any second in this slot.
+    from api.services.billing.manualBillingContracts import VerifiedPaymentEvidence
+    repo.finalizeCapturedPayment(VerifiedPaymentEvidence(attempt.attemptId, attempt.invoiceId, initial.userId,
+        'original-authorized-order', 'original-authorized-payment', 'renewal', attempt.currency, 'authorized',
+        'server_observation', attempt.amount, NOW, None, None, False))
+    assert repo.attemptById(initial.userId, attempt.attemptId)['payment_status'] == 'authorized'
     selection(account, ['banking'])
     revised = renewal(account)
     assert str(revised['id']) != str(original['id'])
@@ -76,7 +81,7 @@ def test_changed_next_selection_does_not_open_a_second_order_with_unresolved_mon
             {'invoiceId': str(revised['id'])}, 'another-browser', expectedCatalogRevision=1))
 
 
-def test_safely_expired_v2_renewal_replays_original_key_and_replaces_with_fresh_key(account):
+def test_lapsed_v2_renewal_replays_original_key_and_is_replaced_for_a_fresh_key(account):
     from datetime import timedelta
     from dataclasses import replace
     from psycopg2.extras import Json
@@ -94,8 +99,9 @@ def test_safely_expired_v2_renewal_replays_original_key_and_replaces_with_fresh_
     metadata['manualBilling']['expiresAt'] = (observed - timedelta(seconds=1)).isoformat()
     query(url, 'UPDATE billing_events SET metadata_json=%s WHERE id=%s',
         (Json(metadata), original.attemptId))
-    repo.recordProviderObservation(original.attemptId, CheckoutProviderSnapshot(
-        original.attemptId, order, 'unpaid', observed, True, original.amount, original.currency, ()))
+    inspection = CheckoutProviderSnapshot(original.attemptId, order, 'unpaid', observed, True,
+                                          original.amount, original.currency, ())
+    repo.recordProviderObservation(original.attemptId, inspection)
     before = query(url, 'SELECT * FROM credit_balances WHERE user_id=%s', (initial.userId,), one=True)
     paid = repo.getCoverageSnapshot(initial.userId, observed)
     count = len(query(url, "SELECT id FROM billing_events WHERE user_id=%s AND event_category='payment_attempt'",
@@ -106,16 +112,20 @@ def test_safely_expired_v2_renewal_replays_original_key_and_replaces_with_fresh_
     assert len(query(url, "SELECT id FROM billing_events WHERE user_id=%s AND event_category='payment_attempt'",
         (initial.userId,))) == count
 
-    replacement = repo.reserveCheckout(replace(request, requestKey='clean-expired-fresh'))
+    # Without fresh provider evidence nothing is decided.
+    with pytest.raises(RuntimeError, match='PAYMENT_SERVICE_BUSY'):
+        repo.reserveCheckout(replace(request, requestKey='clean-expired-fresh'))
+    replacement = repo.reserveCheckout(replace(request, requestKey='clean-expired-fresh'), inspection=inspection,
+                                       inspectedAttempt=repo.attemptById(initial.userId, original.attemptId))
     assert replacement.attemptId != original.attemptId and replacement.invoiceId == original.invoiceId
     assert replacement.state == 'created' and replacement.razorpayOrderId is None
     closed = repo.attemptById(initial.userId, original.attemptId)
     closure = repo._json(closed['metadata_json'])['manualBilling']
-    assert closed['payment_status'] == 'expired'
-    assert closure['closedReason'] == 'CHECKOUT_EXPIRED'
-    assert closure['closureReconciledAt'] >= closure['closedAt']
+    # Only the attempt is replaced; it stays in the recovery scan until its capture window passes.
+    assert closed['payment_status'] == 'cancelled' and closure['closedReason'] == 'SUPERSEDED'
+    assert not closure.get('closureReconciledAt')
     replay = repo.reserveCheckout(request)
-    assert replay.attemptId == original.attemptId and replay.state == 'expired'
+    assert replay.attemptId == original.attemptId and replay.state == 'cancelled'
     assert repo.reserveCheckout(replace(request, requestKey='clean-expired-fresh')).attemptId == replacement.attemptId
     assert len(query(url, "SELECT id FROM billing_events WHERE user_id=%s AND event_category='payment_attempt'",
         (initial.userId,))) == count + 1

@@ -79,7 +79,14 @@ class SubscriptionWorkerService:
             if owned.billingInterval == 'year':
                 invoice = self.repository.createAnnualRenewalInvoice(row['user_id'], row['id'])
                 if invoice and now >= end-timedelta(days=7):
-                    invoice = self.repository.prepareAnnualRenewalInvoice(invoice['id'])
+                    try:
+                        invoice = self.repository.prepareAnnualRenewalInvoice(invoice['id'])
+                    except RuntimeError as exc:
+                        if str(exc) != 'RENEWAL_REPRICING_DEFERRED':
+                            raise
+                        # An authorized payment is confirming against the current revision: retry next run.
+                        result['skipped'] += 1
+                        return
             else:
                 from dateutil.relativedelta import relativedelta
                 invoice = self.repository.createFrozenRenewalInvoice({

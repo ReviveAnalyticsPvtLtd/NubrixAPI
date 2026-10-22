@@ -152,7 +152,7 @@ def acceptedPeriods(row, invoices, events, *, otherSubscriptions=(), allowExpert
     return tuple(periods)
 
 
-def factsFromRecords(row, owner, invoices, events, *, consumed, otherSubscriptions=()):
+def factsFromRecords(row, owner, invoices, events, *, consumed, otherSubscriptions=(), now=None):
     if not owner or owner.get('userId') != row['user_id'] or type(owner.get('isBanned')) is not bool:
         raise ValueError('OWNER_AUTHORITY_MISSING')
     owned = _ownedSubscriptionIds(row, otherSubscriptions)
@@ -161,7 +161,7 @@ def factsFromRecords(row, owner, invoices, events, *, consumed, otherSubscriptio
                 (event.get('subscription_id') is not None and str(event['subscription_id']) not in owned)):
             raise ValueError('EVENT_OWNER_MISMATCH')
     periods = acceptedPeriods(row, invoices, events, otherSubscriptions=otherSubscriptions)
-    unresolved, attempts = unresolvedMoneyFacts(invoices, events)
+    unresolved, attempts = unresolvedMoneyFacts(invoices, events, now)
     trial = TrialFacts(timestamp(row.get('trial_started_at')), timestamp(row.get('trial_ends_at')),
                        timestamp(row.get('trial_closed_at')), EXPERTS if row.get('trial_started_at') else (), consumed)
     return SubscriptionFacts(row['user_id'], str(row['id']), str(row['lifecycle_id']) if row.get('lifecycle_id') else None,
@@ -169,30 +169,40 @@ def factsFromRecords(row, owner, invoices, events, *, consumed, otherSubscriptio
         unresolved, attempts[0] if len(attempts) == 1 else None)
 
 
-def unresolvedMoneyFacts(invoices, events):
-    """Labels do not prove Order closure; share this policy with runtime admission."""
-    unresolved, attempts = False, []
-    invoiceStates = {str(i['id']): str(i.get('status')).upper() for i in invoices}
-    for event in events:
-        frozen = manualMetadata(event)
-        status = event.get('payment_status')
-        pending = (event.get('event_type') in ('payment.capture', 'payment.unmapped')
-                   and event.get('event_status') in ('OBSERVED', 'REQUIRES_RECONCILIATION'))
-        if event.get('event_category') == 'payment_attempt':
-            finalized = status == 'captured' and invoiceStates.get(str(event.get('invoice_id'))) == 'PAID'
-            closedAt = timestamp(frozen.get('closedAt'))
-            reconciledAt = timestamp(frozen.get('closureReconciledAt'))
-            provenClosed = (status in ('failed', 'cancelled', 'expired') and closedAt is not None
-                            and reconciledAt is not None and reconciledAt >= closedAt)
-            # One failed payment or an expired browser clock does not prove an
-            # Order cannot still collect money. Only reconciled closure clears it.
-            pending = not finalized and not provenClosed
-        if event.get('event_type') == 'refund.intent' and event.get('event_status') != 'processed':
-            pending = True
-        unresolved |= pending
-        if pending and event.get('event_category') == 'payment_attempt' and event.get('invoice_id'):
-            attempts.append(RecoverableCheckout(str(event['invoice_id']), str(event['id']), str(status)))
-    return unresolved, attempts
+PRO_TERM_PURPOSES = ('initial_purchase', 'renewal')
+
+
+def paymentInFlight(event, now):
+    """An authorized payment still inside its capture window: money that may capture any second.
+
+    Created-only, failed, captured and refunded payments, historical rows without a frozen
+    purpose and payments past ``created_at + window`` are not in flight.
+    """
+    if now is None or event.get('event_category') != 'payment_attempt' or event.get('payment_status') == 'captured':
+        return False
+    frozen = manualMetadata(event)
+    observation = frozen.get('providerObservation') or {}
+    if event.get('payment_status') != 'authorized' and observation.get('outcome') != 'authorized':
+        return False
+    # Without a provider created_at the payment started before its Order closed.
+    started = timestamp(observation.get('latestPaymentCreatedAt') or frozen.get('expiresAt'))
+    if started is None:
+        return False
+    from datetime import timedelta
+    from api.services.billing.paymentPolicy import captureWindowMinutes
+    return timestamp(now) < started + timedelta(minutes=int(frozen.get('captureWindowMinutes') or captureWindowMinutes()))
+
+
+def unresolvedMoneyFacts(invoices, events, now=None):
+    """In-flight money in the Pro term slot only; shared with runtime admission.
+
+    Owed refunds, other slots (expert additions, top-ups) and historical anomalies never block
+    buying. ``invoices`` is retained for the shared call shape.
+    """
+    attempts = [RecoverableCheckout(str(event['invoice_id']), str(event['id']), str(event.get('payment_status')))
+                for event in events if event.get('invoice_id')
+                and manualMetadata(event).get('purpose') in PRO_TERM_PURPOSES and paymentInFlight(event, now)]
+    return bool(attempts), attempts
 
 
 def _checkHistoricalService(row, others, invoices, events, now):
@@ -278,7 +288,8 @@ def buildBackfillProposal(row, owner, invoices, events, *, now, otherSubscriptio
         patch = jsonValue(dict(plan_code='pro' if consumed or paid else None,
             lifecycle_id=lifecycle, trial_started_at=started, trial_ends_at=ended, trial_closed_at=closed,
             cancellation_requested_at=timestamp(manual.get('cancellationRequestedAt'))))
-        facts = factsFromRecords(row | patch, owner, invoices, events, consumed=consumed, otherSubscriptions=otherSubscriptions)
+        facts = factsFromRecords(row | patch, owner, invoices, events, consumed=consumed,
+                                 otherSubscriptions=otherSubscriptions, now=now)
         evaluateSubscription(facts, now)
         proposal.update(resolution=resolution, patch=patch, trialConsumed=consumed)
     except (ValueError, KeyError, TypeError, SubscriptionAuthorityUnavailable) as exc:

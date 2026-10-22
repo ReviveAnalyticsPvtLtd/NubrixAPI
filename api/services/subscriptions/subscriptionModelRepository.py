@@ -378,7 +378,7 @@ class SubscriptionModelRepository:
                 and financialEvidenceHash(owner, invoices, events, others) == stamp['evidenceHash']
                 and jsonValue({k: row.get(k) for k in NEW_COLUMNS}) == stamp['patch'])
 
-    def loadFacts(self, userId, cursor):
+    def loadFacts(self, userId, cursor, now=None):
         rows, owner, invoices, events = self._records(cursor, userId)
         canonical = [r for r in rows if r['is_canonical'] is True]
         if len(canonical) != 1:
@@ -397,7 +397,8 @@ class SubscriptionModelRepository:
                             and legacyRowHash(original) == archived.get('legacyHash')
                             and stableLegacyHash(original) == payload.get('sourceStableHash'))
             if archiveValid and payload.get('resolution') in ('verified', 'consumed_dates_unknown') and self._stampMatches(row, owner, ownInvoices, ownEvents, others, payload):
-                return factsFromRecords(row, owner, ownInvoices, ownEvents, consumed=payload['trialConsumed'], otherSubscriptions=others)
+                return factsFromRecords(row, owner, ownInvoices, ownEvents, consumed=payload['trialConsumed'],
+                                       otherSubscriptions=others, now=now)
         raise SubscriptionAuthorityUnavailable('Reviewed backfill is missing or stale')
 
     def _runtimeBillingRepository(self):
@@ -491,8 +492,8 @@ class SubscriptionModelRepository:
             with closing(self.connectionFactory()) as db:
                 db.set_session(readonly=True)
                 with db, db.cursor(cursor_factory=RealDictCursor) as cursor:
-                    facts = self.loadFacts(userId, cursor)
-                    return facts, self._now(cursor, now)
+                    evaluated = self._now(cursor, now)
+                    return self.loadFacts(userId, cursor, evaluated), evaluated
         except SubscriptionAuthorityUnavailable:
             raise
         except Exception as exc:
@@ -503,9 +504,9 @@ class SubscriptionModelRepository:
             with closing(self.connectionFactory()) as db:
                 db.set_session(readonly=True)
                 with db, db.cursor(cursor_factory=RealDictCursor) as cursor:
-                    facts = self.loadFacts(userId, cursor)
-                    snapshot = evaluateSubscription(facts, self._now(cursor, now))
-                    cursor.execute('SELECT status,subscribed_experts FROM public.subscriptions WHERE id=%s', (facts.subscriptionId,))
+                    evaluated = self._now(cursor, now)
+                    snapshot = evaluateSubscription(self.loadFacts(userId, cursor, evaluated), evaluated)
+                    cursor.execute('SELECT status,subscribed_experts FROM public.subscriptions WHERE id=%s', (snapshot.subscriptionId,))
                     legacy = cursor.fetchone()
                     differences = []
                     if legacy['status'] != snapshot.status:

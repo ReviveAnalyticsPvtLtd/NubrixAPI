@@ -29,15 +29,19 @@ import pytest  # noqa: E402
 def _freshPaymentWorkerHeartbeat(request):
     """The recovery/refund worker deploys with the backend and beats every minute; Pay requires it.
 
-    Refreshed before every PostgreSQL test that uses the shared manual-billing database, so a slow
-    run can never leave it stale. Tests that need a stale worker make it stale in their own body.
+    Refreshed before every PostgreSQL test that uses the shared manual-billing or live-schema
+    database, so a slow run can never leave it stale. Every purpose's Pay requires it. Tests that
+    need a stale worker make it stale in their own body.
     """
-    if os.environ.get('RUN_MANUAL_BILLING_INTEGRATION') != '1' or 'postgres' not in request.fixturenames:
+    if os.environ.get('RUN_MANUAL_BILLING_INTEGRATION') != '1':
         return
     import psycopg2
-    url = request.getfixturevalue('postgres')
-    with psycopg2.connect(url) as db, db.cursor() as cursor:
-        cursor.execute('''DO $$ BEGIN IF to_regclass('private.payment_recovery_runtime') IS NOT NULL THEN
-            INSERT INTO private.payment_recovery_runtime(singleton,worker_seen_at) VALUES(true,clock_timestamp())
-            ON CONFLICT(singleton) DO UPDATE SET worker_seen_at=EXCLUDED.worker_seen_at; END IF; END $$''')
-    db.close()
+    for fixture in ('postgres', 'actualSchema'):
+        if fixture not in request.fixturenames:
+            continue
+        url = request.getfixturevalue(fixture)
+        with psycopg2.connect(url) as db, db.cursor() as cursor:
+            cursor.execute('''DO $$ BEGIN IF to_regclass('private.payment_recovery_runtime') IS NOT NULL THEN
+                INSERT INTO private.payment_recovery_runtime(singleton,worker_seen_at) VALUES(true,clock_timestamp())
+                ON CONFLICT(singleton) DO UPDATE SET worker_seen_at=EXCLUDED.worker_seen_at; END IF; END $$''')
+        db.close()

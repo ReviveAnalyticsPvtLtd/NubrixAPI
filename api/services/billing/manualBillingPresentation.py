@@ -57,10 +57,14 @@ def purchaseSelectionLabel(snapshot):
     """Customer wording for a frozen selection; never an invoice or attempt identity."""
     names = [_EXPERT_NAMES.get(domain, str(domain)) for domain in snapshot.get('domains') or []]
     interval = 'annual' if snapshot.get('billingMode') == 'annual_prepaid' else 'monthly'
-    if not names:
-        return 'Pro ' + interval
-    experts = names[0] if len(names) == 1 else ', '.join(names[:-1]) + ' and ' + names[-1]
-    return 'Pro ' + interval + ' with ' + experts
+    experts = names[0] if len(names) == 1 else ', '.join(names[:-1]) + ' and ' + names[-1] if names else ''
+    purpose = snapshot.get('purpose')
+    if purpose == 'topup':
+        return 'a credit top-up'
+    if purpose == 'expert_addition':
+        return 'adding ' + experts if experts else 'adding experts'
+    plan = 'Pro ' + interval + (' renewal' if purpose == 'renewal' else '')
+    return plan + ' with ' + experts if experts else plan
 
 
 def serializeCheckoutIntent(intent, publicKey, identity=None):

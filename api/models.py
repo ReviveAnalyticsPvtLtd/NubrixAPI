@@ -229,9 +229,6 @@ class VerifyDomainUpgradeRequest(BaseModel):
 class RemoveDomainRequest(BaseModel):
     domains: list[str]
 
-class CancelPendingAdditionRequest(BaseModel):
-    domain: str
-
 class CancelSubscriptionRequest(BaseModel):
     reason: str | None = None
 

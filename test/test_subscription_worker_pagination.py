@@ -46,3 +46,31 @@ def test_workers_reach_paid_owners_beyond_the_data_api_limit(cap, interval):
     assert result['scanned'] == 1502 and result['errors'] == 0
     assert result['skipped'] == 1501 and result['materialized'] == 1
     assert materialized == ['owner-01501']
+
+
+def test_annual_reminder_retries_when_repricing_waits_for_an_authorized_payment():
+    from datetime import timedelta
+    row = dict(id='00001', user_id='owner-00001', erasure_pending=False)
+    class Client:
+        def table(self, name):
+            return self
+        def select(self, _fields): return self
+        def eq(self, *_): return self
+        def order(self, _field): return self
+        def limit(self, _maximum): return self
+        def gt(self, *_): return self
+        def execute(self):
+            rows, self.rows = getattr(self, 'rows', [row]), []
+            return SimpleNamespace(data=rows)
+    owned = SimpleNamespace(subscriptionId='00001', billingInterval='year', accessSource='paid', accessAllowed=True,
+        status='active', renewalOptOut=False, nextPeriod=None, purchaseBlockReason=None, renewalAvailable=True,
+        currentPeriod=SimpleNamespace(end=NOW + timedelta(days=5)), lifecycleId='life')
+    def deferred(invoiceId):
+        raise RuntimeError('RENEWAL_REPRICING_DEFERRED')
+    enqueued = []
+    repository = SimpleNamespace(activateDueCoverage=lambda owner, now: None,
+        getRenewalContext=lambda owner, now: {}, createAnnualRenewalInvoice=lambda owner, sid: {'id': 'invoice'},
+        prepareAnnualRenewalInvoice=deferred, enqueueSubscriptionNotification=lambda *args: enqueued.append(args))
+    result = SubscriptionWorkerService(Client(), repository, SimpleNamespace(get=lambda owner, now: owned)).execute(
+        reminders=True, now=NOW)
+    assert result['errors'] == 0 and result['skipped'] == 1 and result['prepared'] == 0 and not enqueued
