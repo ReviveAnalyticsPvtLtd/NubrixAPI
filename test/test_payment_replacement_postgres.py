@@ -25,9 +25,9 @@ def pricing(user, domains, interval='month', currency='INR'):
             'billingMode': 'monthly_prepaid' if interval == 'month' else 'annual_prepaid'}
 
 
-def pay(repo, provider, user, revision, domains, interval='month', key=None):
+def pay(repo, provider, user, revision, domains, interval='month', key=None, currency='INR'):
     from api.services.billing.manualPaymentService import ManualPaymentService
-    request = repo.draftCheckoutRequest(user, revision, pricing(user, domains, interval), key or 'pay-' + str(uuid4()))
+    request = repo.draftCheckoutRequest(user, revision, pricing(user, domains, interval, currency), key or 'pay-' + str(uuid4()))
     return ManualPaymentService.forProduction(provider, repo).createCheckout(request)
 
 
@@ -54,11 +54,11 @@ def http(repo, provider, user, monkeypatch):
     return TestClient(app)
 
 
-def submit(client, user, revision, key):
+def submit(client, user, revision, key, currency='INR'):
     from api.services.billing.pricingContext import issuePricingContext
     return client.post('/purchase-draft/checkout', headers={'Idempotency-Key': key}, json={
         'draftRevision': revision, 'expectedCatalogRevision': 1, 'contact': '+919999999999',
-        'pricingContext': issuePricingContext(user, 'INR', 'hosting', catalogRevision=1)})
+        'pricingContext': issuePricingContext(user, currency, 'hosting', catalogRevision=1)})
 
 
 def control(url, attemptId):
@@ -90,14 +90,21 @@ def payment(provider, intent, status, created=None):
     return provider.payments[item['id']]
 
 
-def test_changed_selection_replaces_empty_order_without_user_action(drafts, monkeypatch):
-    repo, provider, old, _ = controlledPurchase(drafts, monkeypatch)
+@pytest.mark.parametrize('currency', ['INR', 'USD'])
+@pytest.mark.parametrize('interval', ['month', 'year'])
+@pytest.mark.parametrize('original,changed', [(('banking',), ['banking', 'telecom']), (('banking', 'telecom'), ['banking'])])
+def test_changed_selection_replaces_empty_order_without_user_action(drafts, monkeypatch, currency, interval, original, changed):
+    repo, provider, old, _ = controlledPurchase(drafts, monkeypatch, original, interval, currency)
     url = drafts[3]
-    repo.saveDraft(old.userId, 1, ['banking'], 'month')
-    response = submit(http(repo, provider, old.userId, monkeypatch), old.userId, 2, 'ui-pay-changed')
+    oldInvoice = query(url, 'SELECT amount,total_amount,currency FROM "Invoices" WHERE id=%s', (old.invoiceId,), one=True)
+    repo.saveDraft(old.userId, 1, changed, interval)
+    response = submit(http(repo, provider, old.userId, monkeypatch), old.userId, 2, 'ui-pay-changed', currency)
     assert response.status_code == 200, response.text
     checkout = response.json()['checkout']
-    assert checkout['attemptId'] != old.attemptId and checkout['domains'] == ['banking']
+    assert checkout['attemptId'] != old.attemptId and checkout['domains'] == sorted(changed)
+    assert checkout['currency'] == currency and checkout['billingMode'] == old.billingMode
+    # The superseded invoice keeps its frozen money facts.
+    assert query(url, 'SELECT amount,total_amount,currency FROM "Invoices" WHERE id=%s', (old.invoiceId,), one=True) == oldInvoice
     assert checkout['orderId'] and checkout['orderId'] != old.razorpayOrderId
     assert len(provider.orderCalls) == 2
     assert provider.orderCalls[1]['payment'] == {'capture': 'automatic', 'capture_options': {
@@ -135,12 +142,15 @@ def test_authorized_old_payment_returns_confirming(drafts, monkeypatch):
     response = submit(http(repo, provider, old.userId, monkeypatch), old.userId, 2, 'ui-pay-while-authorized')
     assert response.status_code == 200, response.text
     checkout = response.json()['checkout']
+    # Nothing that could reopen checkout on the held Order is returned.
+    assert set(checkout) == {'state', 'attemptId', 'earlierPayment'}
     assert checkout['state'] == 'confirming_earlier_payment' and checkout['attemptId'] == old.attemptId
     assert checkout['earlierPayment'] == {'selectionLabel': 'Pro monthly with Banking and Manufacturing',
                                           'amount': old.amount, 'currency': 'INR'}
     intent = pay(repo, provider, old.userId, 2, ['telecom'])
     assert intent.state == 'confirming_earlier_payment' and intent.earlierPayment['amount'] == old.amount
-    assert serializeCheckoutIntent(intent, 'key')['state'] == 'confirming_earlier_payment'
+    assert serializeCheckoutIntent(intent, 'key', {'userContact': '+91'}) == {'state': 'confirming_earlier_payment',
+        'attemptId': old.attemptId, 'earlierPayment': intent.earlierPayment}
     assert query(drafts[3], 'SELECT count(*) AS n FROM "Invoices" WHERE "userId"=%s', (old.userId,), one=True)['n'] == before
     assert len(provider.orderCalls) == 1 and not provider.captureCalls
     assert control(drafts[3], old.attemptId)['closed_at'] is None
@@ -318,7 +328,7 @@ def test_order_window_is_the_reserved_snapshot_window(drafts, monkeypatch):
     monkeypatch.setattr('api.services.billing.purchaseCheckoutService.purchaseActionsReady', lambda: True)
     repo, _, user, _ = drafts
     repo.saveDraft(user, 0, ['banking'], 'month')
-    intent = repo.reserveDraftCheckout(user, 1, pricing(user, ['banking']), 'window')
+    intent = repo.reserveCheckout(repo.draftCheckoutRequest(user, 1, pricing(user, ['banking']), 'window'))
     assert intent.snapshot['captureWindowMinutes'] == 45
     monkeypatch.setenv('PAYMENT_CAPTURE_WINDOW_MINUTES', '60')
     provider = SyntheticPurchaseProvider()
@@ -361,3 +371,107 @@ def test_control_replay_never_opens_an_orphan_slot(drafts, monkeypatch):
     with psycopg2.connect(url) as db, db.cursor(cursor_factory=RealDictCursor) as cursor:
         bindPurchaseControlLocked(cursor, SimpleNamespace(userId=intent.userId, purchaseDraftRevision=1), intent)
     assert query(url, 'SELECT count(*) AS n FROM payment_slots WHERE user_id=%s', (intent.userId,), one=True)['n'] == 1
+
+
+@pytest.mark.parametrize('moment', ['before_observation_is_recorded', 'before_owner_lock'])
+def test_authorization_recorded_after_inspection_is_never_replaced(drafts, monkeypatch, moment):
+    from api.services.billing.manualBillingRecoveryService import ManualBillingRecoveryService
+    from api.services.billing.manualPaymentService import ManualPaymentService
+    from api.services.billing.manualBillingRepository import _now
+    repo, provider, old, _ = controlledPurchase(drafts, monkeypatch)
+    repo.saveDraft(old.userId, 1, ['telecom'], 'month')
+    before = financialRows(drafts[3], old.userId)
+    def authorizeElsewhere():
+        # A browser verify or payment.authorized webhook lands between inspection and the owner lock.
+        item = payment(provider, old, 'authorized')
+        evidence = ManualPaymentService.buildPaymentEvidence(item, attemptId=old.attemptId, invoiceId=old.invoiceId,
+            userId=old.userId, purpose='initial_purchase', observedAt=_now())
+        repo.finalizeCapturedPayment(evidence)
+    if moment == 'before_observation_is_recorded':
+        inspect = ManualBillingRecoveryService.inspectAttempt
+        def inspectThenAuthorize(self, attempt):
+            snapshot = inspect(self, attempt)
+            authorizeElsewhere()
+            return snapshot
+        monkeypatch.setattr(ManualBillingRecoveryService, 'inspectAttempt', inspectThenAuthorize)
+    else:
+        reserve = repo.reserveCheckout
+        def authorizeThenReserve(request, **kwargs):
+            if kwargs.get('inspection') is not None:
+                authorizeElsewhere()
+            return reserve(request, **kwargs)
+        monkeypatch.setattr(repo, 'reserveCheckout', authorizeThenReserve)
+    with pytest.raises(RuntimeError, match='PAYMENT_SERVICE_BUSY'):
+        pay(repo, provider, old.userId, 2, ['telecom'])
+    invoices, attempts, controls = financialRows(drafts[3], old.userId)
+    assert invoices == before[0] and len(attempts) == len(before[1]) and len(controls) == len(before[2])
+    assert attempts[0]['payment_status'] == 'authorized' and not attempts[0]['closed']
+    assert len(provider.orderCalls) == 1
+
+
+@pytest.mark.parametrize('second,expected', [('authorized', 'confirming_earlier_payment'), ('unparseable', 'PAYMENT_SERVICE_BUSY')])
+def test_refunded_order_with_another_live_payment_is_decided_again(drafts, monkeypatch, second, expected):
+    repo, provider, old, _ = controlledPurchase(drafts, monkeypatch)
+    payment(provider, old, 'refunded')
+    held = payment(provider, old, 'authorized')
+    if second == 'unparseable':
+        held.pop('created_at')
+    repo.saveDraft(old.userId, 1, ['telecom'], 'month')
+    try:
+        outcome = pay(repo, provider, old.userId, 2, ['telecom']).state
+    except RuntimeError as exc:
+        outcome = str(exc)
+    assert outcome == expected
+    assert query(drafts[3], 'SELECT count(*) AS n FROM "Invoices" WHERE "userId"=%s', (old.userId,), one=True)['n'] == 1
+    assert len(provider.orderCalls) == 1 and control(drafts[3], old.attemptId)['closed_at'] is None
+
+
+def test_reusing_an_unopened_attempt_requires_fresh_worker_heartbeat(drafts, monkeypatch):
+    monkeypatch.setattr('api.services.billing.purchaseCheckoutService.purchaseActionsReady', lambda: True)
+    repo, _, user, url = drafts
+    repo.saveDraft(user, 0, ['banking'], 'month')
+    reserved = repo.reserveCheckout(repo.draftCheckoutRequest(user, 1, pricing(user, ['banking']), 'reserved-only'))
+    assert reserved.razorpayOrderId is None
+    query(url, "UPDATE private.payment_recovery_runtime SET worker_seen_at=clock_timestamp()-interval '10 minutes'")
+    provider = SyntheticPurchaseProvider()
+    with pytest.raises(RuntimeError, match='PAYMENT_ACTIONS_UNAVAILABLE'):
+        pay(repo, provider, user, 1, ['banking'])
+    assert not provider.orderCalls
+    repo.recordPurchaseWorkerHeartbeat()
+    opened = pay(repo, provider, user, 1, ['banking'])
+    assert opened.attemptId == reserved.attemptId and opened.razorpayOrderId
+
+
+def test_resaving_the_same_selection_reuses_the_order(drafts, monkeypatch):
+    repo, provider, first, _ = controlledPurchase(drafts, monkeypatch)
+    assert repo.saveDraft(first.userId, 1, ['manufacturing', 'banking'], 'month').revision == 2
+    again = pay(repo, provider, first.userId, 2, ['banking', 'manufacturing'])
+    assert again.attemptId == first.attemptId and again.razorpayOrderId == first.razorpayOrderId
+    assert len(provider.orderCalls) == 1
+    with pytest.raises(ValueError, match='PURCHASE_DRAFT_STALE'):
+        pay(repo, provider, first.userId, 1, ['banking', 'manufacturing'])
+
+
+def test_invalid_supersession_is_busy_and_rolls_back(drafts, monkeypatch):
+    repo, provider, old, _ = controlledPurchase(drafts, monkeypatch)
+    repo.saveDraft(old.userId, 1, ['telecom'], 'month')
+    before = financialRows(drafts[3], old.userId)
+    def refuse(*args):
+        raise ValueError('PAYMENT_SUPERSESSION_INVALID')
+    monkeypatch.setattr('api.services.billing.purchaseCheckoutRepository.supersedeAttemptLocked', refuse)
+    response = submit(http(repo, provider, old.userId, monkeypatch), old.userId, 2, 'ui-pay-invalid-supersession')
+    assert response.status_code == 503
+    assert response.json() == {'message': BUSY_COPY, 'errorCode': 'PAYMENT_SERVICE_BUSY'}
+    assert financialRows(drafts[3], old.userId) == before and len(provider.orderCalls) == 1
+
+
+def test_hold_uses_the_capture_window_recorded_on_the_attempt(drafts, monkeypatch):
+    monkeypatch.setenv('PAYMENT_CAPTURE_WINDOW_MINUTES', '60')
+    repo, provider, old, _ = controlledPurchase(drafts, monkeypatch)
+    assert old.snapshot['captureWindowMinutes'] == 60
+    monkeypatch.setenv('PAYMENT_CAPTURE_WINDOW_MINUTES', '45')
+    payment(provider, old, 'authorized', created=time.time() - 50 * 60)
+    repo.saveDraft(old.userId, 1, ['telecom'], 'month')
+    held = pay(repo, provider, old.userId, 2, ['telecom'])
+    assert held.state == 'confirming_earlier_payment' and held.attemptId == old.attemptId
+    assert len(provider.orderCalls) == 1

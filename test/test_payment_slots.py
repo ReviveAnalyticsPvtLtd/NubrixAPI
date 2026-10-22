@@ -140,3 +140,26 @@ def test_slot_key_naive_datetime_rejected_and_renewal_ignores_period_start_with_
         slotKey('renewal', currentTermEnd=None, renewalPeriodStart=naive)
     end = datetime(2026, 12, 1, tzinfo=timezone.utc)
     assert slotKey('renewal', currentTermEnd=end, renewalPeriodStart=None) == end.isoformat()
+
+
+def test_window_comes_from_the_attempt_snapshot():
+    held = snap([payment('authorized', 50)])
+    assert decidePay(live(), 'h2', held, NOW).action == 'replace'
+    assert decidePay(live(), 'h2', held, NOW, windowMinutes=60) == PayDecision('confirming', 'att_1')
+    assert decidePay(live(), 'h2', snap([payment('authorized', 44)]), NOW, windowMinutes=12).action == 'replace'
+
+
+@pytest.mark.parametrize('payments,hash_,expected', [
+    ([payment('refunded'), payment('authorized')], 'h2', 'confirming'),
+    ([payment('refunded'), {'id': 'p', 'status': 'authorized'}], 'h2', 'busy'),
+    ([payment('refunded'), payment('unclassified')], 'h2', 'busy'),
+    ([payment('captured'), payment('authorized', 50)], 'h2', 'replace'),
+    ([payment('captured'), payment('failed'), payment('created')], 'h2', 'replace'),
+    # An Order that took money never takes another payment: same selection is still replaced.
+    ([payment('refunded')], 'h1', 'replace'),
+])
+def test_after_finalizing_the_remaining_payments_decide_again(payments, hash_, expected):
+    from api.services.billing.paymentSlots import decideAfterFinalize
+    snapshot = snap(payments, outcome='unknown')
+    assert decidePay(live(), hash_, snapshot, NOW).action == 'finalize_first'
+    assert decideAfterFinalize(live(), hash_, snapshot, NOW) == PayDecision(expected, 'att_1')

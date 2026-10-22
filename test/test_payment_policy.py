@@ -45,6 +45,9 @@ def test_payment_is_dead_at_window_boundary(monkeypatch):
     created = datetime(2026, 10, 21, tzinfo=timezone.utc)
     assert not paymentIsDead(created, created + timedelta(minutes=45, seconds=-1))
     assert paymentIsDead(created, created + timedelta(minutes=45))
+    # The attempt's own reserved window wins over the current configuration.
+    assert not paymentIsDead(created, created + timedelta(minutes=59), windowMinutes=60)
+    assert paymentIsDead(created, created + timedelta(minutes=60), windowMinutes=60)
 
 
 def test_order_options_use_refund_speed(monkeypatch):

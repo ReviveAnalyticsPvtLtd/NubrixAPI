@@ -118,6 +118,7 @@ def postgres():
             catalogMigration = next((ROOT/'supabase/migrations').glob('*_create_pricing_catalog.sql'))
             cursor.execute(catalogMigration.read_text(encoding='utf-8'))
             # The recovery/refund worker deploys with the backend; Pay requires its fresh heartbeat.
+            # Module-scoped setup uses this beat; test/conftest.py refreshes it before every test.
             cursor.execute('''DO $$ BEGIN IF to_regclass('private.payment_recovery_runtime') IS NOT NULL THEN
                 INSERT INTO private.payment_recovery_runtime(singleton,worker_seen_at) VALUES(true,clock_timestamp())
                 ON CONFLICT(singleton) DO UPDATE SET worker_seen_at=EXCLUDED.worker_seen_at; END IF; END $$''')

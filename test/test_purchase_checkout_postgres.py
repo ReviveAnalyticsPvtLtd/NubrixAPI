@@ -571,7 +571,7 @@ def controlledPurchase(drafts, monkeypatch, domains=('banking', 'manufacturing')
     repo.saveDraft(user, 0, list(domains), interval)
     pricing = {'userId': user, 'domains': list(domains), 'billingMode': 'monthly_prepaid' if interval == 'month' else 'annual_prepaid',
                'currency': currency, 'catalogRevision': 1}
-    intent = repo.reserveDraftCheckout(user, 1, pricing, 'initial')
+    intent = repo.reserveCheckout(repo.draftCheckoutRequest(user, 1, pricing, 'initial'))
     provider = SyntheticPurchaseProvider()
     from api.services.billing.manualPaymentService import ManualPaymentService
     intent = ManualPaymentService.forProduction(provider, repo).openReservedCheckout(intent)

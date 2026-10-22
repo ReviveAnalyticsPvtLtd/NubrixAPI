@@ -125,6 +125,7 @@ class ManualPaymentService:
             # Provider reads happen before the owner lock; the reservation re-reads the
             # live attempt under the lock and is busy if it changed since this snapshot.
             live = self.repository.liveSlotAttempt(request.userId, request.purpose)
+            inspected = None
             if live is not None and live.get('provider_order_id'):
                 inspection = recovery.inspectAttempt(live)
                 if not inspection.complete:
@@ -137,9 +138,23 @@ class ManualPaymentService:
                         raise
                     # Recorded; the slot decision treats an unclassified Order as busy,
                     # or refunded money on it as finalize-first.
-        evidence = {} if inspection is None else {'inspection': inspection}
+                inspected = self.repository.attemptById(request.userId, str(live['id']))
+                if not self._recordedOnlyThisSnapshot(live, inspected, inspection):
+                    raise RuntimeError('PAYMENT_SERVICE_BUSY')  # Other evidence arrived meanwhile: never act on it.
+        evidence = {} if inspection is None else {'inspection': inspection, 'inspectedAttempt': inspected}
         intent = self.repository.reserveCheckout(request, **evidence)
         return self.openReservedCheckout(intent)
+
+    def _recordedOnlyThisSnapshot(self, before, after, snapshot):
+        """The attempt changed only as recording this snapshot explains (or its capture settled it)."""
+        from api.services.billing.manualBillingRepository import _utc
+        if after.get('payment_status') == 'captured':
+            return True
+        observed = self.repository._json(after.get('metadata_json')).get('manualBilling', {}).get('providerObservation', {})
+        expected = before.get('payment_status')
+        if snapshot.outcome == 'authorized' and expected in ('created', 'pending_provider_ack'):
+            expected = 'authorized'
+        return after.get('payment_status') == expected and _utc(observed.get('checkedAt')) == snapshot.observedAt
 
     def openReservedCheckout(self, intent):
         """Submit only an already committed original reservation."""

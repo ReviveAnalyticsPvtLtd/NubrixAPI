@@ -1,5 +1,5 @@
 """Pure purchase slot keys and the Pay decision (open, reuse, replace, confirm, finalize)."""
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import datetime, timedelta, timezone
 from typing import Literal
 
@@ -61,7 +61,7 @@ def _paymentCreatedAt(payment: dict) -> datetime | None:
 
 
 def decidePay(live: LiveAttempt | None, payloadHash: str, snapshot: CheckoutProviderSnapshot | None,
-              now: datetime) -> PayDecision:
+              now: datetime, windowMinutes: int | None = None) -> PayDecision:
     if live is None:
         return PayDecision('open', None)
     attemptId = live.attemptId
@@ -84,10 +84,35 @@ def decidePay(live: LiveAttempt | None, payloadHash: str, snapshot: CheckoutProv
             createdAt = _paymentCreatedAt(payment)
             if createdAt is None:
                 return PayDecision('busy', attemptId)
-            if not paymentIsDead(createdAt, now):
+            if not paymentIsDead(createdAt, now, windowMinutes):
                 return PayDecision('confirming', attemptId)
             heldDead = True
     # Razorpay rejects new payments on an Order holding an authorized payment until it auto-refunds.
     if heldDead:
         return PayDecision('replace', attemptId)
     return PayDecision('reuse' if sameInsideTtl else 'replace', attemptId)
+
+
+_SETTLED = ('captured', 'refunded')
+
+
+def _outcome(statuses) -> str:
+    # Same classes as checkoutRecoveryPolicy, from payments only: the settled ones are gone.
+    if set(statuses) - {'created', 'authorized', 'failed'}:
+        return 'unknown'
+    if 'authorized' in statuses:
+        return 'authorized'
+    return 'processing' if 'created' in statuses else 'unpaid'
+
+
+def decideAfterFinalize(live: LiveAttempt, payloadHash: str, snapshot: CheckoutProviderSnapshot,
+                        now: datetime, windowMinutes: int | None = None) -> PayDecision:
+    """Decide again once every captured payment is finalized, on the payments still in play."""
+    remaining = tuple(p for p in snapshot.payments if p.get('status') not in _SETTLED)
+    rest = replace(snapshot, payments=remaining, outcome=_outcome([p.get('status') for p in remaining]))
+    decision = decidePay(live, payloadHash, rest, now, windowMinutes)
+    if decision.action == 'reuse':
+        return PayDecision('replace', decision.attemptId)  # An Order that took money takes no other payment.
+    if decision.action == 'finalize_first':
+        return PayDecision('busy', decision.attemptId)
+    return decision

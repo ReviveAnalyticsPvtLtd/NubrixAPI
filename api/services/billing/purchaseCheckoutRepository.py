@@ -139,11 +139,6 @@ class PurchaseCheckoutRepository(PurchaseOperationRepositoryMixin, ManualBilling
             {'domains': pricing['domains']}, requestKey, currency=pricing['currency'],
             expectedCatalogRevision=pricing['catalogRevision'], purchaseDraftRevision=draftRevision)
 
-    def reserveDraftCheckout(self, userId, draftRevision, pricing, requestKey, inspection=None):
-        return self.reserveCheckout(self.draftCheckoutRequest(userId, draftRevision, pricing, requestKey),
-                                    inspection=inspection)
-
-
 def guardInitialPurchaseLocked(billing, cursor, request, subscription, now):
     """Runs inside the original invoice reservation transaction, including old clients."""
     from api.services.billing.purchaseCheckoutService import purchaseActionsReady, requirePurchaseActions

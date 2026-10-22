@@ -52,5 +52,6 @@ def orderPaymentOptions(windowMinutes: int | None = None) -> dict:
         'automatic_expiry_period': window, 'manual_expiry_period': window, 'refund_speed': refundSpeed()}}
 
 
-def paymentIsDead(createdAt: datetime, now: datetime) -> bool:
-    return now >= createdAt + timedelta(minutes=captureWindowMinutes())
+def paymentIsDead(createdAt: datetime, now: datetime, windowMinutes: int | None = None) -> bool:
+    """Past the attempt's capture window; pass the window reserved on the attempt when known."""
+    return now >= createdAt + timedelta(minutes=windowMinutes or captureWindowMinutes())

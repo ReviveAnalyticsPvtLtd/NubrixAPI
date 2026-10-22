@@ -68,9 +68,11 @@ def serializeCheckoutIntent(intent, publicKey, identity=None):
         'authorized':'awaiting_capture', 'provider_processing':'awaiting_capture', 'captured':'already_finalized',
         'expired':'expired', 'cancelled':'cancelled', 'superseded':'superseded',
         'confirming_earlier_payment':'confirming_earlier_payment'}.get(intent.state,'requires_reconciliation')
+    if state == 'confirming_earlier_payment':
+        # Only the earlier payment's summary: no Order, key or identity that could reopen checkout on it.
+        return {'state': state, 'attemptId': intent.attemptId, 'earlierPayment': dict(intent.earlierPayment or {})}
     deadline = None if intent.billingMode == 'annual_prepaid' and intent.expiresAt.year == 9999 else intent.expiresAt.isoformat()
-    earlier = {'earlierPayment': dict(intent.earlierPayment)} if intent.earlierPayment else {}
-    return {**(identity or {}), **earlier, 'userId':intent.userId, 'invoiceId':intent.invoiceId,
+    return {**(identity or {}), 'userId':intent.userId, 'invoiceId':intent.invoiceId,
         'attemptId':intent.attemptId, 'razorpayOrderId':intent.razorpayOrderId, 'orderId':intent.razorpayOrderId,
         'razorpayKeyId':publicKey, 'razorpayKey':publicKey, 'amount':intent.amount,
         'currency':intent.currency, 'expiresAt':deadline, 'state':state, 'billingMode':intent.billingMode,

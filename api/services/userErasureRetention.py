@@ -164,7 +164,7 @@ _MANUAL_FIELDS = ('purpose','billingMode','lifecycleId','servicePeriodId','selec
     'invoiceId','attemptId','revision','currency','frozenAmount','payloadHash','periodStart','periodEnd',
     'expiresAt','closedAt','closedReason','closureReconciledAt','orderCreationClaimedAt',
     'zeroOrderLookupAt','coverageState','creditPeriodId','providerPaymentId','revokedAt','refundIntentId',
-    'purchaseDraftRevision','capturePolicy','captureWindowMinutes','purchaseCancellationAcceptedAt','authorizedPaymentId')
+    'purchaseDraftRevision','capturePolicy','captureWindowMinutes','authorizedPaymentId')
 
 
 def _fields(value, keys):
