@@ -333,11 +333,12 @@ class ManualBillingRepository:
             checked = _utc(frozen.get('providerObservation', {}).get('checkedAt'))
             recorded = (self._json(inspectedAttempt.get('metadata_json')).get('manualBilling', {})
                 .get('providerObservation', {}) if inspectedAttempt is not None else {})
+            # Only evidence recorded after the inspection (browser verify, webhook, recovery) makes Pay busy.
+            # An attempt that was already 'authorized' when inspected is decided from the snapshot: a dead or
+            # auto-refunded authorization must free Pay (spec 5 case 4), a fresh one confirms.
             if ((checked and checked > inspection.observedAt)
-                    or (row.get('payment_status') == 'authorized' and inspection.outcome != 'authorized')
                     or (inspectedAttempt is not None and (row.get('payment_status') != inspectedAttempt.get('payment_status')
                         or checked != _utc(recorded.get('checkedAt'))))):
-                # Evidence recorded after the inspection (browser verify, webhook, recovery) wins.
                 raise RuntimeError('PAYMENT_SERVICE_BUSY')
         expiresAt = _utc(frozen.get('expiresAt')) or now
         window = frozen.get('captureWindowMinutes')

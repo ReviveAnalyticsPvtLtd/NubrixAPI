@@ -475,3 +475,37 @@ def test_hold_uses_the_capture_window_recorded_on_the_attempt(drafts, monkeypatc
     held = pay(repo, provider, old.userId, 2, ['telecom'])
     assert held.state == 'confirming_earlier_payment' and held.attemptId == old.attemptId
     assert len(provider.orderCalls) == 1
+
+
+def recordAuthorization(repo, provider, intent):
+    """Browser verify or payment.authorized marks the attempt authorized; returns the provider payment."""
+    from api.services.billing.manualPaymentService import ManualPaymentService
+    from api.services.billing.manualBillingRepository import _now
+    item = payment(provider, intent, 'authorized')
+    repo.finalizeCapturedPayment(ManualPaymentService.buildPaymentEvidence(item, attemptId=intent.attemptId,
+        invoiceId=intent.invoiceId, userId=intent.userId, purpose='initial_purchase', observedAt=_now()))
+    assert repo.attemptById(intent.userId, intent.attemptId)['payment_status'] == 'authorized'
+    return item
+
+
+def test_auto_refunded_authorization_frees_pay(drafts, monkeypatch):
+    repo, provider, old, _ = controlledPurchase(drafts, monkeypatch)
+    held = recordAuthorization(repo, provider, old)
+    # Never captured: Razorpay returned it automatically. Nothing moves the attempt off 'authorized'.
+    provider.payments[held['id']]['status'] = 'refunded'
+    repo.saveDraft(old.userId, 1, ['telecom'], 'month')
+    new = pay(repo, provider, old.userId, 2, ['telecom'])
+    assert new.attemptId != old.attemptId and new.razorpayOrderId and len(provider.orderCalls) == 2
+    assert str(control(drafts[3], old.attemptId)['superseded_by']) == new.attemptId
+    assert [str(row['id']) for row in liveInitial(drafts[3], old.userId)] == [new.attemptId]
+
+
+def test_refunded_and_fresh_authorization_on_an_authorized_attempt_confirms(drafts, monkeypatch):
+    repo, provider, old, _ = controlledPurchase(drafts, monkeypatch)
+    first = recordAuthorization(repo, provider, old)
+    provider.payments[first['id']]['status'] = 'refunded'
+    payment(provider, old, 'authorized')
+    repo.saveDraft(old.userId, 1, ['telecom'], 'month')
+    held = pay(repo, provider, old.userId, 2, ['telecom'])
+    assert held.state == 'confirming_earlier_payment' and held.attemptId == old.attemptId
+    assert len(provider.orderCalls) == 1 and control(drafts[3], old.attemptId)['closed_at'] is None
