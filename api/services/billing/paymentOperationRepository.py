@@ -64,7 +64,7 @@ def reserveRefund(cursor, *, attemptId: str, paymentId: str, amount: int, curren
     return operationId
 
 
-class PurchaseOperationRepositoryMixin:
+class PaymentOperationRepositoryMixin:
     @staticmethod
     def _purchaseSchemaReady(cursor):
         cursor.execute("SELECT to_regclass('private.payment_recovery_runtime') AS relation")
@@ -87,7 +87,7 @@ class PurchaseOperationRepositoryMixin:
     @staticmethod
     def _paymentWorkerFresh(cursor):
         """Guarded storage plus a recent recovery/refund worker heartbeat."""
-        if not PurchaseOperationRepositoryMixin._purchaseSchemaReady(cursor):
+        if not PaymentOperationRepositoryMixin._purchaseSchemaReady(cursor):
             return False
         cursor.execute('''SELECT 1 FROM private.payment_recovery_runtime
             WHERE worker_seen_at BETWEEN clock_timestamp()-interval '5 minutes' AND clock_timestamp()''')
@@ -96,7 +96,7 @@ class PurchaseOperationRepositoryMixin:
     @staticmethod
     def _purchaseRecoveryReady(cursor):
         from api.services.billing.purchaseCheckoutService import purchaseActionsReady
-        return purchaseActionsReady() and PurchaseOperationRepositoryMixin._paymentWorkerFresh(cursor)
+        return purchaseActionsReady() and PaymentOperationRepositoryMixin._paymentWorkerFresh(cursor)
 
     def _purchasePresentation(self,cursor,checkout,draft,allowed):
         from api.services.billing.purchaseCheckoutContracts import PurchaseCheckoutCapabilities
@@ -153,11 +153,11 @@ class PurchaseOperationRepositoryMixin:
                     JOIN public.payment_slot_controls c ON c.attempt_id=o.attempt_id WHERE o.id=%s''',(operationId,))
                 row=cursor.fetchone()
                 if not row:
-                    raise ValueError('PURCHASE_OPERATION_MISSING')
+                    raise ValueError('PAYMENT_OPERATION_MISSING')
                 return dict(row)
         return self._run(operation)
 
-    def beginCompensationSubmission(self,operationId,expectedRevision):
+    def beginRefundSubmission(self,operationId,expectedRevision):
         observed=self.operationById(operationId)
         def operation(connection):
             with connection.cursor(cursor_factory=RealDictCursor) as cursor:
@@ -192,7 +192,7 @@ class PurchaseOperationRepositoryMixin:
                 cursor.execute('SELECT * FROM public.payment_operations WHERE id=%s FOR UPDATE',(operationId,))
                 op=cursor.fetchone()
                 if op['kind']!='refund':
-                    raise ValueError('PURCHASE_OPERATION_KIND_INVALID')
+                    raise ValueError('PAYMENT_OPERATION_KIND_INVALID')
                 if op['state'] in ('succeeded','cancelled'):
                     return
                 submitted=bool(self._json(op['submission_evidence']).get('startedAt'))
@@ -208,7 +208,7 @@ class PurchaseOperationRepositoryMixin:
                     state='submitted'
                 elif submitted:
                     state='needs_attention' if own and all(r['status']=='failed' for r in own) else 'outcome_unknown'
-                elif state=='needs_attention' and op['error_code'] in ('PURCHASE_PROVIDER_RETRIES_ENABLED','PURCHASE_REFUND_HISTORY_INVALID'):
+                elif state=='needs_attention' and op['error_code'] in ('PAYMENT_PROVIDER_RETRIES_ENABLED','PAYMENT_REFUND_HISTORY_INVALID'):
                     state='queued'  # Fresh valid history; this operation never submitted.
                 elif state=='submitted' and externalOnly:
                     # Only explicit external-only history proves no local send.
@@ -219,11 +219,11 @@ class PurchaseOperationRepositoryMixin:
                     cursor.execute("UPDATE public.payment_operations SET state='submission_started' WHERE id=%s",(operationId,))
                 cursor.execute('''UPDATE public.payment_operations SET state=%s,result=%s,error_code=%s,updated_at=clock_timestamp()
                     WHERE id=%s''',(state,Json({**facts,'checkedAt':_now().isoformat(),'externalOnly':externalOnly}),
-                    'PURCHASE_REFUND_FAILED' if state=='needs_attention' and own else None,operationId))
+                    'PAYMENT_REFUND_FAILED' if state=='needs_attention' and own else None,operationId))
         self._run(operation)
         return self.operationById(operationId)
 
-    def prepareFailedCompensationRetry(self,operationId):
+    def prepareFailedRefundRetry(self,operationId):
         observed=self.operationById(operationId)
         def operation(connection):
             with connection.cursor(cursor_factory=RealDictCursor) as cursor:
@@ -233,7 +233,7 @@ class PurchaseOperationRepositoryMixin:
                 evidence=self._json(op['submission_evidence'])
                 facts=self._json(op['result'])
                 own=[r for r in facts.get('refunds',[]) if r['ours'] and r.get('submissionKey')==evidence.get('key')]
-                if (op['kind']!='refund' or op['state']!='needs_attention' or op['error_code']!='PURCHASE_REFUND_FAILED'
+                if (op['kind']!='refund' or op['state']!='needs_attention' or op['error_code']!='PAYMENT_REFUND_FAILED'
                         or not evidence.get('startedAt') or facts.get('pending')!=0 or len(own)!=1
                         or own[0]['status']!='failed' or own[0]['amount']!=evidence['amount']
                         or not facts.get('checkedAt') or not 0<=(_now()-_utc(facts['checkedAt'])).total_seconds()<=60):
@@ -246,15 +246,15 @@ class PurchaseOperationRepositoryMixin:
                 return True
         return self._run(operation)
 
-    def markCompensationUnknown(self,operationId):
-        self._setPurchaseOperationState(operationId,'outcome_unknown','PURCHASE_REFUND_OUTCOME_UNKNOWN',
+    def markRefundOutcomeUnknown(self,operationId):
+        self._setPaymentOperationState(operationId,'outcome_unknown','PAYMENT_REFUND_OUTCOME_UNKNOWN',
             ('submission_started','submitted','outcome_unknown'))
 
-    def failPurchaseOperation(self,operationId,reason):
-        self._setPurchaseOperationState(operationId,'needs_attention',reason,
+    def failPaymentOperation(self,operationId,reason):
+        self._setPaymentOperationState(operationId,'needs_attention',reason,
             ('queued','submission_started','submitted','outcome_unknown','needs_attention','failed'))
 
-    def _setPurchaseOperationState(self,operationId,state,reason,fromStates):
+    def _setPaymentOperationState(self,operationId,state,reason,fromStates):
         row=self.operationById(operationId)
         def operation(connection):
             with connection.cursor() as cursor:
@@ -270,27 +270,27 @@ class PurchaseOperationRepositoryMixin:
                 self._lockUser(cursor,row['user_id'])
                 cursor.execute('''UPDATE public.payment_operations SET escalation_reference=%s,
                     updated_at=clock_timestamp() WHERE id=%s AND escalation_reference IS NULL
-                    AND state NOT IN ('succeeded','cancelled') RETURNING *''',('purchase:'+operationId,operationId))
+                    AND state NOT IN ('succeeded','cancelled') RETURNING *''',('refund:'+operationId,operationId))
                 op=cursor.fetchone()
                 if not op:
                     return False
                 cursor.execute('''INSERT INTO public.billing_events(user_id,invoice_id,event_category,event_type,event_status,
-                    idempotency_key,metadata_json) VALUES(%s,%s,'system','purchase.operation_escalated','OPEN',%s,%s)
+                    idempotency_key,metadata_json) VALUES(%s,%s,'system','payment.refund_escalated','OPEN',%s,%s)
                     ON CONFLICT(idempotency_key) DO NOTHING''', (row['user_id'],row['invoice_id'],
-                    'purchase:escalation:'+operationId,Json({'operationId':operationId,'caseReference':'purchase:'+operationId,'reasonCode':reason})))
+                    'refund:escalation:'+operationId,Json({'operationId':operationId,'caseReference':'refund:'+operationId,'reasonCode':reason})))
                 return True
         created=self._run(operation)
         if created:
             from utils.logger import logger
-            logger.bind(operationId=operationId,caseReference='purchase:'+operationId,reasonCode=reason).error('Purchase financial resolution requires attention')
+            logger.bind(operationId=operationId,caseReference='refund:'+operationId,reasonCode=reason).error('Purchase financial resolution requires attention')
         return bool(created)
 
-    def schedulePurchaseRetry(self,operationId,now):
+    def scheduleRefundRetry(self,operationId,now):
         row=self.operationById(operationId)
-        threshold=max(0,int(os.environ.get('PURCHASE_RESOLUTION_ESCALATION_SECONDS','1800')))
+        threshold=max(0,int(os.environ.get('PAYMENT_REFUND_ESCALATION_SECONDS','1800')))
         escalated=False
         if row['state'] not in ('succeeded','cancelled') and (now-row['created_at']).total_seconds()>=threshold:
-            escalated=self.escalateOperationOnce(operationId,'PURCHASE_RESOLUTION_OVERDUE')
+            escalated=self.escalateOperationOnce(operationId,'PAYMENT_REFUND_OVERDUE')
         def operation(connection):
             with connection.cursor(cursor_factory=RealDictCursor) as cursor:
                 self._lockUser(cursor,row['user_id'])
@@ -302,7 +302,7 @@ class PurchaseOperationRepositoryMixin:
         self._run(operation)
         return escalated
 
-    def recordPurchaseWorkerHeartbeat(self):
+    def recordPaymentWorkerHeartbeat(self):
         def operation(connection):
             with connection.cursor(cursor_factory=RealDictCursor) as cursor:
                 if not self._purchaseSchemaReady(cursor):
@@ -312,8 +312,8 @@ class PurchaseOperationRepositoryMixin:
                 return True
         return self._run(operation)
 
-    def purchaseScanHighWater(self,source):
-        table,key=self._purchaseScanSource(source)
+    def paymentScanHighWater(self,source):
+        table,key=self._paymentScanSource(source)
         def operation(connection):
             with connection.cursor() as cursor:
                 cursor.execute(f'SELECT {key} FROM public.{table} ORDER BY {key} DESC LIMIT 1')
@@ -322,15 +322,15 @@ class PurchaseOperationRepositoryMixin:
         return self._run(operation)
 
     @staticmethod
-    def _purchaseScanSource(source):
+    def _paymentScanSource(source):
         if source=='refund':
             return 'payment_operations','id'
-        raise ValueError('INVALID_PURCHASE_OPERATION_SCAN')
+        raise ValueError('INVALID_PAYMENT_OPERATION_SCAN')
 
-    def purchaseScanPage(self,source,highWater,afterId,now,limit=100):
-        table,key=self._purchaseScanSource(source)
+    def paymentScanPage(self,source,highWater,afterId,now,limit=100):
+        table,key=self._paymentScanSource(source)
         if type(limit) is not int or not 1<=limit<=100:
-            raise ValueError('INVALID_PURCHASE_OPERATION_SCAN')
+            raise ValueError('INVALID_PAYMENT_OPERATION_SCAN')
         def operation(connection):
             with connection.cursor(cursor_factory=RealDictCursor) as cursor:
                 cursor.execute(f'''SELECT *,{key} AS id FROM public.{table} WHERE kind=%s
@@ -358,13 +358,13 @@ class PurchaseOperationRepositoryMixin:
                 return dict(row) if row else None
         return self._run(operation)
 
-    def recoverPurchaseItem(self,source,row,provider,now):
+    def recoverPaymentOperation(self,source,row,provider,now):
         identity=str(row['id'])
-        self._purchaseScanSource(source)
-        from api.services.billing.purchaseCompensationService import PurchaseCompensationService
-        result=PurchaseCompensationService(self,provider).execute(identity)
-        if result['state']=='needs_attention' and result.get('error_code')=='PURCHASE_REFUND_FAILED':
-            self.prepareFailedCompensationRetry(identity)
+        self._paymentScanSource(source)
+        from api.services.billing.paymentRefundService import PaymentRefundService
+        result=PaymentRefundService(self,provider).execute(identity)
+        if result['state']=='needs_attention' and result.get('error_code')=='PAYMENT_REFUND_FAILED':
+            self.prepareFailedRefundRetry(identity)
         resolved=result['state'] in ('succeeded','cancelled')
-        escalated=False if resolved else self.schedulePurchaseRetry(identity,now)
+        escalated=False if resolved else self.scheduleRefundRetry(identity,now)
         return {'resolved':resolved,'escalated':escalated}

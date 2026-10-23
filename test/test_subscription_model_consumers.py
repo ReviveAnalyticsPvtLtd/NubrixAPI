@@ -322,7 +322,7 @@ def test_reconciliation_still_recovers_money_before_closing_checkouts(monkeypatc
     repository = SimpleNamespace(expireStaleCheckouts=lambda:calls.append('expire') or {})
     monkeypatch.setattr('api.services.billing.manualBillingRepository.getManualBillingRepository',lambda:repository)
     monkeypatch.setattr(ManualBillingRecoveryService,'execute',lambda self:calls.append('recover') or {})
-    monkeypatch.setattr('api.services.billing.purchaseOperationWorker.PurchaseOperationWorker.execute',
+    monkeypatch.setattr('api.services.billing.paymentOperationWorker.PaymentOperationWorker.execute',
         lambda self:calls.append('purchase') or {})
     monkeypatch.setattr(ManualCreditRepository,'recoverUsage',lambda self:{})
     task = ReconciliationTask.__new__(ReconciliationTask)

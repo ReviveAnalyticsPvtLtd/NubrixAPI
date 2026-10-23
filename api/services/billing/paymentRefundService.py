@@ -5,7 +5,7 @@ from api.services.billing.purchaseProvider import purchaseProviderOptions
 def compensationReady():
     # Pure configuration/installation check: called under the owner transaction.
     # Schema and a recent actual worker heartbeat are checked by the repository.
-    from api.services.billing.purchaseOperationWorker import HANDLER_VERSION
+    from api.services.billing.paymentOperationWorker import HANDLER_VERSION
     try:
         purchaseProviderOptions()
     except (ValueError,TypeError):
@@ -13,7 +13,7 @@ def compensationReady():
     return HANDLER_VERSION == 1
 
 
-class PurchaseCompensationService:
+class PaymentRefundService:
     def __init__(self, repository, provider):
         self.repository, self.provider = repository, provider
 
@@ -25,7 +25,7 @@ class PurchaseCompensationService:
                 or type(payment.get('amount')) is not int or payment['amount'] != operation['amount']
                 or payment.get('currency') != operation['currency']
                 or type(payment.get('amount_refunded')) is not int):
-            raise ValueError('PURCHASE_REFUND_EVIDENCE_INVALID')
+            raise ValueError('PAYMENT_REFUND_EVIDENCE_INVALID')
         from api.services.billing.manualBillingRecoveryService import ManualBillingRecoveryService
         refunds = list(ManualBillingRecoveryService._pages(lambda params:
             self.provider.payment.fetch_multiple_refund(operation['provider_payment_id'],params,**purchaseProviderOptions())))
@@ -36,14 +36,14 @@ class PurchaseCompensationService:
                     or refund.get('currency') != operation['currency']
                     or type(refund.get('amount')) is not int or refund['amount'] <= 0
                     or refund.get('status') not in ('pending','processed','failed')):
-                raise ValueError('PURCHASE_REFUND_HISTORY_INVALID')
+                raise ValueError('PAYMENT_REFUND_HISTORY_INVALID')
             seen.add(refund['id'])
         processed = sum(r['amount'] for r in refunds if r['status']=='processed')
         pending = sum(r['amount'] for r in refunds if r['status']=='pending')
         # A known pending refund may already be reflected in the payment's
         # aggregate. It never establishes completed return or permits another POST.
         if not processed<=payment['amount_refunded']<=processed+pending or processed+pending > operation['amount']:
-            raise ValueError('PURCHASE_REFUND_HISTORY_INCONSISTENT')
+            raise ValueError('PAYMENT_REFUND_HISTORY_INCONSISTENT')
         # Store only allowlisted facts, not raw provider notes/contact/acquirer data.
         return {'processed':processed,'pending':pending,'refunds':[
             {k:r[k] for k in ('id','amount','status')} | {
@@ -56,8 +56,8 @@ class PurchaseCompensationService:
         if operation['state'] in ('succeeded','cancelled'):
             return operation
         if operation['state']=='queued' and getattr(self.provider,'retry_enabled',False) is True:
-            self.repository.failPurchaseOperation(operationId,'PURCHASE_PROVIDER_RETRIES_ENABLED')
-            self.repository.escalateOperationOnce(operationId,'PURCHASE_PROVIDER_RETRIES_ENABLED')
+            self.repository.failPaymentOperation(operationId,'PAYMENT_PROVIDER_RETRIES_ENABLED')
+            self.repository.escalateOperationOnce(operationId,'PAYMENT_PROVIDER_RETRIES_ENABLED')
             return self.repository.operationById(operationId)
         try:
             facts = self._inspect(operation)
@@ -66,12 +66,12 @@ class PurchaseCompensationService:
                 return result
             if operation['state'] != 'queued' or facts['pending']:
                 return result
-            claim = self.repository.beginCompensationSubmission(operationId, operation['operation_revision'])
+            claim = self.repository.beginRefundSubmission(operationId, operation['operation_revision'])
             if not claim:
                 return self.repository.operationById(operationId)
         except ValueError:
-            self.repository.failPurchaseOperation(operationId,'PURCHASE_REFUND_HISTORY_INVALID')
-            self.repository.escalateOperationOnce(operationId,'PURCHASE_REFUND_HISTORY_INVALID')
+            self.repository.failPaymentOperation(operationId,'PAYMENT_REFUND_HISTORY_INVALID')
+            self.repository.escalateOperationOnce(operationId,'PAYMENT_REFUND_HISTORY_INVALID')
             return self.repository.operationById(operationId)
         except Exception:
             return self.repository.operationById(operationId)
@@ -84,7 +84,7 @@ class PurchaseCompensationService:
                 'receipt':operationId},
                 headers={'X-Refund-Idempotency':claim['submission_evidence']['key']},**purchaseProviderOptions())
         except Exception:
-            self.repository.markCompensationUnknown(operationId)
+            self.repository.markRefundOutcomeUnknown(operationId)
             return self.repository.operationById(operationId)
         return self.recover(operationId)
 
@@ -94,13 +94,13 @@ class PurchaseCompensationService:
             return operation
         try:
             result = self.repository.recordRefundEvidence(operationId,self._inspect(operation))
-            if result['state']=='needs_attention' and result.get('error_code')=='PURCHASE_REFUND_FAILED':
-                self.repository.escalateOperationOnce(operationId,'PURCHASE_REFUND_FAILED')
+            if result['state']=='needs_attention' and result.get('error_code')=='PAYMENT_REFUND_FAILED':
+                self.repository.escalateOperationOnce(operationId,'PAYMENT_REFUND_FAILED')
                 result=self.repository.operationById(operationId)
             return result
         except ValueError:
-            self.repository.failPurchaseOperation(operationId,'PURCHASE_REFUND_HISTORY_INVALID')
-            self.repository.escalateOperationOnce(operationId,'PURCHASE_REFUND_HISTORY_INVALID')
+            self.repository.failPaymentOperation(operationId,'PAYMENT_REFUND_HISTORY_INVALID')
+            self.repository.escalateOperationOnce(operationId,'PAYMENT_REFUND_HISTORY_INVALID')
         except Exception:
-            self.repository.markCompensationUnknown(operationId)
+            self.repository.markRefundOutcomeUnknown(operationId)
         return self.repository.operationById(operationId)

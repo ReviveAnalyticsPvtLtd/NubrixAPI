@@ -43,7 +43,7 @@ def drafts(checkoutDb, monkeypatch):
     billing = ManualBillingRepository(lambda: psycopg2.connect(checkoutDb))
     billing.ensureCanonicalSubscription(user)
     repo = importlib.import_module(name).PurchaseCheckoutRepository(lambda: psycopg2.connect(checkoutDb))
-    repo.recordPurchaseWorkerHeartbeat()
+    repo.recordPaymentWorkerHeartbeat()
     return repo, billing, user, checkoutDb
 
 

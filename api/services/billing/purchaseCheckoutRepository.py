@@ -7,12 +7,12 @@ from api.models import SavePurchaseDraftRequest
 from api.services.billing.manualBillingRepository import ManualBillingRepository, _now, _utc
 from api.services.billing.purchaseCheckoutContracts import PurchaseDraft, PurchaseEditorState
 from api.services.billing.purchaseDraftService import editableCheckoutEnabled
-from api.services.billing.purchaseOperationRepository import PurchaseOperationRepositoryMixin
+from api.services.billing.paymentOperationRepository import PaymentOperationRepositoryMixin
 
 TABLES = ('subscription_purchase_drafts', 'payment_slots', 'payment_slot_controls', 'payment_operations')
 
 
-class PurchaseCheckoutRepository(PurchaseOperationRepositoryMixin, ManualBillingRepository):
+class PurchaseCheckoutRepository(PaymentOperationRepositoryMixin, ManualBillingRepository):
     @staticmethod
     def _requireStorage(cursor):
         for table in TABLES:
@@ -105,7 +105,7 @@ class PurchaseCheckoutRepository(PurchaseOperationRepositoryMixin, ManualBilling
 
     def listDueOperations(self, kind, afterId=None, limit=100):
         if kind != 'refund' or type(limit) is not int or not 1 <= limit <= 100:
-            raise ValueError('INVALID_PURCHASE_OPERATION_SCAN')
+            raise ValueError('INVALID_PAYMENT_OPERATION_SCAN')
         if afterId is not None:
             UUID(str(afterId))
         def operation(connection):

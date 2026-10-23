@@ -8,20 +8,20 @@ from test.test_manual_checkout_http import checkout_client, checkout_database, c
 
 
 def test_worker_scans_past_1000_and_does_not_chase_new_highwater_rows():
-    name = 'api.services.billing.purchaseOperationWorker'
+    name = 'api.services.billing.paymentOperationWorker'
     assert importlib.util.find_spec(name), 'Durable worker must exist'
-    worker = importlib.import_module(name).PurchaseOperationWorker
+    worker = importlib.import_module(name).PaymentOperationWorker
     class Inventory:
         def __init__(self):
             self.ids = list(range(1,1003))
             self.seen = []
-        def purchaseScanHighWater(self, source):
+        def paymentScanHighWater(self, source):
             return 1001 if source == 'refund' else None
-        def purchaseScanPage(self, source, highWater, afterId, now, limit=100):
+        def paymentScanPage(self, source, highWater, afterId, now, limit=100):
             assert source == 'refund' and limit == 100
             return [{'id':n,'state':'succeeded','kind':source} for n in self.ids
                 if (afterId is None or n>afterId) and n<=highWater][:limit]
-        def recoverPurchaseItem(self, source, row, provider, now):
+        def recoverPaymentOperation(self, source, row, provider, now):
             self.seen.append(row['id'])
             return {'resolved':True,'escalated':False}
     repo = Inventory()
@@ -31,7 +31,7 @@ def test_worker_scans_past_1000_and_does_not_chase_new_highwater_rows():
 
 
 def test_readiness_depends_only_on_handler_and_valid_provider_timeout(monkeypatch):
-    name = 'api.services.billing.purchaseCompensationService'
+    name = 'api.services.billing.paymentRefundService'
     assert importlib.util.find_spec(name), 'Compensation readiness must be explicit'
     module = importlib.import_module(name)
     monkeypatch.delenv('PURCHASE_PROVIDER_TIMEOUT_SECONDS',raising=False)

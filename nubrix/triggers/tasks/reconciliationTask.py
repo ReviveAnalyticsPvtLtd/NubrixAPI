@@ -57,8 +57,8 @@ class ReconciliationTask:
         from api.services.billing.manualBillingRecoveryService import ManualBillingRecoveryService
         manualResults = ManualBillingRecoveryService(getManualBillingRepository(), self.razorpayClient).execute()
         from api.services.billing.purchaseCheckoutRepository import getPurchaseCheckoutRepository
-        from api.services.billing.purchaseOperationWorker import PurchaseOperationWorker
-        purchaseResults = PurchaseOperationWorker(getPurchaseCheckoutRepository(),self.razorpayClient).execute()
+        from api.services.billing.paymentOperationWorker import PaymentOperationWorker
+        paymentOperationResults = PaymentOperationWorker(getPurchaseCheckoutRepository(),self.razorpayClient).execute()
         # After provider recovery, so captures are settled before lapsed checkouts close.
         checkoutExpiry = getManualBillingRepository().expireStaleCheckouts()
         from api.services.credits.manualCreditRepository import ManualCreditRepository
@@ -70,7 +70,7 @@ class ReconciliationTask:
             f"{results['errors']} errors, "
             f"{anomalySummary['totalAnomalies']} anomalies detected"
         )
-        return {**results, "manualResults":manualResults, "purchaseResults":purchaseResults, "checkoutExpiry":checkoutExpiry, "usageResults":usageResults, "anomalySummary": anomalySummary}
+        return {**results, "manualResults":manualResults, "paymentOperationResults":paymentOperationResults, "checkoutExpiry":checkoutExpiry, "usageResults":usageResults, "anomalySummary": anomalySummary}
 
     def _reconcileStaleAttempts(self) -> dict:
         """

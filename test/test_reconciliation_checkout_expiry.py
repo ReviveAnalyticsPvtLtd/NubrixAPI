@@ -16,7 +16,7 @@ def test_reconciliation_expires_lapsed_checkouts_after_provider_recovery():
     with patch('api.services.billing.manualBillingRepository.getManualBillingRepository', return_value=repository), \
             patch('api.services.billing.manualBillingRecoveryService.ManualBillingRecoveryService', recovery), \
             patch('api.services.credits.manualCreditRepository.ManualCreditRepository'), \
-            patch('api.services.billing.purchaseOperationWorker.PurchaseOperationWorker.execute',
+            patch('api.services.billing.paymentOperationWorker.PaymentOperationWorker.execute',
                 side_effect=lambda:calls.append('purchase') or {}):
         result = task.execute()
     assert calls == ['recover', 'purchase', 'expire']

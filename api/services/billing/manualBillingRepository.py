@@ -2195,7 +2195,7 @@ class ManualBillingRepository:
 
     def _refundCaptureLocked(self, cursor, subscription, invoice, attempt, evidence, captureId, reason, now):
         """Record the capture as never granted and reserve its one full refund in this transaction."""
-        from api.services.billing.purchaseOperationRepository import reserveRefund
+        from api.services.billing.paymentOperationRepository import reserveRefund
         cursor.execute('update public.billing_events set event_status=%s,failure_reason=%s where id=%s',
                        ('REFUND_RESERVED', reason.upper(), captureId))
         # An Order that took money takes no other payment: an attempt still open ends here.
@@ -2591,7 +2591,7 @@ class ManualBillingRepository:
                    'paymentCreatedAt':evidence.paymentCreatedAt.isoformat() if evidence.paymentCreatedAt else None}),
              evidence.observedAt))
         if reason:
-            from api.services.billing.purchaseOperationRepository import reserveRefund
+            from api.services.billing.paymentOperationRepository import reserveRefund
             reserveRefund(cursor, attemptId=str(attempt['id']), paymentId=evidence.providerPaymentId,
                           amount=evidence.amount, currency=evidence.currency, reason=reason)
             return FinalizationResult(evidence.invoiceId,evidence.attemptId,'refund_pending','unchanged',

@@ -9,7 +9,7 @@ def purchaseActionsReady():
     if not editableCheckoutEnabled() or os.environ.get('SUBSCRIPTION_CANCELLATION_COMPENSATION_ENABLED', 'false').lower() != 'true':
         return False
     try:
-        from api.services.billing.purchaseCompensationService import compensationReady
+        from api.services.billing.paymentRefundService import compensationReady
     except ImportError:
         return False
     return bool(compensationReady())

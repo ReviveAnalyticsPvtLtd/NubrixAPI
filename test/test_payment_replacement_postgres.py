@@ -297,7 +297,7 @@ def test_pre_cutoff_live_attempt_can_be_superseded(drafts, monkeypatch):
 
 def test_cancel_route_removed(drafts, monkeypatch):
     import api.models as models
-    from api.services.billing import purchaseCheckoutRepository, purchaseCheckoutService, purchaseOperationRepository
+    from api.services.billing import purchaseCheckoutRepository, purchaseCheckoutService, paymentOperationRepository
     repo, provider, old, _ = controlledPurchase(drafts, monkeypatch)
     response = http(repo, provider, old.userId, monkeypatch).post(
         '/purchase-checkouts/' + old.attemptId + '/cancel', json={'expectedOperationRevision': 1},
@@ -307,7 +307,7 @@ def test_cancel_route_removed(drafts, monkeypatch):
     assert not hasattr(purchaseCheckoutService.PurchaseCheckoutService, 'cancel')
     for name in ('acceptCancellation', 'cancellationReplay', 'resolvePurchaseCancellation', 'scheduleCancellationRetry'):
         assert not hasattr(purchaseCheckoutRepository.PurchaseCheckoutRepository, name), name
-    assert not hasattr(purchaseOperationRepository.PurchaseOperationRepositoryMixin, 'resolvePurchaseCancellation')
+    assert not hasattr(paymentOperationRepository.PaymentOperationRepositoryMixin, 'resolvePurchaseCancellation')
     columns = {r['column_name'] for r in query(drafts[3], '''SELECT column_name FROM information_schema.columns
         WHERE table_schema='public' AND table_name='payment_slot_controls' ''')}
     assert not {'cancellation_requested_at', 'cancellation_accepted_at'} & columns
@@ -325,7 +325,7 @@ def test_pay_requires_fresh_worker_heartbeat(drafts, monkeypatch):
     response = submit(http(repo, provider, old.userId, monkeypatch), old.userId, 2, 'ui-pay-stale-worker')
     assert response.status_code == 503 and response.json()['errorCode'] == 'PAYMENT_ACTIONS_UNAVAILABLE'
     assert financialRows(drafts[3], old.userId) == before and len(provider.orderCalls) == 1
-    repo.recordPurchaseWorkerHeartbeat()
+    repo.recordPaymentWorkerHeartbeat()
     assert pay(repo, provider, old.userId, 2, ['telecom']).attemptId != old.attemptId
 
 
@@ -448,7 +448,7 @@ def test_reusing_an_unopened_attempt_requires_fresh_worker_heartbeat(drafts, mon
     with pytest.raises(RuntimeError, match='PAYMENT_ACTIONS_UNAVAILABLE'):
         pay(repo, provider, user, 1, ['banking'])
     assert not provider.orderCalls
-    repo.recordPurchaseWorkerHeartbeat()
+    repo.recordPaymentWorkerHeartbeat()
     opened = pay(repo, provider, user, 1, ['banking'])
     assert opened.attemptId == reserved.attemptId and opened.razorpayOrderId
 

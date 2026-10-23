@@ -75,9 +75,9 @@ def closedCapture(drafts, monkeypatch, **selection):
     provider.payments[evidence.providerPaymentId].update(status='captured', amount_refunded=0, created_at=started)
     result = repo.finalizeCapturedPayment(evidence)
     assert result.state == 'refund_pending' and not result.finalized
-    name = 'api.services.billing.purchaseCompensationService'
+    name = 'api.services.billing.paymentRefundService'
     assert importlib.util.find_spec(name), 'Dedicated full compensation handler is required'
-    service = importlib.import_module(name).PurchaseCompensationService(repo, provider)
+    service = importlib.import_module(name).PaymentRefundService(repo, provider)
     return repo, provider, intent, evidence, service
 
 
@@ -152,15 +152,15 @@ def test_inconsistent_refund_history_holds_liability_and_escalates_once(drafts, 
     service.execute(str(op['id']))
     assert not provider.refundCalls
     assert repo.operationById(str(op['id']))['state'] == 'needs_attention'
-    events = query(drafts[3], "SELECT metadata_json FROM billing_events WHERE user_id=%s AND event_type='purchase.operation_escalated'", (intent.userId,))
-    assert len(events) == 1 and events[0]['metadata_json']['caseReference'] == 'purchase:'+str(op['id'])
+    events = query(drafts[3], "SELECT metadata_json FROM billing_events WHERE user_id=%s AND event_type='payment.refund_escalated'", (intent.userId,))
+    assert len(events) == 1 and events[0]['metadata_json']['caseReference'] == 'refund:'+str(op['id'])
 
 
 @pytest.mark.parametrize('mutation', ['granted', 'other_attempt', 'amount', 'currency', 'reason', 'owner', 'order'])
 def test_unrelated_or_invalid_capture_has_no_compensation_authority(drafts, monkeypatch, mutation):
     import psycopg2
     from psycopg2.extras import RealDictCursor
-    from api.services.billing.purchaseOperationRepository import reserveRefund
+    from api.services.billing.paymentOperationRepository import reserveRefund
     repo, provider, intent, evidence, service = closedCapture(drafts, monkeypatch)
     url = drafts[3]
     def reserve(**changes):
@@ -206,7 +206,7 @@ def controlledPurchaseForOtherOwner(drafts, monkeypatch):
 
 def test_verified_late_capture_transport_reserves_and_worker_completes_after_tabs_close(drafts,monkeypatch):
     from api.services.billing.manualPaymentService import ManualPaymentService
-    from api.services.billing.purchaseOperationWorker import PurchaseOperationWorker
+    from api.services.billing.paymentOperationWorker import PaymentOperationWorker
     repo,provider,intent,evidence,_=closedCapture(drafts,monkeypatch)
     provider.refundStatus='processed'
     ManualPaymentService.forProduction(provider,repo).finalizeCapturedPayment(evidence)
@@ -214,7 +214,7 @@ def test_verified_late_capture_transport_reserves_and_worker_completes_after_tab
     assert len(ops)==1
     assert not provider.refundCalls
     monkeypatch.setattr('api.services.billing.purchaseCheckoutService.purchaseActionsReady',lambda:False)
-    PurchaseOperationWorker(repo,provider).execute()
+    PaymentOperationWorker(repo,provider).execute()
     assert repo.operationById(str(ops[0]['id']))['state']=='succeeded'
     assert len(provider.refundCalls)==1
 
@@ -235,8 +235,8 @@ def test_late_capture_after_erasure_refunds_through_retained_authority_without_r
         paymentCreatedAt=datetime.fromtimestamp(payment['created_at'],timezone.utc))
     assert repo.finalizeCapturedPayment(evidence).state=='refund_pending'
     assert repo.finalizeCapturedPayment(evidence).state=='refund_pending'  # replay
-    from api.services.billing.purchaseCompensationService import PurchaseCompensationService
-    service=PurchaseCompensationService(repo,provider)
+    from api.services.billing.paymentRefundService import PaymentRefundService
+    service=PaymentRefundService(repo,provider)
     op=reserved(drafts[3],evidence)
     assert op['user_id'] is None and str(op['erasure_request_id'])==request
     # The account is closed: its money is returned whatever the attempt's state (spec 4.4 row 5).
@@ -255,12 +255,12 @@ def test_obligation_report_exposes_operation_and_one_actionable_case(drafts,monk
     from api.services.billing.manualObligationReport import listObligations
     repo,provider,intent,evidence,service=closedCapture(drafts,monkeypatch)
     op=reserved(drafts[3], evidence)
-    repo.escalateOperationOnce(str(op['id']),'PURCHASE_RESOLUTION_OVERDUE')
+    repo.escalateOperationOnce(str(op['id']),'PAYMENT_REFUND_OVERDUE')
     report=listObligations(repo,limit=500)
     assert report['available']
     items=[r for r in report['items'] if r['id']==str(op['id'])]
     assert len(items)==1 and items[0]['category']=='purchase_refund'
-    assert items[0]['caseReference']=='purchase:'+str(op['id'])
+    assert items[0]['caseReference']=='refund:'+str(op['id'])
 
 
 def test_worker_backoff_and_escalation_never_release_liability(drafts,monkeypatch):
@@ -268,10 +268,10 @@ def test_worker_backoff_and_escalation_never_release_liability(drafts,monkeypatc
     repo,provider,intent,evidence,service=closedCapture(drafts,monkeypatch)
     op=reserved(drafts[3], evidence)
     when=op['created_at']+timedelta(seconds=1801)
-    assert repo.schedulePurchaseRetry(str(op['id']),when)
+    assert repo.scheduleRefundRetry(str(op['id']),when)
     updated=repo.operationById(str(op['id']))
     assert updated['retry_count']==1 and updated['next_retry_at']==when+timedelta(seconds=30)
-    assert not repo.schedulePurchaseRetry(str(op['id']),when)
+    assert not repo.scheduleRefundRetry(str(op['id']),when)
     updated=repo.operationById(str(op['id']))
     assert updated['retry_count']==2 and updated['next_retry_at']==when+timedelta(seconds=60)
     assert updated['state']=='queued'
@@ -325,7 +325,7 @@ def test_sql_keyset_scan_pages_1001_rows_with_fixed_highwater(drafts,monkeypatch
         FROM generate_series(1,1001) n''',(intent.userId,intent.attemptId,intent.invoiceId,intent.amount,intent.currency))
     from api.services.billing.manualBillingRepository import _now
     cutoff=_now()
-    high=repo.purchaseScanHighWater('refund')
+    high=repo.paymentScanHighWater('refund')
     later=str(UUID(int=UUID(str(high)).int+1))
     recordUngrantedCapture(drafts[3],intent,'pay-after-highwater')
     query(drafts[3],'''INSERT INTO payment_operations
@@ -335,7 +335,7 @@ def test_sql_keyset_scan_pages_1001_rows_with_fixed_highwater(drafts,monkeypatch
     after=None
     seen=[]
     while True:
-        page=repo.purchaseScanPage('refund',high,after,cutoff,limit=100)
+        page=repo.paymentScanPage('refund',high,after,cutoff,limit=100)
         if not page:
             break
         seen.extend(str(r['id']) for r in page if r['user_id']==intent.userId and r['provider_payment_id'].startswith('pay-page-'))
@@ -351,14 +351,14 @@ def test_worker_scan_excludes_new_rows_with_uuid_below_highwater(drafts,monkeypa
     repo,provider,intent,evidence,service=closedCapture(drafts,monkeypatch)
     op=reserved(drafts[3], evidence)
     cutoff=_now()
-    high=repo.purchaseScanHighWater('refund')
+    high=repo.paymentScanHighWater('refund')
     newId='00000000-0000-0000-0000-000000002001'
     recordUngrantedCapture(drafts[3],intent,'pay-after-start')
     query(drafts[3],'''INSERT INTO payment_operations
         (id,user_id,attempt_id,invoice_id,provider_payment_id,kind,reason,amount,currency,dedupe_key)
         VALUES(%s,%s,%s,%s,'pay-after-start','refund','paid_after_close',%s,%s,'payment:refund:pay-after-start')''',
         (newId,intent.userId,intent.attemptId,intent.invoiceId,intent.amount,intent.currency))
-    page=repo.purchaseScanPage('refund',high,None,cutoff,limit=100)
+    page=repo.paymentScanPage('refund',high,None,cutoff,limit=100)
     assert newId not in {str(r['id']) for r in page}
 
 
@@ -412,19 +412,19 @@ def test_failed_provider_refund_stays_owed_and_creates_one_case(drafts,monkeypat
     service.execute(str(op['id']))
     service.recover(str(op['id']))
     row=repo.operationById(str(op['id']))
-    assert row['state']=='needs_attention' and row['escalation_reference']=='purchase:'+str(op['id'])
+    assert row['state']=='needs_attention' and row['escalation_reference']=='refund:'+str(op['id'])
     assert repo.readEditor(intent.userId).capabilities.maySubmitLatestDraft
     assert len(provider.refundCalls)==1
 
 
 def test_worker_retries_only_a_verified_terminal_failed_refund_with_new_submission_identity(drafts,monkeypatch):
     from datetime import timedelta
-    from api.services.billing.purchaseOperationWorker import PurchaseOperationWorker
+    from api.services.billing.paymentOperationWorker import PaymentOperationWorker
     repo,provider,intent,evidence,service=closedCapture(drafts,monkeypatch)
     op=reserved(drafts[3], evidence)
     provider.refundStatus='failed'
     service.execute(str(op['id']))
-    worker=PurchaseOperationWorker(repo,provider)
+    worker=PaymentOperationWorker(repo,provider)
     worker.execute(op['created_at']+timedelta(seconds=31))
     assert repo.operationById(str(op['id']))['state']=='queued'
     provider.refundStatus='processed'
@@ -439,7 +439,7 @@ def test_installed_sdk_receives_timeout_and_cannot_repost_unknown_refund(drafts,
     import json
     import razorpay
     from types import SimpleNamespace
-    from api.services.billing.purchaseCompensationService import PurchaseCompensationService
+    from api.services.billing.paymentRefundService import PaymentRefundService
     repo,provider,intent,evidence,_=closedCapture(drafts,monkeypatch)
     requests=[]
     class Session:
@@ -460,7 +460,7 @@ def test_installed_sdk_receives_timeout_and_cannot_repost_unknown_refund(drafts,
             provider.refund(evidence.providerPaymentId,json.loads(options['data']),headers=options['headers'])
             raise TimeoutError('synthetic reply lost at SDK HTTP boundary')
     sdk=razorpay.Client(session=Session(),auth=('synthetic','synthetic'))
-    service=PurchaseCompensationService(repo,sdk)
+    service=PaymentRefundService(repo,sdk)
     op=reserved(drafts[3], evidence)
     assert service.execute(str(op['id']))['state']=='outcome_unknown'
     assert service.execute(str(op['id']))['state']=='submitted'
@@ -541,7 +541,7 @@ def test_concurrent_retry_scheduling_uses_the_locked_retry_count(drafts,monkeypa
     monkeypatch.setattr(repo,'operationById',simultaneousRead)
     now=op['created_at']+timedelta(seconds=1)
     with ThreadPoolExecutor(max_workers=2) as pool:
-        futures=[pool.submit(repo.schedulePurchaseRetry,str(op['id']),now) for _ in range(2)]
+        futures=[pool.submit(repo.scheduleRefundRetry,str(op['id']),now) for _ in range(2)]
         assert all(not f.result(timeout=10) for f in futures)
     row=original(str(op['id']))
     assert row['retry_count']==2
@@ -552,7 +552,7 @@ def test_replacement_late_capture_after_erasure_preserves_slot_ownership(drafts,
     from test.test_subscription_erasure_postgres import runErasure
     from api.services.billing.manualBillingContracts import VerifiedPaymentEvidence
     from api.services.billing.manualBillingRepository import _now
-    from api.services.billing.purchaseCompensationService import PurchaseCompensationService
+    from api.services.billing.paymentRefundService import PaymentRefundService
     repo,original,first,_=controlledPurchase(drafts,monkeypatch)
     provider=SyntheticRefundProvider()
     provider.orders=original.orders
@@ -565,18 +565,18 @@ def test_replacement_late_capture_after_erasure_preserves_slot_ownership(drafts,
         payment['id'],'initial_purchase',second.currency,'captured','server_observation',second.amount,_now(),None,None,False,
         paymentCreatedAt=datetime.fromtimestamp(payment['created_at'],timezone.utc))
     assert repo.finalizeCapturedPayment(evidence).state=='refund_pending'
-    service=PurchaseCompensationService(repo,provider)
+    service=PaymentRefundService(repo,provider)
     op=reserved(drafts[3],evidence)
     provider.refundStatus='processed'
     failures=[]
-    claim=repo.beginCompensationSubmission
+    claim=repo.beginRefundSubmission
     def tracedClaim(*args):
         try:
             return claim(*args)
         except Exception as exc:
             failures.append(type(exc).__name__+':'+str(exc))
             raise
-    monkeypatch.setattr(repo,'beginCompensationSubmission',tracedClaim)
+    monkeypatch.setattr(repo,'beginRefundSubmission',tracedClaim)
     result=service.execute(str(op['id']))
     assert result['state']=='succeeded', failures
     assert not repo.purchaseControl(second.attemptId)['user_id']
