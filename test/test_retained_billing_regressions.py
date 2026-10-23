@@ -109,8 +109,12 @@ def test_actual_initial_verification_checks_amount_and_preserves_snapshot(checko
         before=json.loads(db.execute('SELECT metadata_json FROM "Invoices" WHERE id=?',(intent.invoiceId,)).fetchone()[0])
     if case=='amount':
         from dataclasses import replace
-        with pytest.raises(ValueError,match='EVIDENCE_MISMATCH'):
-            repo.finalizeCapturedPayment(replace(evidence(intent),amount=intent.amount+1))
+        # Money that does not match the attempt's own snapshot needs attention: no grant, no refund (spec 4.4).
+        result=repo.finalizeCapturedPayment(replace(evidence(intent),amount=intent.amount+1))
+        assert result.state=='requires_reconciliation' and not result.finalized
+        with sqlTransaction(path) as db:
+            assert db.execute("SELECT event_status,failure_reason FROM billing_events WHERE event_type='payment.capture'"
+                ).fetchall()==[('REQUIRES_RECONCILIATION','PAYMENT_EVIDENCE_MISMATCH')]
         assert read_row(path,'credit_balances') is None
     else:
         result=repo.finalizeCapturedPayment(evidence(intent))

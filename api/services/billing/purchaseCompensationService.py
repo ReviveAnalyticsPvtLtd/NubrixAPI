@@ -1,4 +1,4 @@
-"""Full refund of a capture on a superseded initial purchase, never proration."""
+"""Full refund of a captured payment that was never granted (any purpose), never proration."""
 from api.services.billing.purchaseProvider import purchaseProviderOptions
 
 
@@ -16,9 +16,6 @@ def compensationReady():
 class PurchaseCompensationService:
     def __init__(self, repository, provider):
         self.repository, self.provider = repository, provider
-
-    def reserveForClosedCapture(self, evidence):
-        return self.repository.reserveCompensation(evidence)
 
     def _inspect(self, operation):
         payment = self.provider.payment.fetch(operation['provider_payment_id'],**purchaseProviderOptions())

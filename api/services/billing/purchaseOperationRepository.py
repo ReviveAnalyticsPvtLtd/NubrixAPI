@@ -4,7 +4,64 @@ from dataclasses import replace
 import os
 from uuid import UUID
 from psycopg2.extras import Json, RealDictCursor
+from api.services.billing.captureRules import REFUND_REASONS
 from api.services.billing.manualBillingRepository import _now, _utc
+
+
+def _refundableCaptureLocked(cursor, operation):
+    """The operation's payment was recorded and never granted: only such money is ever returned."""
+    cursor.execute('''SELECT 1 FROM public.billing_events WHERE provider_payment_id=%s AND event_type='payment.capture'
+        AND event_status='REFUND_RESERVED' AND invoice_id=%s AND currency=%s AND amount>=%s''',
+        (operation['provider_payment_id'], operation['invoice_id'], operation['currency'], operation['amount']))
+    return cursor.fetchone() is not None
+
+
+def reserveRefund(cursor, *, attemptId: str, paymentId: str, amount: int, currency: str, reason: str) -> str:
+    """Reserve the one full refund of a captured payment that was never granted (spec 4.5).
+
+    Runs in the finalization transaction under the owner lock, after the capture is recorded as
+    REFUND_RESERVED. Idempotent per provider payment ('payment:refund:<paymentId>'); the refund
+    worker executes it later, never under this lock.
+    """
+    if (reason not in REFUND_REASONS or not isinstance(paymentId, str) or not paymentId
+            or type(amount) is not int or amount <= 0 or currency not in ('INR', 'USD')):
+        raise ValueError('PAYMENT_REFUND_INVALID')
+    cursor.execute("SELECT * FROM public.billing_events WHERE id=%s AND event_category='payment_attempt' FOR UPDATE",
+                   (attemptId,))
+    attempt = cursor.fetchone()
+    cursor.execute('SELECT * FROM public.payment_slot_controls WHERE attempt_id=%s FOR UPDATE', (attemptId,))
+    control = cursor.fetchone()
+    if (not attempt or not control or not attempt.get('provider_order_id')
+            or control['provider_order_id'] != attempt['provider_order_id']
+            or str(control['invoice_id']) != str(attempt['invoice_id'])
+            or control['user_id'] != attempt['user_id']):
+        raise ValueError('PAYMENT_REFUND_BINDING_INVALID')
+    if amount > int(attempt['amount'] or 0) or currency != attempt['currency']:
+        raise ValueError('PAYMENT_REFUND_AMOUNT_INVALID')
+    cursor.execute('''SELECT * FROM public.billing_events WHERE provider_payment_id=%s
+        AND event_type='payment.capture' FOR UPDATE''', (paymentId,))
+    capture = cursor.fetchone()
+    if (not capture or capture['event_status'] != 'REFUND_RESERVED'
+            or capture['provider_order_id'] != attempt['provider_order_id']
+            or str(capture['invoice_id']) != str(attempt['invoice_id'])
+            or capture['amount'] != amount or capture['currency'] != currency):
+        raise ValueError('PAYMENT_REFUND_CAPTURE_NOT_VERIFIED')
+    cursor.execute("SELECT * FROM public.payment_operations WHERE dedupe_key=%s", ('payment:refund:' + paymentId,))
+    prior = cursor.fetchone()
+    if prior:
+        if str(prior['attempt_id']) != str(attemptId) or prior['amount'] != amount or prior['currency'] != currency:
+            raise ValueError('PAYMENT_REFUND_BINDING_INVALID')
+        return str(prior['id'])
+    cursor.execute('''INSERT INTO public.payment_operations
+        (user_id,attempt_id,invoice_id,provider_payment_id,kind,reason,amount,currency,dedupe_key,erasure_request_id)
+        VALUES(%s,%s,%s,%s,'refund',%s,%s,%s,%s,%s) RETURNING id''',
+        (attempt['user_id'], attemptId, str(attempt['invoice_id']), paymentId, reason, amount, currency,
+         'payment:refund:' + paymentId, control['erasure_request_id']))
+    operationId = str(cursor.fetchone()['id'])
+    metadata = attempt['metadata_json'] if isinstance(attempt['metadata_json'], dict) else {}
+    if metadata.get('manualBilling', {}).pop('closureReconciledAt', None) is not None:
+        cursor.execute('UPDATE public.billing_events SET metadata_json=%s WHERE id=%s', (Json(metadata), attemptId))
+    return operationId
 
 
 class PurchaseOperationRepositoryMixin:
@@ -86,61 +143,7 @@ class PurchaseOperationRepositoryMixin:
         cursor.execute('SELECT * FROM public.payment_slot_controls WHERE attempt_id=%s FOR UPDATE',(attemptId,))
         return attempt,invoice,cursor.fetchone()
 
-    def reserveCompensation(self,evidence):
-        if evidence.financialStatus != 'captured' or evidence.purpose != 'initial_purchase':
-            raise ValueError('PURCHASE_COMPENSATION_EVIDENCE_INVALID')
-        def operation(connection):
-            with connection.cursor(cursor_factory=RealDictCursor) as cursor:
-                cursor.execute("SELECT to_regclass('public.payment_slot_controls') AS relation")
-                if not cursor.fetchone()['relation']:
-                    return None
-                self._requireStorage(cursor)
-                attempt,invoice,control = self._operationContext(cursor,evidence.attemptId)
-                if not control or control['closed_reason']!='SUPERSEDED' or invoice['status']=='PAID':
-                    return None
-                if (str(attempt['invoice_id'])!=evidence.invoiceId or attempt['provider_order_id']!=evidence.providerOrderId
-                        or attempt['amount']!=evidence.amount or attempt['currency']!=evidence.currency
-                        or invoice['total_amount']!=evidence.amount or invoice['currency']!=evidence.currency
-                        or self._json(attempt['metadata_json']).get('manualBilling',{}).get('purpose')!='initial_purchase'):
-                    raise ValueError('PURCHASE_COMPENSATION_EVIDENCE_INVALID')
-                if attempt['user_id'] != evidence.userId:
-                    if attempt['user_id'] is not None or not control or not control['erasure_request_id']:
-                        raise ValueError('PURCHASE_COMPENSATION_OWNER_MISMATCH')
-                    cursor.execute('SELECT 1 FROM private.retained_user_subjects WHERE request_id=%s AND original_user_id=%s',
-                        (control['erasure_request_id'],evidence.userId))
-                    if evidence.userId is not None and not cursor.fetchone():
-                        raise ValueError('PURCHASE_COMPENSATION_OWNER_MISMATCH')
-                frozen=self._json(attempt['metadata_json']).get('manualBilling',{})
-                if (invoice['status']!='VOID' or frozen.get('closedReason')!='SUPERSEDED' or not control['closed_at']
-                        or _utc(frozen.get('closedAt'))!=control['closed_at']):
-                    raise ValueError('PURCHASE_SUPERSESSION_PROOF_INVALID')
-                cursor.execute('''SELECT * FROM public.billing_events WHERE provider_payment_id=%s
-                    AND event_type='payment.capture' FOR UPDATE''',(evidence.providerPaymentId,))
-                capture=cursor.fetchone()
-                if (not capture or str(capture['invoice_id'])!=evidence.invoiceId
-                        or capture['provider_order_id']!=evidence.providerOrderId or capture['amount']!=evidence.amount
-                        or capture['currency']!=evidence.currency or capture['event_status']!='REQUIRES_RECONCILIATION'):
-                    raise ValueError('PURCHASE_COMPENSATION_CAPTURE_NOT_VERIFIED')
-                cursor.execute('SELECT * FROM public.payment_operations WHERE kind=\'refund\' AND provider_payment_id=%s',
-                    (evidence.providerPaymentId,))
-                prior=cursor.fetchone()
-                if prior:
-                    return dict(prior)
-                # Never compete with a pre-existing ordinary refund obligation.
-                cursor.execute("SELECT 1 FROM public.billing_events WHERE invoice_id=%s AND event_type='refund.intent' LIMIT 1",(evidence.invoiceId,))
-                if cursor.fetchone():
-                    raise ValueError('PURCHASE_EXISTING_REFUND_OBLIGATION')
-                cursor.execute('''INSERT INTO public.payment_operations
-                    (user_id,attempt_id,invoice_id,provider_payment_id,kind,reason,amount,currency,dedupe_key,erasure_request_id)
-                    VALUES(%s,%s,%s,%s,'refund','paid_after_close',%s,%s,%s,%s) RETURNING *''',
-                    (attempt['user_id'],evidence.attemptId,evidence.invoiceId,evidence.providerPaymentId,evidence.amount,
-                     evidence.currency,'payment:refund:'+evidence.providerPaymentId,control['erasure_request_id']))
-                result=dict(cursor.fetchone())
-                metadata=self._json(attempt['metadata_json'])
-                metadata['manualBilling'].pop('closureReconciledAt',None)
-                cursor.execute('UPDATE public.billing_events SET metadata_json=%s WHERE id=%s',(Json(metadata),evidence.attemptId))
-                return result
-        return self._run(operation)
+    reserveRefund = staticmethod(reserveRefund)
 
     def operationById(self,operationId):
         UUID(str(operationId))
@@ -163,8 +166,8 @@ class PurchaseOperationRepositoryMixin:
                 op=cursor.fetchone()
                 facts=self._json(op['result'])
                 if (op['kind']!='refund' or op['state']!='queued' or self._json(op['submission_evidence']).get('startedAt')
-                        or control['operation_revision']!=expectedRevision or control['closed_reason']!='SUPERSEDED'
-                        or invoice['status']=='PAID' or facts.get('pending')!=0 or not facts.get('checkedAt')
+                        or control['operation_revision']!=expectedRevision or not _refundableCaptureLocked(cursor,op)
+                        or facts.get('pending')!=0 or not facts.get('checkedAt')
                         or not 0<=(_now()-_utc(facts['checkedAt'])).total_seconds()<=60):
                     return None
                 amount=op['amount']-facts['processed']

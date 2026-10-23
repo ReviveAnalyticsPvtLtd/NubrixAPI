@@ -97,7 +97,8 @@ CREATE INDEX IF NOT EXISTS payment_operations_due_idx ON public.payment_operatio
  WHERE state NOT IN ('succeeded','cancelled');
 CREATE INDEX IF NOT EXISTS payment_operations_owner_idx ON public.payment_operations(user_id,id);
 
--- Retained-only refund authority after erasure detached the original owner.
+-- Retained-only refund authority after erasure detached the original owner. Any full-refund
+-- reason of the capture rules qualifies; the guard separately requires the ungranted capture.
 CREATE OR REPLACE FUNCTION private.authorized_erased_payment(attempt_id uuid,invoice_id uuid,request_id uuid)
 RETURNS boolean LANGUAGE plpgsql SET search_path='' AS $$
 BEGIN
@@ -111,11 +112,9 @@ BEGIN
  WHERE c.attempt_id=authorized_erased_payment.attempt_id AND c.invoice_id=authorized_erased_payment.invoice_id
    AND c.erasure_request_id=authorized_erased_payment.request_id
    AND c.user_id IS NULL AND a.user_id IS NULL AND i."userId" IS NULL
-   AND c.closed_reason='SUPERSEDED'
    AND a.metadata_json->>'erasureRequestId'=c.erasure_request_id::text
    AND r.original_record->>'user_id'=s.original_user_id
    AND r.original_record->>'invoice_id'=c.invoice_id::text
-   AND r.original_record->>'closed_reason'='SUPERSEDED'
    AND e.status='COMPLETED');
 END $$;
 REVOKE ALL ON FUNCTION private.authorized_erased_payment(uuid,uuid,uuid) FROM PUBLIC,anon,authenticated;
@@ -162,6 +161,17 @@ BEGIN
      OR (OLD.settled_payment_id IS NOT NULL AND (NEW.settled_payment_id IS DISTINCT FROM OLD.settled_payment_id
          OR NEW.settled_at IS DISTINCT FROM OLD.settled_at))) THEN
    RAISE EXCEPTION 'payment slot identity or settlement is immutable';
+  END IF;
+  -- A slot settles only with the granted payment of an attempt whose control is in this slot.
+  IF TG_OP='UPDATE' AND OLD.settled_payment_id IS NULL AND NEW.settled_payment_id IS NOT NULL AND NOT EXISTS(
+     SELECT 1 FROM public.billing_events cap
+     JOIN public.billing_events a ON a.event_category='payment_attempt' AND a.provider_order_id=cap.provider_order_id
+       AND a.invoice_id=cap.invoice_id AND a.payment_status='captured'
+     JOIN public.payment_slot_controls c ON c.attempt_id=a.id AND c.slot_id=NEW.slot_id
+       AND c.provider_order_id=a.provider_order_id
+     WHERE cap.provider_payment_id=NEW.settled_payment_id AND cap.event_type='payment.capture'
+       AND cap.event_status='FINALIZED') THEN
+   RAISE EXCEPTION 'payment slot settlement requires a captured payment of its own attempt';
   END IF;
   RETURN NEW;
  END IF;
@@ -234,6 +244,13 @@ BEGIN
      OR attempt.amount IS NULL OR NEW.state<>'queued' OR NEW.currency IS DISTINCT FROM attempt.currency
      OR NEW.amount>attempt.amount) THEN
    RAISE EXCEPTION 'payment operation binding mismatch';
+  END IF;
+  -- Only money that was recorded on this attempt's Order and never granted is ever returned.
+  IF TG_OP='INSERT' AND NOT EXISTS(SELECT 1 FROM public.billing_events cap
+     WHERE cap.provider_payment_id=NEW.provider_payment_id AND cap.event_type='payment.capture'
+       AND cap.event_status='REFUND_RESERVED' AND cap.invoice_id=NEW.invoice_id
+       AND cap.provider_order_id=control.provider_order_id AND cap.currency=NEW.currency AND cap.amount>=NEW.amount) THEN
+   RAISE EXCEPTION 'payment refund requires an ungranted recorded capture';
   END IF;
   IF TG_OP='UPDATE' THEN
    IF NEW.id<>OLD.id OR NEW.provider_payment_id<>OLD.provider_payment_id OR NEW.kind<>OLD.kind OR NEW.reason<>OLD.reason

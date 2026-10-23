@@ -1243,11 +1243,14 @@ class SubscriptionService:
         if paymentEntity.get("order_id") != orderId or paymentEntity.get("id") != paymentId:
             raise ValueError("PAYMENT_ORDER_MISMATCH")
         from api.services.billing.manualPaymentService import ManualPaymentService
+        from api.services.billing.captureRules import providerCreatedAt
+        # The signed webhook payload or authenticated fetch carries the provider's payment start time.
         result = ManualPaymentService.forProduction(self.razorpayClient, repository).finalizeCapturedPayment(VerifiedPaymentEvidence(
             str(attempt["id"]), str(invoiceId), attempt["user_id"], orderId, paymentId,
             frozen.get("purpose", "erased_checkout") if attempt['user_id'] is None else frozen["purpose"], str(paymentEntity.get("currency") or ""),
             str(paymentEntity.get("status") or "").lower(), "server_observation",
-            int(paymentEntity.get("amount") or 0), now or utcNow(), None, None, False))
+            int(paymentEntity.get("amount") or 0), now or utcNow(), None, None, False,
+            paymentCreatedAt=providerCreatedAt(paymentEntity)))
         from api.services.billing.manualBillingPresentation import serializeFinalizationResult
         return serializeFinalizationResult(result)
 

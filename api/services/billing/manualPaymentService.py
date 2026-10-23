@@ -132,11 +132,15 @@ class ManualPaymentService:
         return self.openReservedCheckout(intent)
 
     def _recordedOnlyThisSnapshot(self, before, after, snapshot):
-        """The attempt changed only as recording this snapshot explains (or its capture settled it)."""
+        """The attempt changed only as recording this snapshot explains (or its capture settled it,
+        or finalizing its capture closed it for a full refund)."""
         from api.services.billing.manualBillingRepository import _utc
         if after.get('payment_status') == 'captured':
             return True
-        observed = self.repository._json(after.get('metadata_json')).get('manualBilling', {}).get('providerObservation', {})
+        billing = self.repository._json(after.get('metadata_json')).get('manualBilling', {})
+        observed = billing.get('providerObservation', {})
+        if billing.get('closedReason') == 'PAYMENT_REFUNDED' and before.get('payment_status') != after.get('payment_status'):
+            return _utc(observed.get('checkedAt')) == snapshot.observedAt
         expected = before.get('payment_status')
         if snapshot.outcome == 'authorized' and expected in ('created', 'pending_provider_ack'):
             expected = 'authorized'
@@ -349,12 +353,8 @@ class ManualPaymentService:
           grant.
         """
         if self.repository is not None:
-            result = self.repository.finalizeCapturedPayment(evidence)
-            if (evidence.financialStatus == 'captured' and evidence.purpose == 'initial_purchase'
-                    and result.state == 'requires_reconciliation' and hasattr(self.repository,'connectionFactory')):
-                from api.services.billing.purchaseCheckoutRepository import PurchaseCheckoutRepository
-                PurchaseCheckoutRepository(self.repository.connectionFactory).reserveCompensation(evidence)
-            return result
+            # Grant or full refund is decided and reserved inside the repository's owner transaction.
+            return self.repository.finalizeCapturedPayment(evidence)
         invoiceId = evidence.invoiceId
         operationKey = f"finalize:{invoiceId}"
 
@@ -512,6 +512,7 @@ class ManualPaymentService:
         payment entity carrying captured_at is treated as provider-attested
         evidence when the caller explicitly validated the fetch.
         """
+        from api.services.billing.captureRules import providerCreatedAt
         status = str(payment.get("status") or "").lower()
         capturedAt = payment.get("captured_at")
         provenCaptureAt = None
@@ -543,6 +544,7 @@ class ManualPaymentService:
             provenCaptureAt=provenCaptureAt,
             sourceEventId=sourceEventId,
             timingVerified=timingVerified,
+            paymentCreatedAt=providerCreatedAt(payment),
         )
 
 

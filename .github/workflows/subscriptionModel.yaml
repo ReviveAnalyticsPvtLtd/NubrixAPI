@@ -92,6 +92,7 @@ jobs:
             test/test_purchase_checkout_postgres.py \
             test/test_purchase_compensation.py \
             test/test_payment_replacement_postgres.py \
+            test/test_capture_finalization_postgres.py \
             --junitxml="$RUNNER_TEMP/subscription-postgres.xml"
       - name: Require executed PostgreSQL cases
         run: |

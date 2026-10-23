@@ -1,7 +1,12 @@
-"""Real SQL refund of a capture on a superseded purchase, with a synthetic payment/refund boundary."""
+"""Real SQL full refund of a captured payment that was never granted, with a synthetic payment/refund boundary.
+
+Finalization reserves the refund (spec 4.4/4.5); these cases drive its execution, history checks and retries.
+"""
 from dataclasses import replace
+from datetime import datetime, timezone
 import importlib
 import importlib.util
+import math
 import os
 from uuid import uuid4
 
@@ -9,7 +14,8 @@ import pytest
 from psycopg2.extras import Json
 
 from test.purchaseProviderFixtures import SyntheticPurchaseProvider
-from test.test_purchase_checkout_postgres import checkoutDb, drafts, controlledPurchase, authorization, supersede
+from test.test_purchase_checkout_postgres import (checkoutDb, drafts, controlledPurchase, authorization, supersede,
+    recordUngrantedCapture)
 from test.test_subscription_erasure_postgres import erasureDb
 from test.subscriptionRuntimeFixtures import postgres, runtimeDb, query
 
@@ -50,27 +56,45 @@ class SyntheticRefundProvider(SyntheticPurchaseProvider):
         return result
 
 
+def startedAfter(moment):
+    """A provider payment start (whole seconds) at or after ``moment``."""
+    return math.ceil(moment.timestamp())
+
+
 def closedCapture(drafts, monkeypatch, **selection):
+    """A payment started on a checkout that Pay had already replaced: finalization reserves its full refund."""
     repo, original, intent, _ = controlledPurchase(drafts, monkeypatch, **selection)
     provider = SyntheticRefundProvider()
     provider.orders = original.orders
     supersede(repo, provider, intent)  # Pay with a changed selection replaced the empty Order.
-    evidence = replace(authorization(repo, provider, intent), financialStatus='captured')
-    provider.payments[evidence.providerPaymentId]['status'] = 'captured'
-    provider.payments[evidence.providerPaymentId]['amount_refunded'] = 0
+    closedAt = query(drafts[3], 'SELECT closed_at FROM payment_slot_controls WHERE attempt_id=%s',
+                     (intent.attemptId,), one=True)['closed_at']
+    started = startedAfter(closedAt)
+    evidence = replace(authorization(repo, provider, intent), financialStatus='captured',
+                       paymentCreatedAt=datetime.fromtimestamp(started, timezone.utc))
+    provider.payments[evidence.providerPaymentId].update(status='captured', amount_refunded=0, created_at=started)
     result = repo.finalizeCapturedPayment(evidence)
-    assert result.state == 'requires_reconciliation'
+    assert result.state == 'refund_pending' and not result.finalized
     name = 'api.services.billing.purchaseCompensationService'
     assert importlib.util.find_spec(name), 'Dedicated full compensation handler is required'
     service = importlib.import_module(name).PurchaseCompensationService(repo, provider)
     return repo, provider, intent, evidence, service
 
 
+def reserved(url, evidence):
+    """The one refund operation finalization reserved for the payment."""
+    rows = query(url, "SELECT * FROM payment_operations WHERE provider_payment_id=%s AND kind='refund'",
+                 (evidence.providerPaymentId,))
+    assert len(rows) == 1
+    return dict(rows[0])
+
+
 def test_duplicate_late_capture_reserves_one_full_compensation(drafts, monkeypatch):
     repo, provider, intent, evidence, service = closedCapture(drafts, monkeypatch)
-    first = service.reserveForClosedCapture(evidence)
-    second = service.reserveForClosedCapture(replace(evidence, provenCaptureAt=evidence.observedAt,
-        timingVerified=True))
+    first = reserved(drafts[3], evidence)
+    replayed = repo.finalizeCapturedPayment(replace(evidence, provenCaptureAt=evidence.observedAt, timingVerified=True))
+    assert replayed.state == 'refund_pending'
+    second = reserved(drafts[3], evidence)
     assert str(first['id']) == str(second['id'])
     assert first['kind'] == 'refund' and first['reason'] == 'paid_after_close'
     assert first['dedupe_key'] == 'payment:refund:' + evidence.providerPaymentId
@@ -94,7 +118,7 @@ def test_complete_refund_history_prevents_duplicate_customer_returns(drafts, mon
     if external != 'none':
         provider.externalRefund(evidence.providerPaymentId, intent.amount if external == 'full' else 100, status)
     provider.refundStatus = status
-    op = service.reserveForClosedCapture(evidence)
+    op = reserved(drafts[3], evidence)
     result = service.execute(str(op['id']))
     assert result['state'] == expected
     assert len(provider.refundCalls) == calls
@@ -110,7 +134,7 @@ def test_complete_refund_history_prevents_duplicate_customer_returns(drafts, mon
 @pytest.mark.parametrize('fault', ['before','after'])
 def test_refund_unknown_send_is_lookup_only_even_when_gates_disable(drafts, monkeypatch, fault):
     repo, provider, intent, evidence, service = closedCapture(drafts, monkeypatch)
-    op = service.reserveForClosedCapture(evidence)
+    op = reserved(drafts[3], evidence)
     provider.refundFault = fault
     assert service.execute(str(op['id']))['state'] == 'outcome_unknown'
     monkeypatch.setattr('api.services.billing.purchaseCheckoutService.purchaseActionsReady', lambda: False)
@@ -122,7 +146,7 @@ def test_refund_unknown_send_is_lookup_only_even_when_gates_disable(drafts, monk
 
 def test_inconsistent_refund_history_holds_liability_and_escalates_once(drafts, monkeypatch):
     repo, provider, intent, evidence, service = closedCapture(drafts, monkeypatch)
-    op = service.reserveForClosedCapture(evidence)
+    op = reserved(drafts[3], evidence)
     provider.payments[evidence.providerPaymentId]['amount_refunded'] = 100
     service.execute(str(op['id']))
     service.execute(str(op['id']))
@@ -132,20 +156,43 @@ def test_inconsistent_refund_history_holds_liability_and_escalates_once(drafts, 
     assert len(events) == 1 and events[0]['metadata_json']['caseReference'] == 'purchase:'+str(op['id'])
 
 
-@pytest.mark.parametrize('mutation', ['owner','order','amount','purpose','not_superseded'])
+@pytest.mark.parametrize('mutation', ['granted', 'other_attempt', 'amount', 'currency', 'reason', 'owner', 'order'])
 def test_unrelated_or_invalid_capture_has_no_compensation_authority(drafts, monkeypatch, mutation):
+    import psycopg2
+    from psycopg2.extras import RealDictCursor
+    from api.services.billing.purchaseOperationRepository import reserveRefund
     repo, provider, intent, evidence, service = closedCapture(drafts, monkeypatch)
-    if mutation == 'not_superseded':
+    url = drafts[3]
+    def reserve(**changes):
+        values = dict(attemptId=intent.attemptId, paymentId=evidence.providerPaymentId, amount=intent.amount,
+                      currency=intent.currency, reason='paid_after_close') | changes
+        with psycopg2.connect(url) as db, db.cursor(cursor_factory=RealDictCursor) as cursor:
+            return reserveRefund(cursor, **values)
+    assert reserve() == str(reserved(url, evidence)['id'])  # idempotent on the provider payment
+    if mutation == 'granted':
         otherRepo, otherProvider, otherIntent, _ = controlledPurchaseForOtherOwner(drafts, monkeypatch)
-        otherEvidence = replace(authorization(otherRepo, otherProvider, otherIntent), financialStatus='captured')
-        otherRepo.finalizeCapturedPayment(otherEvidence)
-        result = service.reserveForClosedCapture(otherEvidence)
-        assert result is None
-    else:
-        values = {'owner': {'userId': 'foreign'}, 'order': {'providerOrderId': 'foreign'},
-            'amount': {'amount': evidence.amount+1}, 'purpose': {'purpose':'renewal'}}[mutation]
+        payment = otherProvider.authorize(otherIntent)
+        otherEvidence = replace(authorization(otherRepo, otherProvider, otherIntent), financialStatus='captured',
+            providerPaymentId=payment['id'], paymentCreatedAt=datetime.fromtimestamp(payment['created_at'], timezone.utc))
+        assert otherRepo.finalizeCapturedPayment(otherEvidence).finalized
+        with pytest.raises(ValueError, match='PAYMENT_REFUND_CAPTURE_NOT_VERIFIED'):
+            reserve(attemptId=otherIntent.attemptId, paymentId=payment['id'], amount=otherIntent.amount)
+        assert query(url, 'SELECT * FROM payment_operations WHERE provider_payment_id=%s', (payment['id'],)) == []
+    elif mutation == 'other_attempt':
+        live = repo.readEditor(intent.userId).checkout.attemptId
+        amount = query(url, 'SELECT amount FROM billing_events WHERE id=%s', (live,), one=True)['amount']
+        with pytest.raises(ValueError, match='PAYMENT_REFUND_CAPTURE_NOT_VERIFIED'):
+            reserve(attemptId=live, amount=amount)  # the payment was recorded on another Order
+    elif mutation in ('amount', 'currency', 'reason'):
+        changes = {'amount': {'amount': intent.amount + 1}, 'currency': {'currency': 'USD'},
+                   'reason': {'reason': 'goodwill'}}[mutation]
         with pytest.raises(ValueError):
-            service.reserveForClosedCapture(replace(evidence, **values))
+            reserve(**changes)
+    else:
+        values = {'owner': {'userId': 'foreign'}, 'order': {'providerOrderId': 'foreign'}}[mutation]
+        with pytest.raises(ValueError):
+            repo.finalizeCapturedPayment(replace(evidence, **values))
+    assert len(query(url, 'SELECT id FROM payment_operations WHERE attempt_id=%s', (intent.attemptId,))) == 1
     assert not provider.refundCalls
 
 
@@ -172,7 +219,7 @@ def test_verified_late_capture_transport_reserves_and_worker_completes_after_tab
     assert len(provider.refundCalls)==1
 
 
-def test_late_capture_after_erasure_uses_retained_supersession_without_recreating_account(drafts,monkeypatch):
+def test_late_capture_after_erasure_refunds_through_retained_authority_without_recreating_account(drafts,monkeypatch):
     from test.test_subscription_erasure_postgres import runErasure
     from api.services.billing.manualBillingContracts import VerifiedPaymentEvidence
     from api.services.billing.manualBillingRepository import _now
@@ -184,13 +231,16 @@ def test_late_capture_after_erasure_uses_retained_supersession_without_recreatin
     payment=provider.authorize(intent)
     provider.payments[payment['id']].update(status='captured',amount_refunded=0)
     evidence=VerifiedPaymentEvidence(intent.attemptId,intent.invoiceId,intent.userId,intent.razorpayOrderId,
-        payment['id'],'initial_purchase',intent.currency,'captured','server_observation',intent.amount,_now(),None,None,False)
-    repo.finalizeCapturedPayment(evidence)
+        payment['id'],'initial_purchase',intent.currency,'captured','server_observation',intent.amount,_now(),None,None,False,
+        paymentCreatedAt=datetime.fromtimestamp(payment['created_at'],timezone.utc))
+    assert repo.finalizeCapturedPayment(evidence).state=='refund_pending'
+    assert repo.finalizeCapturedPayment(evidence).state=='refund_pending'  # replay
     from api.services.billing.purchaseCompensationService import PurchaseCompensationService
     service=PurchaseCompensationService(repo,provider)
-    op=service.reserveForClosedCapture(evidence)
+    op=reserved(drafts[3],evidence)
     assert op['user_id'] is None and str(op['erasure_request_id'])==request
-    assert op['kind']=='refund' and op['reason']=='paid_after_close' and op['dedupe_key']=='payment:refund:'+payment['id']
+    # The account is closed: its money is returned whatever the attempt's state (spec 4.4 row 5).
+    assert op['kind']=='refund' and op['reason']=='account_closed' and op['dedupe_key']=='payment:refund:'+payment['id']
     provider.refundStatus='processed'
     assert service.execute(str(op['id']))['state']=='succeeded'
     assert query(drafts[3],'SELECT * FROM "Users" WHERE "userId"=%s',(intent.userId,))==[]
@@ -204,7 +254,7 @@ def test_late_capture_after_erasure_uses_retained_supersession_without_recreatin
 def test_obligation_report_exposes_operation_and_one_actionable_case(drafts,monkeypatch):
     from api.services.billing.manualObligationReport import listObligations
     repo,provider,intent,evidence,service=closedCapture(drafts,monkeypatch)
-    op=service.reserveForClosedCapture(evidence)
+    op=reserved(drafts[3], evidence)
     repo.escalateOperationOnce(str(op['id']),'PURCHASE_RESOLUTION_OVERDUE')
     report=listObligations(repo,limit=500)
     assert report['available']
@@ -216,7 +266,7 @@ def test_obligation_report_exposes_operation_and_one_actionable_case(drafts,monk
 def test_worker_backoff_and_escalation_never_release_liability(drafts,monkeypatch):
     from datetime import timedelta
     repo,provider,intent,evidence,service=closedCapture(drafts,monkeypatch)
-    op=service.reserveForClosedCapture(evidence)
+    op=reserved(drafts[3], evidence)
     when=op['created_at']+timedelta(seconds=1801)
     assert repo.schedulePurchaseRetry(str(op['id']),when)
     updated=repo.operationById(str(op['id']))
@@ -230,7 +280,7 @@ def test_worker_backoff_and_escalation_never_release_liability(drafts,monkeypatc
 
 def test_fully_refunded_payment_entity_settles_refund_without_new_charge(drafts,monkeypatch):
     repo,provider,intent,evidence,service=closedCapture(drafts,monkeypatch)
-    op=service.reserveForClosedCapture(evidence)
+    op=reserved(drafts[3], evidence)
     provider.externalRefund(evidence.providerPaymentId,intent.amount,'processed')
     provider.payments[evidence.providerPaymentId]['status']='refunded'
     assert service.execute(str(op['id']))['state']=='succeeded'
@@ -241,7 +291,7 @@ def test_concurrent_refund_executors_send_once_without_holding_owner_lock(drafts
     from concurrent.futures import ThreadPoolExecutor
     from threading import Event
     repo,provider,intent,evidence,service=closedCapture(drafts,monkeypatch)
-    op=service.reserveForClosedCapture(evidence)
+    op=reserved(drafts[3], evidence)
     entered,release=Event(),Event()
     def delayed():
         entered.set()
@@ -263,6 +313,12 @@ def test_concurrent_refund_executors_send_once_without_holding_owner_lock(drafts
 def test_sql_keyset_scan_pages_1001_rows_with_fixed_highwater(drafts,monkeypatch):
     from uuid import UUID
     repo,provider,intent,evidence,service=closedCapture(drafts,monkeypatch)
+    # Inventory-only phantoms: each still needs its ungranted recorded capture (storage guard).
+    query(drafts[3],'''INSERT INTO billing_events(id,user_id,invoice_id,event_category,event_type,event_status,
+        provider_order_id,provider_payment_id,amount,currency,idempotency_key)
+        SELECT gen_random_uuid(),%s,%s,'reconciliation','payment.capture','REFUND_RESERVED',%s,'pay-page-'||n,%s,%s,
+        'capture:pay-page-'||n FROM generate_series(1,1001) n''',
+        (intent.userId,intent.invoiceId,intent.razorpayOrderId,intent.amount,intent.currency))
     query(drafts[3],'''INSERT INTO payment_operations
         (id,user_id,attempt_id,invoice_id,provider_payment_id,kind,reason,amount,currency,dedupe_key)
         SELECT lpad(to_hex(n),32,'0')::uuid,%s,%s,%s,'pay-page-'||n,'refund','paid_after_close',%s,%s,'payment:refund:pay-page-'||n
@@ -271,6 +327,7 @@ def test_sql_keyset_scan_pages_1001_rows_with_fixed_highwater(drafts,monkeypatch
     cutoff=_now()
     high=repo.purchaseScanHighWater('refund')
     later=str(UUID(int=UUID(str(high)).int+1))
+    recordUngrantedCapture(drafts[3],intent,'pay-after-highwater')
     query(drafts[3],'''INSERT INTO payment_operations
         (id,user_id,attempt_id,invoice_id,provider_payment_id,kind,reason,amount,currency,dedupe_key)
         VALUES(%s,%s,%s,%s,'pay-after-highwater','refund','paid_after_close',%s,%s,'payment:refund:pay-after-highwater')''',
@@ -281,7 +338,7 @@ def test_sql_keyset_scan_pages_1001_rows_with_fixed_highwater(drafts,monkeypatch
         page=repo.purchaseScanPage('refund',high,after,cutoff,limit=100)
         if not page:
             break
-        seen.extend(str(r['id']) for r in page if r['user_id']==intent.userId)
+        seen.extend(str(r['id']) for r in page if r['user_id']==intent.userId and r['provider_payment_id'].startswith('pay-page-'))
         after=page[-1]['id']
     assert len(seen)==1001 and later not in seen
     # These inventory-only identities have no synthetic provider payments.
@@ -292,10 +349,11 @@ def test_sql_keyset_scan_pages_1001_rows_with_fixed_highwater(drafts,monkeypatch
 def test_worker_scan_excludes_new_rows_with_uuid_below_highwater(drafts,monkeypatch):
     from api.services.billing.manualBillingRepository import _now
     repo,provider,intent,evidence,service=closedCapture(drafts,monkeypatch)
-    op=service.reserveForClosedCapture(evidence)
+    op=reserved(drafts[3], evidence)
     cutoff=_now()
     high=repo.purchaseScanHighWater('refund')
     newId='00000000-0000-0000-0000-000000002001'
+    recordUngrantedCapture(drafts[3],intent,'pay-after-start')
     query(drafts[3],'''INSERT INTO payment_operations
         (id,user_id,attempt_id,invoice_id,provider_payment_id,kind,reason,amount,currency,dedupe_key)
         VALUES(%s,%s,%s,%s,'pay-after-start','refund','paid_after_close',%s,%s,'payment:refund:pay-after-start')''',
@@ -328,7 +386,7 @@ def test_completed_correction_is_no_longer_reported_as_a_financial_obligation(dr
     from api.services.billing.manualObligationReport import listObligations
     repo,provider,intent,evidence,service=closedCapture(drafts,monkeypatch)
     provider.refundStatus='processed'
-    op=service.reserveForClosedCapture(evidence)
+    op=reserved(drafts[3], evidence)
     assert service.execute(str(op['id']))['state']=='succeeded'
     cursor=None
     unresolved=[]
@@ -349,7 +407,7 @@ def test_completed_correction_is_no_longer_reported_as_a_financial_obligation(dr
 
 def test_failed_provider_refund_stays_owed_and_creates_one_case(drafts,monkeypatch):
     repo,provider,intent,evidence,service=closedCapture(drafts,monkeypatch)
-    op=service.reserveForClosedCapture(evidence)
+    op=reserved(drafts[3], evidence)
     provider.refundStatus='failed'
     service.execute(str(op['id']))
     service.recover(str(op['id']))
@@ -363,7 +421,7 @@ def test_worker_retries_only_a_verified_terminal_failed_refund_with_new_submissi
     from datetime import timedelta
     from api.services.billing.purchaseOperationWorker import PurchaseOperationWorker
     repo,provider,intent,evidence,service=closedCapture(drafts,monkeypatch)
-    op=service.reserveForClosedCapture(evidence)
+    op=reserved(drafts[3], evidence)
     provider.refundStatus='failed'
     service.execute(str(op['id']))
     worker=PurchaseOperationWorker(repo,provider)
@@ -403,7 +461,7 @@ def test_installed_sdk_receives_timeout_and_cannot_repost_unknown_refund(drafts,
             raise TimeoutError('synthetic reply lost at SDK HTTP boundary')
     sdk=razorpay.Client(session=Session(),auth=('synthetic','synthetic'))
     service=PurchaseCompensationService(repo,sdk)
-    op=service.reserveForClosedCapture(evidence)
+    op=reserved(drafts[3], evidence)
     assert service.execute(str(op['id']))['state']=='outcome_unknown'
     assert service.execute(str(op['id']))['state']=='submitted'
     assert len(provider.refundCalls)==1
@@ -412,7 +470,7 @@ def test_installed_sdk_receives_timeout_and_cannot_repost_unknown_refund(drafts,
 
 def test_provider_internal_retries_cannot_bypass_durable_refund_submission(drafts,monkeypatch):
     repo,provider,intent,evidence,service=closedCapture(drafts,monkeypatch)
-    op=service.reserveForClosedCapture(evidence)
+    op=reserved(drafts[3], evidence)
     provider.retry_enabled=True
     service.execute(str(op['id']))
     assert not provider.refundCalls
@@ -426,7 +484,7 @@ def test_full_original_currency_correction_in_each_supported_phase_and_interval(
     monkeypatch.setenv('SUBSCRIPTION_MODEL_PHASE',phase)
     repo,provider,intent,evidence,service=closedCapture(drafts,monkeypatch,currency=currency,interval=interval)
     provider.refundStatus='processed'
-    op=service.reserveForClosedCapture(evidence)
+    op=reserved(drafts[3], evidence)
     assert service.execute(str(op['id']))['state']=='succeeded'
     assert op['currency']==currency and provider.refundCalls[0][1]['amount']==intent.amount
     assert not repo.getCoverageSnapshot(intent.userId).accessAllowed
@@ -434,7 +492,7 @@ def test_full_original_currency_correction_in_each_supported_phase_and_interval(
 
 def test_corrected_provider_configuration_can_resume_a_never_submitted_correction(drafts,monkeypatch):
     repo,provider,intent,evidence,service=closedCapture(drafts,monkeypatch)
-    op=service.reserveForClosedCapture(evidence)
+    op=reserved(drafts[3], evidence)
     provider.retry_enabled=True
     service.execute(str(op['id']))
     assert not provider.refundCalls
@@ -448,7 +506,7 @@ def test_corrected_provider_configuration_can_resume_a_never_submitted_correctio
 def test_external_pending_refund_must_finish_failing_before_remaining_correction_can_submit(drafts,monkeypatch):
     repo,provider,intent,evidence,service=closedCapture(drafts,monkeypatch)
     pending=provider.externalRefund(evidence.providerPaymentId,100,'pending')
-    op=service.reserveForClosedCapture(evidence)
+    op=reserved(drafts[3], evidence)
     assert service.execute(str(op['id']))['state']=='submitted'
     assert not provider.refundCalls
     provider.refunds[pending['id']]['status']='failed'
@@ -462,7 +520,7 @@ def test_pending_return_in_payment_aggregate_never_means_refund_completed(drafts
     repo,provider,intent,evidence,service=closedCapture(drafts,monkeypatch)
     provider.externalRefund(evidence.providerPaymentId,intent.amount,'pending')
     provider.payments[evidence.providerPaymentId]['amount_refunded']=intent.amount
-    op=service.reserveForClosedCapture(evidence)
+    op=reserved(drafts[3], evidence)
     assert service.execute(str(op['id']))['state']=='submitted'
     assert not provider.refundCalls
     assert repo.readEditor(intent.userId).capabilities.maySubmitLatestDraft
@@ -473,7 +531,7 @@ def test_concurrent_retry_scheduling_uses_the_locked_retry_count(drafts,monkeypa
     from datetime import timedelta
     from threading import Barrier
     repo,provider,intent,evidence,service=closedCapture(drafts,monkeypatch)
-    op=service.reserveForClosedCapture(evidence)
+    op=reserved(drafts[3], evidence)
     original=repo.operationById
     rendezvous=Barrier(2)
     def simultaneousRead(key):
@@ -504,10 +562,11 @@ def test_replacement_late_capture_after_erasure_preserves_slot_ownership(drafts,
     payment=provider.authorize(second)
     provider.payments[payment['id']].update(status='captured',amount_refunded=0)
     evidence=VerifiedPaymentEvidence(second.attemptId,second.invoiceId,first.userId,second.razorpayOrderId,
-        payment['id'],'initial_purchase',second.currency,'captured','server_observation',second.amount,_now(),None,None,False)
-    repo.finalizeCapturedPayment(evidence)
+        payment['id'],'initial_purchase',second.currency,'captured','server_observation',second.amount,_now(),None,None,False,
+        paymentCreatedAt=datetime.fromtimestamp(payment['created_at'],timezone.utc))
+    assert repo.finalizeCapturedPayment(evidence).state=='refund_pending'
     service=PurchaseCompensationService(repo,provider)
-    op=service.reserveForClosedCapture(evidence)
+    op=reserved(drafts[3],evidence)
     provider.refundStatus='processed'
     failures=[]
     claim=repo.beginCompensationSubmission
@@ -532,7 +591,7 @@ def test_refund_webhook_uses_provider_truth_for_machine_correction_without_resub
     from api.services.webhookService import WebhookService
     from api.services.subscriptions.subscriptionService import subscriptionService
     repo,provider,intent,evidence,service=closedCapture(drafts,monkeypatch)
-    op=service.reserveForClosedCapture(evidence)
+    op=reserved(drafts[3], evidence)
     service.execute(str(op['id']))
     refund=next(iter(provider.refunds.values()))
     refund['status']=actual

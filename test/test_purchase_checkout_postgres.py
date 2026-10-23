@@ -208,8 +208,35 @@ def seedControl(url, user, intent, order, purpose='initial_purchase', slot=None,
     return slot
 
 
+def recordUngrantedCapture(url, intent, payment):
+    """The capture rules recorded this payment on the attempt's Order and never granted it."""
+    attempt = query(url, 'SELECT user_id,provider_order_id FROM billing_events WHERE id=%s', (intent.attemptId,), one=True)
+    query(url, '''INSERT INTO billing_events(id,user_id,invoice_id,event_category,event_type,event_status,
+        provider_order_id,provider_payment_id,amount,currency,idempotency_key,failure_reason)
+        VALUES(%s,%s,%s,'reconciliation','payment.capture','REFUND_RESERVED',%s,%s,%s,%s,%s,'DUPLICATE')
+        ON CONFLICT(idempotency_key) WHERE idempotency_key IS NOT NULL DO NOTHING''',
+        (str(uuid4()), attempt['user_id'], intent.invoiceId, attempt['provider_order_id'], payment, intent.amount,
+         intent.currency, 'capture:' + payment))
+
+
+def settleSlot(drafts, slot, purpose='initial_purchase'):
+    """Settle ``slot`` the only way the guard allows: with the granted payment of an attempt bound to it."""
+    _, _, user, url = drafts
+    intent, order = seedAttempt(drafts, purpose)
+    seedControl(url, user, intent, order, purpose, slot=slot)
+    payment = 'pay-' + str(uuid4())
+    query(url, "UPDATE billing_events SET payment_status='captured',event_status='captured' WHERE id=%s", (intent.attemptId,))
+    query(url, '''INSERT INTO billing_events(id,user_id,invoice_id,event_category,event_type,event_status,
+        provider_order_id,provider_payment_id,amount,currency,idempotency_key)
+        VALUES(%s,%s,%s,'reconciliation','payment.capture','FINALIZED',%s,%s,%s,%s,%s)''',
+        (str(uuid4()), user, intent.invoiceId, order, payment, intent.amount, intent.currency, 'capture:' + payment))
+    query(url, 'UPDATE payment_slots SET settled_payment_id=%s,settled_at=clock_timestamp() WHERE slot_id=%s', (payment, slot))
+    return payment
+
+
 def insertRefund(url, user, intent, payment, reason='paid_after_close', kind='refund', dedupe=None,
                  amount=None, currency=None, erasure=None):
+    recordUngrantedCapture(url, intent, payment)  # the storage guard returns only recorded, ungranted money
     return query(url, '''INSERT INTO payment_operations
         (user_id,attempt_id,invoice_id,provider_payment_id,kind,reason,amount,currency,dedupe_key,erasure_request_id)
         VALUES(%s,%s,%s,%s,%s,%s,%s,%s,%s,%s) RETURNING id''',
@@ -251,14 +278,16 @@ def test_slot_unique_while_unsettled(drafts):
         with psycopg2.connect(url) as db, db.cursor(cursor_factory=RealDictCursor) as cursor:
             return openSlotLocked(cursor, user, 'pro_term', 'open')
     assert opened() == str(first) == opened()
-    payment = 'pay-' + str(uuid4())
-    query(url, 'UPDATE payment_slots SET settled_payment_id=%s,settled_at=clock_timestamp() WHERE slot_id=%s', (payment, first))
+    assertStatementRejected(url, 'UPDATE payment_slots SET settled_payment_id=%s,settled_at=clock_timestamp() WHERE slot_id=%s',
+                            ('pay-' + str(uuid4()), first), 'payment slot settlement requires a captured payment')
+    payment = settleSlot(drafts, first)
     for change in ("settled_payment_id='pay-other'", 'settled_at=clock_timestamp()', 'settled_payment_id=NULL,settled_at=NULL'):
         assertStatementRejected(url, f'UPDATE payment_slots SET {change} WHERE slot_id=%s', (first,), SLOT_FROZEN)
     second = opened()
     assert second != str(first) and opened() == second
+    # A payment settles only the slot its attempt is bound to (the unique index backs this up).
     assertStatementRejected(url, 'UPDATE payment_slots SET settled_payment_id=%s,settled_at=clock_timestamp() WHERE slot_id=%s',
-                            (payment, second), 'payment_slots_settled_payment_idx')
+                            (payment, second), 'payment slot settlement requires a captured payment')
     assertStatementRejected(url, '''INSERT INTO payment_slots(user_id,kind,slot_key,settled_payment_id,settled_at)
         VALUES(%s,'topup','settled-at-birth',%s,clock_timestamp())''', (user, 'pay-' + str(uuid4())), 'slot must open unsettled')
     assertStatementRejected(url, insert, (user, 'renewal', 'open'), 'payment_slots_kind_check')
@@ -330,12 +359,12 @@ def test_refund_operation_reason_and_dedupe(drafts):
     ('control_in_settled_slot', CONTROL_BINDING)])
 def test_refund_and_control_inserts_enforce_money_binding(drafts, case, message):
     _, _, user, url = drafts
+    if case == 'control_in_settled_slot':
+        slot = slotFor(url, user)
+        settleSlot(drafts, slot)
     intent, order = seedAttempt(drafts, bind=case != 'order_unbound')
     payment = 'pay-' + str(uuid4())
     if case == 'control_in_settled_slot':
-        slot = slotFor(url, user)
-        query(url, 'UPDATE payment_slots SET settled_payment_id=%s,settled_at=clock_timestamp() WHERE slot_id=%s',
-              ('pay-' + str(uuid4()), slot))
         assertRejected(message, lambda: seedControl(url, user, intent, order, slot=slot), case)
         assert query(url, 'SELECT * FROM payment_slot_controls WHERE attempt_id=%s', (intent.attemptId,)) == []
         seedControl(url, user, intent, order)  # The same control is valid in an unsettled slot.
@@ -373,13 +402,11 @@ def test_only_a_started_unpaid_next_term_control_joins_the_open_term_slot(drafts
     future = renewalControl(slotFor(url, user, 'pro_term', termKey(timedelta(hours=1))))
     paidSlot = slotFor(url, user, 'pro_term', termKey(-timedelta(minutes=2)))
     paidTerm = renewalControl(paidSlot)
-    query(url, 'UPDATE payment_slots SET settled_payment_id=%s,settled_at=clock_timestamp() WHERE slot_id=%s',
-          ('pay-' + str(uuid4()), paidSlot))
+    settleSlot(drafts, paidSlot, 'renewal')
     startedSlot = slotFor(url, user, 'pro_term', termKey(-timedelta(minutes=1)))
     started = renewalControl(startedSlot)
     settledOpen = slotFor(url, user)
-    query(url, 'UPDATE payment_slots SET settled_payment_id=%s,settled_at=clock_timestamp() WHERE slot_id=%s',
-          ('pay-' + str(uuid4()), settledOpen))
+    settleSlot(drafts, settledOpen)
     opened = slotFor(url, user)
     foreign = 'foreign-' + str(uuid4())
     query(url, 'INSERT INTO "Users"("userId") VALUES(%s)', (foreign,))
@@ -533,9 +560,10 @@ def test_due_operation_scan_uses_keyset_and_kind(drafts):
 def test_operation_requires_existing_order_and_amount_authority(drafts, missing):
     _, _, user, url = drafts
     intent, op = seedOperation(drafts)
-    query(url, f'UPDATE billing_events SET {missing}=NULL WHERE id=%s', (intent.attemptId,))
     payment = 'pay-' + str(uuid4())
-    with pytest.raises(psycopg2.Error):
+    recordUngrantedCapture(url, intent, payment)  # only the missing attempt authority can refuse it
+    query(url, f'UPDATE billing_events SET {missing}=NULL WHERE id=%s', (intent.attemptId,))
+    with pytest.raises(psycopg2.Error, match=OPERATION_BINDING):
         query(url, '''INSERT INTO payment_operations
             (user_id,attempt_id,invoice_id,provider_payment_id,kind,reason,amount,currency,dedupe_key)
             SELECT user_id,attempt_id,invoice_id,%s,kind,reason,amount,currency,%s

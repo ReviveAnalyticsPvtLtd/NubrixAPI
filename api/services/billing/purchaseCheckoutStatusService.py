@@ -49,6 +49,8 @@ def reducePurchaseCheckoutStatus(attempt, intent, providerState, results=()):
     recorded = frozen.get('providerObservation', {})
     if any(result.state == 'requires_reconciliation' for result in results):
         state, reason = 'ready', 'PAYMENT_REQUIRES_RECONCILIATION'
+    elif any(result.state == 'refund_pending' for result in results):
+        state, reason = 'ready', 'PURCHASE_CORRECTION_PENDING'  # Never granted; returned in full.
     elif attempt['payment_status'] == 'captured':
         state, reason = 'completed', None
     elif intent.state == 'requires_reconciliation':

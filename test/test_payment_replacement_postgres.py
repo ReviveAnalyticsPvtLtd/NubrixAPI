@@ -1,8 +1,9 @@
 """Pay decides open, reuse, replace or wait for the initial purchase slot; real SQL, synthetic provider."""
+import math
 import os
 import time
 from concurrent.futures import ThreadPoolExecutor
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from threading import Barrier
 from uuid import uuid4
 
@@ -233,10 +234,13 @@ def test_owed_refund_does_not_block_new_purchase(drafts, monkeypatch):
     repo, provider, old, _ = controlledPurchase(drafts, monkeypatch)
     repo.saveDraft(old.userId, 1, ['banking'], 'month')
     replacement = pay(repo, provider, old.userId, 2, ['banking'])
-    late = payment(provider, old, 'captured')
+    # Started on the replaced checkout after it closed: finalization reserves its full refund.
+    closedAt = control(drafts[3], old.attemptId)['closed_at']
+    late = payment(provider, old, 'captured', created=math.ceil(closedAt.timestamp()))
     evidence = VerifiedPaymentEvidence(old.attemptId, old.invoiceId, old.userId, old.razorpayOrderId, late['id'],
-        'initial_purchase', old.currency, 'captured', 'server_observation', old.amount, _now(), None, None, False)
-    assert ManualPaymentService.forProduction(provider, repo).finalizeCapturedPayment(evidence).state == 'requires_reconciliation'
+        'initial_purchase', old.currency, 'captured', 'server_observation', old.amount, _now(), None, None, False,
+        paymentCreatedAt=datetime.fromtimestamp(late['created_at'], timezone.utc))
+    assert ManualPaymentService.forProduction(provider, repo).finalizeCapturedPayment(evidence).state == 'refund_pending'
     owed = query(drafts[3], "SELECT * FROM payment_operations WHERE attempt_id=%s", (old.attemptId,))
     assert len(owed) == 1 and owed[0]['state'] == 'queued' and owed[0]['reason'] == 'paid_after_close'
     assert repo.readEditor(old.userId).capabilities.maySubmitLatestDraft
@@ -365,11 +369,15 @@ def test_control_replay_never_opens_an_orphan_slot(drafts, monkeypatch):
     from psycopg2.extras import RealDictCursor
     from types import SimpleNamespace
     from api.services.billing.purchaseCheckoutRepository import bindPurchaseControlLocked
+    from api.services.billing.manualBillingRepository import _now
+    from api.services.billing.manualPaymentService import ManualPaymentService
     repo, provider, intent, _ = controlledPurchase(drafts, monkeypatch)
     url = drafts[3]
     slot = control(url, intent.attemptId)['slot_id']
-    query(url, 'UPDATE payment_slots SET settled_payment_id=%s,settled_at=clock_timestamp() WHERE slot_id=%s',
-          ('pay-' + str(uuid4()), slot))
+    granted = payment(provider, intent, 'captured')  # the grant settles the attempt's slot
+    assert repo.finalizeCapturedPayment(ManualPaymentService.buildPaymentEvidence(granted, attemptId=intent.attemptId,
+        invoiceId=intent.invoiceId, userId=intent.userId, purpose='initial_purchase', observedAt=_now())).finalized
+    assert query(url, 'SELECT settled_payment_id FROM payment_slots WHERE slot_id=%s', (slot,), one=True)['settled_payment_id']
     with psycopg2.connect(url) as db, db.cursor(cursor_factory=RealDictCursor) as cursor:
         bindPurchaseControlLocked(cursor, SimpleNamespace(userId=intent.userId, purpose='initial_purchase',
             purchaseDraftRevision=1), intent, 'open')

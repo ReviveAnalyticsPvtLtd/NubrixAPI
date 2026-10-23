@@ -135,6 +135,9 @@ class VerifiedPaymentEvidence:
     provenCaptureAt: datetime | None
     sourceEventId: str | None
     timingVerified: bool
+    # Provider payment.created_at (signed webhook payload, authenticated fetch or Order payment listing).
+    # It decides the capture rules (spec 4.4); evidence without it keeps today's handling.
+    paymentCreatedAt: datetime | None = None
 
 
 @dataclass(frozen=True)

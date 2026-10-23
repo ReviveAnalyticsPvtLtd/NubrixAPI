@@ -4,6 +4,7 @@ import json
 
 from api.services.billing.manualBillingContracts import CheckoutProviderSnapshot, VerifiedPaymentEvidence
 from api.services.billing.checkoutRecoveryPolicy import classifyCheckoutProviderOutcome
+from api.services.billing.captureRules import providerCreatedAt
 
 
 class ManualBillingRecoveryService:
@@ -94,15 +95,12 @@ class ManualBillingRecoveryService:
                 continue
             if payment.get('order_id') != attempt['provider_order_id']:
                 raise ValueError('RECOVERY_PAYMENT_ORDER_MISMATCH')
+            # The authenticated Order payment listing carries each payment's provider created_at.
             evidence = VerifiedPaymentEvidence(str(attempt['id']),str(attempt['invoice_id']),
                 attempt['user_id'],attempt['provider_order_id'],payment['id'],frozen.get('purpose','erased_checkout'),payment['currency'],
                 'captured','server_observation',int(payment['amount']),snapshot.observedAt,
-                None,None,False)
-            result = self.repository.finalizeCapturedPayment(evidence)
-            if evidence.purpose=='initial_purchase' and result.state=='requires_reconciliation':
-                from api.services.billing.purchaseCheckoutRepository import PurchaseCheckoutRepository
-                PurchaseCheckoutRepository(self.repository.connectionFactory).reserveCompensation(evidence)
-            results.append(result)
+                None,None,False,paymentCreatedAt=providerCreatedAt(payment))
+            results.append(self.repository.finalizeCapturedPayment(evidence))
         if frozen.get('closedAt'):
             # A complete listing may end the closed attempt's scan: an empty one for an ordinary
             # closure, recover_until for a superseded one (a later capture is still finalized).
