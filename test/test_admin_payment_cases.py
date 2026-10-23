@@ -237,6 +237,36 @@ def test_recheck_of_finalized_case_is_409(cases):
     assert error.value.statusCode == 409
 
 
+def test_recheck_refuses_a_capture_reserved_for_its_refund(cases):
+    """A capture the rules are returning in full is never re-evaluated for a grant."""
+    from api.adminErrors import AdminApiError
+    _, path, captureId, _, _ = cases
+    with sqlTransaction(path) as connection:
+        connection.execute("UPDATE billing_events SET event_status='REFUND_RESERVED',failure_reason='DUPLICATE' WHERE id=?",
+                           (captureId,))
+    with pytest.raises(AdminApiError) as error:
+        act(cases)
+    assert error.value.statusCode == 409 and error.value.errors == {"reasonCode": "PAYMENT_CASE_REFUND_RESERVED"}
+    assert capture(cases)["event_status"] == "REFUND_RESERVED"
+    assert read_row(path, "Invoices")["status"] == "PAYMENT_PENDING" and actions(path) == []
+
+
+def test_recheck_keeps_capture_rules_attention_out_of_the_legacy_rules(cases):
+    """A post-cutover capture escalated by the capture rules is not re-decided by today's rules."""
+    _, path, captureId, _, _ = cases
+    with sqlTransaction(path) as connection:
+        metadata = json.loads(connection.execute("SELECT metadata_json FROM billing_events WHERE id=?",
+                                                 (captureId,)).fetchone()[0])
+        metadata["rulesFacts"] = "CAPTURE_RULES"
+        connection.execute("UPDATE billing_events SET metadata_json=?,failure_reason='PAYMENT_EVIDENCE_MISMATCH' WHERE id=?",
+                           (json.dumps(metadata), captureId))
+    result = act(cases)
+    assert (result["financialStatus"], result["actionOutcome"], result["reasonCode"]) == (
+        "OPEN", "STILL_UNRESOLVED", "CAPTURE_RULES_ATTENTION")
+    assert capture(cases)["event_status"] == "REQUIRES_RECONCILIATION"
+    assert read_row(path, "Invoices")["status"] == "PAYMENT_PENDING"
+
+
 def test_provider_outage_is_503_without_action(cases):
     from api.adminErrors import AdminApiError
     with pytest.raises(AdminApiError) as error:

@@ -1903,6 +1903,10 @@ class ManualBillingRepository:
         before the rules cutover (or evidence without the provider's created_at) keep today's
         handling. No provider network call happens here.
         """
+        from dataclasses import replace as normalized
+        # Providers may spell currencies in either case; matching, records and refunds use one spelling.
+        evidence = normalized(evidence, currency=str(evidence.currency or '').upper())
+
         def operation(connection):
             with connection.cursor(cursor_factory=RealDictCursor) as cursor:
                 self._lockUser(cursor, evidence.userId)
@@ -1935,7 +1939,7 @@ class ManualBillingRepository:
                     raise ValueError('PAYMENT_EVIDENCE_MISMATCH')  # Not this attempt's payment: nothing to bind.
                 # The money itself against the attempt's own snapshot (spec 4.4 row 1).
                 matches = (int(attempt.get('amount') or 0) == evidence.amount
-                           and str(attempt.get('currency')).upper() == evidence.currency.upper())
+                           and str(attempt.get('currency')).upper() == evidence.currency)
                 if evidence.financialStatus != 'captured':
                     if not matches:
                         raise ValueError('PAYMENT_EVIDENCE_MISMATCH')
@@ -1968,56 +1972,68 @@ class ManualBillingRepository:
     _PRICING_FIELDS = ('amount', 'total_amount', 'amount_before_tax', 'tax_amount', 'currency', 'tax_breakdown_json',
                        'tax_rule_version', 'place_of_supply_snapshot', 'pricing_version', 'pricing_reference_snapshot_json')
 
-    def _captureRulesCutoffLocked(self, cursor, evidence):
-        """The rules cutover when the capture rules decide this payment; None keeps today's handling.
-
-        The rules need the provider's payment created_at and the slot storage. An unset cutover
-        opens no new Order, so a payment it cannot place is handled as today.
-        """
+    def _captureRulesClockLocked(self, cursor, evidence):
+        """(cutover, missing facts). The capture rules need the provider's payment created_at, the slot
+        storage and a configured cutover; without them a payment keeps today's handling and ``missing``
+        names what was absent, so it is never mistaken for a genuine pre-cutover anomaly."""
         from api.services.billing.paymentPolicy import paymentRulesEffectiveAt
         from api.services.billing.purchaseCheckoutRepository import _storagePresent
-        if evidence.paymentCreatedAt is None or not _storagePresent(cursor):
-            return None
+        missing = []
+        if evidence.paymentCreatedAt is None:
+            missing.append('created_at')
+        if not _storagePresent(cursor):
+            missing.append('slot_storage')
         try:
-            return paymentRulesEffectiveAt()
+            cutoff = paymentRulesEffectiveAt()
         except RuntimeError:
-            return None
+            cutoff = None
+            missing.append('cutover')
+        if missing:
+            from utils.logger import logger
+            logger.warning('Captured payment kept today\'s handling, capture rules facts missing: attempt={} payment={} missing={}',
+                           evidence.attemptId, evidence.providerPaymentId, ','.join(missing))
+            return None, missing
+        return cutoff, []
 
     def _dbNow(self, cursor):
         cursor.execute('select clock_timestamp() as current_time')
         return _utc(cursor.fetchone()['current_time'])
 
     def _decideCaptureLocked(self, cursor, subscription, invoice, attempt, evidence, capture, existingCoverage, matches):
-        """Spec 4.4 in order: attention, replay, legacy, then the slot facts decide refund or grant."""
+        """Spec 4.4 in order: attention, replay, legacy, then the slot facts decide refund or grant.
+
+        A refund needs no snapshot (it returns the captured amount); only a grant needs the attempt's
+        frozen snapshot, so its completeness is checked once the rules say grant.
+        """
         from dataclasses import replace as withFacts
         from api.services.billing.captureRules import CaptureFacts, attemptClosureTime, classifyCapture
-        cutoff = self._captureRulesCutoffLocked(cursor, evidence)
+        cutoff, missing = self._captureRulesClockLocked(cursor, evidence)
         facts = CaptureFacts(evidenceMatches=matches, alreadyFinalized=capture is not None,
             paymentCreatedAt=evidence.paymentCreatedAt if cutoff else self._EARLIEST,
             rulesEffectiveAt=cutoff or self._LATEST, slotSettledByOther=False, ownerClosed=False,
             attemptClosedAt=None, deliverable=True)
         outcome, _ = classifyCapture(facts)
-        if outcome == 'attention':
-            return self._captureNeedsAttentionLocked(cursor, subscription, invoice, evidence, capture, 'PAYMENT_EVIDENCE_MISMATCH')
         if outcome == 'replay':
             return self._replayCaptureLocked(cursor, subscription, invoice, evidence, capture)
-        captureId = self._recordCaptureLocked(cursor, subscription, evidence)
+        rulesFacts = 'RULES_FACTS_MISSING' if missing else 'PRE_CUTOVER' if outcome == 'legacy' else 'CAPTURE_RULES'
+        if outcome == 'attention':
+            return self._captureNeedsAttentionLocked(cursor, subscription, invoice, evidence, capture,
+                                                     'PAYMENT_EVIDENCE_MISMATCH', rulesFacts, missing)
+        captureId = self._recordCaptureLocked(cursor, subscription, evidence, rulesFacts, missing)
         if outcome == 'legacy':
             result = self._evaluateCaptureLocked(cursor, subscription, invoice, attempt, evidence, captureId, existingCoverage)
             if result.finalized:
                 self._settleLegacyGrantLocked(cursor, subscription, attempt, evidence.providerPaymentId)
             return result
         frozen = self._json(attempt.get('metadata_json')).get('manualBilling', {})
-        if not self._snapshotDescribesPayment(invoice, attempt, frozen):
-            # The attempt's own frozen snapshot cannot say what was paid for: never guess a grant or refund.
-            cursor.execute('update public.billing_events set event_status=%s,failure_reason=%s where id=%s',
-                           ('REQUIRES_RECONCILIATION', 'FROZEN_SNAPSHOT_INCOMPLETE', captureId))
-            return self._result(cursor, invoice, subscription, 'requires_reconciliation', evidence.attemptId, anomalyId=captureId)
         now = self._dbNow(cursor)
-        control, slot = self._captureSlotLocked(cursor, attempt, frozen, now)
+        control, slot, instanceSettled = self._captureSlotLocked(cursor, attempt, frozen, now)
+        if control is None:
+            # No slot can be derived for a pre-rollout attempt: escalate once instead of failing every retry.
+            return self._markAttentionLocked(cursor, subscription, invoice, evidence, captureId, 'PAYMENT_SLOT_UNAVAILABLE')
         captureAt = (evidence.provenCaptureAt if evidence.timingVerified else None) or evidence.observedAt
         facts = withFacts(facts,
-            slotSettledByOther=(slot['settled_payment_id'] not in (None, evidence.providerPaymentId)
+            slotSettledByOther=(instanceSettled or slot['settled_payment_id'] not in (None, evidence.providerPaymentId)
                 or (str(invoice['status']).upper() == 'PAID'
                     and invoice.get('razorpayPaymentId') not in (None, evidence.providerPaymentId))),
             ownerClosed=self._ownerClosedLocked(cursor, subscription),
@@ -2027,27 +2043,43 @@ class ManualBillingRepository:
         outcome, reason = classifyCapture(facts)
         if outcome == 'refund':
             return self._refundCaptureLocked(cursor, subscription, invoice, attempt, evidence, captureId, reason, now)
+        if not self._snapshotDescribesPayment(invoice, attempt, frozen):
+            # It would win, but its own frozen snapshot cannot say what was paid for: never guess a grant.
+            return self._markAttentionLocked(cursor, subscription, invoice, evidence, captureId, 'FROZEN_SNAPSHOT_INCOMPLETE')
         return self._grantSnapshotLocked(cursor, subscription, invoice, attempt, evidence, captureId, control, captureAt, now)
 
-    def _recordCaptureLocked(self, cursor, subscription, evidence):
+    def _recordCaptureLocked(self, cursor, subscription, evidence, rulesFacts=None, missing=()):
         captureId = str(uuid.uuid4())
+        metadata = {'timingKind':evidence.timingKind,
+                    'provenCaptureAt':evidence.provenCaptureAt.isoformat() if evidence.provenCaptureAt else None,
+                    'paymentCreatedAt':evidence.paymentCreatedAt.isoformat() if evidence.paymentCreatedAt else None}
+        if rulesFacts:
+            metadata['rulesFacts'] = rulesFacts  # CAPTURE_RULES, PRE_CUTOVER or RULES_FACTS_MISSING
+        if missing:
+            metadata['rulesFactsMissing'] = list(missing)
         cursor.execute('''insert into public.billing_events
             (id,user_id,subscription_id,invoice_id,event_category,event_type,event_status,provider,
              provider_order_id,provider_payment_id,amount,currency,idempotency_key,metadata_json,occurred_at)
             values (%s,%s,%s,%s,'reconciliation','payment.capture','OBSERVED','razorpay',%s,%s,%s,%s,%s,%s,%s)''',
             (captureId,evidence.userId,subscription['id'],evidence.invoiceId,evidence.providerOrderId,
              evidence.providerPaymentId,evidence.amount,evidence.currency,'capture:'+evidence.providerPaymentId,
-             Json({'timingKind':evidence.timingKind,'provenCaptureAt':evidence.provenCaptureAt.isoformat() if evidence.provenCaptureAt else None,
-                   'paymentCreatedAt':evidence.paymentCreatedAt.isoformat() if evidence.paymentCreatedAt else None}),
-             evidence.observedAt))
+             Json(metadata), evidence.observedAt))
         return captureId
 
-    def _captureNeedsAttentionLocked(self, cursor, subscription, invoice, evidence, capture, reason):
+    def _captureNeedsAttentionLocked(self, cursor, subscription, invoice, evidence, capture, reason, rulesFacts=None, missing=()):
         """Provider money that cannot be proven to be this attempt's: escalated, never granted or refunded."""
-        captureId = str(capture['id']) if capture else self._recordCaptureLocked(cursor, subscription, evidence)
-        if not capture:
-            cursor.execute('update public.billing_events set event_status=%s,failure_reason=%s where id=%s',
-                           ('REQUIRES_RECONCILIATION', reason, captureId))
+        if capture:
+            return self._result(cursor, invoice, subscription, 'requires_reconciliation', evidence.attemptId, anomalyId=capture['id'])
+        captureId = self._recordCaptureLocked(cursor, subscription, evidence, rulesFacts, missing)
+        return self._markAttentionLocked(cursor, subscription, invoice, evidence, captureId, reason)
+
+    def _markAttentionLocked(self, cursor, subscription, invoice, evidence, captureId, reason):
+        """needs_attention: REQUIRES_RECONCILIATION (the obligation report's actionable case)."""
+        cursor.execute('update public.billing_events set event_status=%s,failure_reason=%s where id=%s',
+                       ('REQUIRES_RECONCILIATION', reason, captureId))
+        from utils.logger import logger
+        logger.error('Captured payment needs attention: attempt={} payment={} reason={}',
+                     evidence.attemptId, evidence.providerPaymentId, reason)
         return self._result(cursor, invoice, subscription, 'requires_reconciliation', evidence.attemptId, anomalyId=captureId)
 
     def _replayCaptureLocked(self, cursor, subscription, invoice, evidence, capture):
@@ -2073,19 +2105,30 @@ class ManualBillingRepository:
                 and set(billing.get('domains') or []) == set(frozen.get('domains') or []))
 
     def _captureSlotLocked(self, cursor, attempt, frozen, now):
-        """The attempt's control and slot row; a reused pre-rollout attempt is bound first (account default)."""
+        """(control, slot row, settled instance) for the attempt; (None, None, False) when no slot can be derived.
+
+        A reused pre-rollout attempt is bound first (account default). When a slot instance of its key
+        was settled after the attempt was reserved, the attempt lived alongside it: its capture is a
+        duplicate, recorded through a fresh unsettled slot row (a settled slot takes no new control).
+        """
         from api.services.billing.paymentSlots import attemptSlotKey, effectiveSlotKey, slotKind
         from api.services.billing.purchaseCheckoutRepository import openSlotLocked
         cursor.execute('select * from public.payment_slot_controls where attempt_id=%s for update', (attempt['id'],))
         control = cursor.fetchone()
+        instanceSettled = False
         if control is None:
             key = effectiveSlotKey(attemptSlotKey(frozen, _utc(attempt.get('attempted_at'))), now)
-            if key is None:
-                raise ValueError('PAYMENT_SLOT_UNAVAILABLE')
-            slotId = openSlotLocked(cursor, attempt['user_id'], slotKind(frozen.get('purpose')), key)
+            if key is None or frozen.get('purpose') not in ('initial_purchase', 'renewal', 'expert_addition', 'topup'):
+                return None, None, False
+            kind = slotKind(frozen.get('purpose'))
+            cursor.execute('''select 1 from public.payment_slots where user_id=%s and kind=%s and slot_key=%s
+                and settled_payment_id is not null and settled_at>=%s limit 1''',
+                (attempt['user_id'], kind, key, attempt.get('attempted_at')))
+            instanceSettled = cursor.fetchone() is not None
+            slotId = openSlotLocked(cursor, attempt['user_id'], kind, key)
             control = self._bindControlLocked(cursor, attempt, frozen, slotId)
         cursor.execute('select * from public.payment_slots where slot_id=%s for update', (control['slot_id'],))
-        return control, cursor.fetchone()
+        return control, cursor.fetchone(), instanceSettled
 
     @staticmethod
     def _bindControlLocked(cursor, attempt, frozen, slotId):
@@ -2168,6 +2211,8 @@ class ManualBillingRepository:
         from api.services.billing.purchaseCheckoutRepository import _storagePresent
         cursor.execute('select * from public.billing_events where id=%s for update', (attempt['id'],))
         row = cursor.fetchone()
+        if row.get('payment_status') == 'captured':
+            return  # The granted attempt keeps its control; a duplicate on its Order changes neither.
         billing = self._json(row.get('metadata_json')).get('manualBilling', {})
         if row.get('payment_status') in self._LIVE_STATUSES and not billing.get('closedAt'):
             if billing.get('purpose') != 'renewal' and str(row.get('invoice_id')) != str(keepInvoiceId):
@@ -2459,6 +2504,10 @@ class ManualBillingRepository:
         and staff-entered or recheck-time observations never count as timing.
         """
         stored = self._json(capture.get('metadata_json'))
+        if str(capture.get('event_status') or '').upper() == 'REFUND_RESERVED':
+            return None, 'CAPTURE_REFUND_RESERVED'  # Being returned in full: never re-decided for a grant.
+        if stored.get('rulesFacts') == 'CAPTURE_RULES':
+            return None, 'CAPTURE_RULES_ATTENTION'  # Decided by the capture rules, not today's rules.
         if stored.get('reconsideredAt') or stored.get('timingKind') == 'provider_captured_at':
             return None, 'RECHECK_ALREADY_APPLIED'
         if not (evidence.timingVerified and evidence.provenCaptureAt and evidence.timingKind == 'provider_captured_at'):
@@ -2553,7 +2602,7 @@ class ManualBillingRepository:
     def _erasedRefundReasonLocked(self, cursor, attempt, evidence):
         """The capture rules for an erased owner: always a full refund; None keeps today's handling."""
         from api.services.billing.captureRules import CaptureFacts, attemptClosureTime, classifyCapture
-        cutoff = self._captureRulesCutoffLocked(cursor, evidence)
+        cutoff, _ = self._captureRulesClockLocked(cursor, evidence)
         if cutoff is None:
             return None
         cursor.execute('select * from public.payment_slot_controls where attempt_id=%s for update', (attempt['id'],))

@@ -1020,11 +1020,13 @@ def test_expert_addition_replace_vs_capture_never_grants_twice_nor_loses_the_pay
         assert inspected.wait(timeout=10)
         if order == 'replace_first':
             assert replaced.wait(timeout=10)
-        item = payment(provider, first, 'captured')
+        # Started now (whole provider seconds, rounded up): after the replacement when Pay went first.
+        item = payment(provider, first, 'captured', created=math.ceil(time.time()))
         try:
             return repo.finalizeCapturedPayment(VerifiedPaymentEvidence(first.attemptId, first.invoiceId, user,
                 first.razorpayOrderId, item['id'], 'expert_addition', first.currency, 'captured', 'server_observation',
-                first.amount, _now(), None, None, False)), item['id']
+                first.amount, _now(), None, None, False,
+                paymentCreatedAt=datetime.fromtimestamp(item['created_at'], timezone.utc))), item['id']
         finally:
             captured.set()
     with ThreadPoolExecutor(max_workers=2) as pool:
@@ -1038,9 +1040,12 @@ def test_expert_addition_replace_vs_capture_never_grants_twice_nor_loses_the_pay
         assert outcome == 'PAYMENT_SERVICE_BUSY' or (outcome.attemptId == first.attemptId and outcome.state == 'captured')
         assert liveIn(url, user, ['expert_addition']) == []
     else:
-        # Pay replaced first; the late capture on the closed attempt is held for its refund, never granted.
+        # Pay replaced first; the payment started on the closed checkout is returned in full, never granted.
         assert outcome.attemptId != first.attemptId and frozen(url, first.attemptId)[1]['closedReason'] == 'SUPERSEDED'
         assert liveIn(url, user, ['expert_addition']) == [outcome.attemptId]
+        assert result.state == 'refund_pending'
+        assert [row['reason'] for row in query(url, 'SELECT reason FROM payment_operations WHERE provider_payment_id=%s',
+                                               (paymentId,))] == ['paid_after_close']
     assert result.finalized == (order == 'capture_first') or order == 'concurrent'
     # Never a lost payment record: exactly one capture event for the provider payment.
     assert query(url, '''SELECT count(*) AS n FROM billing_events WHERE provider_payment_id=%s

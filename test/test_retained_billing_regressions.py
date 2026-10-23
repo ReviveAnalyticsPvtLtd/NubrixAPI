@@ -123,3 +123,15 @@ def test_actual_initial_verification_checks_amount_and_preserves_snapshot(checko
         for key in ('pricingSnapshot','taxSnapshot'):
             if key in before: assert after[key]==before[key]
         assert after['manualBilling']['domains']==before['manualBilling']['domains']
+
+
+def test_capture_without_slot_storage_keeps_todays_handling_and_says_why(checkout_database):
+    """No slot storage: the capture rules cannot run; the legacy outcome is marked RULES_FACTS_MISSING."""
+    from dataclasses import replace
+    repo,path=checkout_database
+    manual,checkout=paid_then_request(checkout_database,'monthly_prepaid','initial_purchase')
+    intent=manual.createCheckout(checkout)
+    assert repo.finalizeCapturedPayment(replace(evidence(intent),paymentCreatedAt=NOW)).finalized
+    with sqlTransaction(path) as db:
+        metadata=json.loads(db.execute("SELECT metadata_json FROM billing_events WHERE event_type='payment.capture'").fetchone()[0])
+    assert metadata['rulesFacts']=='RULES_FACTS_MISSING' and metadata['rulesFactsMissing']==['slot_storage']

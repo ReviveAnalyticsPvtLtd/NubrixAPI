@@ -389,6 +389,7 @@ def test_historical_anomaly_untouched(drafts, monkeypatch):
         result = ManualPaymentService.forProduction(provider, repo).finalizeCapturedPayment(evidenceFor(first, item))
         assert result.state == 'requires_reconciliation'
     assert captureRow(url, item['id'])['event_status'] == 'REQUIRES_RECONCILIATION'
+    assert captureRow(url, item['id'])['metadata_json']['rulesFacts'] == 'PRE_CUTOVER'
     assert operations(url, first.userId) == []
     assert slotOfAttempt(url, first.attemptId)['settled_payment_id'] is None
     assert liveIn(url, first.userId, ['initial_purchase']) == [live.attemptId]
@@ -472,3 +473,226 @@ def test_refund_operation_requires_an_ungranted_recorded_capture(drafts, monkeyp
                 (first.userId, first.attemptId, str(granted['invoice_id']), paymentId, first.amount, first.currency,
                  'payment:refund:' + paymentId))
     assert operations(url, first.userId) == []
+
+
+# -- fix round 1 --
+
+def stripFrozen(url, attemptId, *keys):
+    for key in keys:
+        query(url, "UPDATE billing_events SET metadata_json=metadata_json #- %s WHERE id=%s",
+              ('{manualBilling,' + key + '}', attemptId))
+
+
+@pytest.mark.parametrize('slotState', ['settled', 'unsettled'])
+def test_renewal_without_frozen_pricing_is_refunded_when_duplicate_and_escalated_when_it_would_win(
+        drafts, monkeypatch, slotState):
+    """Important #1: a refund needs no snapshot; only a grant does, and then an incomplete one escalates."""
+    url = drafts[3]
+    repo, provider, initial = paidAccount(drafts, monkeypatch, 'year')
+    user = initial.userId
+    invoice = annualRenewalInvoice(repo, user)
+    renewal = purposePay(repo, provider, user, 'renewal', 'annual_prepaid', {'invoiceId': str(invoice['id'])})
+    started = providerPayment(provider, renewal, 'created')
+    stripFrozen(url, renewal.attemptId, 'invoicePricing')  # reserved before attempts froze their invoice price
+    addition = purposePay(repo, provider, user, 'expert_addition', 'annual_prepaid', {'domains': ['telecom']})
+    assert finalize(repo, addition, providerPayment(provider, addition, 'captured')).state == 'expert_activated'
+    assert repo.prepareAnnualRenewalInvoice(renewal.invoiceId) is not None  # repriced in place
+    if slotState == 'settled':
+        newer = purposePay(repo, provider, user, 'renewal', 'annual_prepaid', {'invoiceId': renewal.invoiceId})
+        assert newer.attemptId != renewal.attemptId
+        assert finalize(repo, newer, providerPayment(provider, newer, 'captured')).finalized
+    result = finalize(repo, renewal, capturedNow(provider, started['id']))
+    if slotState == 'settled':
+        assert result.state == 'refund_pending'
+        assert [(op['provider_payment_id'], op['reason'], op['amount']) for op in operations(url, user)] == [
+            (started['id'], 'duplicate', renewal.amount)]
+    else:
+        assert result.state == 'requires_reconciliation' and not result.finalized
+        row = captureRow(url, started['id'])
+        assert (row['event_status'], row['failure_reason']) == ('REQUIRES_RECONCILIATION', 'FROZEN_SNAPSHOT_INCOMPLETE')
+        assert operations(url, user) == [] and invoiceRow(url, renewal.invoiceId)['status'] != 'PAID'
+
+
+def test_initial_purchase_overlapping_a_paid_term_refunds_not_deliverable(drafts, monkeypatch):
+    """A Pro term already paid on another path covers this purchase: nothing left to deliver."""
+    from psycopg2.extras import Json
+    from api.services.billing.manualBillingContracts import CheckoutRequest
+    from api.services.billing.manualPaymentService import ManualPaymentService
+    _, billing, user, url = drafts
+    monkeypatch.delenv('SUBSCRIPTION_EDITABLE_CHECKOUT_ENABLED')
+    monkeypatch.setenv('SUBSCRIPTION_MODEL_PHASE', 'legacy')
+    provider = SyntheticPurchaseProvider()
+    intent = ManualPaymentService.forProduction(provider, billing).createCheckout(CheckoutRequest(
+        user, 'initial_purchase', 'monthly_prepaid', {'domains': ['banking']}, 'overlapped', expectedCatalogRevision=1))
+    subscription = query(url, 'SELECT id FROM subscriptions WHERE user_id=%s AND is_canonical', (user,), one=True)['id']
+    now = datetime.now(timezone.utc)
+    query(url, '''INSERT INTO "Invoices"(id,"userId",subscription_id,status,billing_reason,amount,total_amount,currency,
+        period_start,period_end,"razorpayPaymentId","paidAt",metadata_json)
+        VALUES(%s,%s,%s,'PAID','initial_purchase',%s,%s,'INR',%s,%s,%s,%s,%s)''',
+        (str(uuid4()), user, subscription, intent.amount, intent.amount, now - timedelta(days=1), now + timedelta(days=29),
+         'pay-other-path-' + str(uuid4()), now - timedelta(days=1), Json({'manualBilling': {
+             'purpose': 'initial_purchase', 'billingMode': 'monthly_prepaid', 'domains': ['banking'],
+             'coverageState': 'active', 'lifecycleId': str(uuid4())}})))
+    result = finalize(billing, intent, providerPayment(provider, intent, 'captured'))
+    assert result.state == 'refund_pending' and not result.finalized
+    assert [(op['reason'], op['amount']) for op in operations(url, user)] == [('not_deliverable', intent.amount)]
+    assert invoiceRow(url, intent.invoiceId)['status'] != 'PAID'
+
+
+@pytest.mark.parametrize('order', ['renewal_first', 'repurchase_first'])
+def test_ended_renewal_and_repurchase_share_one_slot_in_either_order(drafts, monkeypatch, order):
+    """Spec 5 case 4b: one Pro term slot across the boundary, so only one of the two payments grants."""
+    from test.test_payment_replacement_postgres import repurchase
+    url = drafts[3]
+    service, provider, renewal, invoice, end = legacyTermEndingSoon(drafts, monkeypatch, 'monthly_prepaid')
+    started = providerPayment(provider, renewal, 'created', created=before(end))
+    afterTermEnd(end)
+    bought = repurchase(service, renewal.userId)
+    assert bought.attemptId != renewal.attemptId
+    assert slotOfAttempt(url, renewal.attemptId)['slot_id'] == slotOfAttempt(url, bought.attemptId)['slot_id']
+    paid = providerPayment(provider, bought, 'created')
+    sequence = [(renewal, started), (bought, paid)]
+    if order == 'repurchase_first':
+        sequence.reverse()
+    (winner, winning), (loser, losing) = sequence
+    assert finalize(service.repository, winner, capturedNow(provider, winning['id'])).finalized
+    assert finalize(service.repository, loser, capturedNow(provider, losing['id'])).state == 'refund_pending'
+    assert [(op['provider_payment_id'], op['reason']) for op in operations(url, renewal.userId)] == [
+        (losing['id'], 'duplicate')]
+    assert slotOfAttempt(url, renewal.attemptId)['settled_payment_id'] == winning['id']
+
+
+def test_superseded_expert_addition_wins_and_the_newer_capture_is_refunded(drafts, monkeypatch):
+    """Spec 5 case 11: the earlier expert set was paid first; the replacement set's payment is a duplicate."""
+    url = drafts[3]
+    repo, provider, initial = paidAccount(drafts, monkeypatch)
+    user = initial.userId
+    first = purposePay(repo, provider, user, 'expert_addition', 'monthly_prepaid', {'domains': ['telecom']})
+    started = providerPayment(provider, first, 'created')
+    second = purposePay(repo, provider, user, 'expert_addition', 'monthly_prepaid', {'domains': ['supplychain']})
+    assert second.attemptId != first.attemptId and frozen(url, first.attemptId)[1]['closedReason'] == 'SUPERSEDED'
+    newer = providerPayment(provider, second, 'created')
+    assert finalize(repo, first, capturedNow(provider, started['id'])).state == 'expert_activated'
+    assert frozen(url, second.attemptId)[1]['closedReason'] == 'SLOT_SETTLED'
+    assert invoiceRow(url, second.invoiceId)['status'] == 'VOID'
+    assert finalize(repo, second, capturedNow(provider, newer['id'])).state == 'refund_pending'
+    assert [(op['provider_payment_id'], op['reason']) for op in operations(url, user)] == [(newer['id'], 'duplicate')]
+    experts = set(repo.getCoverageSnapshot(user).currentPeriod.domains)
+    assert 'telecom' in experts and 'supplychain' not in experts
+
+
+@pytest.mark.parametrize('missing', ['created_at', 'cutover'])
+def test_legacy_fallback_without_rules_facts_is_marked(drafts, monkeypatch, missing):
+    """Minor #1: today's handling for want of rules facts is recorded, never confused with a pre-cutover payment."""
+    from dataclasses import replace
+    url = drafts[3]
+    repo, provider, intent, _ = controlledPurchase(drafts, monkeypatch)
+    item = providerPayment(provider, intent, 'captured')
+    evidence = evidenceFor(intent, item)
+    if missing == 'created_at':
+        evidence = replace(evidence, paymentCreatedAt=None)
+    else:
+        monkeypatch.delenv('PAYMENT_RULES_EFFECTIVE_AT')
+    assert repo.finalizeCapturedPayment(evidence).finalized  # today's handling: inside its window
+    metadata = captureRow(url, item['id'])['metadata_json']
+    assert metadata['rulesFacts'] == 'RULES_FACTS_MISSING' and metadata['rulesFactsMissing'] == [missing]
+
+
+def test_rules_decision_is_marked_on_the_capture(drafts, monkeypatch):
+    url = drafts[3]
+    repo, provider, intent, _ = controlledPurchase(drafts, monkeypatch)
+    item = providerPayment(provider, intent, 'captured')
+    assert finalize(repo, intent, item).finalized
+    metadata = captureRow(url, item['id'])['metadata_json']
+    assert metadata['rulesFacts'] == 'CAPTURE_RULES' and 'rulesFactsMissing' not in metadata
+
+
+def test_second_payment_on_the_granted_order_never_closes_the_winner(drafts, monkeypatch):
+    """Minor #3: a duplicate on the winning attempt's own Order is refunded; the winner's control stays as it was."""
+    url = drafts[3]
+    repo, provider, intent, _ = controlledPurchase(drafts, monkeypatch)
+    assert finalize(repo, intent, providerPayment(provider, intent, 'captured')).finalized
+    held = control(url, intent.attemptId)
+    second = providerPayment(provider, intent, 'captured')
+    assert finalize(repo, intent, second).state == 'refund_pending'
+    now = control(url, intent.attemptId)
+    assert (now['closed_at'], now['closed_reason'], now['recover_until']) == (
+        held['closed_at'], held['closed_reason'], held['recover_until'])
+    assert frozen(url, intent.attemptId)[0] == 'captured'
+    assert [(op['provider_payment_id'], op['reason']) for op in operations(url, intent.userId)] == [
+        (second['id'], 'duplicate')]
+
+
+def test_v2_expert_addition_whose_term_ended_before_the_grant_refunds(drafts, monkeypatch):
+    """Minor #4 (v2): started while its term was current, but nothing of that term is left to deliver."""
+    url = drafts[3]
+    repo, provider, initial = paidAccount(drafts, monkeypatch)
+    user = initial.userId
+    addition = purposePay(repo, provider, user, 'expert_addition', 'monthly_prepaid', {'domains': ['telecom']})
+    started = providerPayment(provider, addition, 'created')  # started inside the term
+    query(url, '''UPDATE "Invoices" SET period_start=period_start-interval '2 months',
+        period_end=period_end-interval '2 months',"paidAt"="paidAt"-interval '2 months' WHERE id=%s''', (initial.invoiceId,))
+    assert repo.getCoverageSnapshot(user).currentPeriod is None  # the term has ended
+    result = finalize(repo, addition, capturedNow(provider, started['id']))
+    assert result.state == 'refund_pending'
+    assert [(op['reason'], op['amount']) for op in operations(url, user)] == [('not_deliverable', addition.amount)]
+
+
+def test_pre_rollout_attempt_of_a_settled_slot_instance_is_a_duplicate(drafts, monkeypatch):
+    """Minor #5: an unbound attempt that lived alongside a slot instance settled meanwhile is a duplicate."""
+    from unittest.mock import patch
+    from api.services.billing.manualBillingContracts import CheckoutRequest
+    from test.test_purchase_checkout_postgres import proveClosed
+    _, billing, user, url = drafts
+    monkeypatch.delenv('SUBSCRIPTION_EDITABLE_CHECKOUT_ENABLED')
+    provider = SyntheticPurchaseProvider()
+    with patch('api.services.billing.purchaseCheckoutRepository.bindPurchaseControlLocked', lambda *args: None):
+        unbound = billing.reserveCheckout(CheckoutRequest(user, 'initial_purchase', 'monthly_prepaid',
+            {'domains': ['banking']}, 'pre-rollout-unbound', expectedCatalogRevision=1))
+    stripFrozen(url, unbound.attemptId, 'capturePolicy')
+    proveClosed(url, unbound.attemptId)  # closed before its Order was ever created
+    winner = billing.reserveCheckout(CheckoutRequest(user, 'initial_purchase', 'monthly_prepaid',
+        {'domains': ['telecom']}, 'bound-winner', expectedCatalogRevision=1))
+    winner = billing.bindProviderOrder(winner.attemptId, provider.createOrder(
+        {'amount': winner.amount, 'currency': winner.currency, 'receipt': winner.attemptId}))
+    assert finalize(billing, winner, providerPayment(provider, winner, 'captured')).finalized
+    closedAt = datetime.fromisoformat(frozen(url, unbound.attemptId)[1]['closedAt'])
+    unbound = billing.bindProviderOrder(unbound.attemptId, provider.createOrder(
+        {'amount': unbound.amount, 'currency': unbound.currency, 'receipt': unbound.attemptId}))
+    late = providerPayment(provider, unbound, 'captured', created=before(closedAt))
+    assert finalize(billing, unbound, late).state == 'refund_pending'
+    assert [(op['provider_payment_id'], op['reason']) for op in operations(url, user)] == [(late['id'], 'duplicate')]
+
+
+def test_unplaceable_pre_rollout_attempt_needs_attention_instead_of_failing(drafts, monkeypatch):
+    """Minor #5: no slot can be derived for it, so it is escalated (recorded once), not raised on every retry."""
+    from unittest.mock import patch
+    from api.services.billing.manualBillingContracts import CheckoutRequest
+    url = drafts[3]
+    repo, provider, initial = paidAccount(drafts, monkeypatch)
+    billing = drafts[1]
+    with patch('api.services.billing.purchaseCheckoutRepository.bindPurchaseControlLocked', lambda *args: None):
+        addition = billing.reserveCheckout(CheckoutRequest(initial.userId, 'expert_addition', 'monthly_prepaid',
+            {'domains': ['telecom']}, 'pre-rollout-addition', expectedCatalogRevision=1))
+    addition = billing.bindProviderOrder(addition.attemptId, provider.createOrder(
+        {'amount': addition.amount, 'currency': addition.currency, 'receipt': addition.attemptId}))
+    stripFrozen(url, addition.attemptId, 'slotKey', 'periodEnd', 'capturePolicy')
+    item = providerPayment(provider, addition, 'captured')
+    for _ in range(2):
+        assert finalize(billing, addition, item).state == 'requires_reconciliation'
+    row = captureRow(url, item['id'])
+    assert (row['event_status'], row['failure_reason']) == ('REQUIRES_RECONCILIATION', 'PAYMENT_SLOT_UNAVAILABLE')
+    assert control(url, addition.attemptId) is None and operations(url, initial.userId) == []
+
+
+def test_lowercase_provider_currency_is_normalised_once(drafts, monkeypatch):
+    """Minor #7: matching, the capture record and the refund all use one currency spelling."""
+    url = drafts[3]
+    repo, provider, first, _ = controlledPurchase(drafts, monkeypatch)
+    supersede(repo, provider, first)
+    item = providerPayment(provider, first, 'captured', created=after(control(url, first.attemptId)['closed_at']))
+    item['currency'] = 'inr'
+    assert finalize(repo, first, item).state == 'refund_pending'
+    assert query(url, '''SELECT currency FROM billing_events WHERE provider_payment_id=%s AND event_type='payment.capture' ''',
+                 (item['id'],), one=True)['currency'] == 'INR'
+    assert [(op['currency'], op['reason']) for op in operations(url, first.userId)] == [('INR', 'paid_after_close')]
