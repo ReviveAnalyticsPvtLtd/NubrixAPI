@@ -265,7 +265,9 @@ class ManualBillingRepository:
 
     def _supersededRecoverUntilLocked(self, cursor, attemptId, billing, snapshot):
         from api.services.billing.purchaseCheckoutRepository import _storagePresent
-        window = timedelta(minutes=int(billing.get('captureWindowMinutes') or captureWindowMinutes()))
+        from api.services.billing.paymentSlots import checkoutTtlSeconds, supersededRecoverUntil
+        minutes = int(billing.get('captureWindowMinutes') or captureWindowMinutes())
+        window = timedelta(minutes=minutes)
         started = [datetime.fromtimestamp(p['created_at'], timezone.utc) for p in snapshot.payments
                    if isinstance(p.get('created_at'), (int, float)) and not isinstance(p.get('created_at'), bool)]
         recorded = _utc(billing.get('providerObservation', {}).get('latestPaymentCreatedAt'))
@@ -284,7 +286,8 @@ class ManualBillingRepository:
                     until = follows
                 if until is not None:
                     return until
-        return follows or _utc(billing['closedAt']) + window
+        return supersededRecoverUntil(_utc(billing['closedAt']), _utc(billing.get('expiresAt')), latest,
+                                      minutes, checkoutTtlSeconds())
 
     def orderlessRecoveryRows(self, userId, purpose, mode):
         def operation(connection):
@@ -341,9 +344,15 @@ class ManualBillingRepository:
         return entries
 
     @staticmethod
-    def _inSlot(entries, kind, key):
-        from api.services.billing.paymentSlots import attemptSlotKey, slotKind
-        selected = []
+    def _inSlot(entries, kind, key, now):
+        """The slot's attempts at ``now``.
+
+        A renewal reserved before its term end E keeps key ISO(E); once E has passed unpaid that
+        term is the open Pro term, so its attempts join the open slot (spec 4.1, 5 case 4b). A term
+        with a captured attempt was paid and is never the open term.
+        """
+        from api.services.billing.paymentSlots import attemptSlotKey, effectiveSlotKey, slotKind
+        keyed = []
         for entry in entries:
             row, _, frozen = entry
             try:
@@ -351,9 +360,10 @@ class ManualBillingRepository:
                     continue
             except ValueError:
                 continue
-            if attemptSlotKey(frozen, _utc(row.get('attempted_at'))) == key:
-                selected.append(entry)
-        return selected
+            keyed.append((attemptSlotKey(frozen, _utc(row.get('attempted_at'))), entry))
+        paid = {own for own, (row, _, _) in keyed if own != key and row.get('payment_status') == 'captured'}
+        return [entry for own, entry in keyed
+                if own == key or (own not in paid and effectiveSlotKey(own, now) == key)]
 
     @classmethod
     def _liveEntry(cls, entries):
@@ -374,15 +384,27 @@ class ManualBillingRepository:
                 kind, key = self._requestSlotLocked(cursor, request, subscription, now)
                 if key is None:
                     return None
-                live = self._liveEntry(self._inSlot(self._slotEntriesLocked(cursor, request.userId), kind, key))
+                live = self._liveEntry(self._inSlot(self._slotEntriesLocked(cursor, request.userId), kind, key, now))
                 return live[0] if live else None
         return self._run(operation)
 
     @staticmethod
     def _slotMoneyInFlight(entries, excluded, now):
-        """Money that may capture any second on another attempt of the slot (spec 4.3 step 3)."""
+        """The newest other attempt of the slot whose money may capture any second (spec 4.3 step 3)."""
         from api.services.subscriptions.subscriptionModelBackfill import paymentInFlight
-        return any(paymentInFlight(row, now) for row, _, _ in entries if str(row['id']) not in excluded)
+        held = [entry for entry in entries if str(entry[0]['id']) not in excluded and paymentInFlight(entry[0], now)]
+        held.sort(key=lambda entry: (_utc(entry[0].get('attempted_at')) or datetime.min.replace(tzinfo=timezone.utc),
+                                     str(entry[0]['id'])))
+        return held[-1] if held else None
+
+    def _confirmingIntent(self, request, entry):
+        """Wait on an earlier payment: its public summary only, nothing that could reopen checkout."""
+        from dataclasses import replace
+        from api.services.billing.manualBillingPresentation import purchaseSelectionLabel
+        row, metadata, frozen = entry
+        intent = self._intentFromAttemptRow(row, metadata, request.userId, frozen.get('purpose') or request.purpose)
+        return replace(intent, state='confirming_earlier_payment', earlierPayment={
+            'selectionLabel': purchaseSelectionLabel(frozen), 'amount': int(row['amount']), 'currency': row['currency']})
 
     def _slotDecisionLocked(self, cursor, request, entries, payloadHash, same, inspection, now,
                             inspectedAttempt=None, beforeReuse=None):
@@ -391,10 +413,10 @@ class ManualBillingRepository:
         ``entries`` are the slot's attempts, ``same(frozen)`` says whether an attempt froze this request,
         ``inspection`` is the provider snapshot taken before the lock and ``inspectedAttempt`` the attempt
         row as it stood once that snapshot was recorded. Any later evidence makes Pay busy.
+        Money in flight on another attempt of the slot holds every open, reuse or replace
+        outcome as ``confirming_earlier_payment`` on that attempt (spec 4.3 step 3).
         """
-        from dataclasses import replace
         from api.services.billing.paymentSlots import LiveAttempt, decideAfterFinalize, decidePay
-        from api.services.billing.manualBillingPresentation import purchaseSelectionLabel
         current = self._liveEntry(entries)
         if inspection is not None and (current is None or str(current[0]['id']) != inspection.attemptId):
             inspected = next((entry for entry in entries if str(entry[0]['id']) == inspection.attemptId), None)
@@ -404,7 +426,8 @@ class ManualBillingRepository:
                                                   inspected[2].get('purpose') or request.purpose), None
             raise RuntimeError('PAYMENT_SERVICE_BUSY')  # The live attempt changed since it was inspected.
         if current is None:
-            return None, None
+            held = self._slotMoneyInFlight(entries, set(), now)
+            return (self._confirmingIntent(request, held), None) if held else (None, None)
         row, metadata, frozen = current
         if inspection is not None:
             checked = _utc(frozen.get('providerObservation', {}).get('checkedAt'))
@@ -441,6 +464,12 @@ class ManualBillingRepository:
                 action = decideAfterFinalize(liveAttempt, decisionHash, inspection, now, window).action
         if action == 'busy':
             raise RuntimeError('PAYMENT_SERVICE_BUSY')
+        if action == 'confirming':
+            return self._confirmingIntent(request, current), None
+        held = self._slotMoneyInFlight(entries, {str(row['id'])}, now)
+        if held:
+            # Neither reuse nor replace while an earlier payment in this slot may still capture.
+            return self._confirmingIntent(request, held), None
         intent = self._intentFromAttemptRow(row, metadata, request.userId, frozen.get('purpose') or request.purpose)
         if action == 'reuse':
             if not row.get('provider_order_id'):
@@ -451,10 +480,6 @@ class ManualBillingRepository:
                 beforeReuse(row)
             self._bindCheckoutRequestLocked(cursor, request, payloadHash, row)
             return intent, None
-        if action == 'confirming':
-            return replace(intent, state='confirming_earlier_payment', earlierPayment={
-                'selectionLabel': purchaseSelectionLabel(frozen), 'amount': int(row['amount']),
-                'currency': row['currency']}), None
         return None, row
 
     def recordProviderObservation(self, attemptId, snapshot):
@@ -834,7 +859,7 @@ class ManualBillingRepository:
                 invoice = cursor.fetchone()
                 revision = int(self._json(invoice.get('metadata_json')).get('manualBilling', {}).get('revision') or 1) if invoice else None
             kind, key = self._requestSlotLocked(cursor, request, subscription, now)
-            slot.update(key=key, entries=self._inSlot(entries, kind, key) if key is not None else [])
+            slot.update(key=key, entries=self._inSlot(entries, kind, key, now) if key is not None else [])
 
             def same(frozen):
                 if not hashMatches(frozen):
@@ -869,9 +894,6 @@ class ManualBillingRepository:
                     raise ValueError('PRICING_CONTEXT_REQUIRED')
                 from api.services.billing.purchaseCheckoutRepository import requirePaymentWorkerLocked
                 requirePaymentWorkerLocked(cursor)  # No new Order opens while nobody can recover or refund it.
-                if self._slotMoneyInFlight(slot['entries'], {str(replaced['id'])} if replaced is not None else set(), now):
-                    # Money that may capture any second on another attempt of this slot (spec 4.3 step 3).
-                    raise ValueError('RECOVERY_REQUIRED')
                 coverage = self._coverageSnapshotLocked(cursor, subscription, now, materialize=True)
                 if self._usesPurchaseAuthority() and request.purpose != 'initial_purchase':
                     subscription = self._purchaseContextLocked(cursor, subscription, coverage, now)
@@ -941,6 +963,9 @@ class ManualBillingRepository:
                     current = json.loads(current) if isinstance(current, str) else current
                     if set(selected) & set(current) or len(set(selected) | set(current)) > 4:
                         raise ValueError('INVALID_EXPERT_SELECTION')
+                if slot.get('key') is None:
+                    # Refused before anything is retired, priced or written.
+                    raise ValueError('PAYMENT_SLOT_UNAVAILABLE')
                 ttl = int(os.environ.get('MANUAL_CHECKOUT_TTL_SECONDS', '1800'))
                 if ttl <= 0:
                     raise ValueError('INVALID_CHECKOUT_TTL')
@@ -991,7 +1016,8 @@ class ManualBillingRepository:
                         'metadata_json': {'manualBilling': billing, 'domains': selected, 'billingMode': request.billingMode}}
                     if request.purpose == 'topup':
                         invoice['metadata_json'].update(tokens=billing['tokens'], packId=billing['packId'])
-                    if replaced is not None:
+                    if replaced is not None and self._json(replaced.get('metadata_json')).get('manualBilling', {}).get('purpose') != 'renewal':
+                        # Only an invoice the replacement voids; a renewal invoice persists.
                         invoice['metadata_json']['manualBilling']['replacesInvoiceIds'] = [str(replaced['invoice_id'])]
                     self._retireReplacedLocked(cursor, subscription, replaced, now, invoice['id'])
                     cursor.execute('insert into public."Invoices" (' + ','.join('"' + key + '"' for key in invoice) +
@@ -1014,13 +1040,14 @@ class ManualBillingRepository:
                 snapshot.update(capturePolicy='automatic', captureWindowMinutes=captureWindowMinutes())
                 if request.purchaseDraftRevision is not None:
                     snapshot.update(purchaseDraftRevision=request.purchaseDraftRevision)
-                if slot.get('key') is None:
-                    raise ValueError('PAYMENT_SLOT_UNAVAILABLE')
                 snapshot['slotKey'] = slot['key']
                 intent = self._reserveCheckoutIntentLocked(cursor, subscription, request.userId, request.purpose,
                     snapshot['requestKey'], payload_hash, snapshot, now)
                 from api.services.billing import purchaseCheckoutRepository as slots
                 slots.bindPurchaseControlLocked(cursor, request, intent, slot['key'])
+                # A started unpaid term's attempts belong to the open slot: one slot instance settles.
+                slots.adoptStartedTermControlsLocked(cursor, intent.attemptId,
+                    [str(row['id']) for row, _, _ in slot['entries']])
                 if replaced is not None:
                     try:
                         slots.supersedeAttemptLocked(cursor, str(replaced['id']), intent.attemptId, now)

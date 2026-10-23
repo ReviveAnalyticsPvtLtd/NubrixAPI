@@ -1594,6 +1594,38 @@ ws://api.example.com/api/latest/utils/ws/getTaskStatus?token=eyJ...&taskId=celer
 
 All routes under `/api/latest/subscriptions/`. Auth via `verifyToken`.
 
+### Checkout outcomes (every Pay route)
+
+Applies to `createSubscription`, `purchase-draft/checkout`, `addDomains`, `createRenewalPaymentSession`,
+`createAnnualRenewalPaymentSession` and `POST /api/latest/credits/topup/order`. The server decides whether
+Pay opens a new checkout, reuses the open one, or replaces it. One open checkout exists per purchase:
+the next Pro term (initial purchase and renewal share it), the expert addition for the current term, or the
+credit top-up. A changed selection, an expired checkout or a revised renewal invoice replaces an unpaid
+checkout automatically. Nothing needs to be cancelled first.
+
+**Earlier payment still confirming (200).** Returned when a payment on an earlier checkout of the same
+purchase may still capture. No new order is created. The client waits and polls status.
+```json
+{
+  "state": "confirming_earlier_payment",
+  "attemptId": "uuid-of-the-earlier-checkout",
+  "earlierPayment": { "selectionLabel": "Pro monthly with Banking", "amount": 11800, "currency": "INR" }
+}
+```
+`purchase-draft/checkout` returns this object as `checkout`; the other routes return it as `data`.
+
+**Payment service busy (503).** The payment provider could not be read, or the checkout changed during
+the check. Nothing was closed or opened. Retry the same request.
+```json
+{ "message": "Payment service is busy. Please try again in a moment.", "errorCode": "PAYMENT_SERVICE_BUSY" }
+```
+
+Removed from the contract: `POST /purchase-checkouts/{attemptId}/cancel`, `POST /cancelPendingAddition`,
+`LIVE_INITIAL_CHECKOUT_CONFLICT`, `LIVE_RENEWAL_CHECKOUT_CONFLICT` and `EXPERT_SELECTION_CONFLICT`.
+Adding an expert that is already subscribed, or going past 4 experts, returns `422 INVALID_EXPERT_SELECTION`.
+
+---
+
 ### 11.1 `GET /api/latest/subscriptions/activateFreeTrial`
 
 **Response (200):**
@@ -1713,26 +1745,7 @@ All routes under `/api/latest/subscriptions/`. Auth via `verifyToken`.
 
 ---
 
-### 11.7 `POST /api/latest/subscriptions/cancelPendingAddition`
-
-**Request Body:**
-```json
-{
-  "domain": "newdomain.com"
-}
-```
-
-**Response (200):**
-```json
-{
-  "status": "SUCCESS",
-  "message": "Pending domain addition cancelled."
-}
-```
-
----
-
-### 11.8 `POST /api/latest/subscriptions/cancelSubscription`
+### 11.7 `POST /api/latest/subscriptions/cancelSubscription`
 
 **Request Body:**
 ```json
@@ -1751,7 +1764,7 @@ All routes under `/api/latest/subscriptions/`. Auth via `verifyToken`.
 
 ---
 
-### 11.9 `POST /api/latest/subscriptions/refund`
+### 11.8 `POST /api/latest/subscriptions/refund`
 
 **Request Body:**
 ```json
@@ -1772,7 +1785,7 @@ All routes under `/api/latest/subscriptions/`. Auth via `verifyToken`.
 
 ---
 
-### 11.10 `GET /api/latest/subscriptions/invoices`
+### 11.9 `GET /api/latest/subscriptions/invoices`
 
 **Response (200):**
 ```json
@@ -1792,7 +1805,7 @@ All routes under `/api/latest/subscriptions/`. Auth via `verifyToken`.
 
 ---
 
-### 11.11 `POST /api/latest/subscriptions/createAnnualRenewalPaymentSession`
+### 11.10 `POST /api/latest/subscriptions/createAnnualRenewalPaymentSession`
 
 **Request Body:**
 ```json
@@ -1812,7 +1825,7 @@ All routes under `/api/latest/subscriptions/`. Auth via `verifyToken`.
 
 ---
 
-### 11.12 `POST /api/latest/subscriptions/verifyAnnualRenewalPayment`
+### 11.11 `POST /api/latest/subscriptions/verifyAnnualRenewalPayment`
 
 **Request Body:**
 ```json

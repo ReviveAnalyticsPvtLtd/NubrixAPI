@@ -296,3 +296,125 @@ def test_lapsed_annual_purchase_with_empty_order_is_replaced_from_a_fresh_listin
     assert repo.attemptById(USER, original.attemptId)['payment_status'] == 'cancelled'
     assert invoice(path, original.invoiceId)['status'] == 'VOID'
     assert counts(path) == (2, 2) and len(provider.order.createdPayloads) == 2
+
+
+# -- money in flight elsewhere in the slot decides every Pay path (spec 4.3 step 3, 5 cases 1, 4, 4a) --
+
+def _service(path, repo):
+    from test.test_manual_payment_entrypoints import RecoverableProvider
+    return ManualPaymentService.forProduction(RecoverableProvider(path), repo)
+
+
+def _authorizeOn(service, intent, created=NOW):
+    """The provider shows an authorized payment on the attempt's Order and the recovery scan records it."""
+    from api.services.billing.manualBillingRecoveryService import ManualBillingRecoveryService
+    provider = service.razorpayClient
+    provider.order.orders[intent.razorpayOrderId]['status'] = 'attempted'
+    provider.paymentsByOrder[intent.razorpayOrderId] = [{
+        'id': 'authorized-' + intent.attemptId, 'order_id': intent.razorpayOrderId, 'status': 'authorized',
+        'amount': intent.amount, 'currency': intent.currency, 'created_at': int(created.timestamp())}]
+    ManualBillingRecoveryService(service.repository, provider).recoverAttempt(
+        service.repository.attemptById(USER, intent.attemptId))
+
+
+def test_late_authorization_on_a_superseded_attempt_holds_reuse_and_replacement(checkout_database):
+    repo, path = checkout_database
+    service = _service(path, repo)
+    first = service.createCheckout(request('first'))
+    live = service.createCheckout(request('second', ('telecom',)))
+    assert live.attemptId != first.attemptId and live.razorpayOrderId
+    # A payment on the superseded Order late-authorized after the replacement opened.
+    _authorizeOn(service, first)
+    earlier = {'selectionLabel': 'Pro monthly with Banking', 'amount': first.amount, 'currency': first.currency}
+    for key, domains in (('same-as-live', ('telecom',)), ('changed-again', ('manufacturing',))):
+        held = service.createCheckout(request(key, domains))
+        assert held.state == 'confirming_earlier_payment', key
+        assert held.attemptId == first.attemptId and held.earlierPayment == earlier, key
+    # Nothing was reused, closed or opened while that money may still capture.
+    assert repo.attemptById(USER, live.attemptId)['payment_status'] == 'pending_provider_ack'
+    assert not repo._json(repo.attemptById(USER, live.attemptId)['metadata_json'])['manualBilling'].get('closedAt')
+    assert counts(path) == (2, 2) and len(service.razorpayClient.order.createdPayloads) == 2
+
+
+def test_open_pay_waits_for_money_in_flight_on_a_closed_attempt(checkout_database):
+    repo, path = checkout_database
+    service = _service(path, repo)
+    first = service.createCheckout(request('first'))
+    _authorizeOn(service, first)
+    attempt = repo.attemptById(USER, first.attemptId)
+    metadata = repo._json(attempt['metadata_json'])
+    metadata['manualBilling'].update(closedAt=NOW.isoformat(), closedReason='CHECKOUT_EXPIRED')
+    with sqlTransaction(path) as db:
+        db.execute("UPDATE billing_events SET payment_status='expired',metadata_json=? WHERE id=?",
+                   (json.dumps(metadata), first.attemptId))
+    held = service.createCheckout(request('fresh', ('telecom',)))
+    assert held.state == 'confirming_earlier_payment' and held.attemptId == first.attemptId
+    assert held.earlierPayment == {'selectionLabel': 'Pro monthly with Banking', 'amount': first.amount,
+                                   'currency': first.currency}
+    assert counts(path) == (1, 1) and len(service.razorpayClient.order.createdPayloads) == 1
+
+
+def test_superseded_scan_lasts_until_the_old_checkout_can_no_longer_start_a_payment(checkout_database):
+    repo, path = checkout_database
+    service = _service(path, repo)
+    first = service.createCheckout(request('first'))
+    assert first.expiresAt == NOW + timedelta(minutes=30)
+    service.createCheckout(request('second', ('telecom',)))
+    # Closed at NOW, but its Checkout modal could still start a payment until expiresAt.
+    for minutes, reconciled in ((50, False), (74, False), (76, True)):
+        at = NOW + timedelta(minutes=minutes)
+        with patch('api.services.billing.manualBillingRepository._now', return_value=at):
+            assert repo.recordClosedAttemptScan(first.attemptId, empty(first, first.razorpayOrderId, at)) is reconciled
+
+
+def test_unavailable_slot_is_refused_before_anything_is_retired_or_written(checkout_database, monkeypatch):
+    from api.services.billing.manualBillingRepository import ManualBillingRepository
+    repo, path = checkout_database
+    before = counts(path)
+    monkeypatch.setattr(ManualBillingRepository, '_requestSlotLocked', lambda self, *args: ('pro_term', None))
+    def retire(*args):
+        raise AssertionError('nothing may be retired without a payable slot')
+    monkeypatch.setattr(ManualBillingRepository, '_retireReplacedLocked', retire)
+    with pytest.raises(ValueError, match='PAYMENT_SLOT_UNAVAILABLE'):
+        repo.reserveCheckout(request('first'))
+    assert counts(path) == before
+
+
+@pytest.mark.parametrize('order', ['capture_first', 'replace_first'])
+def test_expert_addition_replacement_and_capture_never_grant_twice(checkout_database, order, monkeypatch):
+    from api.services.billing.manualBillingRecoveryService import ManualBillingRecoveryService
+    from test.test_manual_payment_entrypoints import evidence, paid_then_request, read_row
+    repo, path = checkout_database
+    service, addition = paid_then_request(checkout_database, 'monthly_prepaid', 'expert_addition')
+    first = service.createCheckout(addition)
+    provider = service.razorpayClient
+    def capture():
+        provider.order.orders[first.razorpayOrderId]['status'] = 'paid'
+        provider.paymentsByOrder[first.razorpayOrderId] = [{
+            'id': 'addition-payment', 'order_id': first.razorpayOrderId, 'status': 'captured',
+            'amount': first.amount, 'currency': first.currency, 'created_at': int(NOW.timestamp())}]
+        return repo.finalizeCapturedPayment(evidence(first, 'addition-payment'))
+    changed = request('changed-set', ('supplychain',), purpose='expert_addition')
+    captured = None
+    if order == 'capture_first':
+        inspect = ManualBillingRecoveryService.inspectAttempt
+        def inspectThenCapture(self, attempt):
+            nonlocal captured
+            snapshot = inspect(self, attempt)  # the empty listing Pay decides from
+            captured = capture()               # the capture lands before Pay takes the owner lock
+            return snapshot
+        monkeypatch.setattr(ManualBillingRecoveryService, 'inspectAttempt', inspectThenCapture)
+        result = service.createCheckout(changed)
+        assert captured.finalized and result.attemptId == first.attemptId and result.state == 'captured'
+    else:
+        result = service.createCheckout(changed)
+        assert result.attemptId != first.attemptId and result.razorpayOrderId
+        captured = capture()
+        assert not captured.finalized
+    experts = read_row(path, 'subscriptions')['subscribed_experts']
+    experts = json.loads(experts) if isinstance(experts, str) else experts
+    assert ('telecom' in experts) == (order == 'capture_first') and 'supplychain' not in experts
+    with sqlTransaction(path) as db:
+        # The payment is never lost: exactly one capture record, granted or awaiting refund.
+        assert db.execute("SELECT count(*) FROM billing_events WHERE provider_payment_id='addition-payment' "
+                          "AND event_type='payment.capture'").fetchone()[0] == 1

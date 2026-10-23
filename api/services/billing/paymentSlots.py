@@ -82,6 +82,37 @@ def attemptSlotKey(frozen: dict, attemptedAt: datetime | None) -> str | None:
         return None
 
 
+def effectiveSlotKey(key: str | None, now: datetime) -> str | None:
+    """The slot an attempt key belongs to at ``now``.
+
+    A next-term Pro key is ISO(term end E). Once E has passed with that term unpaid there is no
+    current term, so the renewal buys the open Pro term together with any repurchase (spec 4.1,
+    5 case 4b). Callers rule out a paid (settled) term.
+    """
+    if key in (None, 'open', 'topup') or str(key).startswith('current:'):
+        return key
+    start = _parsed(key)
+    return 'open' if start is not None and start <= now else key
+
+
+def checkoutTtlSeconds() -> int:
+    import os
+    return int(os.environ.get('MANUAL_CHECKOUT_TTL_SECONDS', '1800'))
+
+
+def supersededRecoverUntil(closedAt: datetime, expiresAt: datetime | None,
+                           latestPaymentAt: datetime | None, windowMinutes: int, ttlSeconds: int = 1800) -> datetime:
+    """Until when a superseded Order can still capture: its Checkout can start a payment until
+    its own deadline, and each payment stays capturable for the window after it started.
+
+    A legacy unbounded deadline is read as the Checkout modal's own timeout (the TTL).
+    """
+    if expiresAt is not None:
+        expiresAt = min(expiresAt, closedAt + timedelta(seconds=int(ttlSeconds)))
+    started = max(moment for moment in (closedAt, expiresAt, latestPaymentAt) if moment is not None)
+    return started + timedelta(minutes=int(windowMinutes))
+
+
 def _paymentCreatedAt(payment: dict) -> datetime | None:
     raw = payment.get('created_at')
     if isinstance(raw, bool) or not isinstance(raw, (int, float)):

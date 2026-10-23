@@ -76,9 +76,14 @@ def test_changed_next_selection_does_not_open_a_second_order_with_unresolved_mon
     selection(account, ['banking'])
     revised = renewal(account)
     assert str(revised['id']) != str(original['id'])
-    with pytest.raises(ValueError, match='RECOVERY_REQUIRED'):
-        repo.reserveCheckout(CheckoutRequest(initial.userId, 'renewal', 'monthly_prepaid',
-            {'invoiceId': str(revised['id'])}, 'another-browser', expectedCatalogRevision=1))
+    # Pay waits on that earlier payment (spec 4.3 step 3): nothing opens, nothing is refused.
+    held = repo.reserveCheckout(CheckoutRequest(initial.userId, 'renewal', 'monthly_prepaid',
+        {'invoiceId': str(revised['id'])}, 'another-browser', expectedCatalogRevision=1))
+    assert held.state == 'confirming_earlier_payment' and held.attemptId == attempt.attemptId
+    assert held.earlierPayment == {'selectionLabel': 'Pro monthly renewal with Banking and Manufacturing',
+                                   'amount': attempt.amount, 'currency': attempt.currency}
+    assert not query(url, '''SELECT id FROM billing_events WHERE invoice_id=%s AND event_category='payment_attempt' ''',
+                     (str(revised['id']),))
 
 
 def test_lapsed_v2_renewal_replays_original_key_and_is_replaced_for_a_fresh_key(account):

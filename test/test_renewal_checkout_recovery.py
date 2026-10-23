@@ -302,3 +302,72 @@ def test_adopted_key_releases_review_after_confirmed_order_absence(checkout_data
         assert connection.execute("SELECT count(*) FROM billing_events WHERE event_category='payment_attempt' AND invoice_id='renewal'").fetchone()[0] == 2
         assert connection.execute("SELECT status FROM \"Invoices\" WHERE id='renewal'").fetchone()[0] == 'UPCOMING'
     assert len(service.razorpayClient.order.createdPayloads) == 2
+
+
+# -- one Pro term slot across the renewal boundary (spec 4.1, 5 case 4b) --
+
+def _renewalReservedBeforeTermEnd(checkout_database, mode):
+    """A renewal whose Order opened five minutes before the term end E."""
+    from api.services.billing.manualBillingRepository import _utc
+    from test.test_manual_payment_entrypoints import read_row
+    service, request = paid_then_request(checkout_database, mode, 'renewal')
+    end = _utc(read_row(checkout_database[1], 'subscriptions')['current_period_end'])
+    with patch('api.services.billing.manualBillingRepository._now', return_value=end - timedelta(minutes=5)):
+        renewal = service.createCheckout(request)
+    assert renewal.razorpayOrderId
+    return service, renewal, end
+
+
+def _repurchase(service, end, key='repurchase'):
+    from test.test_manual_checkout_http import request as checkoutRequest
+    with patch('api.services.billing.manualBillingRepository._now', return_value=end + timedelta(minutes=1)):
+        return service.createCheckout(checkoutRequest(key, ('telecom',), mode='monthly_prepaid'))
+
+
+@pytest.mark.parametrize('mode', ['monthly_prepaid', 'annual_prepaid'])
+def test_repurchase_after_term_end_replaces_empty_renewal_reserved_before_it(checkout_database, mode):
+    service, renewal, end = _renewalReservedBeforeTermEnd(checkout_database, mode)
+    repurchase = _repurchase(service, end)
+    assert repurchase.attemptId != renewal.attemptId and repurchase.razorpayOrderId
+    old = service.repository.attemptById(renewal.userId, renewal.attemptId)
+    frozen = service.repository._json(old['metadata_json'])['manualBilling']
+    # The open term's live attempt is replaced (a lapsed monthly one too).
+    assert old['payment_status'] == 'cancelled' and frozen['closedReason'] == 'SUPERSEDED'
+    with sqlTransaction(checkout_database[1]) as connection:
+        renewalInvoice = connection.execute("SELECT status FROM \"Invoices\" WHERE id='renewal'").fetchone()[0]
+        metadata = json.loads(connection.execute('SELECT metadata_json FROM "Invoices" WHERE id=?',
+                                                 (repurchase.invoiceId,)).fetchone()[0])
+    # Replacement never voids the renewal invoice (a legacy monthly term expires it at the boundary),
+    # so the new invoice claims to replace nothing.
+    assert renewalInvoice == ('EXPIRED' if mode == 'monthly_prepaid' else 'UPCOMING')
+    assert 'replacesInvoiceIds' not in metadata['manualBilling']
+    assert len(service.razorpayClient.order.createdPayloads) == 3
+
+
+@pytest.mark.parametrize('mode', ['monthly_prepaid', 'annual_prepaid'])
+def test_repurchase_after_term_end_waits_for_renewal_payment_in_flight(checkout_database, mode):
+    from api.services.billing.manualBillingRecoveryService import ManualBillingRecoveryService
+    from api.services.subscriptions.subscriptionModelBackfill import unresolvedMoneyFacts
+    service, renewal, end = _renewalReservedBeforeTermEnd(checkout_database, mode)
+    provider = service.razorpayClient
+    provider.order.orders[renewal.razorpayOrderId]['status'] = 'attempted'
+    provider.paymentsByOrder[renewal.razorpayOrderId] = [{
+        'id': 'pay_renewal_in_flight', 'order_id': renewal.razorpayOrderId, 'status': 'authorized',
+        'amount': renewal.amount, 'currency': renewal.currency,
+        'created_at': int((end - timedelta(minutes=2)).timestamp())}]
+    with patch('api.services.billing.manualBillingRepository._now', return_value=end - timedelta(minutes=1)):
+        ManualBillingRecoveryService(service.repository, provider).recoverAttempt(
+            service.repository.attemptById(renewal.userId, renewal.attemptId))
+    before = counts(checkout_database[1])
+    # Annual: the renewal is still the open term's live attempt. Legacy monthly: the boundary closed it,
+    # but its authorized payment is still money in flight in the same slot.
+    held = _repurchase(service, end)
+    assert held.state == 'confirming_earlier_payment' and held.attemptId == renewal.attemptId
+    interval = 'annual' if mode == 'annual_prepaid' else 'monthly'
+    assert held.earlierPayment == {'selectionLabel': f'Pro {interval} renewal with Banking',
+                                   'amount': renewal.amount, 'currency': renewal.currency}
+    assert counts(checkout_database[1]) == before and len(provider.order.createdPayloads) == 2
+    # The snapshot names the same held attempt the reservation waits on.
+    attempt = service.repository.attemptById(renewal.userId, renewal.attemptId)
+    unresolved, attempts = unresolvedMoneyFacts([], [attempt], end + timedelta(minutes=1))
+    assert unresolved and [item.attemptId for item in attempts] == [renewal.attemptId]

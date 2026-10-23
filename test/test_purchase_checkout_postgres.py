@@ -360,6 +360,46 @@ def test_refund_and_control_inserts_enforce_money_binding(drafts, case, message)
         insertRefund(url, user, intent, payment)  # Only the broken condition made the insert fail.
 
 
+def test_only_a_started_unpaid_next_term_control_joins_the_open_term_slot(drafts):
+    from datetime import datetime, timedelta, timezone
+    _, _, user, url = drafts
+    def termKey(delta):
+        return (datetime.now(timezone.utc) + delta).replace(microsecond=0).isoformat()
+    def renewalControl(slot):
+        intent, order = seedAttempt(drafts, 'renewal')
+        proveClosed(url, intent.attemptId)
+        seedControl(url, user, intent, order, 'renewal', slot=slot)
+        return intent.attemptId
+    future = renewalControl(slotFor(url, user, 'pro_term', termKey(timedelta(hours=1))))
+    paidSlot = slotFor(url, user, 'pro_term', termKey(-timedelta(minutes=2)))
+    paidTerm = renewalControl(paidSlot)
+    query(url, 'UPDATE payment_slots SET settled_payment_id=%s,settled_at=clock_timestamp() WHERE slot_id=%s',
+          ('pay-' + str(uuid4()), paidSlot))
+    startedSlot = slotFor(url, user, 'pro_term', termKey(-timedelta(minutes=1)))
+    started = renewalControl(startedSlot)
+    settledOpen = slotFor(url, user)
+    query(url, 'UPDATE payment_slots SET settled_payment_id=%s,settled_at=clock_timestamp() WHERE slot_id=%s',
+          ('pay-' + str(uuid4()), settledOpen))
+    opened = slotFor(url, user)
+    foreign = 'foreign-' + str(uuid4())
+    query(url, 'INSERT INTO "Users"("userId") VALUES(%s)', (foreign,))
+    move = 'UPDATE payment_slot_controls SET operation_revision=operation_revision+1,slot_id=%s WHERE attempt_id=%s'
+    for target, attempt, label in ((opened, future, 'next term not started'), (opened, paidTerm, 'term already paid'),
+                                   (slotFor(url, user, 'pro_term', 'elsewhere'), started, 'not the open term'),
+                                   (slotFor(url, foreign), started, 'another owner'),
+                                   (settledOpen, started, 'settled open term'),
+                                   (slotFor(url, user, 'topup', 'topup'), started, 'another kind')):
+        assertRejected(CONTROL_FROZEN, lambda: query(url, move, (target, attempt)), label)
+    query(url, move, (opened, started))
+    assert control(url, started)['slot_id'] == opened
+    # Never back out of the open term.
+    assertStatementRejected(url, move, (startedSlot, started), CONTROL_FROZEN)
+
+
+def control(url, attemptId):
+    return query(url, 'SELECT * FROM payment_slot_controls WHERE attempt_id=%s', (attemptId,), one=True)
+
+
 def test_trigger_blocks_delete_truncate_and_identity_changes(drafts):
     _, _, user, url = drafts
     other, otherOrder = seedAttempt(drafts, domains=('telecom',))

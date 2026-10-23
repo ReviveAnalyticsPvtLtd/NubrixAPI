@@ -214,6 +214,33 @@ def bindPurchaseControlLocked(cursor, request, intent, slotKey):
          request.purchaseDraftRevision if request.purpose == 'initial_purchase' else None))
 
 
+def adoptStartedTermControlsLocked(cursor, attemptId, slotAttemptIds):
+    """Move the controls of a started, unpaid next term into the open Pro term slot of ``attemptId``.
+
+    A renewal reserved before its term end E was bound to slot ISO(E). Once E passed with no
+    current term it buys the open term (spec 4.1, 5 case 4b), so its controls join the open slot:
+    supersession stays within one slot and a later grant settles one slot instance. The storage
+    guard permits exactly this move (ISO(E) to open, same owner, both unsettled, E <= now).
+    """
+    if not _storagePresent(cursor) or not slotAttemptIds:
+        return
+    cursor.execute('''SELECT s.slot_id FROM public.payment_slot_controls c
+        JOIN public.payment_slots s ON s.slot_id=c.slot_id
+        WHERE c.attempt_id=%s AND s.kind='pro_term' AND s.slot_key='open' AND s.settled_payment_id IS NULL''', (attemptId,))
+    target = cursor.fetchone()
+    if not target:
+        return
+    cursor.execute('''SELECT c.attempt_id FROM public.payment_slot_controls c
+        JOIN public.payment_slots s ON s.slot_id=c.slot_id
+        WHERE c.attempt_id = ANY(%s::uuid[]) AND c.slot_id<>%s AND s.kind='pro_term' AND s.slot_key<>'open'
+          AND s.settled_payment_id IS NULL ORDER BY c.attempt_id FOR UPDATE OF c''',
+        (list(slotAttemptIds), target['slot_id']))
+    for row in cursor.fetchall():
+        cursor.execute('''UPDATE public.payment_slot_controls SET slot_id=%s,
+            operation_revision=operation_revision+1,updated_at=clock_timestamp() WHERE attempt_id=%s''',
+            (target['slot_id'], row['attempt_id']))
+
+
 _LIVE = ('created', 'pending_provider_ack', 'authorized')
 
 
@@ -253,9 +280,8 @@ def retireSupersededAttemptLocked(cursor, attempt, now, replacementInvoiceId=Non
 
 def supersedeAttemptLocked(cursor, attemptId: str, supersededBy: str, now) -> None:
     """Close one attempt in favour of a newer open attempt in the same slot. Runs under the owner lock."""
-    from datetime import timedelta
     from api.services.billing.paymentPolicy import captureWindowMinutes
-    from api.services.billing.paymentSlots import slotKind
+    from api.services.billing.paymentSlots import checkoutTtlSeconds, slotKind, supersededRecoverUntil
     if str(attemptId) == str(supersededBy):
         raise ValueError('PAYMENT_SUPERSESSION_INVALID')
     cursor.execute('''SELECT * FROM public.billing_events WHERE id IN (%s,%s)
@@ -295,11 +321,12 @@ def supersedeAttemptLocked(cursor, attemptId: str, supersededBy: str, now) -> No
             source['user_id'], sourceFrozen.get('purpose'),
             sourceFrozen.get('purchaseDraftRevision') if sourceFrozen.get('purpose') == 'initial_purchase' else None,
             source.get('provider_order_id'), policy))
-    window = timedelta(minutes=int(sourceFrozen.get('captureWindowMinutes') or captureWindowMinutes()))
-    latest = _utc(sourceFrozen.get('providerObservation', {}).get('latestPaymentCreatedAt'))
+    recoverUntil = supersededRecoverUntil(now, _utc(sourceFrozen.get('expiresAt')),
+        _utc(sourceFrozen.get('providerObservation', {}).get('latestPaymentCreatedAt')),
+        int(sourceFrozen.get('captureWindowMinutes') or captureWindowMinutes()), checkoutTtlSeconds())
     cursor.execute('''UPDATE public.payment_slot_controls SET operation_revision=operation_revision+1,
         closed_at=%s,closed_reason='SUPERSEDED',superseded_by=%s,recover_until=%s,updated_at=clock_timestamp()
-        WHERE attempt_id=%s''', (now, supersededBy, (latest or now) + window, attemptId))
+        WHERE attempt_id=%s''', (now, supersededBy, recoverUntil, attemptId))
 
 
 def bindControlledOrderLocked(cursor, attemptId, orderId):

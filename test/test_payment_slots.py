@@ -179,3 +179,31 @@ def test_after_finalizing_the_remaining_payments_decide_again(payments, hash_, e
 def test_pre_rollout_attempts_derive_the_slot_they_were_reserved_in(frozen, attemptedAt, expected):
     from api.services.billing.paymentSlots import attemptSlotKey
     assert attemptSlotKey(frozen, attemptedAt) == expected
+
+
+@pytest.mark.parametrize('key,expected', [
+    ('open', 'open'), ('topup', 'topup'), (None, None),
+    ('current:2026-10-01T12:00:00+00:00', 'current:2026-10-01T12:00:00+00:00'),
+    # The next term has not started: its renewal holds its own slot.
+    ('2026-12-01T12:00:00+00:00', '2026-12-01T12:00:00+00:00'),
+    # Once the next term started with no current term, its renewal buys the open term (spec 4.1, 5 case 4b).
+    ('2026-11-01T12:00:00+00:00', 'open'),
+    ('2026-10-01T12:00:00+00:00', 'open'),
+])
+def test_a_started_next_term_key_belongs_to_the_open_term(key, expected):
+    from api.services.billing.paymentSlots import effectiveSlotKey
+    assert effectiveSlotKey(key, NOW) == expected
+
+
+def test_superseded_scan_covers_every_payment_the_old_checkout_could_still_start():
+    from api.services.billing.paymentSlots import supersededRecoverUntil
+    window = timedelta(minutes=45)
+    assert supersededRecoverUntil(NOW, None, None, 45) == NOW + window
+    # The old Checkout modal stays payable until its own deadline.
+    assert supersededRecoverUntil(NOW, NOW + timedelta(minutes=30), None, 45) == NOW + timedelta(minutes=30) + window
+    assert supersededRecoverUntil(NOW, NOW - timedelta(minutes=5), NOW - timedelta(minutes=40), 45) == NOW + window
+    later = NOW + timedelta(minutes=50)
+    assert supersededRecoverUntil(NOW, NOW + timedelta(minutes=30), later, 45) == later + window
+    # A legacy unbounded deadline: the Checkout modal still times out after the TTL.
+    unbounded = datetime.max.replace(tzinfo=timezone.utc)
+    assert supersededRecoverUntil(NOW, unbounded, None, 45, 1800) == NOW + timedelta(minutes=30) + window

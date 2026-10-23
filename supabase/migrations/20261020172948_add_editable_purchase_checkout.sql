@@ -192,7 +192,16 @@ BEGIN
     RAISE EXCEPTION 'payment owner, purpose, invoice or slot mismatch';
    END IF;
   END IF;
-  IF TG_OP='UPDATE' AND (NEW.slot_id<>OLD.slot_id OR NEW.purpose<>OLD.purpose
+  -- The one permitted slot move: a renewal bound to its next term ISO(E) joins the open Pro term
+  -- once E has passed unpaid (same owner, both slots unsettled), so one slot instance settles.
+  IF TG_OP='UPDATE' AND (NEW.slot_id<>OLD.slot_id AND NOT EXISTS(SELECT 1 FROM public.payment_slots o
+      JOIN public.payment_slots n ON n.slot_id=NEW.slot_id
+      WHERE o.slot_id=OLD.slot_id AND NEW.user_id IS NOT NULL
+        AND o.user_id=NEW.user_id AND n.user_id=NEW.user_id AND o.kind='pro_term' AND n.kind='pro_term'
+        AND o.settled_payment_id IS NULL AND n.settled_payment_id IS NULL AND n.slot_key='open'
+        AND (CASE WHEN o.slot_key ~ '^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9:.]+(Z|[+-][0-9]{2}:[0-9]{2})$'
+                  THEN o.slot_key::timestamptz END) <= clock_timestamp())
+    OR NEW.purpose<>OLD.purpose
     OR NEW.capture_policy<>OLD.capture_policy OR NEW.draft_revision IS DISTINCT FROM OLD.draft_revision
     OR NEW.created_at<>OLD.created_at
     OR (OLD.provider_order_id IS NOT NULL AND NEW.provider_order_id IS DISTINCT FROM OLD.provider_order_id)
