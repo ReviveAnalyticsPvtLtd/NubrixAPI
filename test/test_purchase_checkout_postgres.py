@@ -75,12 +75,29 @@ def test_concurrent_draft_save_has_one_winner_and_no_financial_objects(drafts):
     assert query(url, 'SELECT * FROM "Invoices" WHERE "userId"=%s', (user,)) == []
 
 
+def legacyClient():
+    """A /createSubscription request, which the server accepts only while the editable checkout is off."""
+    from unittest.mock import patch
+    return patch.dict(os.environ, {'SUBSCRIPTION_EDITABLE_CHECKOUT_ENABLED': 'false'})
+
+
+def test_editable_checkout_requires_the_saved_draft_for_initial_purchase(drafts):
+    from api.services.billing.manualBillingContracts import CheckoutRequest
+    _, billing, user, url = drafts
+    before = query(url, 'SELECT count(*) AS n FROM billing_events WHERE user_id=%s', (user,), one=True)['n']
+    with pytest.raises(ValueError, match='PURCHASE_DRAFT_REQUIRED'):
+        billing.reserveCheckout(CheckoutRequest(user, 'initial_purchase', 'monthly_prepaid',
+            {'domains': ['banking']}, 'old-client', expectedCatalogRevision=1))
+    assert query(url, 'SELECT count(*) AS n FROM billing_events WHERE user_id=%s', (user,), one=True)['n'] == before
+
+
 @pytest.mark.parametrize('outcome', ['authorized', 'unknown'])
 def test_unresolved_original_money_does_not_prevent_saving_selection(drafts, outcome):
     from api.services.billing.manualBillingContracts import CheckoutRequest
     repo, billing, user, url = drafts
-    intent = billing.reserveCheckout(CheckoutRequest(user, 'initial_purchase', 'monthly_prepaid',
-        {'domains': ['banking', 'manufacturing']}, expectedCatalogRevision=1))
+    with legacyClient():
+        intent = billing.reserveCheckout(CheckoutRequest(user, 'initial_purchase', 'monthly_prepaid',
+            {'domains': ['banking', 'manufacturing']}, expectedCatalogRevision=1))
     query(url, "UPDATE billing_events SET metadata_json=jsonb_set(metadata_json,'{manualBilling,providerObservation}',%s) WHERE id=%s",
           (Json({'outcome': outcome, 'complete': outcome != 'unknown'}), intent.attemptId))
     initial = repo.readEditor(user)
@@ -89,7 +106,8 @@ def test_unresolved_original_money_does_not_prevent_saving_selection(drafts, out
     repo.saveDraft(user, 0, ['banking'], 'year')
     assert repo.readEditor(user).draft.domains == ('banking',)
     assert query(url, 'SELECT to_jsonb(i) AS row FROM "Invoices" i WHERE id=%s', (intent.invoiceId,), one=True) == before
-    assert not repo.readEditor(user).capabilities.maySubmitLatestDraft
+    # Pay stays offered: the server decides reuse, replace or wait at Pay (spec 4.3), never a capability gate.
+    assert repo.readEditor(user).capabilities.maySubmitLatestDraft
 
 
 @pytest.mark.parametrize('restriction', ['banned', 'erasure', 'paid'])
@@ -105,8 +123,9 @@ def test_restricted_or_current_paid_accounts_cannot_write_drafts(drafts, restric
     else:
         from api.services.billing.manualBillingContracts import CheckoutRequest
         from test.subscriptionRuntimeFixtures import capture
-        capture(billing, billing.reserveCheckout(CheckoutRequest(user, 'initial_purchase', 'monthly_prepaid',
-            {'domains': ['banking']}, expectedCatalogRevision=1)))
+        with legacyClient():
+            capture(billing, billing.reserveCheckout(CheckoutRequest(user, 'initial_purchase', 'monthly_prepaid',
+                {'domains': ['banking']}, expectedCatalogRevision=1)))
     assert not repo.readEditor(user).capabilities.mayEditDraft
     with pytest.raises(ValueError, match='PURCHASE_DRAFT_NOT_ALLOWED'):
         repo.saveDraft(user, 0, ['banking'], 'month')
@@ -173,7 +192,7 @@ def seedAttempt(drafts, purpose='initial_purchase', domains=('banking',), bind=T
     from api.services.billing.manualBillingContracts import CheckoutRequest
     _, billing, user, url = drafts
     # These SQL-level cases insert the control row themselves, with the purpose and slot under test.
-    with patch('api.services.billing.purchaseCheckoutRepository.bindPurchaseControlLocked', lambda *args: None):
+    with patch('api.services.billing.purchaseCheckoutRepository.bindPurchaseControlLocked', lambda *args: None), legacyClient():
         intent = billing.reserveCheckout(CheckoutRequest(user, 'initial_purchase', 'monthly_prepaid',
             {'domains': list(domains)}, expectedCatalogRevision=1))
     order = 'order-' + str(uuid4()) if bind else None

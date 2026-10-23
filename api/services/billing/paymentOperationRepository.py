@@ -1,8 +1,9 @@
-"""Owner-locked persistence for correction refunds and durable recovery scans."""
+"""Owner-locked persistence for full refunds of captured payments that were never granted, any purpose,
+and the refund worker's durable scans. No provider I/O ever happens here, so no lock is held across it."""
 from datetime import timedelta
 from dataclasses import replace
 import os
-from uuid import UUID
+from uuid import UUID, uuid4
 from psycopg2.extras import Json, RealDictCursor
 from api.services.billing.captureRules import REFUND_REASONS
 from api.services.billing.manualBillingRepository import _now, _utc
@@ -16,12 +17,49 @@ def _refundableCaptureLocked(cursor, operation):
     return cursor.fetchone() is not None
 
 
+REFUND_NOTIFICATIONS = {'started': 'payment_refund_started', 'completed': 'payment_refund_completed'}
+
+
+def _recordRefundNotificationLocked(cursor, operationId, milestone):
+    """Commit one customer email intent for a refund milestone (spec 4.7) in the caller's transaction.
+
+    The durable notification bridge delivers it. Its identity is the operation and milestone, so each
+    email is committed exactly once. Content is what the customer needs (amount, currency, reason, start
+    date), never an invoice, attempt, Order, payment or operation identity. A detached (erased) owner is
+    never emailed.
+    """
+    cursor.execute('''SELECT o.*,c.purpose FROM public.payment_operations o
+        JOIN public.payment_slot_controls c ON c.attempt_id=o.attempt_id WHERE o.id=%s''', (operationId,))
+    operation = cursor.fetchone()
+    if not operation or not operation['user_id']:
+        return
+    cursor.execute('SELECT id FROM public.subscriptions WHERE user_id=%s AND is_canonical', (operation['user_id'],))
+    subscription = cursor.fetchone()
+    if not subscription:
+        return
+    startedAt = operation['created_at'].isoformat()
+    metadata = {'amount': operation['amount'], 'currency': operation['currency'], 'reason': operation['reason'],
+                'purpose': operation['purpose'], 'startedAt': startedAt}
+    if milestone == 'completed':
+        metadata['completedAt'] = _now().isoformat()
+    dedupeKey = f"payment_refund:{operation['id']}:{milestone}"
+    intent = {'userId': operation['user_id'], 'subscriptionId': str(subscription['id']),
+              'notificationType': REFUND_NOTIFICATIONS[milestone], 'dedupeKey': dedupeKey,
+              'periodEnd': startedAt, 'metadata': metadata}
+    cursor.execute('''INSERT INTO public.billing_events(id,user_id,subscription_id,event_category,event_type,
+        event_status,idempotency_key,metadata_json,occurred_at)
+        VALUES(%s,%s,%s,'notification','email.billing_intent.committed','COMMITTED',%s,%s,clock_timestamp())
+        ON CONFLICT(idempotency_key) WHERE idempotency_key IS NOT NULL DO NOTHING''',
+        (str(uuid4()), operation['user_id'], subscription['id'], 'notification:' + dedupeKey, Json(intent)))
+
+
 def reserveRefund(cursor, *, attemptId: str, paymentId: str, amount: int, currency: str, reason: str) -> str:
     """Reserve the one full refund of a captured payment that was never granted (spec 4.5).
 
     Runs in the finalization transaction under the owner lock, after the capture is recorded as
     REFUND_RESERVED. Idempotent per provider payment ('payment:refund:<paymentId>'); the refund
-    worker executes it later, never under this lock.
+    worker executes it later, never under this lock. A new reservation commits the customer's
+    'payment_refund_started' email intent in the same transaction.
     """
     if (reason not in REFUND_REASONS or not isinstance(paymentId, str) or not paymentId
             or type(amount) is not int or amount <= 0 or currency not in ('INR', 'USD')):
@@ -58,6 +96,7 @@ def reserveRefund(cursor, *, attemptId: str, paymentId: str, amount: int, curren
         (attempt['user_id'], attemptId, str(attempt['invoice_id']), paymentId, reason, amount, currency,
          'payment:refund:' + paymentId, control['erasure_request_id']))
     operationId = str(cursor.fetchone()['id'])
+    _recordRefundNotificationLocked(cursor, operationId, 'started')
     metadata = attempt['metadata_json'] if isinstance(attempt['metadata_json'], dict) else {}
     if metadata.get('manualBilling', {}).pop('closureReconciledAt', None) is not None:
         cursor.execute('UPDATE public.billing_events SET metadata_json=%s WHERE id=%s', (Json(metadata), attemptId))
@@ -94,14 +133,15 @@ class PaymentOperationRepositoryMixin:
         return cursor.fetchone() is not None
 
     @staticmethod
-    def _purchaseRecoveryReady(cursor):
+    def _payReady(cursor):
+        """Pay needs the editable checkout and a refund worker that is alive (spec 6)."""
         from api.services.billing.purchaseCheckoutService import purchaseActionsReady
         return purchaseActionsReady() and PaymentOperationRepositoryMixin._paymentWorkerFresh(cursor)
 
     def _purchasePresentation(self,cursor,checkout,draft,allowed):
         from api.services.billing.purchaseCheckoutContracts import PurchaseCheckoutCapabilities
         from api.services.billing.purchaseDraftService import editableCheckoutEnabled
-        ready=self._purchaseRecoveryReady(cursor)
+        ready=self._payReady(cursor)
         if checkout:
             cursor.execute("SELECT state FROM public.payment_operations WHERE attempt_id=%s AND kind='refund'",(checkout.attemptId,))
             states={r['state'] for r in cursor.fetchall()}
@@ -220,6 +260,9 @@ class PaymentOperationRepositoryMixin:
                 cursor.execute('''UPDATE public.payment_operations SET state=%s,result=%s,error_code=%s,updated_at=clock_timestamp()
                     WHERE id=%s''',(state,Json({**facts,'checkedAt':_now().isoformat(),'externalOnly':externalOnly}),
                     'PAYMENT_REFUND_FAILED' if state=='needs_attention' and own else None,operationId))
+                if state=='succeeded':
+                    # The provider reports the full amount processed: tell the customer once.
+                    _recordRefundNotificationLocked(cursor,operationId,'completed')
         self._run(operation)
         return self.operationById(operationId)
 

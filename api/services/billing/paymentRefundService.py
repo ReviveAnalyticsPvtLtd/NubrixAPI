@@ -2,17 +2,6 @@
 from api.services.billing.purchaseProvider import purchaseProviderOptions
 
 
-def compensationReady():
-    # Pure configuration/installation check: called under the owner transaction.
-    # Schema and a recent actual worker heartbeat are checked by the repository.
-    from api.services.billing.paymentOperationWorker import HANDLER_VERSION
-    try:
-        purchaseProviderOptions()
-    except (ValueError,TypeError):
-        return False
-    return HANDLER_VERSION == 1
-
-
 class PaymentRefundService:
     def __init__(self, repository, provider):
         self.repository, self.provider = repository, provider

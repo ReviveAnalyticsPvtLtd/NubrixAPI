@@ -109,12 +109,13 @@ def listObligations(repository, limit=100, cursor=None):
                 pages.append(sql.fetchall())
             purchase=[]
             if hasPurchase:
+                # Owed refunds of never-granted captured payments, any purpose; completed refunds drop out.
                 sources=[('payment_operations','id',
-                    "state NOT IN ('succeeded','cancelled')", "'purchase_'||kind")]
+                    "kind='refund' AND state NOT IN ('succeeded','cancelled')", "'payment_refund'")]
                 for table,identity,condition,category in sources:
                     sql.execute(f'SELECT {category} AS category,count(*) AS count FROM public.{table} a WHERE {condition} GROUP BY category')
                     totals.update({r['category']:int(r['count']) for r in sql.fetchall()})
-                    source='purchase_operation'
+                    source='payment_operation'
                     key="'"+source+":'||"+identity+'::text'
                     afterFilter=f' AND (created_at,{key})>(%s,%s)' if after else ''
                     sql.execute(f'''SELECT a.*,{identity} AS id,{category} AS obligation_category FROM public.{table} a
@@ -154,7 +155,7 @@ def listObligations(repository, limit=100, cursor=None):
         category = 'delivery_ambiguous' if row.get('last_error_code') in ('AMBIGUOUS_SEND','AMBIGUOUS_SEND_UNRESOLVED') or (row['status']=='SENDING' and row.get('submission_started_at')) else 'delivery_unresolved'
         project('delivery',row,category,'reconcile_original_tracking_tag' if category=='delivery_ambiguous' else 'dispatch_or_reconcile_original_delivery')
     for source,row in purchase:
-        project(source,row,row['obligation_category'],'reconcile_original_purchase_operation')
+        project(source,row,row['obligation_category'],'reconcile_payment_refund')
         rows[-1].update(state=row.get('state'),
             reasonCode=row.get('error_code'),caseReference=row.get('escalation_reference'))
     from api.services.credits.creditUsageSpool import spoolDirectory

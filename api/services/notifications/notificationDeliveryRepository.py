@@ -35,6 +35,8 @@ _BILLING_NOTIFICATION_TEMPLATE_VERSIONS = {
     "monthly_cancellation_confirmation": "1",
     "subscription_refund_initiated": "1",
     "subscription_refund_processed": "1",
+    "payment_refund_started": "1",
+    "payment_refund_completed": "1",
 }
 
 
@@ -246,8 +248,9 @@ class NotificationDeliveryRepository:
                 submission_started_at = case when %s = 'AMBIGUOUS_SEND'
                     then submission_started_at else null end,
                 last_error_code = %s,
-                -- A payment hold is not a delivery attempt: return the claim's count.
-                attempt_count = case when %s = 'PAYMENT_HOLD' and attempt_count > 0
+                -- A hold (unresolved money, or a template not yet deployed) is not a
+                -- delivery attempt: return the claim's count.
+                attempt_count = case when %s in ('PAYMENT_HOLD', 'TEMPLATE_PENDING') and attempt_count > 0
                     then attempt_count - 1 else attempt_count end,
                 next_attempt_at = %s,
                 next_reconcile_at = %s,

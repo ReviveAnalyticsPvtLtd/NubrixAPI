@@ -1,7 +1,8 @@
-"""Bounded recovery of original identities even while public rollout is disabled."""
-from api.services.billing.manualBillingRepository import _now
+"""Minute refund worker: executes every reserved full refund, any purpose, over a fixed keyset scan.
 
-HANDLER_VERSION = 1
+There is no runtime gate; it always runs once deployed and records the heartbeat Pay requires.
+"""
+from api.services.billing.manualBillingRepository import _now
 
 
 class PaymentOperationWorker:

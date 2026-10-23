@@ -6,13 +6,10 @@ from api.services.billing.purchaseDraftService import editableCheckoutEnabled
 
 
 def purchaseActionsReady():
-    if not editableCheckoutEnabled() or os.environ.get('SUBSCRIPTION_CANCELLATION_COMPENSATION_ENABLED', 'false').lower() != 'true':
-        return False
-    try:
-        from api.services.billing.paymentRefundService import compensationReady
-    except ImportError:
-        return False
-    return bool(compensationReady())
+    """Saved-draft Pay is offered when the editable checkout is enabled. Money rules have no runtime
+    gate (spec 6): the refund worker always runs once deployed, and Pay separately requires its fresh
+    heartbeat, so no new Order opens while nobody can refund."""
+    return editableCheckoutEnabled()
 
 
 def requirePurchaseActions():

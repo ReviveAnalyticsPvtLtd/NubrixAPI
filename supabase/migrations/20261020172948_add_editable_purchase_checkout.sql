@@ -1,4 +1,4 @@
--- Additive purpose-neutral payment storage only. Handlers remain rollout-gated.
+-- Additive purpose-neutral payment storage. No runtime gate: the refund worker always runs once deployed.
 SET LOCAL lock_timeout = '5s';
 CREATE SCHEMA IF NOT EXISTS private;
 
@@ -295,9 +295,19 @@ DO $$ DECLARE name text; BEGIN
   ALTER TABLE private.retained_user_records ADD CONSTRAINT retained_user_records_source_table_check
    CHECK(source_table IN ('billing_events','Invoices','payment_slots','payment_slot_controls','payment_operations'));
  END IF;
+ -- The two refund emails join the durable notification pipeline (existing types unchanged).
+ IF to_regclass('public.notification_deliveries') IS NOT NULL THEN
+  ALTER TABLE public.notification_deliveries DROP CONSTRAINT IF EXISTS notification_deliveries_type_chk;
+  ALTER TABLE public.notification_deliveries ADD CONSTRAINT notification_deliveries_type_chk
+   CHECK (notification_type IN ('trial_expiry_warning','annual_renewal_upcoming',
+    'monthly_renewal_ready','monthly_renewal_reminder','monthly_subscription_expired',
+    'payment_receipt','monthly_cancellation_confirmation',
+    'subscription_refund_initiated','subscription_refund_processed',
+    'payment_refund_started','payment_refund_completed'));
+ END IF;
 END $$;
 
 COMMENT ON TABLE public.subscription_purchase_drafts IS 'Mutable owned selection only; erased with account; no price, contact or entitlement.';
 COMMENT ON TABLE public.payment_slots IS 'Retained purchase slots for every purpose. At most one unsettled slot per owner, kind and key.';
-COMMENT ON TABLE public.payment_slot_controls IS 'Retained per-attempt payment controls for every purpose. Handlers remain rollout-gated.';
-COMMENT ON TABLE public.payment_operations IS 'Retained full-refund operations. Unresolved operations block final erasure. Handlers remain rollout-gated.';
+COMMENT ON TABLE public.payment_slot_controls IS 'Retained per-attempt payment controls for every purpose.';
+COMMENT ON TABLE public.payment_operations IS 'Retained full refunds of never-granted captured payments, any purpose. Unresolved operations block final erasure. The refund worker always runs once deployed.';

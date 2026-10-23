@@ -1,6 +1,8 @@
-"""Real SQL full refund of a captured payment that was never granted, with a synthetic payment/refund boundary.
+"""Real SQL full refund of a captured payment that was never granted, for every purpose, with a synthetic
+payment/refund boundary.
 
-Finalization reserves the refund (spec 4.4/4.5); these cases drive its execution, history checks and retries.
+Finalization reserves the refund (spec 4.4/4.5); these cases drive its execution, history checks, retries,
+escalation and the two customer emails. There is no runtime gate: the refund worker always runs once deployed.
 """
 from dataclasses import replace
 from datetime import datetime, timezone
@@ -76,20 +78,85 @@ def closedCapture(drafts, monkeypatch, **selection):
     result = repo.finalizeCapturedPayment(evidence)
     assert result.state == 'refund_pending' and not result.finalized
     name = 'api.services.billing.paymentRefundService'
-    assert importlib.util.find_spec(name), 'Dedicated full compensation handler is required'
+    assert importlib.util.find_spec(name), 'Dedicated full refund handler is required'
     service = importlib.import_module(name).PaymentRefundService(repo, provider)
     return repo, provider, intent, evidence, service
 
 
 def reserved(url, evidence):
     """The one refund operation finalization reserved for the payment."""
-    rows = query(url, "SELECT * FROM payment_operations WHERE provider_payment_id=%s AND kind='refund'",
-                 (evidence.providerPaymentId,))
+    return reservedFor(url, evidence.providerPaymentId)
+
+
+def reservedFor(url, paymentId):
+    rows = query(url, "SELECT * FROM payment_operations WHERE provider_payment_id=%s AND kind='refund'", (paymentId,))
     assert len(rows) == 1
     return dict(rows[0])
 
 
-def test_duplicate_late_capture_reserves_one_full_compensation(drafts, monkeypatch):
+def refundsVia(provider):
+    """The same synthetic payments and Orders, able to list and send refunds."""
+    refunds = SyntheticRefundProvider()
+    refunds.orders, refunds.payments = provider.orders, provider.payments
+    return refunds
+
+
+def duplicateCapture(drafts, monkeypatch, purpose, currency='INR', interval='month'):
+    """The first payment on ``purpose``'s Order is granted; a second payment on that same Order is a duplicate."""
+    from test.test_payment_replacement_postgres import monthlyRenewalInvoice, annualRenewalInvoice, purposePay
+    from test.test_capture_finalization_postgres import providerPayment, finalize
+    repo, original, initial, _ = controlledPurchase(drafts, monkeypatch, ('banking',), interval, currency)
+    provider = refundsVia(original)
+    mode = 'monthly_prepaid' if interval == 'month' else 'annual_prepaid'
+    intent = initial
+    if purpose != 'initial_purchase':
+        assert finalize(repo, initial, providerPayment(provider, initial, 'captured')).finalized
+        payload = {'renewal': lambda: {'invoiceId': str((monthlyRenewalInvoice if interval == 'month'
+                                                         else annualRenewalInvoice)(repo, initial.userId)['id'])},
+                   'expert_addition': lambda: {'domains': ['telecom']},
+                   'topup': lambda: {'packId': 'medium'}}[purpose]()
+        intent = purposePay(repo, provider, initial.userId, purpose, mode, payload)
+        assert intent.purpose == purpose and intent.currency == currency
+    assert finalize(repo, intent, providerPayment(provider, intent, 'captured')).finalized
+    second = providerPayment(provider, intent, 'captured')
+    second['amount_refunded'] = provider.payments[second['id']]['amount_refunded'] = 0  # as the provider reports it
+    assert finalize(repo, intent, second).state == 'refund_pending'
+    return repo, provider, intent, second['id']
+
+
+def refundIntents(url, operationId):
+    """Committed customer email intents of one refund operation, by milestone."""
+    rows = query(url, """SELECT idempotency_key,user_id,metadata_json FROM billing_events
+        WHERE event_type='email.billing_intent.committed' AND idempotency_key LIKE %s ORDER BY idempotency_key""",
+        ('notification:payment_refund:' + str(operationId) + ':%',))
+    return {row['idempotency_key'].rsplit(':', 1)[1]: row for row in rows}
+
+
+@pytest.mark.parametrize('purpose', ['initial_purchase', 'renewal', 'expert_addition', 'topup'])
+@pytest.mark.parametrize('interval', ['month', 'year'])
+@pytest.mark.parametrize('currency', ['INR', 'USD'])
+def test_refund_matrix(drafts, monkeypatch, currency, interval, purpose):
+    from api.services.billing.paymentRefundService import PaymentRefundService
+    url = drafts[3]
+    repo, provider, intent, paymentId = duplicateCapture(drafts, monkeypatch, purpose, currency, interval)
+    op = reservedFor(url, paymentId)
+    invoice = query(url, 'SELECT amount_before_tax,tax_amount,total_amount,currency FROM "Invoices" WHERE id=%s',
+                    (intent.invoiceId,), one=True)
+    # The full captured amount, tax included, in the payment's own currency.
+    assert (op['kind'], op['reason'], op['currency'], invoice['currency']) == ('refund', 'duplicate', currency, currency)
+    assert op['amount'] == intent.amount == invoice['total_amount'] == invoice['amount_before_tax'] + invoice['tax_amount']
+    provider.refundStatus = 'processed'
+    service = PaymentRefundService(repo, provider)
+    assert service.execute(str(op['id']))['state'] == 'succeeded'
+    service.execute(str(op['id']))
+    service.recover(str(op['id']))
+    assert [(call[0], call[1]['amount']) for call in provider.refundCalls] == [(paymentId, intent.amount)]
+    assert [r['provider_payment_id'] for r in query(url, 'SELECT provider_payment_id FROM payment_operations WHERE user_id=%s',
+                                                     (intent.userId,))] == [paymentId]
+    assert set(refundIntents(url, op['id'])) == {'started', 'completed'}
+
+
+def test_late_capture_reserves_one_full_refund(drafts, monkeypatch):
     repo, provider, intent, evidence, service = closedCapture(drafts, monkeypatch)
     first = reserved(drafts[3], evidence)
     replayed = repo.finalizeCapturedPayment(replace(evidence, provenCaptureAt=evidence.observedAt, timingVerified=True))
@@ -132,7 +199,7 @@ def test_complete_refund_history_prevents_duplicate_customer_returns(drafts, mon
 
 
 @pytest.mark.parametrize('fault', ['before','after'])
-def test_refund_unknown_send_is_lookup_only_even_when_gates_disable(drafts, monkeypatch, fault):
+def test_unknown_send_lookup_only(drafts, monkeypatch, fault):
     repo, provider, intent, evidence, service = closedCapture(drafts, monkeypatch)
     op = reserved(drafts[3], evidence)
     provider.refundFault = fault
@@ -157,7 +224,7 @@ def test_inconsistent_refund_history_holds_liability_and_escalates_once(drafts, 
 
 
 @pytest.mark.parametrize('mutation', ['granted', 'other_attempt', 'amount', 'currency', 'reason', 'owner', 'order'])
-def test_unrelated_or_invalid_capture_has_no_compensation_authority(drafts, monkeypatch, mutation):
+def test_unrelated_or_invalid_capture_has_no_refund_authority(drafts, monkeypatch, mutation):
     import psycopg2
     from psycopg2.extras import RealDictCursor
     from api.services.billing.paymentOperationRepository import reserveRefund
@@ -219,7 +286,7 @@ def test_verified_late_capture_transport_reserves_and_worker_completes_after_tab
     assert len(provider.refundCalls)==1
 
 
-def test_late_capture_after_erasure_refunds_through_retained_authority_without_recreating_account(drafts,monkeypatch):
+def test_erased_owner_refund_uses_retained_authority(drafts,monkeypatch):
     from test.test_subscription_erasure_postgres import runErasure
     from api.services.billing.manualBillingContracts import VerifiedPaymentEvidence
     from api.services.billing.manualBillingRepository import _now
@@ -249,6 +316,7 @@ def test_late_capture_after_erasure_refunds_through_retained_authority_without_r
     payload={'payload':{'refund':{'entity':refund}}}
     linked=query(drafts[3],'SELECT private.erasure_request_for_webhook(NULL,%s) AS request',(Json(payload),),one=True)
     assert str(linked['request'])==request
+    assert refundIntents(drafts[3],op['id'])=={}  # an erased account is never emailed
 
 
 def test_obligation_report_exposes_operation_and_one_actionable_case(drafts,monkeypatch):
@@ -259,22 +327,31 @@ def test_obligation_report_exposes_operation_and_one_actionable_case(drafts,monk
     report=listObligations(repo,limit=500)
     assert report['available']
     items=[r for r in report['items'] if r['id']==str(op['id'])]
-    assert len(items)==1 and items[0]['category']=='purchase_refund'
+    assert len(items)==1 and items[0]['category']=='payment_refund'
     assert items[0]['caseReference']=='refund:'+str(op['id'])
 
 
-def test_worker_backoff_and_escalation_never_release_liability(drafts,monkeypatch):
+def test_backoff_and_single_escalation(drafts,monkeypatch):
     from datetime import timedelta
     repo,provider,intent,evidence,service=closedCapture(drafts,monkeypatch)
     op=reserved(drafts[3], evidence)
+    key=str(op['id'])
+    early=op['created_at']+timedelta(seconds=1799)
+    assert not repo.scheduleRefundRetry(key,early)  # unresolved for under 30 minutes: no case yet
+    assert repo.operationById(key)['next_retry_at']==early+timedelta(seconds=30)
     when=op['created_at']+timedelta(seconds=1801)
-    assert repo.scheduleRefundRetry(str(op['id']),when)
-    updated=repo.operationById(str(op['id']))
-    assert updated['retry_count']==1 and updated['next_retry_at']==when+timedelta(seconds=30)
-    assert not repo.scheduleRefundRetry(str(op['id']),when)
-    updated=repo.operationById(str(op['id']))
-    assert updated['retry_count']==2 and updated['next_retry_at']==when+timedelta(seconds=60)
-    assert updated['state']=='queued'
+    escalated=[]
+    for retry in range(1,10):
+        escalated.append(repo.scheduleRefundRetry(key,when))
+        updated=repo.operationById(key)
+        assert updated['retry_count']==retry+1
+        assert updated['next_retry_at']==when+timedelta(seconds=min(30*2**min(retry,7),3600))
+    assert escalated==[True]+[False]*8
+    events=query(drafts[3],"SELECT metadata_json FROM billing_events WHERE event_type='payment.refund_escalated' AND user_id=%s",
+                 (intent.userId,))
+    assert [e['metadata_json']['reasonCode'] for e in events]==['PAYMENT_REFUND_OVERDUE']
+    updated=repo.operationById(key)
+    assert updated['state']=='queued' and updated['escalation_reference']=='refund:'+key
     assert repo.readEditor(intent.userId).capabilities.maySubmitLatestDraft
 
 
@@ -310,7 +387,7 @@ def test_concurrent_refund_executors_send_once_without_holding_owner_lock(drafts
     assert len(provider.refundCalls)==1
 
 
-def test_sql_keyset_scan_pages_1001_rows_with_fixed_highwater(drafts,monkeypatch):
+def test_keyset_scan_past_1000_rows(drafts,monkeypatch):
     from uuid import UUID
     repo,provider,intent,evidence,service=closedCapture(drafts,monkeypatch)
     # Inventory-only phantoms: each still needs its ungranted recorded capture (storage guard).
@@ -382,7 +459,7 @@ def test_broken_storage_protection_disables_purchase_actions(drafts,monkeypatch,
     assert repo.readEditor(intent.userId).capabilities.maySubmitLatestDraft
 
 
-def test_completed_correction_is_no_longer_reported_as_a_financial_obligation(drafts,monkeypatch):
+def test_completed_refund_is_no_longer_reported_as_a_financial_obligation(drafts,monkeypatch):
     from api.services.billing.manualObligationReport import listObligations
     repo,provider,intent,evidence,service=closedCapture(drafts,monkeypatch)
     provider.refundStatus='processed'
@@ -397,6 +474,10 @@ def test_completed_correction_is_no_longer_reported_as_a_financial_obligation(dr
         cursor=report['nextCursor']
         if not cursor:
             break
+    # The two refund emails wait for the notification bridge; they are messages, not money owed.
+    emails=[row for row in unresolved if row['category'].startswith('notification')]
+    assert sorted(row['category'] for row in emails)==['notification_unbridged']*2
+    unresolved=[row for row in unresolved if row not in emails]
     # The returned money is settled. Only attempt-level facts remain: the live replacement and the
     # superseded Order, which stays scanned until its capture window passes.
     assert not [row for row in unresolved if row['providerPaymentId']==evidence.providerPaymentId or row['id']==str(op['id'])]
@@ -417,11 +498,14 @@ def test_failed_provider_refund_stays_owed_and_creates_one_case(drafts,monkeypat
     assert len(provider.refundCalls)==1
 
 
-def test_worker_retries_only_a_verified_terminal_failed_refund_with_new_submission_identity(drafts,monkeypatch):
+@pytest.mark.parametrize('purpose',['initial_purchase','expert_addition'])
+def test_failed_refund_retries_new_submission_key(drafts,monkeypatch,purpose):
     from datetime import timedelta
     from api.services.billing.paymentOperationWorker import PaymentOperationWorker
-    repo,provider,intent,evidence,service=closedCapture(drafts,monkeypatch)
-    op=reserved(drafts[3], evidence)
+    from api.services.billing.paymentRefundService import PaymentRefundService
+    repo,provider,intent,paymentId=duplicateCapture(drafts,monkeypatch,purpose)
+    service=PaymentRefundService(repo,provider)
+    op=reservedFor(drafts[3],paymentId)
     provider.refundStatus='failed'
     service.execute(str(op['id']))
     worker=PaymentOperationWorker(repo,provider)
@@ -431,7 +515,8 @@ def test_worker_retries_only_a_verified_terminal_failed_refund_with_new_submissi
     worker.execute(op['created_at']+timedelta(seconds=92))
     assert repo.operationById(str(op['id']))['state']=='succeeded'
     assert len(provider.refundCalls)==2
-    assert provider.refundCalls[0][2]['headers']!=provider.refundCalls[1][2]['headers']
+    keys=[call[2]['headers']['X-Refund-Idempotency'] for call in provider.refundCalls]
+    assert keys[0]!=keys[1] and [call[1]['notes']['purchaseSubmissionKey'] for call in provider.refundCalls]==keys
     assert all(call[1]['amount']==intent.amount for call in provider.refundCalls)
 
 
@@ -480,7 +565,7 @@ def test_provider_internal_retries_cannot_bypass_durable_refund_submission(draft
 @pytest.mark.parametrize('phase',['dual','v2'])
 @pytest.mark.parametrize('currency',['INR','USD'])
 @pytest.mark.parametrize('interval',['month','year'])
-def test_full_original_currency_correction_in_each_supported_phase_and_interval(drafts,monkeypatch,phase,currency,interval):
+def test_full_original_currency_refund_in_each_supported_phase_and_interval(drafts,monkeypatch,phase,currency,interval):
     monkeypatch.setenv('SUBSCRIPTION_MODEL_PHASE',phase)
     repo,provider,intent,evidence,service=closedCapture(drafts,monkeypatch,currency=currency,interval=interval)
     provider.refundStatus='processed'
@@ -490,7 +575,7 @@ def test_full_original_currency_correction_in_each_supported_phase_and_interval(
     assert not repo.getCoverageSnapshot(intent.userId).accessAllowed
 
 
-def test_corrected_provider_configuration_can_resume_a_never_submitted_correction(drafts,monkeypatch):
+def test_corrected_provider_configuration_can_resume_a_never_submitted_refund(drafts,monkeypatch):
     repo,provider,intent,evidence,service=closedCapture(drafts,monkeypatch)
     op=reserved(drafts[3], evidence)
     provider.retry_enabled=True
@@ -503,7 +588,7 @@ def test_corrected_provider_configuration_can_resume_a_never_submitted_correctio
     assert len(provider.refundCalls)==1
 
 
-def test_external_pending_refund_must_finish_failing_before_remaining_correction_can_submit(drafts,monkeypatch):
+def test_external_pending_refund_must_finish_failing_before_the_remaining_refund_can_submit(drafts,monkeypatch):
     repo,provider,intent,evidence,service=closedCapture(drafts,monkeypatch)
     pending=provider.externalRefund(evidence.providerPaymentId,100,'pending')
     op=reserved(drafts[3], evidence)
@@ -587,7 +672,7 @@ def test_replacement_late_capture_after_erasure_preserves_slot_ownership(drafts,
 
 
 @pytest.mark.parametrize('actual,expected',[('pending','submitted'),('processed','succeeded'),('failed','needs_attention')])
-def test_refund_webhook_uses_provider_truth_for_machine_correction_without_resubmission(drafts,monkeypatch,actual,expected):
+def test_refund_webhook_uses_provider_truth_without_resubmission(drafts,monkeypatch,actual,expected):
     from api.services.webhookService import WebhookService
     from api.services.subscriptions.subscriptionService import subscriptionService
     repo,provider,intent,evidence,service=closedCapture(drafts,monkeypatch)
@@ -610,3 +695,93 @@ def test_refund_webhook_uses_provider_truth_for_machine_correction_without_resub
         assert not any(r.get('status')=='processed' for r in emitted)
     assert len(provider.refundCalls)==1
     assert not repo.getCoverageSnapshot(intent.userId).accessAllowed
+
+
+@pytest.mark.parametrize('purpose',['renewal','topup'])
+def test_external_partial_refund_refunds_remainder(drafts,monkeypatch,purpose):
+    from api.services.billing.paymentRefundService import PaymentRefundService
+    repo,provider,intent,paymentId=duplicateCapture(drafts,monkeypatch,purpose)
+    provider.externalRefund(paymentId,100,'processed')  # someone returned part of it in the dashboard
+    provider.refundStatus='processed'
+    op=reservedFor(drafts[3],paymentId)
+    service=PaymentRefundService(repo,provider)
+    assert service.execute(str(op['id']))['state']=='succeeded'
+    service.execute(str(op['id']))
+    assert [call[1]['amount'] for call in provider.refundCalls]==[intent.amount-100]
+
+
+def test_refund_does_not_need_compensation_flag(drafts,monkeypatch):
+    from pathlib import Path
+    from api.services.billing.purchaseCheckoutService import purchaseActionsReady as actionsReady
+    from api.services.billing.paymentOperationWorker import PaymentOperationWorker
+    flag='SUBSCRIPTION_CANCELLATION_'+'COMPENSATION_ENABLED'
+    monkeypatch.delenv(flag,raising=False)
+    repo,provider,intent,evidence,service=closedCapture(drafts,monkeypatch)
+    # The real readiness, not the fixture's stand-in: only the editable checkout flag and a fresh worker.
+    monkeypatch.setattr('api.services.billing.purchaseCheckoutService.purchaseActionsReady',actionsReady)
+    op=reserved(drafts[3],evidence)
+    provider.refundStatus='processed'
+    PaymentOperationWorker(repo,provider).execute()
+    assert repo.operationById(str(op['id']))['state']=='succeeded' and len(provider.refundCalls)==1
+    assert actionsReady() and repo.readEditor(intent.userId).capabilities.maySubmitLatestDraft
+    monkeypatch.setenv(flag,'false')
+    assert actionsReady()
+    monkeypatch.delenv('SUBSCRIPTION_EDITABLE_CHECKOUT_ENABLED')
+    assert not actionsReady()
+    root=Path(__file__).resolve().parents[1]
+    assert not [str(path) for folder in ('api','nubrix') for path in (root/folder).rglob('*.py')
+                if flag in path.read_text(encoding='utf-8')]
+
+
+def test_refund_notifications_enqueued_once(drafts,monkeypatch):
+    import json
+    import psycopg2
+    from api.services.notifications.notificationDeliveryRepository import NotificationDeliveryRepository
+    from api.services.subscriptions.paymentValidationService import parseUtc
+    url=drafts[3]
+    repo,provider,intent,evidence,service=closedCapture(drafts,monkeypatch)
+    op=reserved(url,evidence)
+    key=str(op['id'])
+    repo.finalizeCapturedPayment(evidence)  # a replayed finalization reserves nothing new
+    assert set(refundIntents(url,key))=={'started'}
+    service.execute(key)  # submitted, not yet processed by the provider
+    assert repo.operationById(key)['state']=='submitted' and set(refundIntents(url,key))=={'started'}
+    refund=next(iter(provider.refunds.values()))
+    refund['status']='processed'
+    provider.payments[evidence.providerPaymentId]['amount_refunded']=intent.amount
+    for _ in range(2):
+        service.recover(key)
+        service.execute(key)
+    assert repo.operationById(key)['state']=='succeeded'
+    intents=refundIntents(url,key)
+    assert set(intents)=={'started','completed'}
+    hidden={intent.invoiceId,intent.attemptId,intent.razorpayOrderId,evidence.providerPaymentId,key}
+    for milestone,row in intents.items():
+        committed=row['metadata_json']
+        assert row['user_id']==intent.userId and committed['userId']==intent.userId
+        assert committed['notificationType']=='payment_refund_'+milestone
+        assert committed['dedupeKey']=='payment_refund:'+key+':'+milestone
+        facts=committed['metadata']
+        assert (facts['amount'],facts['currency'],facts['reason'])==(intent.amount,'INR','paid_after_close')
+        assert parseUtc(facts['startedAt'])==op['created_at']
+        # Customer-facing facts only: no invoice, attempt, Order, payment or operation identity.
+        assert not [identity for identity in hidden if identity in json.dumps(facts)]
+    assert 'completedAt' in intents['completed']['metadata_json']['metadata']
+    # The durable delivery pipeline accepts both types once and holds them until their template ships.
+    deliveries=NotificationDeliveryRepository(lambda: psycopg2.connect(url))
+    created=[]
+    for _ in range(2):
+        for row in intents.values():
+            committed=row['metadata_json']
+            delivery,isNew=deliveries.enqueueBillingNotification(userId=committed['userId'],
+                subscriptionId=committed['subscriptionId'],notificationType=committed['notificationType'],
+                dedupeKey=committed['dedupeKey'],periodEnd=committed['periodEnd'],metadata=committed['metadata'])
+            created.append(isNew)
+    assert created==[True,True,False,False]
+    claimed=[d for d in deliveries.claimDue('refund-email-test',limit=50) if d['user_id']==intent.userId]
+    assert sorted(d['notification_type'] for d in claimed)==['payment_refund_completed','payment_refund_started']
+    for delivery in claimed:
+        assert deliveries.scheduleRetry(str(delivery['id']),'refund-email-test','TEMPLATE_PENDING',
+            delivery['created_at'].isoformat(),None,payloadVersion=delivery['payload_version'])
+    held=query(url,'SELECT status,attempt_count,last_error_code FROM notification_deliveries WHERE user_id=%s',(intent.userId,))
+    assert [(h['status'],h['attempt_count'],h['last_error_code']) for h in held]==[('RETRY_PENDING',0,'TEMPLATE_PENDING')]*2

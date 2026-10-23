@@ -148,6 +148,8 @@ def test_no_due_today_or_period_start_email_types_exist():
         "monthly_cancellation_confirmation",
         "subscription_refund_initiated",
         "subscription_refund_processed",
+        "payment_refund_started",
+        "payment_refund_completed",
     }
 
 

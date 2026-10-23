@@ -56,6 +56,8 @@ def test_template_versions_cover_all_supported_billing_types():
         "monthly_cancellation_confirmation",
         "subscription_refund_initiated",
         "subscription_refund_processed",
+        "payment_refund_started",
+        "payment_refund_completed",
     }
 
 

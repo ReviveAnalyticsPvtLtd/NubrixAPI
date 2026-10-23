@@ -238,6 +238,19 @@ def test_heldBillingSolicitationIsRescheduledNotCancelled():
     assert len(repository.retries) == 1 and repository.retries[0][2] == "PAYMENT_HOLD"
 
 
+def test_refundEmailIsHeldUntilItsTemplateShipsWithoutSpendingAnAttempt():
+    for notificationType in ("payment_refund_started", "payment_refund_completed"):
+        delivery = _delivery(notification_type=notificationType, metadata_json={
+            "amount": 472000, "currency": "INR", "reason": "duplicate", "startedAt": "2026-09-16T01:00:00+00:00"})
+        repository = FakeRepository([delivery])
+        edge = FakeEdgeClient([])
+        service = _service(repository, edge, subscriptions=[_subscription(status="expired", billing_mode="monthly_prepaid")])
+        result = service.dispatchBatch("worker-a")
+        assert edge.payloads == [] and repository.terminals == []
+        assert result["cancelled"] == 0 and result["failed"] == 0 and result["errors"] == 0
+        assert len(repository.retries) == 1 and repository.retries[0][2] == "TEMPLATE_PENDING"
+
+
 def test_committedBillingReceiptDispatchesEvenAfterSubscriptionExpires():
     delivery = _delivery(notification_type="payment_receipt", metadata_json={"paymentId":"pay_123","amount":3000,"currency":"INR"})
     repository = FakeRepository([delivery])

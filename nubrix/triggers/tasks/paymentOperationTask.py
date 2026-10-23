@@ -1,4 +1,4 @@
-"""Recover only durable original purchase identities; no recurring payments."""
+"""Every minute: execute reserved full refunds of captured payments that were never granted."""
 
 
 class PaymentOperationTask:

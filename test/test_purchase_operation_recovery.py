@@ -30,20 +30,20 @@ def test_worker_scans_past_1000_and_does_not_chase_new_highwater_rows():
     assert result == {'checked':1001,'resolved':1001,'noProgress':0,'errors':0,'escalated':0}
 
 
-def test_readiness_depends_only_on_handler_and_valid_provider_timeout(monkeypatch):
-    name = 'api.services.billing.paymentRefundService'
-    assert importlib.util.find_spec(name), 'Compensation readiness must be explicit'
-    module = importlib.import_module(name)
-    monkeypatch.delenv('PURCHASE_PROVIDER_TIMEOUT_SECONDS',raising=False)
-    assert module.compensationReady()
-    monkeypatch.setenv('PURCHASE_PROVIDER_TIMEOUT_SECONDS','0')
-    assert not module.compensationReady()
+RETIRED_FLAG = 'SUBSCRIPTION_CANCELLATION_' + 'COMPENSATION_ENABLED'
+
+
+def test_refund_engine_has_no_runtime_gate():
+    module = importlib.import_module('api.services.billing.paymentRefundService')
+    assert not hasattr(module, 'compensationReady')
+    worker = importlib.import_module('api.services.billing.paymentOperationWorker')
+    assert not hasattr(worker, 'HANDLER_VERSION')
 
 
 def test_submit_route_fails_closed_before_provider_io(checkout_client, monkeypatch):
     client, provider, path = checkout_client
-    monkeypatch.setenv('SUBSCRIPTION_EDITABLE_CHECKOUT_ENABLED', 'true')
-    monkeypatch.delenv('SUBSCRIPTION_CANCELLATION_COMPENSATION_ENABLED', raising=False)
+    monkeypatch.delenv('SUBSCRIPTION_EDITABLE_CHECKOUT_ENABLED', raising=False)
+    monkeypatch.setenv(RETIRED_FLAG, 'true')
     before = counts(path)
     response = client.post('/purchase-draft/checkout', headers={'Idempotency-Key': 'pay'}, json={
         'draftRevision': 1, 'contact': '', 'pricingContext': 'unused', 'expectedCatalogRevision': 1})
@@ -51,11 +51,13 @@ def test_submit_route_fails_closed_before_provider_io(checkout_client, monkeypat
     assert counts(path) == before and not provider.order.createdPayloads
 
 
-def test_purchase_actions_need_both_flags_and_a_valid_provider_timeout(monkeypatch):
+def test_purchase_actions_follow_only_the_editable_checkout_flag(monkeypatch):
     module = importlib.import_module('api.services.billing.purchaseCheckoutService')
     monkeypatch.setenv('SUBSCRIPTION_EDITABLE_CHECKOUT_ENABLED', 'true')
-    monkeypatch.delenv('SUBSCRIPTION_CANCELLATION_COMPENSATION_ENABLED', raising=False)
-    assert module.purchaseActionsReady() is False
-    monkeypatch.setenv('SUBSCRIPTION_CANCELLATION_COMPENSATION_ENABLED', 'true')
-    monkeypatch.setenv('PURCHASE_PROVIDER_TIMEOUT_SECONDS', '0')
+    monkeypatch.delenv(RETIRED_FLAG, raising=False)
+    assert module.purchaseActionsReady() is True
+    monkeypatch.setenv(RETIRED_FLAG, 'false')
+    assert module.purchaseActionsReady() is True
+    monkeypatch.delenv('SUBSCRIPTION_EDITABLE_CHECKOUT_ENABLED')
+    monkeypatch.setenv(RETIRED_FLAG, 'true')
     assert module.purchaseActionsReady() is False

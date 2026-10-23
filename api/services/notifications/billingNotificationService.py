@@ -11,6 +11,7 @@ sweep date — so repricing/resume never duplicate a delivered milestone.
 
 __all__ = [
     "SUPPORTED_BILLING_NOTIFICATION_TYPES",
+    "BILLING_TEMPLATES_PENDING",
     "buildBillingNotificationIntent",
     "isBillingNotificationEligible",
     "enqueueBillingIntent",
@@ -31,7 +32,16 @@ SUPPORTED_BILLING_NOTIFICATION_TYPES = {
     "monthly_cancellation_confirmation",
     "subscription_refund_initiated",
     "subscription_refund_processed",
+    "payment_refund_started",
+    "payment_refund_completed",
 }
+
+# Registered types whose billingEmail template is not deployed yet: their deliveries are
+# durably queued and held (never sent, never failed) until the template ships.
+BILLING_TEMPLATES_PENDING = frozenset({
+    "payment_refund_started",
+    "payment_refund_completed",
+})
 
 _SOLICITATION_TYPES = {
     "annual_renewal_upcoming",
