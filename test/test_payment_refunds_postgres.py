@@ -697,6 +697,78 @@ def test_refund_webhook_uses_provider_truth_without_resubmission(drafts,monkeypa
     assert not repo.getCoverageSnapshot(intent.userId).accessAllowed
 
 
+@pytest.mark.parametrize('kind,status,expected', [
+    ('created', 'pending', 'submitted'), ('processed', 'processed', 'succeeded'),
+    ('failed', 'failed', 'needs_attention')])
+def test_refund_webhook_with_operation_note_never_claws_back(drafts, monkeypatch, kind, status, expected):
+    from api.services.billing.paymentRefundService import PaymentRefundService
+    from api.services.webhookService import WebhookService, EVENT_HANDLERS
+    from api.services.subscriptions.subscriptionService import subscriptionService
+    repo, provider, intent, paymentId = duplicateCapture(drafts, monkeypatch, 'topup')
+    op = reservedFor(drafts[3], paymentId)
+    PaymentRefundService(repo, provider).execute(str(op['id']))
+    refund = next(iter(provider.refunds.values()))
+    refund['status'] = status
+    provider.payments[paymentId]['amount_refunded'] = intent.amount if status == 'processed' else 0
+    monkeypatch.setattr('api.services.billing.purchaseCheckoutRepository.getPurchaseCheckoutRepository', lambda: repo)
+    monkeypatch.setattr(subscriptionService, 'razorpayClient', provider)
+    webhook = WebhookService.__new__(WebhookService)
+    webhook._auditLog = lambda *args, **kwargs: None
+    getattr(webhook, EVENT_HANDLERS['refund.' + kind])({'payload': {'refund': {'entity': dict(refund)}}})
+    assert repo.operationById(str(op['id']))['state'] == expected
+    balance = query(drafts[3], 'SELECT topup_tokens FROM credit_balances WHERE user_id=%s', (intent.userId,), one=True)
+    assert balance['topup_tokens'] == 5000000
+    assert query(drafts[3], "SELECT id FROM billing_events WHERE user_id=%s AND event_type='credit.topup_refunded'",
+                 (intent.userId,)) == []
+    assert len(provider.refundCalls) == 1
+
+
+def test_refund_failed_restores_nothing_and_schedules_retry(drafts, monkeypatch):
+    from api.services.billing.paymentOperationWorker import PaymentOperationWorker
+    from api.services.webhookService import WebhookService, EVENT_HANDLERS
+    from api.services.subscriptions.subscriptionService import subscriptionService
+    repo, provider, intent, evidence, service = closedCapture(drafts, monkeypatch)
+    op = reserved(drafts[3], evidence)
+    service.execute(str(op['id']))
+    refund = next(iter(provider.refunds.values()))
+    oldKey = refund['notes']['purchaseSubmissionKey']
+    refund['status'] = 'failed'
+    monkeypatch.setattr('api.services.billing.purchaseCheckoutRepository.getPurchaseCheckoutRepository', lambda: repo)
+    monkeypatch.setattr(subscriptionService, 'razorpayClient', provider)
+    webhook = WebhookService.__new__(WebhookService)
+    getattr(webhook, EVENT_HANDLERS['refund.failed'])({'payload': {'refund': {'entity': dict(refund)}}})
+    assert repo.operationById(str(op['id']))['error_code'] == 'PAYMENT_REFUND_FAILED'
+    worker = PaymentOperationWorker(repo, provider)
+    assert worker.execute()['errors'] == 0
+    retry = repo.operationById(str(op['id']))
+    assert retry['state'] == 'queued' and retry['retry_count'] == 1
+    assert retry['next_retry_at'] > datetime.now(timezone.utc)
+    assert len(provider.refundCalls) == 1
+    provider.refundStatus = 'processed'
+    assert worker.execute(now=retry['next_retry_at'])['resolved'] == 1
+    assert len(provider.refundCalls) == 2
+    assert provider.refundCalls[-1][1]['notes']['purchaseSubmissionKey'] != oldKey
+    assert not repo.getCoverageSnapshot(intent.userId).accessAllowed
+
+
+@pytest.mark.parametrize('granted', [False, True])
+def test_topup_refund_sql_outcome_and_replay(drafts, monkeypatch, granted):
+    from api.services.credits.manualCreditRepository import ManualCreditRepository
+    repo, provider, intent, duplicateId = duplicateCapture(drafts, monkeypatch, 'topup')
+    paymentId = query(drafts[3], 'SELECT "razorpayPaymentId" FROM "Invoices" WHERE id=%s',
+                      (intent.invoiceId,), one=True)['razorpayPaymentId'] if granted else duplicateId
+    credits = ManualCreditRepository(repo)
+    refundId = 'topup-refund-' + str(uuid4())
+    first = credits.clawbackTopup(intent.userId, refundId, paymentId, intent.amount)
+    assert first == {'clawed': granted, 'tokens': 5000000 if granted else 0,
+                     'status': 'clawed_back' if granted else 'not_granted'}
+    assert credits.clawbackTopup(intent.userId, refundId, paymentId, intent.amount) == {
+        'clawed': False, 'tokens': 0, 'status': 'already_applied'}
+    balance = query(drafts[3], 'SELECT topup_tokens FROM credit_balances WHERE user_id=%s', (intent.userId,), one=True)
+    assert balance['topup_tokens'] == (0 if granted else 5000000)
+    assert len(query(drafts[3], 'SELECT id FROM billing_events WHERE idempotency_key=%s', ('topup-refund:' + refundId,))) == 1
+
+
 @pytest.mark.parametrize('purpose',['renewal','topup'])
 def test_external_partial_refund_refunds_remainder(drafts,monkeypatch,purpose):
     from api.services.billing.paymentRefundService import PaymentRefundService

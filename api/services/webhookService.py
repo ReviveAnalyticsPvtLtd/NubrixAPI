@@ -46,8 +46,8 @@ EVENT_HANDLERS = {
     "order.paid": "_handleOrderPaid",
     "payment.failed": "_handlePaymentFailed",
     "refund.processed": "_handleRefundProcessed",
-    "refund.created": "_handleRefundProcessed",
-    "refund.failed": "_handleRefundProcessed",
+    "refund.created": "_handleRefundCreated",
+    "refund.failed": "_handleRefundFailed",
     "token.confirmed": "_handleTokenConfirmed",
     "token.cancelled": "_handleTokenCancelled",
 }
@@ -554,23 +554,17 @@ class WebhookService:
         )
         logger.info(f"Token cancelled event recorded as inert: {tokenEntity.get('id')}")
 
+    def _handleRefundCreated(self, event: dict) -> None:
+        self._handleRefund(event, "created", "pending")
+
+    def _handleRefundFailed(self, event: dict) -> None:
+        self._handleRefund(event, "failed", "failed")
+
     def _handleRefundProcessed(self, event: dict) -> None:
-        """
-        Handle the refund.processed webhook event.
+        self._handleRefund(event, "processed", "processed")
 
-        Refunds of credit top-up payments claw back the purchased tokens in
-        proportion to the refunded amount. Every other payment type keeps the
-        log-only behaviour.
-
-        The discrimination is on notes.type as fetched from Razorpay, backed by
-        a second check inside the RPC that the invoice is billing_reason
-        'add_on'. A subscription refund satisfies neither and moves no tokens.
-        The Razorpay client is borrowed from subscriptionService, as
-        _handlePaymentCaptured already does.
-
-        Args:
-            event (dict): The Razorpay webhook event.
-        """
+    def _handleRefund(self, event: dict, eventKind: str, status: str) -> None:
+        """Route operation refunds exclusively; only processed granted top-ups debit tokens."""
         refundEntity = event.get("payload", {}).get("refund", {}).get("entity", {})
         notes = refundEntity.get('notes')
         notes = notes if isinstance(notes,dict) else {}
@@ -591,7 +585,7 @@ class WebhookService:
         intentId = notes.get("refundIntentId")
         if intentId:
             from api.services.billing.manualBillingRepository import getManualBillingRepository
-            getManualBillingRepository().settleRefundEvidence(intentId, {"refunds": [refundEntity]})
+            getManualBillingRepository().settleRefundEvidence(intentId, {"refunds": [{**refundEntity, "status": status}]})
             return
         paymentId = refundEntity.get("payment_id", "")
         refundId = refundEntity.get("id", "")
@@ -610,11 +604,11 @@ class WebhookService:
                 userId = paymentNotes.get("userId") or "system"
             except Exception as e:
                 logger.warning(
-                    f"Could not fetch payment {paymentId} during refund.processed: {e}"
+                    f"Could not fetch payment {paymentId} during refund.{eventKind}: {e}"
                 )
 
         clawedTokens = 0
-        if paymentType == "credit_topup" and userId != "system" and refundId:
+        if status == "processed" and paymentType == "credit_topup" and userId != "system" and refundId:
             from api.services.credits.creditService import creditService
 
             result = creditService.clawbackTopupTokens(
@@ -627,18 +621,18 @@ class WebhookService:
             )
 
         self._auditLog(
-            userId, "refund.processed",
+            userId, "refund." + eventKind,
             paymentId=paymentId,
             amount=refundAmount,
             currency=refundEntity.get("currency", "INR"),
-            status="processed",
+            status=status,
             metadata={
                 "refund_id": refundId,
                 "paymentType": paymentType,
                 "tokensClawedBack": clawedTokens,
             }
         )
-        logger.info(f"Refund processed for payment {paymentId}")
+        logger.info(f"Refund {status} for payment {paymentId}")
 
     @staticmethod
     def _sendPaymentFailureEmail(email: str, name: str, reason: str) -> None:

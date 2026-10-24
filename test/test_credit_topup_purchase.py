@@ -49,6 +49,12 @@ if not hasattr(joseStub, "JWTError"):
 razorpayStub = sys.modules.setdefault("razorpay", types.ModuleType("razorpay"))
 if not hasattr(razorpayStub, "Client"):
     razorpayStub.Client = lambda *a, **k: MagicMock()
+if not hasattr(razorpayStub, "errors"):
+    razorpayStub.errors = types.ModuleType("razorpay.errors")
+for errorName in ("GatewayError", "ServerError", "BadRequestError"):
+    if not hasattr(razorpayStub.errors, errorName):
+        setattr(razorpayStub.errors, errorName, type(errorName, (Exception,), {}))
+sys.modules.setdefault("razorpay.errors", razorpayStub.errors)
 
 
 class TestTopupPricingSnapshot(unittest.TestCase):
@@ -378,11 +384,11 @@ class TestTopupWebhooks(unittest.TestCase):
 
 
 
-    def test_refund_of_a_topup_payment_claws_back(self):
+    def test_processed_refund_of_a_topup_payment_requests_granted_only_clawback(self):
         svc = self._service()
         with self._razorpay({"userId": "u1", "type": "credit_topup"}), \
              patch("api.services.credits.creditService.creditService.clawbackTopupTokens",
-                   return_value={"clawed": True, "tokens": 2500000}) as claw, \
+                   return_value={"clawed": True, "tokens": 2500000, "status": "clawed_back"}) as claw, \
              patch.object(svc, "_auditLog"):
             svc._handleRefundProcessed(self._refund())
         claw.assert_called_once_with("u1", "rfnd_1", "pay_abc", 99950)

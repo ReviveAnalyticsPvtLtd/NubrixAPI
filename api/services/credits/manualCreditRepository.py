@@ -502,12 +502,19 @@ class ManualCreditRepository:
                     saved=self.repository._json(previous['metadata_json'])
                     if saved['userId']!=userId or saved['paymentId']!=paymentId or saved['amount']!=amount:
                         raise ValueError('TOPUP_REFUND_IDENTITY_CONFLICT')
-                    return {'clawed':False,'tokens':0}
+                    return {'clawed':False,'tokens':0,'status':'already_applied'}
                 cursor.execute('''select * from public."Invoices" where "userId"=%s and "razorpayPaymentId"=%s
                     and billing_reason='add_on' and status='PAID' for update''',(userId,paymentId))
                 invoice=cursor.fetchone()
                 if not invoice:
-                    raise ValueError('OWNED_PAID_TOPUP_MISSING')
+                    # Duplicate/closed captures never granted tokens. Keep a durable
+                    # no-op under the same refund identity so delivery can complete.
+                    metadata={'userId':userId,'paymentId':paymentId,'refundId':refundId,'amount':amount}
+                    cursor.execute('''insert into public.billing_events(id,user_id,event_category,event_type,
+                        event_status,idempotency_key,metadata_json,occurred_at)
+                        values(%s,%s,'audit','credit.topup_refund_not_granted','NOT_GRANTED',%s,%s,%s)''',
+                        (str(uuid.uuid4()),userId,key,Json(metadata),datetime.now(timezone.utc)))
+                    return {'clawed':False,'tokens':0,'status':'not_granted'}
                 tokens=int(self.repository._json(invoice['metadata_json']).get('tokens') or 0)
                 captured=int(invoice.get('total_amount') or invoice.get('amount') or 0)
                 if not tokens or not captured or amount>captured:
@@ -531,7 +538,7 @@ class ManualCreditRepository:
                 cursor.execute('''insert into public.billing_events(id,user_id,invoice_id,event_category,event_type,event_status,idempotency_key,metadata_json,occurred_at)
                     values(%s,%s,%s,'audit','credit.topup_refunded','SETTLED',%s,%s,%s)''',
                     (str(uuid.uuid4()),userId,invoice['id'],key,Json(metadata),datetime.now(timezone.utc)))
-                return {'clawed':True,'tokens':clawed}
+                return {'clawed':True,'tokens':clawed,'status':'clawed_back'}
         return self.repository._run(operation)
 
     def recoverUsage(self,limit=100):
