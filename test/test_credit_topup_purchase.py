@@ -401,14 +401,16 @@ class TestTopupWebhooks(unittest.TestCase):
             svc._handleRefundProcessed(self._refund())
         claw.assert_not_called()
 
-    def test_refund_still_audits_when_the_payment_fetch_fails(self):
+    def test_processed_refund_retries_when_the_payment_fetch_fails(self):
+        from utils.webhookExceptions import RetryableWebhookError
         svc = self._service()
         with self._razorpay(fetchRaises=True), \
              patch("api.services.credits.creditService.creditService.clawbackTopupTokens") as claw, \
              patch.object(svc, "_auditLog") as audit:
-            svc._handleRefundProcessed(self._refund())
+            with self.assertRaises(RetryableWebhookError):
+                svc._handleRefundProcessed(self._refund())
         claw.assert_not_called()
-        audit.assert_called()
+        audit.assert_not_called()
 
 
 class TestStuckPurchaseSweep(unittest.TestCase):

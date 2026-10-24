@@ -606,6 +606,8 @@ class WebhookService:
                 logger.warning(
                     f"Could not fetch payment {paymentId} during refund.{eventKind}: {e}"
                 )
+                if status == "processed":
+                    raise RetryableWebhookError("REFUND_PAYMENT_LOOKUP_UNAVAILABLE") from e
 
         clawedTokens = 0
         if status == "processed" and paymentType == "credit_topup" and userId != "system" and refundId:

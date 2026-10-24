@@ -6,8 +6,31 @@ from types import SimpleNamespace
 import pytest
 
 from test.test_manual_billing_runtime import database, USER, SUB, sqlTransaction, read_row
-from test.test_manual_auth_coverage import SqlRestClient
+from test.test_manual_auth_coverage import SqlRestClient, SqlRestQuery
 from api.services.credits.manualCreditRepository import ManualCreditRepository
+
+
+class WebhookRestQuery(SqlRestQuery):
+    def execute(self):
+        if self.payload is None:
+            return super().execute()
+        # Supabase returns the rows changed by the conditional claim, even
+        # though their new status no longer matches the original WHERE clause.
+        import sqlite3
+        with sqlTransaction(self.path) as db:
+            db.row_factory = sqlite3.Row
+            assignments = ','.join(f'"{key}"=?' for key in self.payload)
+            where = ' AND '.join(f'"{key}"=?' for key, _ in self.filters)
+            values = [json.dumps(value) if isinstance(value, (dict, list)) else value
+                      for value in self.payload.values()]
+            rows = db.execute(f'UPDATE "{self.table}" SET {assignments} WHERE {where} RETURNING *',
+                              values + [value for _, value in self.filters]).fetchall()
+        return SimpleNamespace(data=[dict(row) for row in rows])
+
+
+class WebhookRestClient(SqlRestClient):
+    def table(self, name):
+        return WebhookRestQuery(self.path, name)
 
 
 def refundEvent(kind='processed', refundId='refund-one', amount=150, notes=None):
@@ -43,7 +66,7 @@ def webhook(database, monkeypatch):
     monkeypatch.setitem(sys.modules, 'api.services.credits.creditService',
         SimpleNamespace(creditService=SimpleNamespace(clawbackTopupTokens=credits.clawbackTopup)))
     service = WebhookService.__new__(WebhookService)
-    service.client = SqlRestClient(path)
+    service.client = WebhookRestClient(path)
     audits = []
     service._auditLog = lambda *args, **kwargs: audits.append((args, kwargs))
     return service, credits, path, audits
@@ -105,3 +128,44 @@ def test_not_granted_outcome_is_explicit(webhook):
         db.execute("UPDATE \"Invoices\" SET status='PAYMENT_PENDING'")
     assert credits.clawbackTopup(USER, 'refund-one', 'topup-payment', 150) == {
         'clawed': False, 'tokens': 0, 'status': 'not_granted'}
+
+
+def test_processed_refund_fetch_failure_retries_and_replay_claws_back_once(webhook, monkeypatch):
+    from utils.webhookExceptions import RetryableWebhookError
+    service, _, path, _ = webhook
+    payment = sys.modules['api.services.subscriptions.subscriptionService'].subscriptionService.razorpayClient.payment
+    availableFetch = payment.fetch
+    def unavailableFetch(paymentId):
+        raise TimeoutError('synthetic provider outage')
+    monkeypatch.setattr(payment, 'fetch', unavailableFetch)
+    event = refundEvent(amount=50)
+    with pytest.raises(RetryableWebhookError):
+        service.processEvent(event, 'retryable-refund')
+    failed = read_row(path, 'WebhookEvents')
+    assert failed['status'] == 'failed' and failed['attempts'] == 1
+    assert json.loads(failed['payload']) == event
+    assert read_row(path, 'credit_balances')['topup_tokens'] == 500
+    assert read_row(path, 'billing_events') is None
+    monkeypatch.setattr(payment, 'fetch', availableFetch)
+    service.processEvent(event, 'retryable-refund')
+    completed = read_row(path, 'WebhookEvents')
+    assert completed['status'] == 'completed' and completed['attempts'] == 2
+    assert completed['errorMessage'] is None
+    service.processEvent(event, 'retryable-refund')
+    service.processEvent(event, 'same-refund-new-delivery')
+    assert read_row(path, 'credit_balances')['topup_tokens'] == 334
+    with sqlTransaction(path) as db:
+        assert db.execute('SELECT count(*) FROM billing_events').fetchone()[0] == 1
+
+
+@pytest.mark.parametrize('delayedKind', ['created', 'failed'])
+def test_delayed_refund_event_preserves_processed_settlement(webhook, delayedKind):
+    service, _, path, _ = webhook
+    service.processEvent(refundEvent(amount=50), 'processed-first')
+    assert read_row(path, 'credit_balances')['topup_tokens'] == 334
+    service.processEvent(refundEvent(delayedKind, amount=50), 'delayed-event')
+    assert read_row(path, 'credit_balances')['topup_tokens'] == 334
+    with sqlTransaction(path) as db:
+        assert db.execute('SELECT event_type,event_status FROM billing_events').fetchall() == [
+            ('credit.topup_refunded', 'SETTLED')]
+        assert db.execute('SELECT status FROM "WebhookEvents"').fetchall() == [('completed',), ('completed',)]
