@@ -816,7 +816,7 @@ def presentStatus(repo, userId, now=None):
 
 
 @pytest.mark.parametrize('currency', ['INR', 'USD'])
-def test_payment_status_shows_refund_progress_without_ids(drafts, monkeypatch, currency):
+def test_payment_status_binds_refund_to_its_attempt_without_other_ids(drafts, monkeypatch, currency):
     import json
     from api.services.billing.paymentRefundService import PaymentRefundService
     from api.services.billing.paymentStatusPresentation import supportReference
@@ -826,8 +826,8 @@ def test_payment_status_shows_refund_progress_without_ids(drafts, monkeypatch, c
     status = presentStatus(repo, intent.userId)
     # The granted attempt is completed; its duplicate payment is a refund on its way, not an error.
     assert status['checkout']['state'] == 'completed' and status['checkout']['attemptId'] == intent.attemptId
-    assert status['refunds'] == [{'amount': intent.amount, 'currency': currency, 'reason': 'duplicate',
-                                  'state': 'on_its_way', 'startedAt': op['created_at'].isoformat()}]
+    assert status['refunds'] == [{'attemptId': intent.attemptId, 'amount': intent.amount, 'currency': currency,
+        'reason': 'duplicate', 'state': 'on_its_way', 'startedAt': op['created_at'].isoformat()}]
     assert status['paymentAttention'] is None
     hidden = {intent.invoiceId, intent.razorpayOrderId, paymentId, str(op['id'])}
     assert not [identity for identity in hidden if identity in json.dumps(status['refunds'])]

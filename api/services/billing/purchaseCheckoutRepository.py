@@ -36,22 +36,24 @@ class PurchaseCheckoutRepository(PaymentOperationRepositoryMixin, ManualBillingR
 
     def readEditor(self, userId):
         def operation(connection):
+            from api.services.billing.paymentStatusPresentation import PRO_TERM_PURPOSES, checkoutAttempt
             from api.services.billing.purchaseCheckoutStatusService import reducePurchaseCheckoutStatus
             with connection.cursor(cursor_factory=RealDictCursor) as cursor:
                 subscription, allowed = self._editorContext(cursor, userId)
                 cursor.execute('SELECT * FROM public.subscription_purchase_drafts WHERE user_id=%s', (userId,))
                 stored = cursor.fetchone()
-                cursor.execute('''SELECT * FROM public.billing_events WHERE user_id=%s AND subscription_id=%s
-                    AND event_category='payment_attempt' AND metadata_json->'manualBilling'->>'purpose'='initial_purchase'
-                    ORDER BY created_at DESC,id DESC LIMIT 1''', (userId, subscription['id']))
-                attempt = cursor.fetchone()
+                now = _now()
+                # The attempt Pay would wait on in the Pro term slot, else the newest initial purchase:
+                # the same selector as payment status, so the editor never contradicts Pay.
+                shown = checkoutAttempt(cursor, userId, now, PRO_TERM_PURPOSES, ('initial_purchase',), subscription['id'])
                 draft, checkout = PurchaseDraft(userId), None
-                if attempt:
+                if shown:
+                    attempt, frozen = shown
                     metadata = self._json(attempt.get('metadata_json'))
-                    frozen = metadata['manualBilling']
-                    intent = self._intentFromAttemptRow(attempt, metadata, userId, 'initial_purchase')
-                    checkout = reducePurchaseCheckoutStatus(attempt, intent, _now())
-                    if not frozen.get('closedAt') and intent.state not in ('cancelled', 'expired', 'superseded', 'captured'):
+                    intent = self._intentFromAttemptRow(attempt, metadata, userId, frozen['purpose'])
+                    checkout = reducePurchaseCheckoutStatus(attempt, intent, now)
+                    if (frozen['purpose'] == 'initial_purchase' and not frozen.get('closedAt')
+                            and intent.state not in ('cancelled', 'expired', 'superseded', 'captured')):
                         draft = PurchaseDraft(userId, domains=tuple(frozen.get('domains', [])),
                             billingInterval='year' if frozen.get('billingMode') == 'annual_prepaid' else 'month')
                 draft = self._draft(userId, stored) if stored else draft

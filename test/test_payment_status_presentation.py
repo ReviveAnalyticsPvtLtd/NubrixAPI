@@ -57,13 +57,14 @@ def authorizedAt(started):
 
 
 def operation(path, *, state='queued', reason='duplicate', startedAt=NOW, amount=472000, currency='INR',
-              user=USER, error=None, escalated=False):
+              user=USER, error=None, escalated=False, attemptId=None):
     operationId = str(uuid.uuid4())
+    attemptId = attemptId or str(uuid.uuid4())
     with sqlTransaction(path) as db:
         db.execute('''INSERT INTO payment_operations(id,user_id,attempt_id,invoice_id,provider_payment_id,kind,reason,
             state,amount,currency,error_code,escalation_reference,created_at,updated_at)
             VALUES(?,?,?,?,?,'refund',?,?,?,?,?,?,?,?)''',
-            (operationId, user, str(uuid.uuid4()), str(uuid.uuid4()), 'pay_' + operationId[:8], reason, state,
+            (operationId, user, attemptId, str(uuid.uuid4()), 'pay_' + operationId[:8], reason, state,
              amount, currency, error, 'refund:' + operationId if escalated else None,
              startedAt.isoformat(), startedAt.isoformat()))
     return operationId
@@ -131,32 +132,44 @@ def test_status_never_shows_another_owners_checkout(statusDb):
 
 def test_refund_states_and_no_ids_in_refunds(statusDb):
     repository, path = statusDb
-    returned = operation(path, state='succeeded', reason='duplicate', startedAt=NOW - timedelta(days=20))
+    a, b, c, d = (str(uuid.uuid4()) for _ in range(4))
+    returned = operation(path, state='succeeded', reason='duplicate', startedAt=NOW - timedelta(days=20), attemptId=a)
     moving = operation(path, state='submitted', reason='paid_after_close', startedAt=NOW - timedelta(days=1),
-                       amount=5000, currency='USD')
-    late = operation(path, state='queued', reason='not_deliverable', startedAt=NOW - timedelta(days=15))
+                       amount=5000, currency='USD', attemptId=b)
+    late = operation(path, state='queued', reason='not_deliverable', startedAt=NOW - timedelta(days=15), attemptId=c)
     operation(path, state='cancelled', startedAt=NOW - timedelta(days=2))
     failed = operation(path, state='needs_attention', reason='account_closed', error='PAYMENT_REFUND_FAILED',
-                       startedAt=NOW - timedelta(hours=1))
+                       startedAt=NOW - timedelta(hours=1), attemptId=d)
     refunds = present(repository)['refunds']
+    # attemptId binds API calls only (the poller's own attempt); it is never displayed.
     assert refunds == [
-        {'amount': 472000, 'currency': 'INR', 'reason': 'account_closed', 'state': 'on_its_way',
+        {'attemptId': d, 'amount': 472000, 'currency': 'INR', 'reason': 'account_closed', 'state': 'on_its_way',
          'startedAt': (NOW - timedelta(hours=1)).isoformat()},
-        {'amount': 5000, 'currency': 'USD', 'reason': 'paid_after_close', 'state': 'on_its_way',
+        {'attemptId': b, 'amount': 5000, 'currency': 'USD', 'reason': 'paid_after_close', 'state': 'on_its_way',
          'startedAt': (NOW - timedelta(days=1)).isoformat()},
-        {'amount': 472000, 'currency': 'INR', 'reason': 'not_deliverable', 'state': 'delayed',
+        {'attemptId': c, 'amount': 472000, 'currency': 'INR', 'reason': 'not_deliverable', 'state': 'delayed',
          'startedAt': (NOW - timedelta(days=15)).isoformat()},
-        {'amount': 472000, 'currency': 'INR', 'reason': 'duplicate', 'state': 'returned',
+        {'attemptId': a, 'amount': 472000, 'currency': 'INR', 'reason': 'duplicate', 'state': 'returned',
          'startedAt': (NOW - timedelta(days=20)).isoformat()},
     ]
     with sqlite3.connect(path) as db:
-        identities = {value for row in db.execute('SELECT id,attempt_id,invoice_id,provider_payment_id FROM payment_operations')
+        identities = {value for row in db.execute('SELECT id,invoice_id,provider_payment_id FROM payment_operations')
                       for value in row}
     assert {returned, moving, late, failed} <= identities
     text = json.dumps(present(repository))
     assert not [identity for identity in identities if identity in text]
     # A failed send the worker retries on its own within a minute is a refund on its way, not attention.
     assert present(repository)['paymentAttention'] is None
+
+
+def test_refund_binds_its_own_attempt_while_another_is_shown(statusDb):
+    repository, path = statusDb
+    paid = attempt(path, status='cancelled', closed=True, attemptedAt=NOW - timedelta(minutes=20))
+    shown = attempt(path, attemptedAt=NOW - timedelta(minutes=5), domains=('telecom',))
+    operation(path, state='queued', reason='paid_after_close', attemptId=paid)
+    status = present(repository)
+    assert status['checkout']['attemptId'] == shown and status['checkout']['state'] == 'ready'
+    assert [refund['attemptId'] for refund in status['refunds']] == [paid]
 
 
 @pytest.mark.parametrize('started,boundary', [
@@ -185,7 +198,16 @@ def test_attention_reference_format(statusDb):
     repository, path = statusDb
     capture(path, rulesFacts='PRE_CUTOVER', reason='CAPTURE_OUTSIDE_WINDOW')  # historical: untouched
     capture(path, status='FINALIZED', reason=None)
-    operation(path, state='needs_attention', error='PAYMENT_REFUND_FAILED')  # retried automatically
+    # A failed send not yet escalated is retried automatically by the worker within a minute.
+    operation(path, state='needs_attention', error='PAYMENT_REFUND_FAILED', startedAt=NOW - timedelta(minutes=1))
+    assert present(repository)['paymentAttention'] is None
+    # Once unresolved past the escalation threshold the worker escalates it while it keeps retrying:
+    # the escalated case shows its reference at once.
+    overdue = operation(path, state='needs_attention', error='PAYMENT_REFUND_FAILED',
+                        startedAt=NOW - timedelta(minutes=31), escalated=True)
+    assert present(repository)['paymentAttention'] == {'reference': supportReference(overdue)}
+    with sqlTransaction(path) as db:
+        db.execute("UPDATE payment_operations SET state='succeeded' WHERE id=?", (overdue,))
     assert present(repository)['paymentAttention'] is None
 
     for index, reason in enumerate(('FROZEN_SNAPSHOT_INCOMPLETE', 'PAYMENT_SLOT_UNAVAILABLE', 'PAYMENT_EVIDENCE_MISMATCH')):
@@ -237,6 +259,43 @@ def test_status_is_owner_scoped_and_no_store(statusClient):
     client.app.dependency_overrides.pop(verifyToken)
     unauthenticated = client.get('/payment-status')
     assert unauthenticated.status_code in (401, 403)
+
+
+@pytest.mark.parametrize('age,refresh', [(timedelta(seconds=4, microseconds=999999), False),
+                                         (timedelta(seconds=5), True), (timedelta(seconds=-1), True), (None, True)])
+def test_provider_refresh_is_bounded_by_the_last_observation(statusDb, age, refresh):
+    from api.services.billing.paymentStatusPresentation import PROVIDER_REFRESH_INTERVAL, needsProviderRefresh
+    assert PROVIDER_REFRESH_INTERVAL == timedelta(seconds=5)
+    _, path = statusDb
+    observation = {'outcome': 'unpaid', 'complete': True, 'checkedAt': (NOW - age).isoformat()} if age is not None else None
+    attemptId = attempt(path, observation=observation)
+    with sqlTransaction(path) as db:
+        db.row_factory = sqlite3.Row
+        row = dict(db.execute('SELECT * FROM billing_events WHERE id=?', (attemptId,)).fetchone())
+    assert needsProviderRefresh(row, NOW) is refresh
+
+
+def test_refresh_error_still_presents_committed_status(statusClient, monkeypatch):
+    from api.services.billing.manualBillingContracts import CheckoutProviderSnapshot
+    from api.services.billing.manualBillingRecoveryService import ManualBillingRecoveryService
+    client, _, path = statusClient
+    with sqlTransaction(path) as db:
+        db.execute('''CREATE TABLE payment_operations (
+            id TEXT PRIMARY KEY, user_id TEXT, attempt_id TEXT, invoice_id TEXT, provider_payment_id TEXT,
+            kind TEXT, reason TEXT, state TEXT, amount INTEGER, currency TEXT, error_code TEXT,
+            escalation_reference TEXT, created_at TEXT, updated_at TEXT)''')
+    shown = attempt(path)
+    refunded = attempt(path, status='cancelled', closed=True, attemptedAt=NOW - timedelta(minutes=20))
+    operation(path, attemptId=refunded)
+    monkeypatch.setattr(ManualBillingRecoveryService, 'inspectAttempt', lambda self, row: CheckoutProviderSnapshot(
+        str(row['id']), row['provider_order_id'], 'captured', NOW, True, int(row['amount']), row['currency'], ()))
+    def bound(self, row, snapshot):
+        raise ValueError('PAYMENT_ALREADY_BOUND')
+    monkeypatch.setattr(ManualBillingRecoveryService, 'applyObservation', bound)
+    response = client.get('/payment-status')
+    assert response.status_code == 200
+    body = response.json()
+    assert body['checkout']['attemptId'] == shown and [r['attemptId'] for r in body['refunds']] == [refunded]
 
 
 def test_status_route_replaces_the_per_attempt_status_route(statusClient):

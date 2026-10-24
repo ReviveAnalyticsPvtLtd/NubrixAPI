@@ -546,6 +546,9 @@ def test_status_and_pay_agree_on_a_superseded_attempt_holding_an_authorization(d
     assert shown == {'state': 'confirming_earlier_payment', 'attemptId': old.attemptId, 'amount': old.amount,
                      'currency': old.currency, 'selectionLabel': 'Pro monthly with Banking and Manufacturing'}
     assert PurchaseCheckoutStatusService(repo, provider).refresh(old.userId)['checkout'] == shown
+    # The purchase editor binds the same attempt with the same state: it never says Pay is ready while Pay waits.
+    editor = repo.readEditor(old.userId).checkout
+    assert (editor.attemptId, editor.state) == (old.attemptId, 'confirming_earlier_payment')
     repo.saveDraft(old.userId, 2, ['supplychain'], 'month')
     held = pay(repo, provider, old.userId, 3, ['supplychain'])
     assert held.state == 'confirming_earlier_payment' and held.attemptId == shown['attemptId']

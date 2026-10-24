@@ -29,12 +29,17 @@ class PurchaseCheckoutStatusService:
         return self.repository._run(operation)
 
     def _observe(self, attempt):
-        observation = self.recovery.inspectAttempt(attempt)
+        """Best effort: a failed refresh never hides the committed checkout, refunds or attention."""
+        import re
         try:
+            observation = self.recovery.inspectAttempt(attempt)
             self.recovery.applyObservation(attempt, observation)
-        except RuntimeError as exc:
-            if str(exc) != 'PROVIDER_STATUS_UNKNOWN':
-                raise
+        except Exception as exc:
+            if isinstance(exc, RuntimeError) and str(exc) == 'PROVIDER_STATUS_UNKNOWN':
+                return
+            from utils.logger import logger
+            code = str(exc) if re.fullmatch(r'[A-Z][A-Z0-9_]{0,63}', str(exc)) else type(exc).__name__
+            logger.error('Payment status refresh failed: attempt={} reason={}', str(attempt['id']), code)
 
 
 def reducePurchaseCheckoutStatus(attempt, intent, now) -> PurchaseCheckoutStatus:

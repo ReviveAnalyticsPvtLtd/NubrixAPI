@@ -105,6 +105,23 @@ def test_captured_status_finalizes_original_once(status_checkout, checkout_datab
         assert db.execute("SELECT count(*) FROM billing_events WHERE event_type='payment.capture'").fetchone()[0] == 1
 
 
+def test_polling_reads_the_provider_at_most_once_per_refresh_interval(status_checkout, monkeypatch):
+    from datetime import timedelta as delta
+    import api.services.billing.manualBillingRepository as billing
+    client, provider, _, intent = status_checkout
+    reads = []
+    fetch = provider.order.fetch
+    provider.order.fetch = lambda *args, **kwargs: reads.append(args) or fetch(*args, **kwargs)
+    payment(provider, intent)
+    assert checkout(status(client))['state'] == 'confirming_earlier_payment'
+    assert checkout(status(client))['state'] == 'confirming_earlier_payment'  # a second tab, same instant
+    assert len(reads) == 1
+    later = NOW + delta(seconds=5)
+    monkeypatch.setattr(billing, '_now', lambda: later)
+    checkout(status(client))
+    assert len(reads) == 2
+
+
 def test_authorized_observation_cannot_downgrade_capture(status_checkout, checkout_database):
     client, provider, _, intent = status_checkout
     repository, _ = checkout_database

@@ -1627,20 +1627,29 @@ Reading it may ask the provider about the shown checkout's order and finalize mo
 {
   "checkout": { "state": "confirming_earlier_payment", "attemptId": "uuid", "amount": 11800, "currency": "INR",
                 "selectionLabel": "Pro monthly with Banking" },
-  "refunds": [ { "amount": 11800, "currency": "INR", "reason": "duplicate", "state": "on_its_way",
-                 "startedAt": "2026-10-21T09:30:00+00:00" } ],
+  "refunds": [ { "attemptId": "uuid", "amount": 11800, "currency": "INR", "reason": "duplicate",
+                 "state": "on_its_way", "startedAt": "2026-10-21T09:30:00+00:00" } ],
   "paymentAttention": null
 }
 ```
 - `checkout` is the newest checkout an earlier payment holds, else the newest checkout, or `null`. `state` is
   `ready`, `confirming_earlier_payment` (an authorized payment inside its capture window) or `completed`
   (granted). `attemptId` binds API calls only; it is never displayed.
-- `refunds` lists the owner's automatic full refunds, newest first. `reason` is `duplicate`,
+- `refunds` lists the owner's automatic full refunds, newest first. Each `attemptId` names the checkout the
+  money is returned for; it binds API calls only (a poller finds the refund for its own checkout) and is never
+  displayed. `reason` is `duplicate`,
   `paid_after_close`, `not_deliverable` or `account_closed`; `state` is `on_its_way`, `returned`, or
   `delayed` (more than 10 working days, Monday to Friday, without being processed).
 - `paymentAttention` is `{"reference": "NBX-7K2Q"}` only when a person must resolve a payment or refund;
   it is the only place a support reference appears. No invoice, order, payment or refund identity is returned.
+- The provider is read at most once per 5 seconds per checkout; a failed provider read still returns the
+  committed status.
 - `503 PURCHASE_STATUS_UNAVAILABLE` when status cannot be read; retry later.
+
+**Release note: refund emails.** `payment_refund_started` and `payment_refund_completed` are sent through the
+`billingEmail` Edge function, which must be deployed with these templates before or together with this
+backend. If an older function answers `UNSUPPORTED_NOTIFICATION_TYPE`, those two emails are retried with the
+usual backoff until it is deployed (bounded by the delivery attempt limit); every other type stays permanent.
 
 Removed from the contract: `POST /purchase-checkouts/{attemptId}/status` (use `payment-status`),
 `POST /purchase-checkouts/{attemptId}/cancel`, `POST /cancelPendingAddition`,

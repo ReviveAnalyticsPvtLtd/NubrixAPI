@@ -12,6 +12,18 @@ def test_billing_uncertain_acceptance_requires_reconciliation(monkeypatch,status
     assert result.outcome=='AMBIGUOUS' and result.errorCode=='AMBIGUOUS_SEND'
 
 
+@pytest.mark.parametrize('notificationType,outcome', [('payment_refund_started', 'RETRYABLE'),
+    ('payment_refund_completed', 'RETRYABLE'), ('payment_receipt', 'PERMANENT')])
+def test_refund_email_waits_for_its_template_while_other_types_fail(monkeypatch, notificationType, outcome):
+    """An Edge function deployed before the refund templates answers 400 UNSUPPORTED_NOTIFICATION_TYPE:
+    refund emails retry with the usual backoff until it ships; every other type stays permanent."""
+    monkeypatch.setenv('BILLING_NOTIFICATION_EMAIL_URL', 'https://example.test/billingEmail')
+    response = FakeResponse(400, {'errorCode': 'UNSUPPORTED_NOTIFICATION_TYPE'})
+    result = EdgeEmailClient(edgeUrl='https://example.test/warningEmail', apiKey='test',
+        requestPost=lambda *args, **kwargs: response).sendBilling({'notificationType': notificationType})
+    assert (result.outcome, result.errorCode) == (outcome, 'UNSUPPORTED_NOTIFICATION_TYPE')
+
+
 class FakeResponse:
     def __init__(self, statusCode, payload=None, jsonError=None):
         self.status_code = statusCode
