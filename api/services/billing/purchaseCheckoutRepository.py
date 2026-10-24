@@ -50,11 +50,7 @@ class PurchaseCheckoutRepository(PaymentOperationRepositoryMixin, ManualBillingR
                     metadata = self._json(attempt.get('metadata_json'))
                     frozen = metadata['manualBilling']
                     intent = self._intentFromAttemptRow(attempt, metadata, userId, 'initial_purchase')
-                    observation = frozen.get('providerObservation', {})
-                    checked = _utc(observation.get('checkedAt'))
-                    fresh = checked and 0 <= (_now() - checked).total_seconds() <= 60
-                    providerState = observation.get('outcome', 'unknown') if fresh and observation.get('complete') else 'unknown'
-                    checkout = reducePurchaseCheckoutStatus(attempt, intent, providerState)
+                    checkout = reducePurchaseCheckoutStatus(attempt, intent, _now())
                     if not frozen.get('closedAt') and intent.state not in ('cancelled', 'expired', 'superseded', 'captured'):
                         draft = PurchaseDraft(userId, domains=tuple(frozen.get('domains', [])),
                             billingInterval='year' if frozen.get('billingMode') == 'annual_prepaid' else 'month')

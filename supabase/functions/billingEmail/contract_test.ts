@@ -19,7 +19,7 @@ Deno.test('annual milestones describe Pro with yearly coverage', () => {
 Deno.test("all billing types render their own escaped message", () => {
   const subjects = new Set<string>();
   for (const notificationType of BILLING_TYPES) {
-    const request = parseBillingRequest({...base,notificationType});
+    const request = parseBillingRequest({...base,notificationType,metadata:{amount:3000,currency:"INR",startedAt:base.periodEnd}});
     const message = renderBillingMessage(request,"https://app.example.test/account");
     if (message.htmlContent.includes("<script>") || !message.htmlContent.includes("&lt;script&gt;")) throw new Error("unescaped recipient");
     subjects.add(message.subject);
@@ -98,9 +98,42 @@ Deno.test("each email links to the page that handles it", () => {
 Deno.test("every email has a plain-text part and the support contact", () => {
   for (const notificationType of BILLING_TYPES) {
     const message = renderBillingMessage(parseBillingRequest({...base,notificationType,
-      metadata:{amount:3000,currency:"INR",finalPaidEnd:base.periodEnd}}),"https://app.example.test");
+      metadata:{amount:3000,currency:"INR",finalPaidEnd:base.periodEnd,startedAt:base.periodEnd}}),"https://app.example.test");
     if (!message.textContent || /<(table|td|a |p |h1|html)/i.test(message.textContent)) throw new Error("missing or HTML text part");
     if (!message.textContent.includes(message.subject)) throw new Error("text part lacks subject");
     if (!message.htmlContent.includes("nubrixai@reviveanalytics.com")) throw new Error("support contact missing");
   }
+});
+
+Deno.test("refund emails render amount and date without invoice ids", () => {
+  const hidden = {invoiceId:"inv_secret_1", attemptId:"7d0f8a52-attempt-secret", paymentId:"pay_secret_1",
+    providerPaymentId:"pay_secret_2", orderId:"order_secret_1", operationId:"op-secret-1"};
+  const render = (notificationType: string, metadata: Record<string, unknown>) =>
+    renderBillingMessage(parseBillingRequest({...base,notificationType,metadata:{...hidden,...metadata}}),"https://app.example.test");
+  const started = render("payment_refund_started",{amount:472000,currency:"INR",reason:"duplicate",purpose:"renewal",
+    startedAt:"2026-10-21T09:30:00+00:00"});
+  const completed = render("payment_refund_completed",{amount:5000,currency:"USD",reason:"paid_after_close",purpose:"topup",
+    startedAt:"2026-10-21T09:30:00+00:00",completedAt:"2026-10-24T11:05:00+00:00"});
+  for (const part of [started.htmlContent, started.textContent])
+    if (!part.includes("A refund of INR 4720.00 is on its way — started 21 Oct 2026, 09:30 UTC.")) throw new Error("started copy missing");
+  for (const part of [completed.htmlContent, completed.textContent])
+    for (const fact of ["USD 50.00", "21 Oct 2026, 09:30 UTC", "24 Oct 2026, 11:05 UTC"])
+      if (!part.includes(fact)) throw new Error(`missing ${fact}`);
+  for (const message of [started, completed]) {
+    for (const identity of Object.values(hidden))
+      if (message.htmlContent.includes(identity) || message.textContent.includes(identity)) throw new Error(`identity ${identity} rendered`);
+    if (!message.htmlContent.includes("https://app.example.test/settings/billing-details")) throw new Error("refund does not open billing details");
+    if (!message.textContent.includes("Refund amount")) throw new Error("refund amount label missing");
+  }
+  if (started.subject === completed.subject) throw new Error("milestones share a subject");
+});
+
+Deno.test("refund emails require the amount and start date", () => {
+  for (const notificationType of ["payment_refund_started","payment_refund_completed"])
+    for (const metadata of [{currency:"INR",startedAt:base.periodEnd},{amount:3000,currency:"INR"},{amount:3000,currency:"INR",startedAt:"soon"}]) {
+      let rejected = false;
+      try { renderBillingMessage(parseBillingRequest({...base,notificationType,metadata}),"https://app.example.test"); }
+      catch { rejected = true; }
+      if (!rejected) throw new Error(`${notificationType} rendered without its facts`);
+    }
 });

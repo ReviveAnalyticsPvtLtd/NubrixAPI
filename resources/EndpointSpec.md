@@ -1620,7 +1620,30 @@ the check. Nothing was closed or opened. Retry the same request.
 { "message": "Payment service is busy. Please try again in a moment.", "errorCode": "PAYMENT_SERVICE_BUSY" }
 ```
 
-Removed from the contract: `POST /purchase-checkouts/{attemptId}/cancel`, `POST /cancelPendingAddition`,
+**Payment status (`GET /api/latest/subscriptions/payment-status`, 200, `Cache-Control: private, no-store`).**
+The signed-in owner's payment status for every purpose; the client polls it while a payment confirms.
+Reading it may ask the provider about the shown checkout's order and finalize money that already captured.
+```json
+{
+  "checkout": { "state": "confirming_earlier_payment", "attemptId": "uuid", "amount": 11800, "currency": "INR",
+                "selectionLabel": "Pro monthly with Banking" },
+  "refunds": [ { "amount": 11800, "currency": "INR", "reason": "duplicate", "state": "on_its_way",
+                 "startedAt": "2026-10-21T09:30:00+00:00" } ],
+  "paymentAttention": null
+}
+```
+- `checkout` is the newest checkout an earlier payment holds, else the newest checkout, or `null`. `state` is
+  `ready`, `confirming_earlier_payment` (an authorized payment inside its capture window) or `completed`
+  (granted). `attemptId` binds API calls only; it is never displayed.
+- `refunds` lists the owner's automatic full refunds, newest first. `reason` is `duplicate`,
+  `paid_after_close`, `not_deliverable` or `account_closed`; `state` is `on_its_way`, `returned`, or
+  `delayed` (more than 10 working days, Monday to Friday, without being processed).
+- `paymentAttention` is `{"reference": "NBX-7K2Q"}` only when a person must resolve a payment or refund;
+  it is the only place a support reference appears. No invoice, order, payment or refund identity is returned.
+- `503 PURCHASE_STATUS_UNAVAILABLE` when status cannot be read; retry later.
+
+Removed from the contract: `POST /purchase-checkouts/{attemptId}/status` (use `payment-status`),
+`POST /purchase-checkouts/{attemptId}/cancel`, `POST /cancelPendingAddition`,
 `LIVE_INITIAL_CHECKOUT_CONFLICT`, `LIVE_RENEWAL_CHECKOUT_CONFLICT` and `EXPERT_SELECTION_CONFLICT`.
 Adding an expert that is already subscribed, or going past 4 experts, returns `422 INVALID_EXPERT_SELECTION`.
 

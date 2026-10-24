@@ -16,10 +16,8 @@ class PurchaseCheckoutStatus:
     attemptId: str
     purpose: str
     # Pay is always the action; the server waits only while an earlier payment is confirming.
+    # Refunds and support references are in the payment status (paymentStatusPresentation), not here.
     state: Literal['ready', 'confirming_earlier_payment', 'completed']
-    providerState: Literal['unpaid', 'authorized', 'processing', 'captured', 'unknown', 'released']
-    pendingReason: str | None = None
-    refundState: str = 'none'
     capabilities: PurchaseCheckoutCapabilities = field(default_factory=PurchaseCheckoutCapabilities)
 
 

@@ -204,13 +204,6 @@ class NotificationDeliveryService:
             return
 
         if billingDelivery:
-            from api.services.notifications.billingNotificationService import BILLING_TEMPLATES_PENDING
-            if delivery.get("notification_type") in BILLING_TEMPLATES_PENDING:
-                # Committed and queued; its email template ships separately. Hold it without
-                # spending an attempt, so it is neither sent nor failed meanwhile.
-                self._scheduleRetry(delivery,workerId,'TEMPLATE_PENDING',now + datetime.timedelta(hours=1),None)
-                summary['retryScheduled'] += 1
-                return
             authorization = self.repository.authorizeBillingSubmissionResult(
                 str(delivery['id']),workerId,delivery['payload_version'])
             if authorization == 'HELD':

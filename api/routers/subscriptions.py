@@ -123,14 +123,13 @@ def submitPurchaseDraft(request: SubmitPurchaseDraftRequest,
     return _purchaseSubmitResponse(token, request, key)
 
 
-@router.post('/purchase-checkouts/{attemptId}/status')
-def refreshPurchaseCheckoutStatus(attemptId: str, token=Depends(verifyToken)):
+@router.get('/payment-status')
+def getPaymentStatus(token=Depends(verifyToken)):
+    """The signed-in owner's checkout, refunds and support reference (spec 4.7); never cached."""
     import os
-    from uuid import UUID
     from jose import jwt, JWTError
     from api.services.billing.manualBillingRepository import getManualBillingRepository
     from api.services.billing.purchaseCheckoutStatusService import PurchaseCheckoutStatusService
-    from api.services.billing.manualBillingPresentation import serializePurchaseCheckoutStatus
 
     headers = {'Cache-Control': 'private, no-store'}
     try:
@@ -141,22 +140,11 @@ def refreshPurchaseCheckoutStatus(attemptId: str, token=Depends(verifyToken)):
         return ORJSONResponse({'message': 'Authentication required.', 'errorCode': 'AUTHENTICATION_REQUIRED'},
                               status_code=401, headers=headers)
     try:
-        UUID(attemptId)
-    except ValueError:
-        return ORJSONResponse({'message': 'Checkout was not found.', 'errorCode': 'PURCHASE_CHECKOUT_NOT_FOUND'},
-                              status_code=404, headers=headers)
-    try:
         service = PurchaseCheckoutStatusService(getManualBillingRepository(), subscriptionService.razorpayClient)
-        return ORJSONResponse(serializePurchaseCheckoutStatus(service.refresh(userId, attemptId)), headers=headers)
-    except ValueError as exc:
-        if str(exc) == 'OWNED_PAYMENT_ATTEMPT_MISSING':
-            return ORJSONResponse({'message': 'Checkout was not found.', 'errorCode': 'PURCHASE_CHECKOUT_NOT_FOUND'},
-                                  status_code=404, headers=headers)
-        from utils.logger import logger
-        logger.exception('Purchase checkout status authority was invalid')
+        return ORJSONResponse(service.refresh(userId), headers=headers)
     except Exception:
         from utils.logger import logger
-        logger.exception('Purchase checkout status refresh failed')
+        logger.exception('Payment status refresh failed')
     return ORJSONResponse({'message': 'Payment status is temporarily unavailable.',
                           'errorCode': 'PURCHASE_STATUS_UNAVAILABLE'}, status_code=503, headers=headers)
 

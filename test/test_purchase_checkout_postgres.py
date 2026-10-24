@@ -683,7 +683,7 @@ def test_authorized_evidence_never_submits_capture(drafts, monkeypatch, source):
     from api.services.billing.manualBillingRecoveryService import ManualBillingRecoveryService
     repo, provider, intent, _ = controlledPurchase(drafts, monkeypatch)
     payment = provider.authorize(intent)
-    assert PurchaseCheckoutStatusService(repo, provider).refresh(intent.userId, intent.attemptId).state == 'confirming_earlier_payment'
+    assert PurchaseCheckoutStatusService(repo, provider).refresh(intent.userId)['checkout']['state'] == 'confirming_earlier_payment'
     assert not provider.captureCalls
     if source == 'browser':
         from api.services.billing.manualBillingRepository import _now

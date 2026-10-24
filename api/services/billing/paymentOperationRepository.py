@@ -142,32 +142,11 @@ class PaymentOperationRepositoryMixin:
         from api.services.billing.purchaseCheckoutContracts import PurchaseCheckoutCapabilities
         from api.services.billing.purchaseDraftService import editableCheckoutEnabled
         ready=self._payReady(cursor)
-        if checkout:
-            cursor.execute("SELECT state FROM public.payment_operations WHERE attempt_id=%s AND kind='refund'",(checkout.attemptId,))
-            states={r['state'] for r in cursor.fetchall()}
-            if states:
-                refund='completed' if states=={'succeeded'} else 'needs_attention' if 'needs_attention' in states else 'submitted' if 'submitted' in states else 'pending'
-                checkout=replace(checkout,refundState=refund,
-                    pendingReason=None if refund=='completed' else 'PURCHASE_CORRECTION_PENDING')
         # Owed refunds and other money never block Pay; the server decides open, reuse or replace.
         capabilities=PurchaseCheckoutCapabilities(
             mayEditDraft=bool(allowed and editableCheckoutEnabled()),
             maySubmitLatestDraft=bool(ready and allowed and draft.revision>0))
         return replace(checkout,capabilities=capabilities) if checkout else None,capabilities
-
-    def projectPurchaseStatus(self,status):
-        from api.services.billing.purchaseCheckoutContracts import PurchaseDraft
-        def operation(connection):
-            with connection.cursor(cursor_factory=RealDictCursor) as cursor:
-                cursor.execute("SELECT to_regclass('public.payment_operations') AS relation")
-                if not cursor.fetchone()['relation']:
-                    return status
-                subscription,allowed=self._editorContext(cursor,status.userId)
-                cursor.execute('SELECT * FROM public.subscription_purchase_drafts WHERE user_id=%s',(status.userId,))
-                stored=cursor.fetchone()
-                draft=self._draft(status.userId,stored) if stored else PurchaseDraft(status.userId)
-                return self._purchasePresentation(cursor,status,draft,allowed)[0]
-        return self._run(operation)
 
     def _operationContext(self,cursor,attemptId):
         cursor.execute('SELECT user_id FROM public.billing_events WHERE id=%s',(attemptId,))

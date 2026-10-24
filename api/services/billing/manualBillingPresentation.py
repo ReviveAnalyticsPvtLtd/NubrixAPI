@@ -88,11 +88,6 @@ def serializeCheckoutIntent(intent, publicKey, identity=None):
         'checkoutConfig':{'display':{'hide':[{'method':method} for method in HIDDEN_CHECKOUT_METHODS]}}}
 
 
-def serializePurchaseCheckoutStatus(status):
-    from dataclasses import asdict
-    return {'schemaVersion': 1, **asdict(status)}
-
-
 def serializeFinalizationResult(result):
     state = {'expert_activated':'activated', 'topup_granted':'activated', 'elapsed':'expired',
         'unchanged':'awaiting_finalization'}.get(result.state,result.state)

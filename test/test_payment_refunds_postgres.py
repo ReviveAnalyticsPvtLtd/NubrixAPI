@@ -805,6 +805,44 @@ def test_refund_does_not_need_compensation_flag(drafts,monkeypatch):
                 if flag in path.read_text(encoding='utf-8')]
 
 
+def presentStatus(repo, userId, now=None):
+    from psycopg2.extras import RealDictCursor
+    from api.services.billing.manualBillingRepository import _now
+    from api.services.billing.paymentStatusPresentation import presentPaymentStatus
+    def operation(connection):
+        with connection.cursor(cursor_factory=RealDictCursor) as cursor:
+            return presentPaymentStatus(cursor, userId, now or _now())
+    return repo._run(operation)
+
+
+@pytest.mark.parametrize('currency', ['INR', 'USD'])
+def test_payment_status_shows_refund_progress_without_ids(drafts, monkeypatch, currency):
+    import json
+    from api.services.billing.paymentRefundService import PaymentRefundService
+    from api.services.billing.paymentStatusPresentation import supportReference
+    url = drafts[3]
+    repo, provider, intent, paymentId = duplicateCapture(drafts, monkeypatch, 'topup', currency)
+    op = reservedFor(url, paymentId)
+    status = presentStatus(repo, intent.userId)
+    # The granted attempt is completed; its duplicate payment is a refund on its way, not an error.
+    assert status['checkout']['state'] == 'completed' and status['checkout']['attemptId'] == intent.attemptId
+    assert status['refunds'] == [{'amount': intent.amount, 'currency': currency, 'reason': 'duplicate',
+                                  'state': 'on_its_way', 'startedAt': op['created_at'].isoformat()}]
+    assert status['paymentAttention'] is None
+    hidden = {intent.invoiceId, intent.razorpayOrderId, paymentId, str(op['id'])}
+    assert not [identity for identity in hidden if identity in json.dumps(status['refunds'])]
+    assert repo.escalateOperationOnce(str(op['id']), 'PAYMENT_REFUND_OVERDUE')
+    assert presentStatus(repo, intent.userId)['paymentAttention'] == {'reference': supportReference(str(op['id']))}
+    provider.refundStatus = 'processed'
+    service = PaymentRefundService(repo, provider)
+    service.execute(str(op['id']))
+    provider.payments[paymentId]['amount_refunded'] = intent.amount
+    service.recover(str(op['id']))
+    assert repo.operationById(str(op['id']))['state'] == 'succeeded'
+    done = presentStatus(repo, intent.userId)
+    assert [refund['state'] for refund in done['refunds']] == ['returned'] and done['paymentAttention'] is None
+
+
 def test_refund_notifications_enqueued_once(drafts,monkeypatch):
     import json
     import psycopg2
@@ -839,7 +877,7 @@ def test_refund_notifications_enqueued_once(drafts,monkeypatch):
         # Customer-facing facts only: no invoice, attempt, Order, payment or operation identity.
         assert not [identity for identity in hidden if identity in json.dumps(facts)]
     assert 'completedAt' in intents['completed']['metadata_json']['metadata']
-    # The durable delivery pipeline accepts both types once and holds them until their template ships.
+    # The durable delivery pipeline accepts both types once.
     deliveries=NotificationDeliveryRepository(lambda: psycopg2.connect(url))
     created=[]
     for _ in range(2):
@@ -850,10 +888,33 @@ def test_refund_notifications_enqueued_once(drafts,monkeypatch):
                 dedupeKey=committed['dedupeKey'],periodEnd=committed['periodEnd'],metadata=committed['metadata'])
             created.append(isNew)
     assert created==[True,True,False,False]
-    claimed=[d for d in deliveries.claimDue('refund-email-test',limit=50) if d['user_id']==intent.userId]
-    assert sorted(d['notification_type'] for d in claimed)==['payment_refund_completed','payment_refund_started']
-    for delivery in claimed:
-        assert deliveries.scheduleRetry(str(delivery['id']),'refund-email-test','TEMPLATE_PENDING',
-            delivery['created_at'].isoformat(),None,payloadVersion=delivery['payload_version'])
-    held=query(url,'SELECT status,attempt_count,last_error_code FROM notification_deliveries WHERE user_id=%s',(intent.userId,))
-    assert [(h['status'],h['attempt_count'],h['last_error_code']) for h in held]==[('RETRY_PENDING',0,'TEMPLATE_PENDING')]*2
+    # As the earlier build left them: held for the template, the claim's attempt given back.
+    query(url,"""UPDATE notification_deliveries SET status='RETRY_PENDING',attempt_count=0,last_error_code='TEMPLATE_PENDING',
+        next_attempt_at=now()-interval '1 second' WHERE user_id=%s""",(intent.userId,))
+    sent=dispatchRefundEmails(url,intent.userId,monkeypatch)
+    assert sorted(p['notificationType'] for p in sent)==['payment_refund_completed','payment_refund_started']
+    for payload in sent:
+        assert not [identity for identity in hidden if identity in json.dumps(payload['metadata'])]
+    assert dispatchRefundEmails(url,intent.userId,monkeypatch)==[]  # delivered once, never again
+    final=query(url,'SELECT status,attempt_count FROM notification_deliveries WHERE user_id=%s',(intent.userId,))
+    assert [(row['status'],row['attempt_count']) for row in final]==[('ACCEPTED',1)]*2
+
+
+def dispatchRefundEmails(url, userId, monkeypatch):
+    """One real dispatch pass (claim, eligibility, locked submission fence, accept) with a recording edge."""
+    monkeypatch.setenv('DATABASE_URL', url)  # the subscription authority read during eligibility
+    import psycopg2
+    from api.services.notifications.edgeEmailClient import EdgeSendResult
+    from api.services.notifications.notificationDeliveryRepository import NotificationDeliveryRepository
+    from api.services.notifications.notificationDeliveryService import NotificationDeliveryService
+    from test.test_notification_delivery_service import FakeEdgeClient, FakeLedger, FakeSupabase
+    subscriptions=[{key:(str(value) if key=='id' else value) for key,value in row.items()} for row in query(url,
+        'SELECT id,user_id,erasure_pending,is_canonical,cancellation_requested_at FROM subscriptions WHERE user_id=%s',(userId,))]
+    edge=FakeEdgeClient([EdgeSendResult(outcome='ACCEPTED',messageId='refund-message-'+str(uuid4())) for _ in range(10)])
+    service=NotificationDeliveryService(repository=NotificationDeliveryRepository(lambda: psycopg2.connect(url)),
+        edgeClient=edge,supabaseClient=FakeSupabase(subscriptions=subscriptions,
+            users=[{'userId':userId,'email':'refund@example.test','fullName':'Refund Customer'}]),
+        eventService=FakeLedger(),brevoClient=object(),now=lambda: datetime.now(timezone.utc))
+    summary=service.dispatchBatch('refund-email-test')
+    assert summary['errors']==0 and summary['failed']==0 and summary['cancelled']==0
+    return edge.payloads

@@ -8,6 +8,7 @@ from threading import Barrier
 from uuid import uuid4
 
 import pytest
+from psycopg2.extras import RealDictCursor
 
 from test.purchaseProviderFixtures import SyntheticPurchaseProvider
 from test.test_purchase_checkout_postgres import checkoutDb, drafts, controlledPurchase  # noqa:F401
@@ -520,6 +521,38 @@ def test_refunded_and_fresh_authorization_on_an_authorized_attempt_confirms(draf
     held = pay(repo, provider, old.userId, 2, ['telecom'])
     assert held.state == 'confirming_earlier_payment' and held.attemptId == old.attemptId
     assert len(provider.orderCalls) == 1 and control(drafts[3], old.attemptId)['closed_at'] is None
+
+
+def test_status_and_pay_agree_on_a_superseded_attempt_holding_an_authorization(drafts, monkeypatch):
+    """A closed (superseded) attempt still holding an in-window authorized payment confirms in status as in Pay."""
+    from api.services.billing.manualBillingRecoveryService import ManualBillingRecoveryService
+    from api.services.billing.manualBillingRepository import _now
+    from api.services.billing.paymentStatusPresentation import presentPaymentStatus
+    from api.services.billing.purchaseCheckoutStatusService import PurchaseCheckoutStatusService
+    repo, provider, old, _ = controlledPurchase(drafts, monkeypatch)
+    repo.saveDraft(old.userId, 1, ['telecom'], 'month')
+    new = pay(repo, provider, old.userId, 2, ['telecom'])
+    assert new.attemptId != old.attemptId and frozen(drafts[3], old.attemptId)[1]['closedReason'] == 'SUPERSEDED'
+    started = time.time()
+    payment(provider, old, 'authorized', created=started)  # a late authorization on the replaced Order
+    ManualBillingRecoveryService(repo, provider).recoverAttempt(repo.attemptById(old.userId, old.attemptId))
+    assert frozen(drafts[3], old.attemptId)[0] == 'cancelled'
+    def present(now):
+        def operation(connection):
+            with connection.cursor(cursor_factory=RealDictCursor) as cursor:
+                return presentPaymentStatus(cursor, old.userId, now)
+        return repo._run(operation)
+    shown = present(_now())['checkout']
+    assert shown == {'state': 'confirming_earlier_payment', 'attemptId': old.attemptId, 'amount': old.amount,
+                     'currency': old.currency, 'selectionLabel': 'Pro monthly with Banking and Manufacturing'}
+    assert PurchaseCheckoutStatusService(repo, provider).refresh(old.userId)['checkout'] == shown
+    repo.saveDraft(old.userId, 2, ['supplychain'], 'month')
+    held = pay(repo, provider, old.userId, 3, ['supplychain'])
+    assert held.state == 'confirming_earlier_payment' and held.attemptId == shown['attemptId']
+    # Past the attempt's own capture window the authorization is dead: status shows the live attempt as ready.
+    window = timedelta(minutes=old.snapshot['captureWindowMinutes'])
+    after = present(datetime.fromtimestamp(int(started), timezone.utc) + window + timedelta(seconds=1))['checkout']
+    assert after['state'] == 'ready' and after['attemptId'] == new.attemptId
 
 
 # -- every purpose shares the slot rules (renewal, expert addition, top-up) --
