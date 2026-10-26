@@ -137,13 +137,30 @@ class RecoverableProvider(StrictFakeRazorpayClient):
                 raise TimeoutError('provider accepted order, acknowledgement lost')
             return order
         self.order.create = create
-        self.order.all = lambda params: {'items': [order for order in self.order.orders.values() if order['receipt'] == params['receipt']]}
-        self.order.payments = lambda order, params=None: {'items': self.paymentsByOrder.get(order, [])}
+        self.order.all = lambda params, **options: {'items': [order for order in self.order.orders.values() if order['receipt'] == params['receipt']]}
+        self.order.payments = lambda order, params=None, **options: {'items': self.paymentsByOrder.get(order, [])}
 
 
 def test_default_service_uses_production_repository():
     from api.services.billing.manualBillingRepository import ManualBillingRepository
     assert isinstance(ManualPaymentService().repository, ManualBillingRepository)
+
+
+def test_shared_contact_is_not_durable_checkout_ownership(checkout_database):
+    repository,path=checkout_database
+    other='same-contact-other'
+    with sqlTransaction(path) as connection:
+        connection.execute('INSERT INTO "Users"("userId") VALUES(?)',(other,))
+    provider=RecoverableProvider(path)
+    service=ManualPaymentService.forProduction(provider,repository)
+    firstRequest=request('contact-a',contact='+919999999999')
+    secondRequest=replace(request('contact-b',contact='+919999999999'),userId=other)
+    first,second=service.createCheckout(firstRequest),service.createCheckout(secondRequest)
+    assert first.razorpayOrderId!=second.razorpayOrderId
+    assert provider.forbiddenCalls==[]
+    assert repository.attemptById(other,second.attemptId)['user_id']==other
+    with pytest.raises(ValueError):
+        repository.attemptById(other,first.attemptId)
 
 
 @pytest.mark.parametrize('mode', ['monthly_prepaid', 'annual_prepaid'])
@@ -186,6 +203,8 @@ def test_delayed_failure_cannot_downgrade_captured_payment(checkout_database):
     repository, path = checkout_database
     service = ManualPaymentService.forProduction(RecoverableProvider(path), repository)
     intent = service.createCheckout(request('capture'))
+    failed = service.finalizeCapturedPayment(replace(evidence(intent), financialStatus='failed'))
+    assert not failed.finalized and read_row(path, 'Invoices')['status'] == 'PAYMENT_PENDING'
     first = service.finalizeCapturedPayment(evidence(intent))
     service.finalizeCapturedPayment(replace(evidence(intent), financialStatus='failed'))
     assert first.finalized and read_row(path, 'Invoices')['status'] == 'PAID'

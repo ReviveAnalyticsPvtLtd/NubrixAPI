@@ -122,7 +122,7 @@ def test_incomplete_payment_listing_does_not_finalize_partial_money(checkout_dat
     provider = service.razorpayClient
     page = [{'id': f'pay_{index}', 'order_id': first.razorpayOrderId, 'status': 'captured',
         'amount': first.amount, 'currency': first.currency} for index in range(100)]
-    def payments(order, params):
+    def payments(order, params, **options):
         if params['skip']:
             raise TimeoutError('second page unavailable')
         return {'items': page}
@@ -138,7 +138,7 @@ def test_cancellation_during_provider_read_cannot_reopen_renewal(checkout_databa
     service, request = paid_then_request(checkout_database, 'monthly_prepaid', 'renewal')
     service.createCheckout(request)
     originalFetch = service.razorpayClient.order.fetch
-    def fetch(order):
+    def fetch(order, **options):
         service.repository.setRenewalOptOut(request.userId, True, None, 'cancel')
         return originalFetch(order)
     with patch.object(service.razorpayClient.order, 'fetch', side_effect=fetch):

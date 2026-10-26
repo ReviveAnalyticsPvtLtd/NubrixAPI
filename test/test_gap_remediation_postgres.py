@@ -117,7 +117,7 @@ class OrderProvider:
             order={**payload,'id':'order-'+str(uuid.uuid4())}
             self.orders[order['id']]=order
             return order
-    def list(self,params):
+    def list(self,params,**options):
         with self.lock: return {'items':[row.copy() for row in self.orders.values() if row['receipt']==params['receipt']]}
 
 

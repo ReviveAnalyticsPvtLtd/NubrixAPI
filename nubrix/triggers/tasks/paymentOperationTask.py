@@ -6,4 +6,7 @@ class PaymentOperationTask:
         from api.services.billing.purchaseCheckoutRepository import getPurchaseCheckoutRepository
         from api.services.billing.paymentOperationWorker import PaymentOperationWorker
         from api.services.subscriptions.subscriptionService import subscriptionService
-        return PaymentOperationWorker(getPurchaseCheckoutRepository(),subscriptionService.razorpayClient).execute()
+        from api.services.billing.manualBillingRecoveryService import ManualBillingRecoveryService
+        repository,provider=getPurchaseCheckoutRepository(),subscriptionService.razorpayClient
+        recovery=ManualBillingRecoveryService(repository,provider).executeRecentCaptures()
+        return {**PaymentOperationWorker(repository,provider).execute(),'captureRecovery':recovery}

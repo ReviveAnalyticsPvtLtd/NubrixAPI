@@ -160,8 +160,8 @@ def test_recovery_of_stale_original_snapshot_is_financial_only(account):
     runErasure(url,initial.userId)
     payment = {'id':'pay-'+intent.attemptId,'order_id':order,'amount':intent.amount,'currency':'INR','status':'captured'}
     provider = SimpleNamespace(order=SimpleNamespace(
-        fetch=lambda _:dict(id=order,amount=intent.amount,currency='INR',status='paid'),
-        payments=lambda *_:{'items':[payment]}))
+        fetch=lambda _,**options:dict(id=order,amount=intent.amount,currency='INR',status='paid'),
+        payments=lambda *_,**options:{'items':[payment]}))
     assert ManualBillingRecoveryService(repo,provider).recoverAttempt(before)==1
     assert repo.attemptForOrder(order)['user_id'] is None
     assert query(url,'SELECT user_id FROM credit_balances WHERE user_id=%s',(initial.userId,))==[]

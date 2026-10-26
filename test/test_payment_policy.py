@@ -119,3 +119,97 @@ def test_order_rejection_fails_closed(checkout_database):
         'select payment_status,provider_order_id,metadata_json from billing_events').fetchone()
     assert row[0] == 'failed' and not row[1]
     assert json.loads(row[2])['manualBilling']['closedReason'] == 'ORDER_NOT_CREATED'
+
+
+@pytest.mark.parametrize('outcome', ['unpaid', 'refunded'])
+def test_complete_terminal_listing_retires_stale_authorized_status(outcome):
+    from api.services.subscriptions.subscriptionModelBackfill import paymentInFlight
+    now = datetime(2026, 10, 24, tzinfo=timezone.utc)
+    event = {'event_category': 'payment_attempt', 'payment_status': 'authorized',
+        'metadata_json': {'manualBilling': {'purpose': 'renewal', 'captureWindowMinutes': 45,
+            'providerObservation': {'outcome': outcome, 'complete': True,
+                'latestPaymentCreatedAt': now.isoformat()}}}}
+    assert not paymentInFlight(event, now)
+    event['metadata_json']['manualBilling']['providerObservation']['complete'] = False
+    assert paymentInFlight(event, now)
+
+
+def test_legacy_authorization_deadline_uses_finite_attempt_origin():
+    from api.services.subscriptions.subscriptionModelBackfill import paymentInFlight
+    now = datetime(2026, 10, 24, tzinfo=timezone.utc)
+    event = {'event_category': 'payment_attempt', 'payment_status': 'authorized',
+        'attempted_at': now - timedelta(minutes=45),
+        'metadata_json': {'manualBilling': {'purpose': 'renewal', 'captureWindowMinutes': 45,
+            'expiresAt': datetime.max.replace(tzinfo=timezone.utc).isoformat()}}}
+    assert not paymentInFlight(event, now)
+    assert paymentInFlight(event, now - timedelta(seconds=1))
+
+
+def test_incomplete_observation_preserves_legacy_closed_authorization(checkout_database):
+    import json
+    from api.services.billing.manualBillingContracts import CheckoutProviderSnapshot
+    from api.services.subscriptions.subscriptionModelBackfill import paymentInFlight
+    from test.test_manual_billing_runtime import NOW, sqlTransaction
+    repository, path = checkout_database
+    intent = ManualPaymentService.forProduction(RecoverableProvider(path), repository).createCheckout(request('legacy-auth'))
+    row = repository.attemptById(intent.userId, intent.attemptId)
+    metadata = repository._json(row['metadata_json'])
+    metadata['manualBilling'].update(closedAt=NOW.isoformat(), closedReason='SUPERSEDED',
+        providerObservation={'outcome':'authorized', 'hasPayments':True,
+            'latestPaymentCreatedAt':NOW.isoformat(), 'checkedAt':NOW.isoformat(), 'complete':True})
+    with sqlTransaction(path) as db:
+        db.execute("UPDATE billing_events SET payment_status='failed',metadata_json=? WHERE id=?",
+                   (json.dumps(metadata),intent.attemptId))
+    assert paymentInFlight(repository.attemptById(intent.userId,intent.attemptId),NOW)
+    repository.recordProviderObservation(intent.attemptId,CheckoutProviderSnapshot(intent.attemptId,
+        intent.razorpayOrderId,'unknown',NOW+timedelta(seconds=1),False,intent.amount,intent.currency,()))
+    assert paymentInFlight(repository.attemptById(intent.userId,intent.attemptId),NOW+timedelta(seconds=1))
+
+
+def test_recovery_defaults_to_bounded_provider_options():
+    from api.services.billing.manualBillingRecoveryService import ManualBillingRecoveryService
+    assert ManualBillingRecoveryService(None, None).requestOptions == purchaseProviderOptions()
+    assert ManualBillingRecoveryService(None, None, {'timeout': 2}).requestOptions == {'timeout': 2}
+
+
+def test_installed_sdk_bounds_order_pages_and_receipt_lookup():
+    from types import SimpleNamespace
+    import razorpay
+    from api.services.billing.manualBillingRecoveryService import ManualBillingRecoveryService
+    seen=[]
+    def get(url,**options):
+        seen.append((url,options))
+        if url.endswith('/payments'):
+            data={'items':[{'id':'pay-'+str(n),'order_id':'order-test','amount':100,'currency':'INR','status':'failed'}
+                           for n in range(100)] if options['params']['skip']==0 else []}
+        elif url.endswith('/order-test'):
+            data={'id':'order-test','amount':100,'currency':'INR','status':'created'}
+        else:
+            data={'items':[]}
+        return SimpleNamespace(status_code=200,json=lambda:data)
+    provider=razorpay.Client(auth=('synthetic','synthetic'))
+    provider.session=SimpleNamespace(get=get)
+    repo=SimpleNamespace(closeUncreatedOrder=lambda identity:True)
+    recovery=ManualBillingRecoveryService(repo,provider)
+    row={'id':'attempt','provider_order_id':'order-test','amount':100,'currency':'INR'}
+    assert recovery.inspectAttempt(row).complete
+    assert recovery.recoverAttempt({**row,'provider_order_id':None})==1
+    assert len(seen)==4 and all(options['timeout']==purchaseProviderOptions()['timeout'] for _,options in seen)
+    assert seen[-1][1]['params']['receipt']=='attempt'
+
+
+def test_timed_out_pay_changes_no_owned_checkout(checkout_database):
+    from test.test_manual_checkout_http import counts
+    repo,path=checkout_database
+    provider=RecoverableProvider(path)
+    service=ManualPaymentService.forProduction(provider,repo)
+    first=service.createCheckout(request('first'))
+    before=counts(path)
+    def timeout(*args,**options):
+        assert options==purchaseProviderOptions()
+        raise TimeoutError('synthetic timeout')
+    provider.order.fetch=timeout
+    with pytest.raises(RuntimeError,match='PAYMENT_SERVICE_BUSY'):
+        service.createCheckout(request('changed',domains=('telecom',)))
+    assert counts(path)==before
+    assert not repo._json(repo.attemptById(first.userId,first.attemptId)['metadata_json'])['manualBilling'].get('closedAt')

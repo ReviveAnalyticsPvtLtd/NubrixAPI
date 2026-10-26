@@ -501,7 +501,6 @@ def test_operation_binding_dedupe_and_terminal_state_are_enforced(drafts):
     repo, _, user, url = drafts
     intent, op = seedOperation(drafts)
     assert repo.getControl(user, intent.attemptId)['draft_revision'] == 1
-    assert repo.hasUnresolvedPurchaseOperations(user)
     with pytest.raises(ValueError, match='OWNED_PAYMENT_ATTEMPT_MISSING'):
         repo.getControl('foreign', intent.attemptId)
     with pytest.raises(psycopg2.IntegrityError):
@@ -516,18 +515,16 @@ def test_operation_binding_dedupe_and_terminal_state_are_enforced(drafts):
         query(url, "UPDATE payment_operations SET state='succeeded' WHERE id=%s", (op,))
     query(url, "UPDATE payment_operations SET state='submission_started' WHERE id=%s", (op,))
     query(url, "UPDATE payment_operations SET state='succeeded' WHERE id=%s", (op,))
-    assert not repo.hasUnresolvedPurchaseOperations(user)
     with pytest.raises(psycopg2.Error):
         query(url, "UPDATE payment_operations SET state='queued' WHERE id=%s", (op,))
 
 
-@pytest.mark.parametrize('kind', ['refund'])
-def test_unresolved_operations_block_erasure_atomically_then_resolved_originals_are_retained(drafts, kind):
+def test_unresolved_operations_block_erasure_atomically_then_resolved_originals_are_retained(drafts):
     from nubrix.triggers.tasks.userErasureTask import UserErasureTask
     from test.test_user_erasure_task import FakeExternalCleanup, FakeAudit
     repo, _, user, url = drafts
     repo.saveDraft(user, 0, ['telecom'], 'year')
-    intent, op = seedOperation(drafts, kind)
+    intent, op = seedOperation(drafts)
     original = query(url, 'SELECT to_jsonb(o) AS row FROM payment_operations o WHERE id=%s', (op,), one=True)['row']
     repository, request = startErasure(url, user)
     failures = []
@@ -560,19 +557,6 @@ def test_unresolved_operations_block_erasure_atomically_then_resolved_originals_
         assert detached['user_id'] is None and str(detached['erasure_request_id']) == request
     counts = repository.getRequest(request)['retention_manifest']['retainedRecordCounts']
     assert counts['payment_operations'] == 1 and counts['payment_slot_controls'] == 1 and counts['payment_slots'] == 1
-
-
-def test_due_operation_scan_uses_keyset_and_kind(drafts):
-    repo, _, user, _ = drafts
-    _, operation = seedOperation(drafts)
-    rows = repo.listDueOperations('refund', None, 100)
-    assert str(operation) in [str(row['id']) for row in rows]
-    assert all(row['kind'] == 'refund' for row in rows)
-    assert all(str(row['id']) > str(operation) for row in repo.listDueOperations('refund', str(operation), 100))
-    with pytest.raises(ValueError):
-        repo.listDueOperations('compensation', None, 100)
-    with pytest.raises(ValueError):
-        repo.listDueOperations('foreign', None, 100)
 
 
 @pytest.mark.parametrize('missing', ['amount', 'provider_order_id'])
@@ -820,5 +804,3 @@ def test_submit_http_verifies_signed_pricing_and_keeps_contact_out_of_storage(dr
     frozen = query(url, 'SELECT metadata_json FROM "Invoices" WHERE "userId"=%s', (user,), one=True)['metadata_json']
     assert '+919999999999' not in str(frozen)
     assert len(provider.orderCalls) == 1
-
-

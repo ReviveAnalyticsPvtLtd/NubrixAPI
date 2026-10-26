@@ -16,7 +16,7 @@ class PurchaseCheckoutStatusService:
     def refresh(self, userId: str) -> dict:
         from api.services.billing.manualBillingRepository import _now
         shown = self._read(lambda cursor: presentation.checkoutAttempt(cursor, userId, _now()))
-        if shown is not None and presentation.needsProviderRefresh(shown[0], _now()):
+        if shown is not None and self._claimRefresh(userId, str(shown[0]['id'])):
             self._observe(shown[0])
         now = _now()
         return self._read(lambda cursor: presentation.presentPaymentStatus(cursor, userId, now))
@@ -27,6 +27,29 @@ class PurchaseCheckoutStatusService:
             with connection.cursor(cursor_factory=RealDictCursor) as cursor:
                 return read(cursor)
         return self.repository._run(operation)
+
+    def _claimRefresh(self, userId, attemptId):
+        """Commit a short per-attempt claim before any network work; never fake an observation."""
+        from datetime import timedelta
+        from psycopg2.extras import Json
+        from api.services.billing.manualBillingRepository import _now, _utc
+        def claim(cursor):
+            cursor.execute('''SELECT * FROM public.billing_events
+                WHERE id=%s AND user_id=%s AND event_category='payment_attempt' FOR UPDATE''', (attemptId, userId))
+            attempt = cursor.fetchone()
+            now = _now()
+            if not attempt or not presentation.needsProviderRefresh(attempt, now):
+                return False
+            metadata = self.repository._json(attempt.get('metadata_json'))
+            frozen = metadata.setdefault('manualBilling', {})
+            claimed = _utc(frozen.get('providerRefreshClaimedAt'))
+            if claimed and timedelta(0) <= now - claimed < presentation.PROVIDER_REFRESH_INTERVAL:
+                return False
+            frozen['providerRefreshClaimedAt'] = now.isoformat()
+            cursor.execute('UPDATE public.billing_events SET metadata_json=%s WHERE id=%s AND user_id=%s',
+                           (Json(metadata), attemptId, userId))
+            return True
+        return self._read(claim)
 
     def _observe(self, attempt):
         """Best effort: a failed refresh never hides the committed checkout, refunds or attention."""

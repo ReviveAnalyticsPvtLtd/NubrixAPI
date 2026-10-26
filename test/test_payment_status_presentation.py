@@ -213,7 +213,7 @@ def test_attention_reference_format(statusDb):
     for index, reason in enumerate(('FROZEN_SNAPSHOT_INCOMPLETE', 'PAYMENT_SLOT_UNAVAILABLE', 'PAYMENT_EVIDENCE_MISMATCH')):
         captureId = capture(path, reason=reason, occurredAt=NOW + timedelta(seconds=index + 1))
         assert present(repository)['paymentAttention'] == {'reference': supportReference(captureId)}
-    missing = capture(path, rulesFacts='RULES_FACTS_MISSING', reason='CAPTURE_OUTSIDE_WINDOW',
+    missing = capture(path, rulesFacts='RULES_FACTS_MISSING', reason='CAPTURE_TIMING_UNVERIFIED',
                       occurredAt=NOW + timedelta(minutes=1))
     assert present(repository)['paymentAttention'] == {'reference': supportReference(missing)}
     escalated = operation(path, state='submitted', startedAt=NOW + timedelta(minutes=2), escalated=True)

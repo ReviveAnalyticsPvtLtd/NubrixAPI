@@ -101,30 +101,6 @@ class PurchaseCheckoutRepository(PaymentOperationRepositoryMixin, ManualBillingR
                 return dict(row)
         return self._run(operation)
 
-    def listDueOperations(self, kind, afterId=None, limit=100):
-        if kind != 'refund' or type(limit) is not int or not 1 <= limit <= 100:
-            raise ValueError('INVALID_PAYMENT_OPERATION_SCAN')
-        if afterId is not None:
-            UUID(str(afterId))
-        def operation(connection):
-            with connection.cursor(cursor_factory=RealDictCursor) as cursor:
-                self._requireStorage(cursor)
-                cursor.execute('''SELECT * FROM public.payment_operations WHERE kind=%s
-                    AND state NOT IN ('succeeded','cancelled') AND next_retry_at<=clock_timestamp()
-                    AND (%s::uuid IS NULL OR id>%s::uuid) ORDER BY id LIMIT %s''', (kind, afterId, afterId, limit))
-                return list(cursor.fetchall())
-        return self._run(operation)
-
-    def hasUnresolvedPurchaseOperations(self, userId):
-        def operation(connection):
-            with connection.cursor(cursor_factory=RealDictCursor) as cursor:
-                self._requireStorage(cursor)
-                self._lockUser(cursor, userId)
-                cursor.execute('''SELECT 1 FROM public.payment_operations
-                    WHERE user_id=%s AND state NOT IN ('succeeded','cancelled') LIMIT 1''', (userId,))
-                return cursor.fetchone() is not None
-        return self._run(operation)
-
     def draftCheckoutRequest(self, userId, draftRevision, pricing, requestKey):
         """The saved-draft Pay request; the caller reserves it through the shared reservation path."""
         from api.services.billing.purchaseCheckoutService import requirePurchaseActions, validatePurchaseKey

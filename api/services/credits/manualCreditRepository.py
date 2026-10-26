@@ -488,7 +488,7 @@ class ManualCreditRepository:
                     (str(uuid.uuid4()),context.userId,key,Json(metadata),datetime.now(timezone.utc)))
         self.repository._run(operation)
 
-    def clawbackTopup(self,userId,refundId,paymentId,amount):
+    def clawbackTopup(self,userId,refundId,paymentId,amount,*,paymentEvidence=None):
         if not refundId or amount<=0:
             raise ValueError('INVALID_TOPUP_REFUND')
         def operation(connection):
@@ -506,40 +506,97 @@ class ManualCreditRepository:
                 cursor.execute('''select * from public."Invoices" where "userId"=%s and "razorpayPaymentId"=%s
                     and billing_reason='add_on' and status='PAID' for update''',(userId,paymentId))
                 invoice=cursor.fetchone()
-                if not invoice:
-                    # Duplicate/closed captures never granted tokens. Keep a durable
-                    # no-op under the same refund identity so delivery can complete.
-                    metadata={'userId':userId,'paymentId':paymentId,'refundId':refundId,'amount':amount}
+                metadata={'userId':userId,'paymentId':paymentId,'refundId':refundId,'amount':amount}
+                if invoice:
+                    return self._settleTopupRefundLocked(cursor,invoice,metadata)
+                cursor.execute('''SELECT * FROM public.billing_events WHERE user_id=%s AND provider_payment_id=%s
+                    AND event_type='payment.capture' AND event_status='REFUND_RESERVED' ''',(userId,paymentId))
+                ungranted=cursor.fetchone()
+                if ungranted:
+                    if amount>int(ungranted['amount']):
+                        raise ValueError('INVALID_TOPUP_REFUND_AMOUNT')
                     cursor.execute('''insert into public.billing_events(id,user_id,event_category,event_type,
                         event_status,idempotency_key,metadata_json,occurred_at)
                         values(%s,%s,'audit','credit.topup_refund_not_granted','NOT_GRANTED',%s,%s,%s)''',
                         (str(uuid.uuid4()),userId,key,Json(metadata),datetime.now(timezone.utc)))
                     return {'clawed':False,'tokens':0,'status':'not_granted'}
-                tokens=int(self.repository._json(invoice['metadata_json']).get('tokens') or 0)
-                captured=int(invoice.get('total_amount') or invoice.get('amount') or 0)
-                if not tokens or not captured or amount>captured:
-                    raise ValueError('INVALID_TOPUP_REFUND_AMOUNT')
-                cursor.execute("select metadata_json from public.billing_events where user_id=%s and event_type='credit.topup_refunded'",(userId,))
+                # A missing PAID invoice is not proof of a never-grantable capture.
+                # Only fetched payment evidence bound to local owned money may wait for its grant.
+                payment=paymentEvidence or {}
+                if payment.get('id')!=paymentId or payment.get('status') not in ('captured','refunded'):
+                    raise ValueError('TOPUP_REFUND_PAYMENT_EVIDENCE_REQUIRED')
+                cursor.execute('''SELECT * FROM public.billing_events WHERE user_id=%s AND provider_order_id=%s
+                    AND event_category='payment_attempt' FOR UPDATE''',(userId,payment.get('order_id')))
+                attempt=cursor.fetchone()
+                frozen=self.repository._json((attempt or {}).get('metadata_json')).get('manualBilling',{})
+                if (not attempt or frozen.get('purpose')!='topup' or payment.get('currency')!=attempt['currency']
+                        or payment.get('amount')!=attempt['amount']):
+                    raise ValueError('TOPUP_REFUND_PAYMENT_BINDING_INVALID')
+                cursor.execute('SELECT * FROM public."Invoices" WHERE id=%s AND "userId"=%s FOR UPDATE',
+                               (attempt['invoice_id'],userId))
+                invoice=cursor.fetchone()
+                captured=int(attempt['amount'])
+                if (not invoice or invoice['billing_reason']!='add_on' or invoice['currency']!=attempt['currency']
+                        or int(invoice.get('total_amount') or invoice.get('amount') or 0)!=captured
+                        or int(self.repository._json(invoice['metadata_json']).get('tokens') or 0)!=int(frozen.get('tokens') or 0)
+                        or int(frozen.get('tokens') or 0)<=0):
+                    raise ValueError('TOPUP_REFUND_PAYMENT_BINDING_INVALID')
+                cursor.execute('''SELECT metadata_json FROM public.billing_events WHERE user_id=%s
+                    AND event_type IN ('credit.topup_refund_pending','credit.topup_refunded')''',(userId,))
                 refunded=sum(int(self.repository._json(row['metadata_json'])['amount']) for row in cursor.fetchall()
                     if self.repository._json(row['metadata_json'])['paymentId']==paymentId)
                 if refunded+amount>captured:
                     raise ValueError('TOPUP_REFUND_EXCEEDS_CAPTURE')
-                # Difference of cumulative floors ensures multiple partial refunds add up exactly.
-                entitled=(tokens*(refunded+amount)//captured)-(tokens*refunded//captured)
-                cursor.execute('select topup_tokens from public.credit_balances where user_id=%s for update',(userId,))
-                balance=cursor.fetchone()
-                if not balance:
-                    raise ValueError('CREDIT_BALANCE_MISSING')
-                clawed=min(int(balance['topup_tokens'] or 0),entitled)
-                cursor.execute('update public.credit_balances set topup_tokens=topup_tokens-%s,balance_version=balance_version+1,updated_at=%s where user_id=%s',
-                    (clawed,datetime.now(timezone.utc),userId))
-                metadata={'userId':userId,'paymentId':paymentId,'refundId':refundId,'amount':amount,
-                    'tokensClawed':clawed,'unfundedTokens':entitled-clawed}
-                cursor.execute('''insert into public.billing_events(id,user_id,invoice_id,event_category,event_type,event_status,idempotency_key,metadata_json,occurred_at)
-                    values(%s,%s,%s,'audit','credit.topup_refunded','SETTLED',%s,%s,%s)''',
+                metadata.update(attemptId=str(attempt['id']),orderId=attempt['provider_order_id'],
+                                currency=attempt['currency'],capturedAmount=captured)
+                cursor.execute('''INSERT INTO public.billing_events(id,user_id,invoice_id,event_category,event_type,
+                    event_status,idempotency_key,metadata_json,occurred_at)
+                    VALUES(%s,%s,%s,'audit','credit.topup_refund_pending','PENDING',%s,%s,%s)''',
                     (str(uuid.uuid4()),userId,invoice['id'],key,Json(metadata),datetime.now(timezone.utc)))
-                return {'clawed':True,'tokens':clawed,'status':'clawed_back'}
+                return {'clawed':False,'tokens':0,'status':'pending_grant'}
         return self.repository._run(operation)
+
+    def _settleTopupRefundLocked(self,cursor,invoice,metadata,pendingId=None):
+        userId,paymentId,amount=metadata['userId'],metadata['paymentId'],metadata['amount']
+        tokens=int(self.repository._json(invoice['metadata_json']).get('tokens') or 0)
+        captured=int(invoice.get('total_amount') or invoice.get('amount') or 0)
+        if not tokens or not captured or amount>captured:
+            raise ValueError('INVALID_TOPUP_REFUND_AMOUNT')
+        cursor.execute("select metadata_json from public.billing_events where user_id=%s and event_type='credit.topup_refunded'",(userId,))
+        refunded=sum(int(self.repository._json(row['metadata_json'])['amount']) for row in cursor.fetchall()
+            if self.repository._json(row['metadata_json'])['paymentId']==paymentId)
+        if refunded+amount>captured:
+            raise ValueError('TOPUP_REFUND_EXCEEDS_CAPTURE')
+        entitled=(tokens*(refunded+amount)//captured)-(tokens*refunded//captured)
+        cursor.execute('select topup_tokens from public.credit_balances where user_id=%s for update',(userId,))
+        balance=cursor.fetchone()
+        if not balance:
+            raise ValueError('CREDIT_BALANCE_MISSING')
+        clawed=min(int(balance['topup_tokens'] or 0),entitled)
+        cursor.execute('update public.credit_balances set topup_tokens=topup_tokens-%s,balance_version=balance_version+1,updated_at=%s where user_id=%s',
+            (clawed,datetime.now(timezone.utc),userId))
+        metadata={**metadata,'tokensClawed':clawed,'unfundedTokens':entitled-clawed}
+        if pendingId:
+            cursor.execute('''UPDATE public.billing_events SET event_type='credit.topup_refunded',event_status='SETTLED',
+                metadata_json=%s WHERE id=%s''',(Json(metadata),pendingId))
+        else:
+            cursor.execute('''insert into public.billing_events(id,user_id,invoice_id,event_category,event_type,event_status,idempotency_key,metadata_json,occurred_at)
+                values(%s,%s,%s,'audit','credit.topup_refunded','SETTLED',%s,%s,%s)''',
+                (str(uuid.uuid4()),userId,invoice['id'],'topup-refund:'+str(metadata['refundId']),Json(metadata),datetime.now(timezone.utc)))
+        return {'clawed':True,'tokens':clawed,'status':'clawed_back'}
+
+    def applyPendingTopupRefundsLocked(self,cursor,invoice,attempt,evidence):
+        cursor.execute('''SELECT id,metadata_json FROM public.billing_events WHERE user_id=%s AND invoice_id=%s
+            AND event_type='credit.topup_refund_pending' AND event_status='PENDING' ORDER BY created_at,id FOR UPDATE''',
+            (evidence.userId,invoice['id']))
+        for row in cursor.fetchall():
+            data=self.repository._json(row['metadata_json'])
+            if data['paymentId']!=evidence.providerPaymentId:
+                continue
+            if (data['attemptId']!=str(attempt['id']) or data['orderId']!=evidence.providerOrderId
+                    or data['currency']!=evidence.currency or data['capturedAmount']!=evidence.amount):
+                raise ValueError('TOPUP_REFUND_PAYMENT_BINDING_INVALID')
+            self._settleTopupRefundLocked(cursor,invoice,data,row['id'])
 
     def recoverUsage(self,limit=100):
         from api.services.credits.creditUsageSpool import recoverSpooledUsage

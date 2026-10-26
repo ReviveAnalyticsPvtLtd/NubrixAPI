@@ -84,7 +84,28 @@ def checkoutAttempt(cursor, userId: str, now: datetime, purposes=PURPOSES, fallb
     if held:
         return held[-1]
     fallback = rows if fallbackPurposes is None else [entry for entry in rows if entry[1].get('purpose') in fallbackPurposes]
-    return fallback[-1] if fallback else None
+    if not fallback:
+        return None
+    latest = fallback[-1]
+    if latest[1].get('closedReason') == 'SLOT_SETTLED':
+        # Follow the committed settlement of this slot only. A later independent
+        # purchase keeps its place; the cancelled sibling is never relabelled paid.
+        cursor.execute('''SELECT s.settled_payment_id FROM public.payment_slot_controls c
+            JOIN public.payment_slots s ON s.slot_id=c.slot_id
+            WHERE c.attempt_id=%s AND c.user_id=%s''', (latest[0]['id'], userId))
+        slot = cursor.fetchone()
+        if slot and slot['settled_payment_id']:
+            cursor.execute('''SELECT c.attempt_id FROM public.payment_slot_controls c
+                JOIN public.billing_events b ON b.id=c.attempt_id
+                JOIN public.billing_events paid ON paid.provider_order_id=b.provider_order_id
+                WHERE c.slot_id=(SELECT slot_id FROM public.payment_slot_controls WHERE attempt_id=%s)
+                AND c.user_id=%s AND b.payment_status='captured' AND paid.provider_payment_id=%s
+                AND paid.event_type='payment.capture' AND paid.event_status='FINALIZED' ''',
+                (latest[0]['id'], userId, slot['settled_payment_id']))
+            winner = cursor.fetchone()
+            if winner:
+                return next((entry for entry in rows if str(entry[0]['id']) == str(winner['attempt_id'])), latest)
+    return latest
 
 
 def needsProviderRefresh(attempt: dict, now: datetime) -> bool:

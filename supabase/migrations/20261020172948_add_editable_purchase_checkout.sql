@@ -97,6 +97,39 @@ CREATE INDEX IF NOT EXISTS payment_operations_due_idx ON public.payment_operatio
  WHERE state NOT IN ('succeeded','cancelled');
 CREATE INDEX IF NOT EXISTS payment_operations_owner_idx ON public.payment_operations(user_id,id);
 
+-- A pre-rollout attempt erased before controls existed can acquire refund-only authority.
+-- Its immutable originals, not unauthenticated metadata or a fabricated control archive, prove it.
+CREATE OR REPLACE FUNCTION private.exact_retained_payment_attempt(attempt_id uuid,invoice_id uuid,request_id uuid)
+RETURNS boolean LANGUAGE plpgsql STABLE SET search_path='' AS $$
+BEGIN
+ RETURN EXISTS(SELECT 1 FROM public.billing_events a JOIN public."Invoices" i ON i.id=a.invoice_id
+ JOIN private.retained_user_records ar ON ar.source_table='billing_events' AND ar.source_id=a.id AND ar.request_id=$3
+ JOIN private.retained_user_records ir ON ir.source_table='Invoices' AND ir.source_id=i.id AND ir.request_id=ar.request_id
+ JOIN private.retained_user_subjects s ON s.request_id=ar.request_id
+ JOIN public.user_erasure_requests e ON e.id=s.request_id
+ WHERE a.id=$1 AND i.id=$2 AND a.user_id IS NULL AND i."userId" IS NULL AND e.status='COMPLETED'
+ AND a.metadata_json->>'erasureRequestId'=$3::text AND i.metadata_json->>'erasureRequestId'=$3::text
+ AND ar.original_record->>'id'=a.id::text AND ir.original_record->>'id'=i.id::text
+ AND ar.original_record->>'user_id'=s.original_user_id AND ir.original_record->>'userId'=s.original_user_id
+ AND ar.original_record->>'invoice_id'=i.id::text AND a.event_category='payment_attempt'
+ AND ar.original_record->>'event_category'='payment_attempt'
+ AND a.provider_order_id IS NOT NULL AND ar.original_record->>'provider_order_id'=a.provider_order_id
+ AND a.amount>0 AND ar.original_record->>'amount'=a.amount::text
+ AND a.currency IN ('INR','USD') AND ar.original_record->>'currency'=a.currency
+ AND i.currency=a.currency AND ir.original_record->>'currency'=a.currency
+ AND coalesce(i.total_amount,i.amount)=a.amount
+ AND coalesce(ir.original_record->>'total_amount',ir.original_record->>'amount')=a.amount::text
+ AND a.metadata_json->'manualBilling'->>'purpose' IN ('initial_purchase','renewal','expert_addition','topup')
+ AND ar.original_record->'metadata_json'->'manualBilling'->>'purpose'=a.metadata_json->'manualBilling'->>'purpose'
+ AND coalesce(ar.original_record->'metadata_json'->'manualBilling'->>'capturePolicy','account_default') IN ('account_default','automatic')
+ AND ar.record_hash=encode(sha256(convert_to(ar.original_record::text,'UTF8')),'hex')
+ AND ir.record_hash=encode(sha256(convert_to(ir.original_record::text,'UTF8')),'hex')
+ AND NOT EXISTS(SELECT 1 FROM private.retained_user_records cr WHERE cr.source_table='payment_slot_controls' AND cr.source_id=a.id));
+END
+$$;
+REVOKE ALL ON FUNCTION private.exact_retained_payment_attempt(uuid,uuid,uuid) FROM PUBLIC,anon,authenticated;
+GRANT EXECUTE ON FUNCTION private.exact_retained_payment_attempt(uuid,uuid,uuid) TO service_role;
+
 -- Retained-only refund authority after erasure detached the original owner. Any full-refund
 -- reason of the capture rules qualifies; the guard separately requires the ungranted capture.
 CREATE OR REPLACE FUNCTION private.authorized_erased_payment(attempt_id uuid,invoice_id uuid,request_id uuid)
@@ -115,7 +148,13 @@ BEGIN
    AND a.metadata_json->>'erasureRequestId'=c.erasure_request_id::text
    AND r.original_record->>'user_id'=s.original_user_id
    AND r.original_record->>'invoice_id'=c.invoice_id::text
-   AND e.status='COMPLETED');
+   AND e.status='COMPLETED') OR EXISTS(SELECT 1 FROM public.payment_slot_controls c
+ JOIN public.payment_slots s ON s.slot_id=c.slot_id
+ WHERE c.attempt_id=authorized_erased_payment.attempt_id AND c.invoice_id=authorized_erased_payment.invoice_id
+ AND c.erasure_request_id=authorized_erased_payment.request_id AND c.user_id IS NULL
+ AND c.slot_id=c.attempt_id AND s.slot_key='retained:'||c.attempt_id::text
+ AND c.closed_reason='ACCOUNT_CLOSED' AND s.settled_payment_id IS NULL
+ AND private.exact_retained_payment_attempt(c.attempt_id,c.invoice_id,c.erasure_request_id));
 END $$;
 REVOKE ALL ON FUNCTION private.authorized_erased_payment(uuid,uuid,uuid) FROM PUBLIC,anon,authenticated;
 GRANT EXECUTE ON FUNCTION private.authorized_erased_payment(uuid,uuid,uuid) TO service_role;
@@ -153,7 +192,15 @@ BEGIN
  END IF;
 
  IF TG_TABLE_NAME='payment_slots' THEN
-  IF TG_OP='INSERT' AND (NEW.user_id IS NULL OR NEW.settled_payment_id IS NOT NULL OR NEW.settled_at IS NOT NULL) THEN
+  IF NEW.user_id IS NULL AND NEW.slot_key='retained:'||NEW.slot_id::text THEN
+   SELECT * INTO attempt FROM public.billing_events WHERE id=NEW.slot_id;
+   IF NEW.settled_payment_id IS NOT NULL OR NEW.settled_at IS NOT NULL
+      OR NEW.kind IS DISTINCT FROM (CASE attempt.metadata_json->'manualBilling'->>'purpose'
+         WHEN 'topup' THEN 'topup' WHEN 'expert_addition' THEN 'expert_addition' ELSE 'pro_term' END)
+      OR NOT private.exact_retained_payment_attempt(attempt.id,attempt.invoice_id,NEW.erasure_request_id) THEN
+    RAISE EXCEPTION 'retained payment authority required';
+   END IF;
+  ELSIF TG_OP='INSERT' AND (NEW.user_id IS NULL OR NEW.settled_payment_id IS NOT NULL OR NEW.settled_at IS NOT NULL) THEN
    RAISE EXCEPTION 'payment slot must open unsettled for its owner';
   END IF;
   IF TG_OP='UPDATE' AND (NEW.slot_id<>OLD.slot_id OR NEW.kind<>OLD.kind OR NEW.slot_key<>OLD.slot_key
@@ -183,8 +230,18 @@ BEGIN
  END IF;
  SELECT * INTO attempt FROM public.billing_events WHERE id=NEW.attempt_id;
  IF TG_OP='INSERT' AND NEW.user_id IS NULL THEN
-  IF TG_TABLE_NAME<>'payment_operations' THEN RAISE EXCEPTION 'retained payment authority required'; END IF;
-  IF NEW.kind<>'refund' OR NOT private.authorized_erased_payment(NEW.attempt_id,NEW.invoice_id,NEW.erasure_request_id) THEN
+  IF TG_TABLE_NAME='payment_slot_controls' THEN
+   SELECT * INTO slot FROM public.payment_slots WHERE slot_id=NEW.slot_id;
+   IF NEW.slot_id<>NEW.attempt_id OR slot.slot_key IS DISTINCT FROM 'retained:'||NEW.attempt_id::text
+     OR slot.erasure_request_id IS DISTINCT FROM NEW.erasure_request_id OR slot.user_id IS NOT NULL
+     OR NEW.closed_reason IS DISTINCT FROM 'ACCOUNT_CLOSED' OR NEW.closed_at IS NULL
+     OR NEW.superseded_by IS NOT NULL OR NEW.operation_revision<>0
+     OR NOT private.exact_retained_payment_attempt(NEW.attempt_id,NEW.invoice_id,NEW.erasure_request_id)
+     OR NEW.capture_policy IS DISTINCT FROM (SELECT coalesce(r.original_record->'metadata_json'->'manualBilling'->>'capturePolicy','account_default')
+        FROM private.retained_user_records r WHERE r.source_table='billing_events' AND r.source_id=NEW.attempt_id AND r.request_id=NEW.erasure_request_id) THEN
+    RAISE EXCEPTION 'retained payment authority required';
+   END IF;
+  ELSIF NEW.kind<>'refund' OR NOT private.authorized_erased_payment(NEW.attempt_id,NEW.invoice_id,NEW.erasure_request_id) THEN
    RAISE EXCEPTION 'retained payment authority required';
   END IF;
  END IF;
@@ -196,7 +253,7 @@ BEGIN
    IF attempt.user_id IS DISTINCT FROM NEW.user_id OR attempt.invoice_id IS DISTINCT FROM NEW.invoice_id
       OR attempt.event_category IS DISTINCT FROM 'payment_attempt'
       OR attempt.metadata_json->'manualBilling'->>'purpose' IS DISTINCT FROM NEW.purpose
-      OR NOT EXISTS(SELECT 1 FROM public."Invoices" i WHERE i.id=NEW.invoice_id AND i."userId"=NEW.user_id)
+      OR NOT EXISTS(SELECT 1 FROM public."Invoices" i WHERE i.id=NEW.invoice_id AND i."userId" IS NOT DISTINCT FROM NEW.user_id)
       OR slot.user_id IS DISTINCT FROM NEW.user_id OR slot.settled_payment_id IS NOT NULL
       OR slot.kind IS DISTINCT FROM slot_kind THEN
     RAISE EXCEPTION 'payment owner, purpose, invoice or slot mismatch';

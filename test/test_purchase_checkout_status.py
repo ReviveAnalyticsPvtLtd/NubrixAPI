@@ -27,7 +27,7 @@ def status_checkout(checkout_client, monkeypatch):
     # Token issuance has its own session tests; this fixture owns no Sessions table.
     import api.routers.subscriptions as routes
     monkeypatch.setattr(routes.subscriptionService, '_reissueTokenWithUpdatedClaims', lambda token, *_: token)
-    provider.order.payments = lambda order, params: {
+    provider.order.payments = lambda order, params, **options: {
         'items': provider.paymentsByOrder.get(order, [])[params['skip']:params['skip'] + params['count']]}
     first = client.post('/createSubscription', json={'domains': ['banking'], 'contact': ''},
                         headers={'Idempotency-Key': 'status-original'})
@@ -225,7 +225,7 @@ def test_incomplete_provider_listing_never_finalizes_partial_capture(status_chec
         if params['skip']:
             raise TimeoutError('incomplete listing')
         return {'items': [dict(item, id=f'payment-{index}') for index in range(100)]}
-    provider.order.payments = lambda order, params: truncated(params)
+    provider.order.payments = lambda order, params, **options: truncated(params)
     assert checkout(status(client))['state'] == 'ready'
     assert not checkout_database[0].getCoverageSnapshot(USER).accessAllowed
 

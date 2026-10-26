@@ -119,6 +119,15 @@ def test_superseded_payment_wins_unsettled_slot_and_closes_newer(drafts, monkeyp
     assert slot['settled_payment_id'] == started['id'] and slot['slot_id'] == slotOfAttempt(url, second.attemptId)['slot_id']
     assert liveIn(url, first.userId, ['initial_purchase']) == []
     assert operations(url, first.userId) == []
+    from api.services.billing.purchaseCheckoutStatusService import PurchaseCheckoutStatusService
+    shown = PurchaseCheckoutStatusService(repo, provider).refresh(first.userId)['checkout']
+    assert shown['attemptId'] == first.attemptId and shown['state'] == 'completed'
+    assert shown['selectionLabel'] == 'Pro monthly with Banking and Manufacturing'
+    editor = repo.readEditor(first.userId)
+    assert editor.checkout.attemptId == first.attemptId and editor.checkout.state == 'completed'
+    # A genuinely new independent slot must remain visible after this completed slot.
+    topup = purposePay(repo,provider,first.userId,'topup','monthly_prepaid',{'packId':'medium'})
+    assert PurchaseCheckoutStatusService(repo,provider).refresh(first.userId)['checkout']['attemptId']==topup.attemptId
 
 
 def test_second_capture_in_slot_reserves_one_full_refund(drafts, monkeypatch):
@@ -556,6 +565,10 @@ def test_ended_renewal_and_repurchase_share_one_slot_in_either_order(drafts, mon
         sequence.reverse()
     (winner, winning), (loser, losing) = sequence
     assert finalize(service.repository, winner, capturedNow(provider, winning['id'])).finalized
+    from api.services.billing.purchaseCheckoutStatusService import PurchaseCheckoutStatusService
+    shown=PurchaseCheckoutStatusService(service.repository,provider).refresh(winner.userId)['checkout']
+    assert shown['attemptId']==winner.attemptId and shown['state']=='completed'
+    assert drafts[0].readEditor(winner.userId).checkout.attemptId==winner.attemptId
     assert finalize(service.repository, loser, capturedNow(provider, losing['id'])).state == 'refund_pending'
     assert [(op['provider_payment_id'], op['reason']) for op in operations(url, renewal.userId)] == [
         (losing['id'], 'duplicate')]
@@ -605,6 +618,62 @@ def test_rules_decision_is_marked_on_the_capture(drafts, monkeypatch):
     assert finalize(repo, intent, item).finalized
     metadata = captureRow(url, item['id'])['metadata_json']
     assert metadata['rulesFacts'] == 'CAPTURE_RULES' and 'rulesFactsMissing' not in metadata
+
+
+@pytest.mark.parametrize('era,marker', [('old', 'PRE_CUTOVER'), ('new', 'CAPTURE_RULES'), ('missing', 'RULES_FACTS_MISSING')])
+def test_mismatched_capture_provenance_is_independent_of_outcome(drafts, monkeypatch, era, marker):
+    from dataclasses import replace
+    from api.services.billing.purchaseCheckoutStatusService import PurchaseCheckoutStatusService
+    repo, provider, intent, _ = controlledPurchase(drafts, monkeypatch)
+    item = providerPayment(provider, intent, 'captured')
+    evidence = evidenceFor(intent, item)
+    if era == 'old':
+        monkeypatch.setenv('PAYMENT_RULES_EFFECTIVE_AT', (evidence.paymentCreatedAt + timedelta(days=1)).isoformat())
+    elif era == 'missing':
+        evidence = replace(evidence, paymentCreatedAt=None)
+    result = repo.finalizeCapturedPayment(replace(evidence, amount=evidence.amount + 1))
+    assert not result.finalized
+    assert captureRow(drafts[3], item['id'])['metadata_json']['rulesFacts'] == marker
+    status = PurchaseCheckoutStatusService(repo, provider)
+    status._observe = lambda attempt: None
+    assert bool(status.refresh(intent.userId)['paymentAttention']) is (era != 'old')
+    def recheck(connection):
+        from psycopg2.extras import RealDictCursor
+        with connection.cursor(cursor_factory=RealDictCursor) as cursor:
+            repo._lockUser(cursor,intent.userId)
+            cursor.execute('SELECT * FROM billing_events WHERE provider_payment_id=%s FOR UPDATE',(item['id'],))
+            return repo.reconsiderCaptureLocked(cursor,cursor.fetchone(),replace(evidence,
+                amount=evidence.amount+1,timingVerified=True,timingKind='provider_captured_at',provenCaptureAt=evidence.observedAt))
+    assert repo._run(recheck)[1]==('CAPTURE_RULES_ATTENTION' if era=='new' else 'PROVIDER_EVIDENCE_MISMATCH')
+
+
+def test_status_refresh_claim_is_atomic_and_expires(drafts, monkeypatch):
+    from api.services.billing.purchaseCheckoutStatusService import PurchaseCheckoutStatusService
+    from threading import Event
+    repo, provider, intent, _ = controlledPurchase(drafts, monkeypatch)
+    entered, release = Event(), Event()
+    first = PurchaseCheckoutStatusService(repo, provider)
+    calls = []
+    def stalled(attempt):
+        calls.append(attempt['id'])
+        entered.set()
+        assert release.wait(10)
+    first._observe = stalled
+    second = PurchaseCheckoutStatusService(repo, provider)
+    second._observe = lambda attempt: calls.append(attempt['id'])
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        pending = pool.submit(first.refresh, intent.userId)
+        assert entered.wait(10)
+        try:
+            assert second.refresh(intent.userId)['checkout']['attemptId'] == intent.attemptId
+            assert len(calls) == 1
+        finally:
+            release.set()
+        pending.result()
+    query(drafts[3], """UPDATE billing_events SET metadata_json=jsonb_set(metadata_json,
+        '{manualBilling,providerRefreshClaimedAt}',to_jsonb((clock_timestamp()-interval '1 minute')::text)) WHERE id=%s""", (intent.attemptId,))
+    second.refresh(intent.userId)
+    assert len(calls) == 2
 
 
 def test_second_payment_on_the_granted_order_never_closes_the_winner(drafts, monkeypatch):

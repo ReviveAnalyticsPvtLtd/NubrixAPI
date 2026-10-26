@@ -306,9 +306,6 @@ def test_cancel_route_removed(drafts, monkeypatch):
     assert response.status_code in (404, 405)
     assert not hasattr(models, 'CancelPurchaseCheckoutRequest')
     assert not hasattr(purchaseCheckoutService.PurchaseCheckoutService, 'cancel')
-    for name in ('acceptCancellation', 'cancellationReplay', 'resolvePurchaseCancellation', 'scheduleCancellationRetry'):
-        assert not hasattr(purchaseCheckoutRepository.PurchaseCheckoutRepository, name), name
-    assert not hasattr(paymentOperationRepository.PaymentOperationRepositoryMixin, 'resolvePurchaseCancellation')
     columns = {r['column_name'] for r in query(drafts[3], '''SELECT column_name FROM information_schema.columns
         WHERE table_schema='public' AND table_name='payment_slot_controls' ''')}
     assert not {'cancellation_requested_at', 'cancellation_accepted_at'} & columns

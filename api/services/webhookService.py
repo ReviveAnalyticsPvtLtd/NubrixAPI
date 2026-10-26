@@ -614,7 +614,7 @@ class WebhookService:
             from api.services.credits.creditService import creditService
 
             result = creditService.clawbackTopupTokens(
-                userId, refundId, paymentId, refundAmount
+                userId, refundId, paymentId, refundAmount, paymentEvidence=payment
             )
             clawedTokens = result["tokens"]
             logger.info(

@@ -91,25 +91,19 @@ def test_refund_failed_restores_nothing(webhook):
 
 
 @pytest.mark.parametrize('invoiceStatus', ['PAYMENT_PENDING', 'FAILED', 'SUPERSEDED', None])
-def test_refund_webhook_for_ungranted_topup_is_recorded_once(webhook, invoiceStatus):
+def test_unbound_pregrant_refund_is_not_consumed_as_a_noop(webhook, invoiceStatus):
+    from utils.exceptionHandler import CustomException
     service, credits, path, _ = webhook
     with sqlTransaction(path) as db:
         if invoiceStatus is None:
             db.execute('DELETE FROM "Invoices"')
         else:
             db.execute('UPDATE "Invoices" SET status=?', (invoiceStatus,))
-    service.processEvent(refundEvent(), 'ungranted-one')
-    service.processEvent(refundEvent(), 'ungranted-replay')
+    with pytest.raises(CustomException, match='TOPUP_REFUND_PAYMENT_EVIDENCE_REQUIRED'):
+        service.processEvent(refundEvent(), 'unbound-refund')
     assert read_row(path, 'credit_balances')['topup_tokens'] == 500
-    with sqlTransaction(path) as db:
-        assert db.execute('SELECT status FROM "WebhookEvents"').fetchall() == [('completed',), ('completed',)]
-        rows = db.execute('SELECT event_status,metadata_json FROM billing_events').fetchall()
-    assert len(rows) == 1 and rows[0][0] == 'NOT_GRANTED'
-    assert json.loads(rows[0][1])['paymentId'] == 'topup-payment'
-    assert credits.clawbackTopup(USER, 'refund-one', 'topup-payment', 150) == {
-        'clawed': False, 'tokens': 0, 'status': 'already_applied'}
-    with pytest.raises(ValueError, match='TOPUP_REFUND_IDENTITY_CONFLICT'):
-        credits.clawbackTopup(USER, 'refund-one', 'topup-payment', 149)
+    assert read_row(path, 'billing_events') is None
+    assert read_row(path, 'WebhookEvents')['status'] == 'failed'
 
 
 def test_processed_refund_of_granted_topup_claws_back_once(webhook):
@@ -122,12 +116,13 @@ def test_processed_refund_of_granted_topup_claws_back_once(webhook):
     assert read_row(path, 'credit_balances')['topup_tokens'] == 0
 
 
-def test_not_granted_outcome_is_explicit(webhook):
+def test_nonpaid_invoice_alone_is_not_never_grantable_proof(webhook):
     _, credits, path, _ = webhook
     with sqlTransaction(path) as db:
         db.execute("UPDATE \"Invoices\" SET status='PAYMENT_PENDING'")
-    assert credits.clawbackTopup(USER, 'refund-one', 'topup-payment', 150) == {
-        'clawed': False, 'tokens': 0, 'status': 'not_granted'}
+    with pytest.raises(ValueError, match='TOPUP_REFUND_PAYMENT_EVIDENCE_REQUIRED'):
+        credits.clawbackTopup(USER, 'refund-one', 'topup-payment', 150)
+    assert read_row(path, 'billing_events') is None
 
 
 def test_processed_refund_fetch_failure_retries_and_replay_claws_back_once(webhook, monkeypatch):

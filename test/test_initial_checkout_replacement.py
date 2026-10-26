@@ -94,7 +94,7 @@ def test_old_capture_after_replacement_never_grants_access(checkout_database, ch
         service.client = SqlRestClient(path)
         service._handlePaymentCaptured({'payload': {'payment': {'entity': payment}}})
     else:
-        provider.order.payments = lambda order, params: {'items': provider.paymentsByOrder[order]}
+        provider.order.payments = lambda order, params, **options: {'items': provider.paymentsByOrder[order]}
         with patch('api.services.billing.manualBillingRecoveryService.datetime', SimpleNamespace(now=lambda _: NOW)):
             ManualBillingRecoveryService(repo, provider).recoverAttempt(repo.attemptById(USER, original['attemptId']))
     assert invoice(path, original['invoiceId'])['status'] == 'VOID'

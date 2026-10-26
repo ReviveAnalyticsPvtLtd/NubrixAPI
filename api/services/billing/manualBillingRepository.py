@@ -214,6 +214,24 @@ class ManualBillingRepository:
                     (Json({'lastRecoveryAt':_now().isoformat(),'lastRecoveryOutcome':outcome or 'checked'}),eventId))
         return self._run(operation)
 
+    def recentCaptureRecoveryRows(self,limit=50):
+        """Bounded fair minute inventory, independent of writes caused by ordinary status polls."""
+        if type(limit) is not int or not 1 <= limit <= 100:
+            raise ValueError('INVALID_CAPTURE_RECOVERY_LIMIT')
+        def operation(connection):
+            with connection.cursor(cursor_factory=RealDictCursor) as cursor:
+                cursor.execute('''SELECT * FROM public.billing_events WHERE event_category='payment_attempt'
+                    AND metadata_json->'manualBilling' IS NOT NULL AND payment_status<>'captured'
+                    AND (payment_status IN ('created','pending_provider_ack','authorized')
+                      OR (metadata_json->'manualBilling'->>'closedAt' IS NOT NULL
+                        AND metadata_json->'manualBilling'->>'closureReconciledAt' IS NULL))
+                    AND (metadata_json->>'lastRecoveryAt' IS NULL
+                      OR (metadata_json->>'lastRecoveryAt')::timestamptz<=clock_timestamp()-interval '45 seconds')
+                    ORDER BY coalesce((metadata_json->>'lastRecoveryAt')::timestamptz,attempted_at,created_at),id
+                    LIMIT %s''',(limit,))
+                return list(cursor.fetchall())
+        return self._run(operation)
+
     def _refreshFinancialOwnerLocked(self,cursor,eventId,owner):
         """Erasure can commit between the optimistic owner read and its lock."""
         cursor.execute('SELECT user_id FROM public.billing_events WHERE id=%s',(eventId,))
@@ -536,6 +554,16 @@ class ManualBillingRepository:
                 billing['providerObservation'] = {'orderId': snapshot.providerOrderId,
                     'outcome': snapshot.outcome, 'checkedAt': snapshot.observedAt.isoformat(),
                     'complete': snapshot.complete, 'hasPayments': bool(snapshot.payments)}
+                statuses = {p.get('status') for p in snapshot.payments}
+                if snapshot.complete and not statuses - {'created', 'authorized', 'captured', 'failed', 'refunded'}:
+                    billing['providerObservation']['authorizationActive'] = 'authorized' in statuses
+                elif 'authorizationActive' in previous:
+                    billing['providerObservation']['authorizationActive'] = previous['authorizationActive']
+                elif previous.get('complete') and previous.get('outcome') in ('unpaid', 'processing', 'refunded'):
+                    billing['providerObservation']['authorizationActive'] = False
+                elif previous.get('outcome') == 'authorized' or attempt['payment_status'] == 'authorized':
+                    # Upgrade legacy observations without losing a closed Order's known authorization.
+                    billing['providerObservation']['authorizationActive'] = True
                 if latest is not None:
                     # Bounds how long a superseded Order can still late-authorize (provider time).
                     billing['providerObservation']['latestPaymentCreatedAt'] = latest.isoformat()
@@ -550,8 +578,8 @@ class ManualBillingRepository:
         """Close after a complete zero-match receipt lookup and a grace period.
 
         This is operational absence evidence, never capture-timing proof.
-        Retain the receipt: subsequently discovered money is an anomaly on
-        this closed attempt, not a grant on the replacement checkout.
+        Retain the receipt: later money follows the payment-created-at rules
+        for this attempt and its slot, never the replacement's identity.
         ``providerRejected`` is a provider 4xx on creation, which proves no
         Order exists, so the grace period is skipped.
         """
@@ -581,7 +609,8 @@ class ManualBillingRepository:
                     cursor.execute('update public.billing_events set metadata_json=%s where id=%s', (Json(metadata), attemptId))
                     return True
                 billing.update(closedAt=now.isoformat(), closedReason='ORDER_NOT_CREATED',
-                    zeroOrderLookupAt=now.isoformat(), closureReconciledAt=now.isoformat())
+                    closureReconciledAt=now.isoformat())
+                billing['providerOrderRejectedAt' if providerRejected else 'zeroOrderLookupAt'] = now.isoformat()
                 cursor.execute("update public.billing_events set payment_status='failed',event_status='failed',metadata_json=%s where id=%s",
                     (Json(metadata), attemptId))
                 if billing.get('purpose') != 'renewal':
@@ -1954,7 +1983,10 @@ class ManualBillingRepository:
                                     not previous.get('checkedAt') or _utc(previous['checkedAt']) <= evidence.observedAt):
                                 attemptBilling['providerObservation'] = {'orderId': evidence.providerOrderId,
                                     'outcome': 'authorized', 'checkedAt': evidence.observedAt.isoformat(),
-                                    'complete': False, 'hasPayments': True}
+                                    'complete': False, 'hasPayments': True, 'authorizationActive': True}
+                                started = evidence.paymentCreatedAt or _utc(previous.get('latestPaymentCreatedAt'))
+                                if started is not None:
+                                    attemptBilling['providerObservation']['latestPaymentCreatedAt'] = started.isoformat()
                             cursor.execute('update public.billing_events set payment_status=%s,metadata_json=%s where id=%s',
                                 ('authorized', Json(attemptMetadata), evidence.attemptId))
                     return self._result(cursor,invoice, subscription, 'awaiting_capture', evidence.attemptId)
@@ -2015,7 +2047,8 @@ class ManualBillingRepository:
         outcome, _ = classifyCapture(facts)
         if outcome == 'replay':
             return self._replayCaptureLocked(cursor, subscription, invoice, evidence, capture)
-        rulesFacts = 'RULES_FACTS_MISSING' if missing else 'PRE_CUTOVER' if outcome == 'legacy' else 'CAPTURE_RULES'
+        rulesFacts = ('RULES_FACTS_MISSING' if missing else
+                      'PRE_CUTOVER' if evidence.paymentCreatedAt < cutoff else 'CAPTURE_RULES')
         if outcome == 'attention':
             return self._captureNeedsAttentionLocked(cursor, subscription, invoice, evidence, capture,
                                                      'PAYMENT_EVIDENCE_MISMATCH', rulesFacts, missing)
@@ -2603,10 +2636,12 @@ class ManualBillingRepository:
         """The capture rules for an erased owner: always a full refund; None keeps today's handling."""
         from api.services.billing.captureRules import CaptureFacts, attemptClosureTime, classifyCapture
         cutoff, _ = self._captureRulesClockLocked(cursor, evidence)
-        if cutoff is None:
+        if cutoff is None or evidence.paymentCreatedAt < cutoff:
             return None
         cursor.execute('select * from public.payment_slot_controls where attempt_id=%s for update', (attempt['id'],))
         control = cursor.fetchone()
+        if control is None:
+            control = self._bindRetainedControlLocked(cursor,attempt)
         if control is None or control['provider_order_id'] != attempt.get('provider_order_id'):
             return None  # No retained control to refund through: kept for review.
         cursor.execute('select settled_payment_id from public.payment_slots where slot_id=%s for update', (control['slot_id'],))
@@ -2617,6 +2652,33 @@ class ManualBillingRepository:
             attemptClosureTime(_utc(frozen.get('expiresAt')), _utc(frozen.get('closedAt')), _utc(control.get('closed_at'))),
             True))
         return reason if outcome == 'refund' else None
+
+    def _bindRetainedControlLocked(self,cursor,attempt):
+        """Refund-only control from exact immutable originals; never create a historical archive."""
+        from api.services.billing.paymentSlots import slotKind
+        requestId=self._json(attempt.get('metadata_json')).get('erasureRequestId')
+        cursor.execute('SELECT private.exact_retained_payment_attempt(%s,%s,%s) AS proven',
+                       (attempt['id'],attempt['invoice_id'],requestId))
+        if not cursor.fetchone()['proven']:
+            return None
+        cursor.execute('''SELECT original_record FROM private.retained_user_records
+            WHERE source_table='billing_events' AND source_id=%s AND request_id=%s''',(attempt['id'],requestId))
+        original=cursor.fetchone()['original_record']['metadata_json']['manualBilling']
+        purpose=original['purpose']
+        kind,key=slotKind(purpose),'retained:'+str(attempt['id'])
+        cursor.execute('''INSERT INTO public.payment_slots(slot_id,user_id,kind,slot_key,erasure_request_id)
+            VALUES(%s,NULL,%s,%s,%s) ON CONFLICT(slot_id) DO NOTHING''',(attempt['id'],kind,key,requestId))
+        cursor.execute('SELECT * FROM public.payment_slots WHERE slot_id=%s FOR UPDATE',(attempt['id'],))
+        slot=cursor.fetchone()
+        if (slot['user_id'] is not None or str(slot['erasure_request_id'])!=str(requestId)
+                or slot['kind']!=kind or slot['slot_key']!=key or slot['settled_payment_id'] is not None):
+            raise ValueError('RETAINED_PAYMENT_SLOT_CONFLICT')
+        cursor.execute('''INSERT INTO public.payment_slot_controls(attempt_id,slot_id,invoice_id,user_id,purpose,
+            provider_order_id,capture_policy,closed_at,closed_reason,erasure_request_id)
+            VALUES(%s,%s,%s,NULL,%s,%s,%s,clock_timestamp(),'ACCOUNT_CLOSED',%s) RETURNING *''',
+            (attempt['id'],attempt['id'],attempt['invoice_id'],purpose,attempt['provider_order_id'],
+             original.get('capturePolicy') or 'account_default',requestId))
+        return cursor.fetchone()
 
     def activateDueCoverage(self, userId: str, now: datetime) -> FinalizationResult:
         def operation(connection):
@@ -2962,6 +3024,8 @@ class ManualBillingRepository:
         if cursor.fetchone() is None: raise ValueError('TOPUP_BALANCE_MISSING')
         cursor.execute('update public.credit_balances set topup_tokens=topup_tokens+%s,balance_version=balance_version+1,updated_at=%s where user_id=%s',
             (tokens,evidence.observedAt,evidence.userId))
+        from api.services.credits.manualCreditRepository import ManualCreditRepository
+        ManualCreditRepository(self).applyPendingTopupRefundsLocked(cursor,invoice,attempt,evidence)
         cursor.execute('update public."Invoices" set status=\'PAID\',"razorpayPaymentId"=%s,"paidAt"=%s where id=%s',
             (evidence.providerPaymentId,evidence.observedAt,invoice['id']))
         cursor.execute("update public.billing_events set payment_status='captured',event_status='captured',completed_at=%s where id=%s",

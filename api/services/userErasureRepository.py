@@ -31,6 +31,22 @@ ERASURE_STEP_NAMES = (
     "verify_and_finalize",
 )
 
+
+def preparePaymentControlsForErasure(cursor, userId):
+    """Establish owned recovery authority before archiving/detaching legacy Orders."""
+    from api.services.billing.manualBillingRepository import ManualBillingRepository, _now
+    with cursor.connection.cursor(cursor_factory=RealDictCursor) as financial:
+        financial.execute('''SELECT a.* FROM public.billing_events a JOIN public."Invoices" i ON i.id=a.invoice_id
+            WHERE a.user_id=%s AND i."userId"=%s AND a.event_category='payment_attempt'
+            AND a.provider_order_id IS NOT NULL AND a.amount>0 AND a.currency=i.currency
+            AND a.amount=coalesce(i.total_amount,i.amount)
+            AND NOT EXISTS(SELECT 1 FROM public.payment_slot_controls c WHERE c.attempt_id=a.id)
+            ORDER BY a.id FOR UPDATE OF a''', (userId,userId))
+        billing = ManualBillingRepository()
+        for attempt in financial.fetchall():
+            frozen = billing._json(attempt.get('metadata_json')).get('manualBilling', {})
+            billing._captureSlotLocked(financial,attempt,frozen,_now())
+
 REQUEST_SELECT = """
     id, target_user_id, subject_fingerprint, requested_by, idempotency_key,
     status, last_error_code, attempt_count, created_at, updated_at, started_at,
@@ -563,6 +579,9 @@ class UserErasureRepository:
                     raise AdminApiError(409, 'SUBSCRIPTION_ERASURE_RETENTION_PENDING')
                 if retained:
                     assertErasureLease(cursor,requestId,workerId,userId)
+                    if 'payment_slot_controls' in purchases:
+                        preparePaymentControlsForErasure(cursor,userId)
+                        purchases = purchaseErasureInventory(cursor,userId)
                     archiveOriginals(cursor,requestId,userId)
                     for table in ('payment_operations', 'payment_slot_controls', 'payment_slots'):
                         if table in purchases:

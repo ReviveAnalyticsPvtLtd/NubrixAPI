@@ -11,7 +11,8 @@ class ManualBillingRecoveryService:
     def __init__(self, repository, provider, requestOptions=None):
         self.repository = repository
         self.provider = provider
-        self.requestOptions = dict(requestOptions or {})
+        from api.services.billing.purchaseProvider import purchaseProviderOptions
+        self.requestOptions = dict(purchaseProviderOptions() if requestOptions is None else requestOptions)
 
     @staticmethod
     def _pages(fetch, parameters=None):
@@ -129,9 +130,15 @@ class ManualBillingRecoveryService:
                 resolved += 1
         return resolved
 
+    def executeRecentCaptures(self):
+        return self._recoverRows(self.repository.recentCaptureRecoveryRows())
+
     def execute(self):
+        return self._recoverRows(self.repository.pendingRecoveryRows())
+
+    def _recoverRows(self, rows):
         summary = {'resolved':0,'errors':0,'checked':0,'noProgress':0}
-        for row in self.repository.pendingRecoveryRows():
+        for row in rows:
             outcome='failed'
             try:
                 resolved = (self.recoverAttempt(row) if row['event_category'] == 'payment_attempt'

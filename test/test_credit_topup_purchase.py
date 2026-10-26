@@ -391,7 +391,8 @@ class TestTopupWebhooks(unittest.TestCase):
                    return_value={"clawed": True, "tokens": 2500000, "status": "clawed_back"}) as claw, \
              patch.object(svc, "_auditLog"):
             svc._handleRefundProcessed(self._refund())
-        claw.assert_called_once_with("u1", "rfnd_1", "pay_abc", 99950)
+        claw.assert_called_once_with("u1", "rfnd_1", "pay_abc", 99950,
+            paymentEvidence={"id":"pay_abc","notes":{"userId":"u1","type":"credit_topup"}})
 
     def test_refund_of_a_subscription_payment_moves_no_tokens(self):
         svc = self._service()

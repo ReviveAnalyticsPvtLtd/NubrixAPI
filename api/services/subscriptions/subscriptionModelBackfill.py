@@ -182,15 +182,20 @@ def paymentInFlight(event, now):
         return False
     frozen = manualMetadata(event)
     observation = frozen.get('providerObservation') or {}
-    if event.get('payment_status') != 'authorized' and observation.get('outcome') != 'authorized':
+    if observation.get('authorizationActive') is False or (observation.get('complete')
+            and observation.get('outcome') in ('unpaid', 'processing', 'refunded')):
         return False
-    # Without a provider created_at the payment started before its Order closed.
-    started = timestamp(observation.get('latestPaymentCreatedAt') or frozen.get('expiresAt'))
+    if (event.get('payment_status') != 'authorized' and observation.get('outcome') != 'authorized'
+            and observation.get('authorizationActive') is not True):
+        return False
+    # Legacy expiry may be year 9999. A missing provider time is bounded by the
+    # persisted attempt origin, never a distant or moving expiry/observation.
+    started = timestamp(observation.get('latestPaymentCreatedAt') or event.get('attempted_at') or event.get('created_at'))
     if started is None:
         return False
     from datetime import timedelta
     from api.services.billing.paymentPolicy import captureWindowMinutes
-    return timestamp(now) < started + timedelta(minutes=int(frozen.get('captureWindowMinutes') or captureWindowMinutes()))
+    return timestamp(now) - started < timedelta(minutes=int(frozen.get('captureWindowMinutes') or captureWindowMinutes()))
 
 
 def unresolvedMoneyFacts(invoices, events, now=None):

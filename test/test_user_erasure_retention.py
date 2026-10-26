@@ -33,6 +33,6 @@ def test_purchase_recovery_facts_survive_erasure_without_contact():
         'authorizedPaymentId': 'payment-1', 'contact': '+919999999999'}}, 'request-1')
     assert cleaned['manualBilling']['purchaseDraftRevision'] == 2
     assert cleaned['manualBilling']['capturePolicy'] == 'automatic'
-    assert cleaned['manualBilling']['authorizedPaymentId'] == 'payment-1'
+    assert 'authorizedPaymentId' not in cleaned['manualBilling']
     assert 'purchaseCancellationAcceptedAt' not in cleaned['manualBilling']  # No user cancellation exists.
     assert 'contact' not in cleaned['manualBilling']

@@ -163,8 +163,8 @@ def archiveOriginals(cursor,requestId,userId):
 _MANUAL_FIELDS = ('purpose','billingMode','lifecycleId','servicePeriodId','selectionEventId','selectionVersion',
     'invoiceId','attemptId','revision','currency','frozenAmount','payloadHash','periodStart','periodEnd',
     'expiresAt','closedAt','closedReason','closureReconciledAt','orderCreationClaimedAt',
-    'zeroOrderLookupAt','coverageState','creditPeriodId','providerPaymentId','revokedAt','refundIntentId',
-    'purchaseDraftRevision','capturePolicy','captureWindowMinutes','authorizedPaymentId')
+    'zeroOrderLookupAt','providerOrderRejectedAt','coverageState','creditPeriodId','providerPaymentId','revokedAt','refundIntentId',
+    'purchaseDraftRevision','capturePolicy','captureWindowMinutes')
 
 
 def _fields(value, keys):
