@@ -3,10 +3,10 @@ and the refund worker's durable scans. No provider I/O ever happens here, so no 
 from datetime import timedelta
 from dataclasses import replace
 import os
-from uuid import UUID, uuid4
+from uuid import UUID
 from psycopg2.extras import Json, RealDictCursor
 from api.services.billing.captureRules import REFUND_REASONS
-from api.services.billing.manualBillingRepository import _now, _utc
+from api.services.billing.manualBillingRepository import _commitNotificationIntentLocked, _now, _utc
 
 
 def _refundableCaptureLocked(cursor, operation):
@@ -46,11 +46,7 @@ def _recordRefundNotificationLocked(cursor, operationId, milestone):
     intent = {'userId': operation['user_id'], 'subscriptionId': str(subscription['id']),
               'notificationType': REFUND_NOTIFICATIONS[milestone], 'dedupeKey': dedupeKey,
               'periodEnd': startedAt, 'metadata': metadata}
-    cursor.execute('''INSERT INTO public.billing_events(id,user_id,subscription_id,event_category,event_type,
-        event_status,idempotency_key,metadata_json,occurred_at)
-        VALUES(%s,%s,%s,'notification','email.billing_intent.committed','COMMITTED',%s,%s,clock_timestamp())
-        ON CONFLICT(idempotency_key) WHERE idempotency_key IS NOT NULL DO NOTHING''',
-        (str(uuid4()), operation['user_id'], subscription['id'], 'notification:' + dedupeKey, Json(intent)))
+    _commitNotificationIntentLocked(cursor, intent)
 
 
 def reserveRefund(cursor, *, attemptId: str, paymentId: str, amount: int, currency: str, reason: str) -> str:

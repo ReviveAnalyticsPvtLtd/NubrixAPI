@@ -77,6 +77,19 @@ def _isoText(value):
     return value.isoformat() if isinstance(value, datetime) else value
 
 
+def _commitNotificationIntentLocked(cursor, intent: dict, occurredAt: datetime | None = None) -> None:
+    """Commit one customer email intent in the caller's transaction, once per dedupe key.
+
+    The notification bridge delivers it. An intent already committed under the key is left as it is;
+    ``occurredAt`` defaults to the database clock.
+    """
+    cursor.execute('''insert into public.billing_events(id,user_id,subscription_id,event_category,
+        event_type,event_status,idempotency_key,metadata_json,occurred_at)
+        values(%s,%s,%s,'notification','email.billing_intent.committed','COMMITTED',%s,%s,coalesce(%s::timestamptz,clock_timestamp()))
+        on conflict(idempotency_key) where idempotency_key is not null do nothing''',
+        (str(uuid.uuid4()),intent['userId'],intent['subscriptionId'],'notification:'+intent['dedupeKey'],Json(intent),occurredAt))
+
+
 def _payloadHash(payload: dict) -> str:
     normalized = json.dumps(payload, sort_keys=True, separators=(",", ":"))
     return hashlib.sha256(normalized.encode("utf-8")).hexdigest()
@@ -3149,11 +3162,7 @@ class ManualBillingRepository:
         intent = {'userId':subscription['user_id'], 'subscriptionId':str(subscription['id']),
             'notificationType':notificationType, 'dedupeKey':dedupeKey,
             'periodEnd':str(metadata.get('periodEnd') or subscription.get('current_period_end') or ''), 'metadata':metadata}
-        cursor.execute('''insert into public.billing_events(id,user_id,subscription_id,event_category,
-            event_type,event_status,idempotency_key,metadata_json,occurred_at)
-            values(%s,%s,%s,'notification','email.billing_intent.committed','COMMITTED',%s,%s,%s)
-            on conflict(idempotency_key) where idempotency_key is not null do nothing''',
-            (str(uuid.uuid4()),subscription['user_id'],subscription['id'],'notification:'+dedupeKey,Json(intent),_now()))
+        _commitNotificationIntentLocked(cursor,intent,_now())
         cursor.execute('select id,metadata_json from public.billing_events where idempotency_key=%s for update',('notification:'+dedupeKey,))
         existing = cursor.fetchone()
         old = self._json(existing['metadata_json'])
