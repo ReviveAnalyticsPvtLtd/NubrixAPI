@@ -17,7 +17,6 @@ class LiveAttempt:
     payloadHash: str
     expiresAt: datetime
     providerOrderId: str | None
-    invoiceRevision: int | None
 
 
 @dataclass(frozen=True)

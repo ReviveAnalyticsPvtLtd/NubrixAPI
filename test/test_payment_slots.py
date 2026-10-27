@@ -15,7 +15,7 @@ def window(monkeypatch):
 
 
 def live(expiresIn=600, order='order_1', hash_='h1'):
-    return LiveAttempt('att_1', hash_, NOW + timedelta(seconds=expiresIn), order, 1)
+    return LiveAttempt('att_1', hash_, NOW + timedelta(seconds=expiresIn), order)
 
 
 def payment(status, ageMinutes=1):

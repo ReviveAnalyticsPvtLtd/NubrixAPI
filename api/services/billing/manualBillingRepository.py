@@ -473,8 +473,7 @@ class ManualBillingRepository:
         if not row.get('provider_order_id') and row.get('payment_status') == 'created' and not frozen.get('orderCreationClaimedAt'):
             action = 'reuse' if isSame and now < expiresAt else 'replace'  # Order creation never started: no money.
         else:
-            liveAttempt = LiveAttempt(str(row['id']), str(frozen.get('payloadHash')), expiresAt,
-                                      row.get('provider_order_id'), int(frozen.get('revision') or 1))
+            liveAttempt = LiveAttempt(str(row['id']), str(frozen.get('payloadHash')), expiresAt, row.get('provider_order_id'))
             # ``same`` also compares what the hash does not cover (renewal invoice revision, catalog
             # revision): a request that differs only there must still never match the frozen hash.
             decisionHash = liveAttempt.payloadHash if isSame else 'changed:' + payloadHash
