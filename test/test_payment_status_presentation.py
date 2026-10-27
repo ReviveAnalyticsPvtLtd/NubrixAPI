@@ -304,3 +304,31 @@ def test_status_route_replaces_the_per_attempt_status_route(statusClient):
     owned = attempt(path)
     response = client.post('/purchase-checkouts/' + owned + '/status', json={})
     assert response.status_code == 404  # no route serves this path any more
+
+
+def test_attempt_read_fetches_only_the_requested_purposes_and_subscription(statusDb):
+    """Every status poll reads the owner's attempts: other purposes and subscriptions stay in the database."""
+    from api.services.billing.paymentStatusPresentation import _attempts
+    repository, path = statusDb
+    wanted = attempt(path, purpose='renewal')
+    attempt(path, purpose='topup')
+    attempt(path, purpose='expert_addition')
+    other = attempt(path, purpose='initial_purchase')
+    with sqlTransaction(path) as db:
+        db.execute("UPDATE billing_events SET subscription_id='other-subscription' WHERE id=?", (other,))
+    fetched = []
+    class Recording:
+        def __init__(self, cursor):
+            self.cursor = cursor
+        def execute(self, *args):
+            return self.cursor.execute(*args)
+        def fetchall(self):
+            rows = self.cursor.fetchall()
+            fetched.extend(rows)
+            return rows
+    def operation(connection):
+        with connection.cursor() as cursor:
+            return _attempts(Recording(cursor), USER, ('initial_purchase', 'renewal'), SUB)
+    rows = repository._run(operation)
+    assert [str(row['id']) for row, _ in rows] == [wanted]
+    assert [str(row['id']) for row in fetched] == [wanted]

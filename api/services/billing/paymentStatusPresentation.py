@@ -59,14 +59,15 @@ def checkoutState(attempt: dict, now: datetime) -> str:
 
 def _attempts(cursor, userId, purposes=PURPOSES, subscriptionId=None):
     from api.services.billing.manualBillingRepository import ManualBillingRepository, _utc
-    cursor.execute('''SELECT * FROM public.billing_events WHERE user_id=%s AND event_category='payment_attempt' ''',
-                   (userId,))
-    rows = []
-    for row in cursor.fetchall():
-        frozen = ManualBillingRepository._json(row.get('metadata_json')).get('manualBilling') or {}
-        if frozen.get('purpose') in purposes and (subscriptionId is None
-                                                  or str(row.get('subscription_id')) == str(subscriptionId)):
-            rows.append((row, frozen))
+    # Every poll runs this: only the requested purposes and subscription leave the database. Whole rows,
+    # since the shown attempt is also inspected and finalized.
+    subscription = None if subscriptionId is None else str(subscriptionId)
+    cursor.execute('''SELECT * FROM public.billing_events WHERE user_id=%s AND event_category='payment_attempt'
+        AND metadata_json->'manualBilling'->>'purpose' IN (''' + ','.join(['%s'] * len(purposes)) + ''')
+        AND (%s IS NULL OR subscription_id=%s)''',
+                   (userId, *purposes, subscription, subscription))
+    rows = [(row, ManualBillingRepository._json(row.get('metadata_json')).get('manualBilling') or {})
+            for row in cursor.fetchall()]
     # Newest last; at one instant a still-open attempt is newer than the one it replaced.
     rows.sort(key=lambda entry: (_utc(entry[0].get('attempted_at') or entry[0].get('created_at')) or _EARLIEST,
                                  not entry[1].get('closedAt'), str(entry[0]['id'])))
