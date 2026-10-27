@@ -25,7 +25,7 @@ CREATE TABLE IF NOT EXISTS public.subscription_purchase_drafts (
 CREATE TABLE IF NOT EXISTS public.payment_slots (
  slot_id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
  user_id text REFERENCES public."Users"("userId"),
- kind text NOT NULL CHECK(kind IN ('pro_term','expert_addition','topup')),
+ kind text NOT NULL CONSTRAINT payment_slots_kind_check CHECK(kind IN ('pro_term','expert_addition','topup')),
  slot_key text NOT NULL CHECK(length(slot_key) BETWEEN 1 AND 200),
  settled_payment_id text CHECK(length(settled_payment_id) BETWEEN 1 AND 200),
  settled_at timestamptz,
@@ -50,7 +50,7 @@ CREATE TABLE IF NOT EXISTS public.payment_slot_controls (
  operation_revision bigint NOT NULL DEFAULT 0 CHECK(operation_revision BETWEEN 0 AND 9007199254740991),
  provider_order_id text,
  -- 'account_default' marks pre-rollout Orders created without a per-Order payment field.
- capture_policy text NOT NULL CHECK(capture_policy IN ('automatic','account_default')),
+ capture_policy text NOT NULL CONSTRAINT payment_slot_controls_capture_policy_check CHECK(capture_policy IN ('automatic','account_default')),
  superseded_by uuid REFERENCES public.payment_slot_controls(attempt_id),
  closed_at timestamptz,
  closed_reason text CHECK(closed_reason ~ '^[A-Z][A-Z0-9_]{0,63}$'),
@@ -74,8 +74,9 @@ CREATE TABLE IF NOT EXISTS public.payment_operations (
  attempt_id uuid NOT NULL REFERENCES public.payment_slot_controls(attempt_id),
  invoice_id uuid NOT NULL REFERENCES public."Invoices"(id),
  provider_payment_id text NOT NULL CHECK(length(provider_payment_id) BETWEEN 1 AND 200),
- kind text NOT NULL CHECK(kind IN ('refund')),
- reason text NOT NULL CHECK(reason IN ('duplicate','paid_after_close','not_deliverable','account_closed')),
+ kind text NOT NULL CONSTRAINT payment_operations_kind_check CHECK(kind IN ('refund')),
+ reason text NOT NULL CONSTRAINT payment_operations_reason_check
+   CHECK(reason IN ('duplicate','paid_after_close','not_deliverable','account_closed')),
  state text NOT NULL DEFAULT 'queued' CHECK(state IN
    ('queued','submission_started','outcome_unknown','submitted','succeeded','failed','cancelled','needs_attention')),
  amount bigint NOT NULL CHECK(amount>0),
