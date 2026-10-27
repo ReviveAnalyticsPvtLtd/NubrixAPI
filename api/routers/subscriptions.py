@@ -258,7 +258,7 @@ async def verifySubscription(
         ORJSONResponse: Verification result.
     """
     try:
-        result = subscriptionService.verifySubscription(payload=payload.dict(), token=token)
+        result = subscriptionService.verifySubscription(payload=payload.model_dump(), token=token)
         return ORJSONResponse(
             status_code=200,
             content={
