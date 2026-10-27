@@ -303,8 +303,7 @@ class PaymentOperationRepositoryMixin:
                 return True
         created=self._run(operation)
         if created:
-            from utils.logger import logger
-            logger.bind(operationId=operationId,caseReference='refund:'+operationId,reasonCode=reason).error('Purchase financial resolution requires attention')
+            logger.bind(operationId=operationId,caseReference='refund:'+operationId,reasonCode=reason).error('Payment refund requires attention')
         return bool(created)
 
     def scheduleRefundRetry(self,operationId,now):

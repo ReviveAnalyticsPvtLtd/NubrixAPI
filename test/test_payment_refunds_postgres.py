@@ -357,12 +357,15 @@ def test_backoff_and_single_escalation(drafts,monkeypatch):
     assert repo.operationById(key)['next_retry_at']==early+timedelta(seconds=30)
     when=op['created_at']+timedelta(seconds=1801)
     escalated=[]
-    for retry in range(1,10):
-        escalated.append(repo.scheduleRefundRetry(key,when))
-        updated=repo.operationById(key)
-        assert updated['retry_count']==retry+1
-        assert updated['next_retry_at']==when+timedelta(seconds=min(30*2**min(retry,7),3600))
+    with errorLogs() as logged:
+        for retry in range(1,10):
+            escalated.append(repo.scheduleRefundRetry(key,when))
+            updated=repo.operationById(key)
+            assert updated['retry_count']==retry+1
+            assert updated['next_retry_at']==when+timedelta(seconds=min(30*2**min(retry,7),3600))
     assert escalated==[True]+[False]*8
+    assert logged==[('Payment refund requires attention',
+                     {'operationId':key,'caseReference':'refund:'+key,'reasonCode':'PAYMENT_REFUND_OVERDUE'})]
     events=query(drafts[3],"SELECT metadata_json FROM billing_events WHERE event_type='payment.refund_escalated' AND user_id=%s",
                  (intent.userId,))
     assert [e['metadata_json']['reasonCode'] for e in events]==['PAYMENT_REFUND_OVERDUE']
