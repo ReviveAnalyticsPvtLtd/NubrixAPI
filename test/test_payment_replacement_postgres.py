@@ -303,7 +303,7 @@ def test_cancel_route_removed(drafts, monkeypatch):
     response = http(repo, provider, old.userId, monkeypatch).post(
         '/purchase-checkouts/' + old.attemptId + '/cancel', json={'expectedOperationRevision': 1},
         headers={'Idempotency-Key': 'cancel'})
-    assert response.status_code in (404, 405)
+    assert response.status_code == 404  # no route serves this path any more
     assert not hasattr(models, 'CancelPurchaseCheckoutRequest')
     assert not hasattr(purchaseCheckoutService.PurchaseCheckoutService, 'cancel')
     columns = {r['column_name'] for r in query(drafts[3], '''SELECT column_name FROM information_schema.columns
@@ -897,7 +897,7 @@ def test_expert_cancel_route_and_unused_slot_retry_columns_removed(drafts, monke
     from api.services.subscriptions.subscriptionService import SubscriptionService
     repo, provider, initial = paidAccount(drafts, monkeypatch)
     response = http(repo, provider, initial.userId, monkeypatch).post('/cancelPendingAddition', json={'domain': 'telecom'})
-    assert response.status_code in (404, 405)
+    assert response.status_code == 404  # no route serves this path any more
     assert not hasattr(models, 'CancelPendingAdditionRequest')
     assert not hasattr(SubscriptionService, 'cancelPendingAddition')
     assert not hasattr(ManualBillingRepository, 'cancelExpertAddition')

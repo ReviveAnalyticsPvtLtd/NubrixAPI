@@ -272,7 +272,9 @@ def test_status_requires_authentication(status_checkout):
     from api.commons import verifyToken
     client, _, _, intent = status_checkout
     client.app.dependency_overrides.pop(verifyToken)
-    assert status(client).status_code in (401, 403)
+    response = status(client)
+    # The locked FastAPI's HTTPBearer rejects a missing credential with 403.
+    assert (response.status_code, response.json()) == (403, {'detail': 'Not authenticated'})
 
 
 def test_status_response_is_not_cacheable(status_checkout):

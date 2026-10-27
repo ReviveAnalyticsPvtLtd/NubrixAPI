@@ -258,7 +258,8 @@ def test_status_is_owner_scoped_and_no_store(statusClient):
     from api.commons import verifyToken
     client.app.dependency_overrides.pop(verifyToken)
     unauthenticated = client.get('/payment-status')
-    assert unauthenticated.status_code in (401, 403)
+    # The locked FastAPI's HTTPBearer rejects a missing credential with 403.
+    assert (unauthenticated.status_code, unauthenticated.json()) == (403, {'detail': 'Not authenticated'})
 
 
 @pytest.mark.parametrize('age,refresh', [(timedelta(seconds=4, microseconds=999999), False),
@@ -302,4 +303,4 @@ def test_status_route_replaces_the_per_attempt_status_route(statusClient):
     client, _, path = statusClient
     owned = attempt(path)
     response = client.post('/purchase-checkouts/' + owned + '/status', json={})
-    assert response.status_code in (404, 405)
+    assert response.status_code == 404  # no route serves this path any more
