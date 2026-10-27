@@ -191,7 +191,7 @@ def previewPricing(request: SubscriptionPricingPreviewRequest, token=Depends(ver
 
 
 @router.get("/activateFreeTrial")
-async def activateFreeTrial(token=Depends(verifyToken)):
+def activateFreeTrial(token=Depends(verifyToken)):
     """
     Activate a free trial for a user.
 
@@ -216,7 +216,7 @@ async def activateFreeTrial(token=Depends(verifyToken)):
 
 
 @router.post("/createSubscription")
-async def createSubscription(request: CreateSubscriptionRequest, token=Depends(verifyToken),
+def createSubscription(request: CreateSubscriptionRequest, token=Depends(verifyToken),
     requestKey: str | None = Header(default=None, alias="Idempotency-Key", min_length=1, max_length=128)
 ):
     """
@@ -243,7 +243,7 @@ async def createSubscription(request: CreateSubscriptionRequest, token=Depends(v
 
 
 @router.post("/verifySubscription")
-async def verifySubscription(
+def verifySubscription(
     payload: VerifySubscriptionRequest,
     token=Depends(verifyToken)
 ):
@@ -272,7 +272,7 @@ async def verifySubscription(
 
 
 @router.post("/addDomains")
-async def addDomains(payload: AddDomainsRequest, token=Depends(verifyToken),
+def addDomains(payload: AddDomainsRequest, token=Depends(verifyToken),
     requestKey: str | None = Header(default=None, alias="Idempotency-Key", min_length=1, max_length=128)
 ):
     """
@@ -302,7 +302,7 @@ async def addDomains(payload: AddDomainsRequest, token=Depends(verifyToken),
 
 
 @router.post("/verifyDomainUpgrade")
-async def verifyDomainUpgrade(
+def verifyDomainUpgrade(
     payload: VerifyDomainUpgradeRequest,
     token=Depends(verifyToken)
 ):
@@ -331,7 +331,7 @@ async def verifyDomainUpgrade(
 
 
 @router.post("/removeDomain")
-async def removeDomain(payload: RemoveDomainRequest, token=Depends(verifyToken)):
+def removeDomain(payload: RemoveDomainRequest, token=Depends(verifyToken)):
     """
     Schedule a domain removal at the end of the current billing cycle.
 
@@ -357,7 +357,7 @@ async def removeDomain(payload: RemoveDomainRequest, token=Depends(verifyToken))
 
 
 @router.post("/cancelSubscription")
-async def cancelSubscription(payload: CancelSubscriptionRequest, token=Depends(verifyToken)):
+def cancelSubscription(payload: CancelSubscriptionRequest, token=Depends(verifyToken)):
     """
     Cancel the authenticated user's subscription at the end
     of the current billing cycle.
@@ -384,7 +384,7 @@ async def cancelSubscription(payload: CancelSubscriptionRequest, token=Depends(v
 
 
 @router.post("/refund")
-async def refund(payload: RefundRequest, token=Depends(verifyToken)):
+def refund(payload: RefundRequest, token=Depends(verifyToken)):
     """
     Initiate a refund for a Razorpay payment.
 
@@ -415,7 +415,7 @@ async def refund(payload: RefundRequest, token=Depends(verifyToken)):
 
 
 @router.get("/invoices")
-async def getInvoices(token=Depends(verifyToken)):
+def getInvoices(token=Depends(verifyToken)):
     """
     Retrieve all invoices for the authenticated user.
 
@@ -439,7 +439,7 @@ async def getInvoices(token=Depends(verifyToken)):
 
 
 @router.post("/prepareRenewalInvoice")
-async def prepareRenewalInvoice(
+def prepareRenewalInvoice(
     _request: PrepareRenewalInvoiceRequest | None = None,
     token=Depends(verifyToken),
 ):
@@ -465,7 +465,7 @@ async def prepareRenewalInvoice(
 
 
 @router.post("/createRenewalPaymentSession")
-async def createRenewalPaymentSession(
+def createRenewalPaymentSession(
     request: CreateRenewalSessionRequest,
     token=Depends(verifyToken),
     requestKey: str | None = Header(default=None, alias="Idempotency-Key", min_length=1, max_length=128)
@@ -491,7 +491,7 @@ async def createRenewalPaymentSession(
 
 
 @router.post("/verifyRenewalPayment")
-async def verifyRenewalPayment(
+def verifyRenewalPayment(
     payload: VerifyRenewalPaymentRequest,
     token=Depends(verifyToken),
 ):
@@ -524,7 +524,7 @@ async def verifyRenewalPayment(
 
 
 @router.post("/resumeRenewal")
-async def resumeRenewal(
+def resumeRenewal(
     _request: ResumeRenewalRequest | None = None,
     token=Depends(verifyToken),
 ):
@@ -549,7 +549,7 @@ async def resumeRenewal(
 
 
 @router.post("/createAnnualRenewalPaymentSession")
-async def createAnnualRenewalPaymentSession(
+def createAnnualRenewalPaymentSession(
     request: CreateAnnualRenewalSessionRequest,
     token=Depends(verifyToken),
     requestKey: str | None = Header(default=None, alias="Idempotency-Key", min_length=1, max_length=128)
@@ -581,7 +581,7 @@ async def createAnnualRenewalPaymentSession(
 
 
 @router.post("/verifyAnnualRenewalPayment")
-async def verifyAnnualRenewalPayment(
+def verifyAnnualRenewalPayment(
     payload: VerifyAnnualRenewalPaymentRequest,
     token=Depends(verifyToken)
 ):

@@ -1,7 +1,6 @@
 from test.pricingFixtures import catalog_source
 import hashlib
 import hmac
-import asyncio
 import json
 import os
 import sys
@@ -305,7 +304,7 @@ class TestCreditReadContracts(unittest.TestCase):
             "api.services.credits.creditService.creditService.getBalanceSnapshot",
             return_value=self._snapshot(),
         ):
-            response = asyncio.run(getCreditBalance(user=user))
+            response = getCreditBalance(user=user)
 
         data = json.loads(response.body)["data"]
         self.assertEqual(
@@ -335,7 +334,7 @@ class TestCreditReadContracts(unittest.TestCase):
             "api.services.credits.langfuseUsageService.getUsageBreakdown",
             return_value=breakdown,
         ):
-            response = asyncio.run(getCreditUsage(user=user))
+            response = getCreditUsage(user=user)
 
         data = json.loads(response.body)["data"]
         self.assertEqual(data["monthlyTokens"], {"total": 10_000_000, "used": 2_500_000})
