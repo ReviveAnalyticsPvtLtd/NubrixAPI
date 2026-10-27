@@ -34,7 +34,6 @@ def test_retired_pack_is_unavailable(configured,monkeypatch):
     ('TOPUP_NOT_ELIGIBLE', 403, 403),
 ])
 def test_topup_route_preserves_typed_service_errors(monkeypatch, marker, service_status, http_status):
-    import asyncio
     from fastapi import HTTPException
     from api.models import CreateTopupOrderRequest
     from api.routers.credits import createTopupOrder
@@ -47,7 +46,7 @@ def test_topup_route_preserves_typed_service_errors(monkeypatch, marker, service
                               uiMessage='Pack cannot be purchased.', errorCode=marker)
     monkeypatch.setattr(topupService, 'createTopupOrder', unavailable)
     with pytest.raises(HTTPException) as result:
-        asyncio.run(createTopupOrder(CreateTopupOrderRequest(packId='small'), token='local-token', requestKey='local-key'))
+        createTopupOrder(CreateTopupOrderRequest(packId='small'), token='local-token', requestKey='local-key')
     assert result.value.status_code == http_status
     assert result.value.detail['errorCode'] == marker
     assert result.value.detail['message'] == 'Pack cannot be purchased.'

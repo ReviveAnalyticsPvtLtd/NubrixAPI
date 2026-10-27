@@ -9,6 +9,9 @@ from fastapi import FastAPI
 
 
 ROUTER_FILES = ('api/routers/subscriptions.py', 'api/routers/credits.py')
+# Billing handlers in routers that are otherwise out of this guard's scope: only these names are checked.
+# getUserProfile is the billing refresh behind every settings focus and every grant.
+NAMED_HANDLERS = {'api/routers/manager.py': {'getUserProfile'}}
 ROUTE_METHODS = {'get', 'post', 'put', 'patch', 'delete', 'head', 'options', 'api_route'}
 
 
@@ -18,19 +21,27 @@ def _isRouterRoute(decorator):
             and isinstance(target.value, ast.Name) and target.value.id == 'router')
 
 
+def _routeHandlers(relative):
+    root = Path(__file__).resolve().parent.parent
+    tree = ast.parse((root / relative).read_text(encoding='utf-8'), filename=relative)
+    return [node for node in ast.walk(tree)
+            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+            and any(_isRouterRoute(decorator) for decorator in node.decorator_list)]
+
+
+def _blocksTheEventLoop(node):
+    return isinstance(node, ast.AsyncFunctionDef) and not any(isinstance(child, ast.Await) for child in ast.walk(node))
+
+
 def test_billing_route_handlers_never_block_the_event_loop():
     offenders = []
-    root = Path(__file__).resolve().parent.parent
     for relative in ROUTER_FILES:
-        tree = ast.parse((root / relative).read_text(encoding='utf-8'), filename=relative)
-        for node in ast.walk(tree):
-            if not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
-                continue
-            if not any(_isRouterRoute(decorator) for decorator in node.decorator_list):
-                continue
-            awaits = any(isinstance(child, ast.Await) for child in ast.walk(node))
-            if isinstance(node, ast.AsyncFunctionDef) and not awaits:
-                offenders.append(f'{relative}:{node.lineno} {node.name}')
+        offenders += [f'{relative}:{node.lineno} {node.name}' for node in _routeHandlers(relative) if _blocksTheEventLoop(node)]
+    for relative, names in NAMED_HANDLERS.items():
+        handlers = [node for node in _routeHandlers(relative) if node.name in names]
+        missing = sorted(names - {node.name for node in handlers})
+        assert not missing, f'{relative} no longer defines the named billing route handler(s) {missing}'
+        offenders += [f'{relative}:{node.lineno} {node.name}' for node in handlers if _blocksTheEventLoop(node)]
     assert not offenders, (
         f'{len(offenders)} async route handler(s) never await and block the event loop; '
         'declare them with def so FastAPI runs them in its threadpool:\n' + '\n'.join(offenders))
