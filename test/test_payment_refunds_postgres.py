@@ -845,6 +845,7 @@ def test_payment_status_binds_refund_to_its_attempt_without_other_ids(drafts, mo
 
 def test_refund_notifications_enqueued_once(drafts,monkeypatch):
     import json
+    from unittest.mock import patch
     import psycopg2
     from api.services.notifications.notificationDeliveryRepository import NotificationDeliveryRepository
     from api.services.subscriptions.paymentValidationService import parseUtc
@@ -877,17 +878,29 @@ def test_refund_notifications_enqueued_once(drafts,monkeypatch):
         # Customer-facing facts only: no invoice, attempt, Order, payment or operation identity.
         assert not [identity for identity in hidden if identity in json.dumps(facts)]
     assert 'completedAt' in intents['completed']['metadata_json']['metadata']
-    # The durable delivery pipeline accepts both types once.
+    # The production bridge moves both committed intents into the durable delivery pipeline once.
     deliveries=NotificationDeliveryRepository(lambda: psycopg2.connect(url))
-    created=[]
-    for _ in range(2):
-        for row in intents.values():
-            committed=row['metadata_json']
-            delivery,isNew=deliveries.enqueueBillingNotification(userId=committed['userId'],
-                subscriptionId=committed['subscriptionId'],notificationType=committed['notificationType'],
-                dedupeKey=committed['dedupeKey'],periodEnd=committed['periodEnd'],metadata=committed['metadata'])
-            created.append(isNew)
-    assert created==[True,True,False,False]
+    statuses=lambda: query(url,"""SELECT event_status FROM billing_events WHERE idempotency_key LIKE %s""",
+                           ('notification:payment_refund:'+key+':%',))
+    with patch('api.services.notifications.notificationDeliveryRepository.getNotificationDeliveryRepository',
+               return_value=deliveries):
+        for _ in range(20):  # earlier tests' intents in this database come first, 100 per pass
+            repo.bridgeNotificationIntents()
+            if statuses()==[{'event_status':'BRIDGED'}]*2:
+                break
+        repo.bridgeNotificationIntents()  # a replayed bridge creates nothing new
+    # Only this owner's deliveries take part in the dispatch pass below.
+    query(url,"""UPDATE notification_deliveries SET next_attempt_at=now()+interval '1 day'
+        WHERE user_id IS DISTINCT FROM %s AND status IN ('PENDING','RETRY_PENDING')""",(intent.userId,))
+    bridged=refundIntents(url,key)
+    assert {milestone:row['metadata_json'] for milestone,row in bridged.items()}=={
+        milestone:row['metadata_json'] for milestone,row in intents.items()}
+    assert statuses()==[{'event_status':'BRIDGED'}]*2
+    queued=query(url,"""SELECT notification_type,dedupe_key,metadata_json FROM notification_deliveries
+        WHERE user_id=%s ORDER BY notification_type""",(intent.userId,))
+    assert [(row['notification_type'],row['dedupe_key']) for row in queued]==[
+        ('payment_refund_'+milestone,'payment_refund:'+key+':'+milestone) for milestone in ('completed','started')]
+    assert [row['metadata_json'] for row in queued]==[intents[m]['metadata_json']['metadata'] for m in ('completed','started')]
     # As the earlier build left them: held for the template, the claim's attempt given back.
     query(url,"""UPDATE notification_deliveries SET status='RETRY_PENDING',attempt_count=0,last_error_code='TEMPLATE_PENDING',
         next_attempt_at=now()-interval '1 second' WHERE user_id=%s""",(intent.userId,))
