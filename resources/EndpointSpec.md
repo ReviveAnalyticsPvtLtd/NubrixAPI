@@ -1615,9 +1615,15 @@ purchase may still capture. No new order is created. The client waits and polls 
 `purchase-draft/checkout` returns this object as `checkout`; the other routes return it as `data`.
 
 **Payment service busy (503).** The payment provider could not be read, or the checkout changed during
-the check. Nothing was closed or opened. Retry the same request.
+the check. Nothing was closed or opened. Retry the same request. Match on `errorCode`; the copy is the same
+on every route. `purchase-draft/checkout` returns:
 ```json
 { "message": "Payment service is busy. Please try again in a moment.", "errorCode": "PAYMENT_SERVICE_BUSY" }
+```
+The other routes return the standard error body, which also carries `status` and `backendLogMessage`:
+```json
+{ "status": 503, "message": "Payment service is busy. Please try again in a moment.",
+  "backendLogMessage": "Error encountered in line no: [...]", "errorCode": "PAYMENT_SERVICE_BUSY" }
 ```
 
 **Payment status (`GET /api/latest/subscriptions/payment-status`, 200, `Cache-Control: private, no-store`).**
