@@ -331,6 +331,22 @@ def test_obligation_report_exposes_operation_and_one_actionable_case(drafts,monk
     assert items[0]['caseReference']=='refund:'+str(op['id'])
 
 
+def errorLogs():
+    """Collect ERROR records logged inside the block: (message, extra)."""
+    from contextlib import contextmanager
+    from loguru import logger
+    @contextmanager
+    def capture():
+        records=[]
+        sinkId=logger.add(lambda message: records.append((message.record['message'],dict(message.record['extra']))),
+                          level='ERROR')
+        try:
+            yield records
+        finally:
+            logger.remove(sinkId)
+    return capture()
+
+
 def test_backoff_and_single_escalation(drafts,monkeypatch):
     from datetime import timedelta
     repo,provider,intent,evidence,service=closedCapture(drafts,monkeypatch)
@@ -911,6 +927,22 @@ def test_refund_notifications_enqueued_once(drafts,monkeypatch):
     assert dispatchRefundEmails(url,intent.userId,monkeypatch)==[]  # delivered once, never again
     final=query(url,'SELECT status,attempt_count FROM notification_deliveries WHERE user_id=%s',(intent.userId,))
     assert [(row['status'],row['attempt_count']) for row in final]==[('ACCEPTED',1)]*2
+
+
+def test_refund_email_skipped_without_canonical_subscription_is_logged(drafts,monkeypatch):
+    """An owned refund whose owner lost the canonical subscription is still returned; the email it
+    cannot address is logged for repair, never sent to an invented recipient."""
+    repo,provider,intent,evidence,service=closedCapture(drafts,monkeypatch)
+    url=drafts[3]
+    key=str(reserved(url,evidence)['id'])
+    assert set(refundIntents(url,key))=={'started'}
+    query(url,'UPDATE subscriptions SET is_canonical=false WHERE user_id=%s',(intent.userId,))
+    provider.refundStatus='processed'
+    with errorLogs() as logged:
+        assert service.execute(key)['state']=='succeeded'
+    assert set(refundIntents(url,key))=={'started'}
+    assert logged==[('Refund email skipped: owner has no canonical subscription',
+                     {'operationId':key,'milestone':'completed'})]
 
 
 def dispatchRefundEmails(url, userId, monkeypatch):

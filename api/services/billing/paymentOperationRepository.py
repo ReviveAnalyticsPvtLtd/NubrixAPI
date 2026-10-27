@@ -7,6 +7,7 @@ from uuid import UUID
 from psycopg2.extras import Json, RealDictCursor
 from api.services.billing.captureRules import REFUND_REASONS
 from api.services.billing.manualBillingRepository import _commitNotificationIntentLocked, _now, _utc
+from utils.logger import logger
 
 
 def _refundableCaptureLocked(cursor, operation):
@@ -26,7 +27,8 @@ def _recordRefundNotificationLocked(cursor, operationId, milestone):
     The durable notification bridge delivers it. Its identity is the operation and milestone, so each
     email is committed exactly once. Content is what the customer needs (amount, currency, reason, start
     date), never an invoice, attempt, Order, payment or operation identity. A detached (erased) owner is
-    never emailed.
+    never emailed; an owner without a canonical subscription cannot be addressed, so the skipped email
+    is logged for repair and the refund itself goes ahead.
     """
     cursor.execute('''SELECT o.*,c.purpose FROM public.payment_operations o
         JOIN public.payment_slot_controls c ON c.attempt_id=o.attempt_id WHERE o.id=%s''', (operationId,))
@@ -36,6 +38,8 @@ def _recordRefundNotificationLocked(cursor, operationId, milestone):
     cursor.execute('SELECT id FROM public.subscriptions WHERE user_id=%s AND is_canonical', (operation['user_id'],))
     subscription = cursor.fetchone()
     if not subscription:
+        logger.bind(operationId=str(operation['id']), milestone=milestone).error(
+            'Refund email skipped: owner has no canonical subscription')
         return
     startedAt = operation['created_at'].isoformat()
     metadata = {'amount': operation['amount'], 'currency': operation['currency'], 'reason': operation['reason'],
