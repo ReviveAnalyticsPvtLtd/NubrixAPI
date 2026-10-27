@@ -278,3 +278,66 @@ def test_status_requires_authentication(status_checkout):
 def test_status_response_is_not_cacheable(status_checkout):
     client, _, _, intent = status_checkout
     assert status(client).headers['cache-control'] == 'private, no-store'
+
+
+def replay_original(client, key='status-original'):
+    return client.post('/createSubscription', json={'domains': ['banking'], 'contact': ''},
+        headers={'Idempotency-Key': key})
+
+
+def test_created_only_payment_replay_reopens_the_same_order(status_checkout):
+    # Spec 4.3: a created payment (approval never given) does not hold the user.
+    client, provider, _, intent = status_checkout
+    provider.order.orders[intent['orderId']]['status'] = 'attempted'
+    payment(provider, intent, status='created')
+    status(client)
+    replay = replay_original(client)
+    assert replay.status_code == 200 and replay.json()['state'] == 'payment_pending'
+    assert replay.json()['orderId'] == intent['orderId']
+    assert len(provider.order.createdPayloads) == 1
+
+
+def test_lapsed_created_only_replay_is_retired_and_a_fresh_key_replaces_it(status_checkout, checkout_database):
+    client, provider, path, intent = status_checkout
+    repository, _ = checkout_database
+    provider.order.orders[intent['orderId']]['status'] = 'attempted'
+    payment(provider, intent, status='created')
+    status(client)
+    attempt = repository.attemptById(USER, intent['attemptId'])
+    metadata = repository._json(attempt['metadata_json'])
+    metadata['manualBilling']['expiresAt'] = (NOW - timedelta(seconds=1)).isoformat()
+    with sqlTransaction(path) as db:
+        db.execute('UPDATE billing_events SET metadata_json=? WHERE id=?', (json.dumps(metadata), intent['attemptId']))
+    replay = replay_original(client)
+    # payment_pending with a past deadline: the client retires it and retries under a fresh key.
+    assert replay.status_code == 200 and replay.json()['state'] == 'payment_pending'
+    assert replay.json()['expiresAt'] == (NOW - timedelta(seconds=1)).isoformat()
+    fresh = replay_original(client, 'status-fresh')
+    assert fresh.status_code == 200 and fresh.json()['state'] == 'payment_pending'
+    assert fresh.json()['orderId'] != intent['orderId'] and len(provider.order.createdPayloads) == 2
+
+
+def test_dead_authorized_replay_is_retired_and_a_fresh_key_replaces_it(status_checkout, checkout_database):
+    # Spec 4.3: past created_at + window the payment is dead and Pay proceeds.
+    client, provider, _, intent = status_checkout
+    repository, _ = checkout_database
+    window = repository._json(repository.attemptById(USER, intent['attemptId'])['metadata_json'])['manualBilling']['captureWindowMinutes']
+    item = payment(provider, intent)
+    item['created_at'] = int((NOW - timedelta(minutes=window, seconds=1)).timestamp())
+    assert verify(client, intent, item).status_code == 200
+    assert repository.attemptById(USER, intent['attemptId'])['payment_status'] == 'authorized'
+    replay = replay_original(client)
+    assert replay.status_code == 200 and replay.json()['state'] == 'expired'
+    assert replay.json()['attemptId'] == intent['attemptId']
+    fresh = replay_original(client, 'status-fresh')
+    assert fresh.status_code == 200 and fresh.json()['state'] == 'payment_pending'
+    assert fresh.json()['orderId'] != intent['orderId'] and len(provider.order.createdPayloads) == 2
+
+
+def test_live_authorized_replay_still_waits(status_checkout):
+    client, provider, _, intent = status_checkout
+    item = payment(provider, intent)
+    item['created_at'] = int((NOW - timedelta(minutes=1)).timestamp())
+    assert verify(client, intent, item).status_code == 200
+    replay = replay_original(client)
+    assert replay.status_code == 200 and replay.json()['state'] == 'awaiting_capture'

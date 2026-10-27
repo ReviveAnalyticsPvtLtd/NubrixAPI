@@ -67,11 +67,23 @@ def purchaseSelectionLabel(snapshot):
     return plan + ' with ' + experts if experts else plan
 
 
+def _authorizationInFlight(intent):
+    """The evidence and window payment status waits on: past created_at + window the payment is dead."""
+    from api.services.billing.manualBillingRepository import _now
+    from api.services.subscriptions.subscriptionModelBackfill import paymentInFlight
+    return paymentInFlight({'event_category': 'payment_attempt', 'payment_status': 'authorized',
+        'metadata_json': {'manualBilling': intent.snapshot}, 'attempted_at': intent.attemptStartedAt}, _now())
+
+
 def serializeCheckoutIntent(intent, publicKey, identity=None):
+    # Only money that may still capture holds Pay (spec 4.3): created-only payments leave the Order
+    # payable, and a dead authorization retires this replay so the next Pay replaces it.
     state = {'created':'payment_pending', 'pending_provider_ack':'payment_pending',
-        'authorized':'awaiting_capture', 'provider_processing':'awaiting_capture', 'captured':'already_finalized',
+        'authorized':'awaiting_capture', 'provider_processing':'payment_pending', 'captured':'already_finalized',
         'expired':'expired', 'cancelled':'cancelled', 'superseded':'superseded',
         'confirming_earlier_payment':'confirming_earlier_payment'}.get(intent.state,'requires_reconciliation')
+    if intent.state == 'authorized' and not _authorizationInFlight(intent):
+        state = 'expired'
     if state == 'confirming_earlier_payment':
         # Only the earlier payment's summary: no Order, key or identity that could reopen checkout on it.
         return {'state': state, 'attemptId': intent.attemptId, 'earlierPayment': dict(intent.earlierPayment or {})}

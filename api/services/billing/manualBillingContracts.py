@@ -105,6 +105,8 @@ class CheckoutIntent:
     snapshot: dict
     # Set only with state 'confirming_earlier_payment': {selectionLabel, amount, currency}.
     earlierPayment: dict | None = None
+    # When the attempt started: bounds an authorization with no recorded provider time (paymentInFlight).
+    attemptStartedAt: datetime | None = None
 
 
 @dataclass(frozen=True)

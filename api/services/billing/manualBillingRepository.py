@@ -1747,7 +1747,7 @@ class ManualBillingRepository:
             """
             select id, user_id, subscription_id, invoice_id,
                    payment_status, provider_order_id,
-                   metadata_json
+                   metadata_json, attempted_at, created_at
             from public.billing_events
             where id = %s
             limit 1
@@ -1790,6 +1790,7 @@ class ManualBillingRepository:
             expiresAt=expiresAt,
             razorpayOrderId=row.get("provider_order_id"),
             snapshot=dict(billing),
+            attemptStartedAt=_utc(row.get("attempted_at") or row.get("created_at")),
         )
 
     def bindProviderOrder(self, attemptId: str, order: dict) -> CheckoutIntent:
