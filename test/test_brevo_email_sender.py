@@ -1,7 +1,6 @@
-import logging
-
 import pytest
 import requests
+from loguru import logger
 
 from api.services.notifications.brevoEmailSender import BrevoEmailSender, EmailSendResult
 
@@ -162,18 +161,24 @@ def test_otherClientErrorsArePermanent(kind, status):
     assert (result.outcome, result.errorCode) == ("PERMANENT", f"BREVO_HTTP_{status}")
 
 
-def test_providerRejectionIsPermanentAndKeyNeverLogged(caplog):
-    caplog.set_level(logging.DEBUG)
-    for status in (400, 401):
-        body = {"code": "unauthorized", "message": f"bad key {API_KEY} for a@b.co"}
-        post = RecordingPost(response=FakeResponse(status, body))
-        for kind in ("trial", "billing"):
-            result = SEND[kind](_sender(post))
-            assert result.outcome == "PERMANENT"
-            assert API_KEY not in repr(result)
-            assert "a@b.co" not in repr(result)
-    assert API_KEY not in caplog.text
-    assert "a@b.co" not in caplog.text
+def test_providerRejectionIsPermanentAndKeyNeverLogged():
+    captured = []
+    sinkId = logger.add(captured.append, level="DEBUG")
+    try:
+        for status in (400, 401):
+            body = {"code": "unauthorized", "message": f"bad key {API_KEY} for a@b.co"}
+            post = RecordingPost(response=FakeResponse(status, body))
+            for kind in ("trial", "billing"):
+                result = SEND[kind](_sender(post))
+                assert result.outcome == "PERMANENT"
+                assert API_KEY not in repr(result)
+                assert "a@b.co" not in repr(result)
+    finally:
+        logger.remove(sinkId)
+    logged = "".join(str(record) for record in captured)
+    assert DELIVERY_ID in logged
+    assert API_KEY not in logged
+    assert "a@b.co" not in logged
 
 
 @pytest.mark.parametrize("kind,field,value,code", [
