@@ -8,7 +8,7 @@ NubrixAI Analytics Hub API — FastAPI + Celery + LangChain monolith.
 - Celery worker + beat on Redis for billing/subscription/credit/cron jobs.
 - LangChain + LangGraph orchestrating LLM components (Gemini via Google GenAI, Groq, Cerebras, OpenAI via OpenRouter).
 - Polars as the primary data engine for LLM-generated code (pandas fallback retained for backward compat).
-- Supabase (Postgres + Storage + Edge Functions), Razorpay billing, Langfuse tracing, Logtail logging.
+- Supabase (Postgres + Storage), Razorpay billing, Langfuse tracing, Logtail logging.
 
 ## Run / Build
 - Dev server: `uv run uvicorn main:app --reload --port 7860`. Swagger at `/api/latest/documentation/docs`.
@@ -38,7 +38,7 @@ NubrixAI Analytics Hub API — FastAPI + Celery + LangChain monolith.
 - Celery: beat schedule is in `nubrix/triggers/celery.py` (UTC). All times are UTC. `pastDueSuspension` and `entitlementBoundary` run every 30 min; `reconciliation` every 15 min; `creditReconciliation` hourly; billing/expiry sweeps are daily at 00:00–02:00 UTC. No queue split — single celery worker handles all tasks.
 - `pyproject.toml` has no `[tool.pytest]` / lint config and there is no test directory — there are no automated tests. CI is a single GitHub Actions workflow `.github/workflows/subscriptionCron.yaml` that runs `python nubrix/components/subscriptionManager.py` daily. Do not invent a test command.
 - `prompts.yaml`, `codeTemplates.yaml`, `config.ini` are loaded by absolute path via `os.path.join(os.getcwd(), ...)` in `CodeGenerator` and friends — run from repo root.
-- `.env` is required and gitignored. Required keys: `SECRET_KEY`, `SUPABASE_URL`, `SUPABASE_KEY`, `DATABASE_URL`, `REDIS_HOST/PORT/PASSWORD`, plus provider keys (`GEMINI_API_KEY`/`GOOGLE_API_KEY`, `GROQ_API_KEY`, `CEREBRAS_API_KEY`, `OPENAI_API_KEY`, `LANGSMITH_*`, `LOGTAIL_*`, `RAZORPAY_*`, `BREVO_API_KEY`, `LANGFUSE_*`).
+- `.env` is required and gitignored. Required keys: `SECRET_KEY`, `SUPABASE_URL`, `SUPABASE_KEY`, `DATABASE_URL`, `REDIS_HOST/PORT/PASSWORD`, plus provider keys (`GEMINI_API_KEY`/`GOOGLE_API_KEY`, `GROQ_API_KEY`, `CEREBRAS_API_KEY`, `OPENAI_API_KEY`, `LANGSMITH_*`, `LOGTAIL_*`, `RAZORPAY_*`, `BREVO_API_KEY`, `BREVO_SENDER_EMAIL`, `BREVO_SENDER_NAME`, `DASHBOARD_BASE_URL`, `LANGFUSE_*`).
 - `AGENTS.md` and `CLAUDE.md` are gitignored on purpose — this file is for the local agent, not for git.
 - `OPENBLAS_NUM_THREADS=2` is set in `.env` to throttle BLAS (numpy/scipy) in the container.
 

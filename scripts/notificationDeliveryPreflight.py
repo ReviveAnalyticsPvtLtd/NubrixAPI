@@ -20,9 +20,10 @@ _REQUIRED_ENVIRONMENT = (
     "DATABASE_URL",
     "SUPABASE_URL",
     "SUPABASE_KEY",
-    "FREE_TRIAL_EXPIRY_WARNING_EMAIL_URL",
-    "SUPABASE_KEY_OLD",
     "BREVO_API_KEY",
+    "BREVO_SENDER_EMAIL",
+    "BREVO_SENDER_NAME",
+    "DASHBOARD_BASE_URL",
     "REDIS_HOST",
     "REDIS_PORT",
     "REDIS_PASSWORD",
@@ -50,7 +51,7 @@ def runPreflight(
     *,
     environ=None,
     repository=None,
-    edgeClient=None,
+    emailSender=None,
     brevoClient=None,
     redisClient=None,
     now=None,
@@ -64,7 +65,7 @@ def runPreflight(
         "ok": True,
         "environment": "ok",
         "database": "not_checked",
-        "edgeFunction": "not_checked",
+        "emailSender": "not_checked",
         "brevoEvents": "not_checked",
         "redis": "not_checked",
         "scheduler": "not_checked",
@@ -93,14 +94,14 @@ def runPreflight(
         result["ok"] = False
 
     try:
-        if edgeClient is None:
-            from api.services.notifications.edgeEmailClient import EdgeEmailClient
+        if emailSender is None:
+            from api.services.notifications.brevoEmailSender import BrevoEmailSender
 
-            edgeClient = EdgeEmailClient()
-        edgeClient.validate()
-        result["edgeFunction"] = "ok"
+            emailSender = BrevoEmailSender()
+        emailSender.validate()
+        result["emailSender"] = "ok"
     except Exception:
-        result["edgeFunction"] = "failed:EDGE_VALIDATION_FAILED"
+        result["emailSender"] = "failed:EMAIL_SENDER_VALIDATION_FAILED"
         result["ok"] = False
 
     try:
