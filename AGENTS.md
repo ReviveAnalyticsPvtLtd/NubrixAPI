@@ -8,7 +8,7 @@ NubrixAI Analytics Hub API — FastAPI + Celery + LangChain monolith.
 - Celery worker + beat on Redis for billing/subscription/credit/cron jobs.
 - LangChain + LangGraph orchestrating LLM components (Gemini via Google GenAI, Groq, Cerebras, OpenAI via OpenRouter).
 - Polars as the primary data engine for LLM-generated code (pandas fallback retained for backward compat).
-- Supabase (Postgres + Storage + Edge Functions), Razorpay billing, Langfuse tracing, Logtail logging.
+- Supabase (Postgres + Storage), Razorpay billing, Langfuse tracing, Logtail logging.
 
 ## Run / Build
 - Dev server: `uv run uvicorn main:app --reload --port 7860`. Swagger at `/api/latest/documentation/docs`.

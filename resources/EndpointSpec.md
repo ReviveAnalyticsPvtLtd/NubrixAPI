@@ -1652,10 +1652,10 @@ Reading it may ask the provider about the shown checkout's order and finalize mo
   committed status.
 - `503 PURCHASE_STATUS_UNAVAILABLE` when status cannot be read; retry later.
 
-**Release note: refund emails.** `payment_refund_started` and `payment_refund_completed` are sent through the
-`billingEmail` Edge function, which must be deployed with these templates before or together with this
-backend. If an older function answers `UNSUPPORTED_NOTIFICATION_TYPE`, those two emails are retried with the
-usual backoff until it is deployed (bounded by the delivery attempt limit); every other type stays permanent.
+**Release note: refund emails.** `payment_refund_started` and `payment_refund_completed` are rendered by the
+backend (`api/services/notifications/emailTemplates.py`) and sent to Brevo by `BrevoEmailSender`. They need
+`BREVO_API_KEY`, `BREVO_SENDER_EMAIL`, `BREVO_SENDER_NAME` and `DASHBOARD_BASE_URL` to be configured on the
+backend.
 
 Removed from the contract: `POST /purchase-checkouts/{attemptId}/status` (use `payment-status`),
 `POST /purchase-checkouts/{attemptId}/cancel`, `POST /cancelPendingAddition`,
