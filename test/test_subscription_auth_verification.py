@@ -109,6 +109,16 @@ def test_verify_never_reads_the_credit_balance(verification,monkeypatch):
     assert 'credits' not in response.json() and response.json()['subscription']['status']=='expired'
 
 
+def test_authenticated_requests_do_not_force_a_full_garbage_collection(verification,monkeypatch):
+    # A full collection walks every tracked object while holding the GIL, stalling the worker's other requests.
+    import gc
+    http,headers,_,_,_ = verification
+    collections = []
+    monkeypatch.setattr(gc,'collect',lambda *args:collections.append(args) or 0)
+    assert http.get('/auth/verify',headers=headers).status_code==200
+    assert collections==[]
+
+
 @pytest.mark.parametrize('restriction',['banned','missing','mismatched_session','erased'])
 def test_verify_preserves_live_account_and_session_guards(verification,restriction):
     http,headers,client,_,_ = verification

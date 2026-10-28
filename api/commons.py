@@ -32,7 +32,6 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from fastapi import Depends
 import os
-import gc
 
 security = HTTPBearer()
 client = create_client(
@@ -58,7 +57,6 @@ def _verifyTokenInternal(credentials: HTTPAuthorizationCredentials, checkExpiry:
     """
     Internal helper to verify the token, cross-validate with JWT payload, and optionally check for expiry.
     """
-    gc.collect()
     token = credentials.credentials
     
     # 1. Decode JWT to verify integrity and extract email
