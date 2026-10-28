@@ -187,6 +187,21 @@ class TestCreditServiceMonthly(unittest.TestCase):
         self.assertNotIn("dailyQuota", snap)
         self.assertNotIn("effectiveRemaining", snap)
 
+    def test_snapshot_reads_the_authoritative_balance_once(self):
+        # Each authoritative read is two locked PostgreSQL transactions; /auth/verify pays for every one.
+        svc = self._service()
+        manual = {"plan_tier": "pro", "monthly_token_quota": 10000000, "used_tokens": 4800,
+                  "remaining_tokens": 9995200, "topup_tokens": 0, "period_start": "2026-07-01T00:00:00+00:00",
+                  "period_end": "2026-08-01T00:00:00+00:00", "last_reset_at": None}
+        svc._manualBalance = MagicMock(return_value=manual)
+        with patch.object(svc, "_dbRow", return_value=None):
+            snap = svc.getBalanceSnapshot("u1")
+        self.assertEqual(svc._manualBalance.call_count, 1)
+        self.assertEqual(snap["monthlyRemainingTokens"], 9995200)
+        self.assertEqual(snap["topupTokens"], 0)
+        self.assertEqual(snap["usedTokens"], 4800)
+        self.assertTrue(snap["initialized"])
+
     def test_snapshot_defaults_when_no_row(self):
         svc = self._service()
         with patch.object(svc, "_dbRow", return_value=None):
