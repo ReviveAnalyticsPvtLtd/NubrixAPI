@@ -240,3 +240,11 @@ def test_reviewed_trial_consumption_cannot_discard_other_owned_paid_service(cove
         facts = factsFromRecords(row | proposal['patch'], owner, invoices, events, consumed=True, otherSubscriptions=[old])
         snapshot = evaluateSubscription(facts, NOW)
         assert snapshot.status == 'expired' and snapshot.purchaseAllowed and snapshot.currentPeriod is None
+
+
+@pytest.mark.parametrize('field,value', [('pending_removals', ['banking']),
+    ('pending_additions', [{'domain': 'telecom', 'state': 'awaiting_payment', 'attemptId': 'missing'}])])
+def test_legacy_selection_without_owned_destination_is_reported_unresolved(field, value):
+    row, owner, invoices, events = source('paid')
+    row[field] = value
+    assert buildBackfillProposal(row, owner, invoices, events, now=NOW)['resolution'] == 'needs_review'

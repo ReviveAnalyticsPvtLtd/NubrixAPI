@@ -1,4 +1,5 @@
 export const BILLING_TYPES = [
+  "annual_renewal_upcoming",
   "monthly_renewal_ready", "monthly_renewal_reminder", "monthly_subscription_expired",
   "payment_receipt", "monthly_cancellation_confirmation",
   "subscription_refund_initiated", "subscription_refund_processed",
@@ -32,6 +33,7 @@ function escape(value: unknown): string {
 }
 export function renderBillingMessage(request: BillingRequest, appUrl: string) {
   const messages: Record<BillingType, [string, string]> = {
+    annual_renewal_upcoming: ["Your Pro yearly coverage is ending soon", "Your next yearly invoice is available in your account. Renewal is a manual purchase; no automatic payment will be taken. Your current paid access continues until its paid end."],
     monthly_renewal_ready: ["Your monthly renewal invoice is ready", "Pay before your current period ends to keep access for the next calendar month. Early payment preserves your remaining paid days."],
     monthly_renewal_reminder: ["Your monthly subscription ends tomorrow", "Your renewal invoice is still unpaid. Complete checkout before expiry to keep access. No automatic payment will be taken."],
     monthly_subscription_expired: ["Your monthly subscription has expired", "Paid access has ended. You can purchase a new subscription from your account. Your stored purchased credits are preserved."],
@@ -40,8 +42,16 @@ export function renderBillingMessage(request: BillingRequest, appUrl: string) {
     subscription_refund_initiated: ["Your approved refund has been initiated", "Support approved the unused-time refund. The affected service access has ended; processing at the payment provider is tracked separately."],
     subscription_refund_processed: ["Your approved refund has been processed", "The payment provider has processed your approved unused-time refund. Bank posting times may vary."],
   };
-  const [subject, defaultText] = messages[request.notificationType];
+  let [subject, defaultText] = messages[request.notificationType];
   const metadata = request.metadata;
+  if (metadata.billingInterval === 'year') {
+    if (request.notificationType === 'monthly_renewal_ready') {
+      subject = 'Your Pro yearly renewal invoice is ready';
+      defaultText = 'Pay before your current coverage ends to keep access for the next year. Early payment preserves your remaining paid days.';
+    } else if (request.notificationType === 'monthly_renewal_reminder') subject = 'Your Pro yearly coverage ends tomorrow';
+    else if (request.notificationType === 'monthly_subscription_expired') subject = 'Your Pro yearly coverage has expired';
+    else if (request.notificationType === 'monthly_cancellation_confirmation') subject = 'Pro renewal reminders stopped';
+  }
   const topup = request.notificationType === "payment_receipt" && metadata.purpose === "topup";
   const refund = request.notificationType.startsWith("subscription_refund_");
   let text = defaultText;
@@ -89,7 +99,7 @@ export function renderBillingMessage(request: BillingRequest, appUrl: string) {
     invoiceId = String(metadata.invoiceId);
     if (!/^[A-Za-z0-9_-]{1,128}$/.test(invoiceId)) throw new Error("INVALID_INVOICE_ID");
   }
-  const renewal = request.notificationType === "monthly_renewal_ready" || request.notificationType === "monthly_renewal_reminder";
+  const renewal = request.notificationType === "annual_renewal_upcoming" || request.notificationType === "monthly_renewal_ready" || request.notificationType === "monthly_renewal_reminder";
   const action = renewal
     ? {label:"Pay renewal invoice", path:invoiceId ? `/settings/manage-plan?renewalInvoiceId=${encodeURIComponent(invoiceId)}` : "/settings/manage-plan"}
     : request.notificationType === "monthly_subscription_expired"

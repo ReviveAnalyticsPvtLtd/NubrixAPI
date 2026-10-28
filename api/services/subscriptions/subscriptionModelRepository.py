@@ -10,7 +10,7 @@ from api.services.billing.manualBillingPresentation import serializeSubscription
 from api.services.subscriptions.subscriptionModel import SubscriptionAuthorityUnavailable, evaluateSubscription
 from api.services.subscriptions.subscriptionCompatibility import getSubscriptionModelPhase
 from api.services.subscriptions.subscriptionModelBackfill import (
-    NEW_COLUMNS, MODEL_EVENTS, buildBackfillProposal, evidenceHash, financialEvidenceHash,
+    NEW_COLUMNS, MODEL_EVENTS, EXPERTS, acceptedCapture, acceptedPeriods, buildBackfillProposal, evidenceHash, financialEvidenceHash,
     factsFromRecords, jsonValue, legacyRow, legacyRowHash, metadata, stableLegacyHash, timestamp,
 )
 
@@ -64,6 +64,8 @@ class SubscriptionModelRepository:
             with db, db.cursor() as cursor:
                 cursor.execute('SELECT DISTINCT user_id FROM public.subscriptions ORDER BY user_id')
                 users = [r[0] for r in cursor.fetchall()]
+                from api.services.userErasureRetention import retentionAvailable
+                erasureReady = retentionAvailable(cursor)
         proposals = []
         for userId in users:
             with closing(self.connectionFactory()) as db:
@@ -81,14 +83,15 @@ class SubscriptionModelRepository:
                         proposals.append(proposal)
         counts = {key: sum(p['resolution'] == key for p in proposals) for key in ('verified', 'consumed_dates_unknown', 'needs_review')}
         return {'schemaVersion': 2, 'readOnly': True, 'counts': counts, 'proposals': proposals,
+                'consumerBlockers': [] if erasureReady else ['SUBSCRIPTION_ERASURE_RETENTION_PENDING'],
                 'authorizesCutover': False}
 
-    def _event(self, cursor, row, eventType, key, payload):
+    def _event(self, cursor, row, eventType, key, payload, *, invoiceId=None):
         cursor.execute('''INSERT INTO public.billing_events
-            (id,user_id,subscription_id,event_category,event_type,event_status,idempotency_key,metadata_json)
-            VALUES(%s,%s,%s,'audit',%s,'COMMITTED',%s,%s)
+            (id,user_id,subscription_id,invoice_id,event_category,event_type,event_status,idempotency_key,metadata_json)
+            VALUES(%s,%s,%s,%s,'audit',%s,'COMMITTED',%s,%s)
             ON CONFLICT(idempotency_key) WHERE idempotency_key IS NOT NULL DO NOTHING RETURNING id''',
-            (str(uuid4()), row['user_id'], row['id'], eventType, key, Json(jsonValue(payload))))
+            (str(uuid4()), row['user_id'], row['id'], invoiceId, eventType, key, Json(jsonValue(payload))))
         inserted = cursor.fetchone()
         if inserted:
             return str(inserted['id'])
@@ -96,9 +99,167 @@ class SubscriptionModelRepository:
         existing = cursor.fetchone()
         if (not existing or existing['event_type'] != eventType or existing['event_status'] != 'COMMITTED'
                 or existing['user_id'] != row['user_id'] or str(existing['subscription_id']) != str(row['id'])
+                or str(existing.get('invoice_id')) != str(invoiceId)
                 or metadata(existing) != jsonValue(payload)):
             raise ValueError('REVIEW_ARCHIVE_CONFLICT')
         return str(existing['id'])
+
+    def _accountPurchaseRecords(self, cursor, subscriptionId):
+        cursor.execute('SELECT user_id FROM public.subscriptions WHERE id=%s', (subscriptionId,))
+        record = cursor.fetchone()
+        if not record:
+            raise SubscriptionAuthorityUnavailable('Purchased subscription missing')
+        rows, owner, invoices, events = self._records(cursor, record['user_id'])
+        row = next(r for r in rows if str(r['id']) == str(subscriptionId))
+        invoices, events, others = self._related(row, rows, invoices, events)
+        owned = {str(r['id']) for r in rows}
+        if not owner or any(i.get('userId') != row['user_id'] or str(i.get('subscription_id')) not in owned for i in invoices):
+            raise SubscriptionAuthorityUnavailable('Purchase owner mismatch')
+        if any(e.get('user_id') != row['user_id'] or
+               (e.get('subscription_id') is not None and str(e['subscription_id']) not in owned) for e in events):
+            raise SubscriptionAuthorityUnavailable('Purchase event owner mismatch')
+        return row, invoices, events, others
+
+    def _purchaseRecords(self, cursor, subscriptionId):
+        row, invoices, events, _ = self._accountPurchaseRecords(cursor, subscriptionId)
+        # Only this row's invoices may grant service. Account-level audits do
+        # not grant periods; all owned money remains available to the guard.
+        return row, [i for i in invoices if str(i['subscription_id']) == str(row['id'])], [
+            e for e in events if e.get('subscription_id') is None or str(e['subscription_id']) == str(row['id'])]
+
+    def _acceptedPurchases(self, cursor, subscriptionId):
+        try:
+            row, invoices, events = self._purchaseRecords(cursor, subscriptionId)
+            periods = acceptedPeriods(row, invoices, events, allowExpertAdditions=True)
+            for period in periods:
+                if (period.start is None or period.end is None or period.start >= period.end
+                        or len(set(period.experts)) != len(period.experts)):
+                    raise ValueError('INVALID_ACCEPTED_PERIOD')
+            grants = []
+            for invoice in invoices:
+                billing = metadata(invoice).get('manualBilling', {})
+                if str(invoice.get('status')).upper() != 'PAID' or billing.get('purpose') != 'expert_addition':
+                    continue
+                acceptedCapture(row, invoice, events)
+                matches = [e for e in events if e.get('event_type') == 'subscription.expert_grant'
+                           and e.get('event_status') == 'COMMITTED' and str(e.get('invoice_id')) == str(invoice['id'])]
+                if len(matches) != 1:
+                    raise ValueError('EXPERT_GRANT_REQUIRES_REVIEW')
+                grant = metadata(matches[0])['expertGrant']
+                attempt = next((e for e in events if str(e.get('id')) == grant.get('attemptId')
+                    and e.get('event_category') == 'payment_attempt' and str(e.get('invoice_id')) == str(invoice['id'])), None)
+                frozen = metadata(attempt).get('manualBilling', {}) if attempt else {}
+                if (not attempt or attempt.get('payment_status') != 'captured'
+                        or attempt.get('provider_order_id') != invoice.get('razorpay_order_id')
+                        or attempt.get('amount') != invoice.get('total_amount') or attempt.get('currency') != invoice.get('currency')
+                        or any(frozen.get(k) != billing.get(k) for k in ('purpose', 'billingMode', 'lifecycleId', 'servicePeriodId'))
+                        or set(frozen.get('domains', [])) != set(billing.get('domains', []))):
+                    raise ValueError('EXPERT_GRANT_ATTEMPT_MISMATCH')
+                period = next((p for p in periods if p.id == grant.get('periodId')), None)
+                domains = grant.get('experts')
+                acceptedAt = timestamp(grant.get('acceptedAt'))
+                if (not period or not isinstance(domains, list) or not domains or len(domains) != len(set(domains))
+                        or not set(domains) <= set(EXPERTS) or set(domains) != set(billing.get('domains', []))
+                        or grant.get('lifecycleId') != period.lifecycleId or billing.get('lifecycleId') != period.lifecycleId
+                        or billing.get('servicePeriodId') != period.id or str(invoice['id']) != grant.get('invoiceId')
+                        or not acceptedAt or not period.start <= acceptedAt < period.end
+                        or timestamp(invoice.get('period_end')) != period.end):
+                    raise ValueError('EXPERT_GRANT_PERIOD_MISMATCH')
+                revokedAt = timestamp(billing.get('revokedAt'))
+                if billing.get('coverageState') == 'revoked' and revokedAt is None:
+                    raise ValueError('EXPERT_REVOCATION_REQUIRES_REVIEW')
+                grants.append(grant | {'revokedAt': revokedAt})
+            return row, periods, grants
+        except (ValueError, KeyError, TypeError) as exc:
+            raise SubscriptionAuthorityUnavailable('Owned purchase evidence unavailable') from exc
+
+    def loadAcceptedPeriods(self, cursor, subscriptionId, lifecycleId=None):
+        _, periods, _ = self._acceptedPurchases(cursor, subscriptionId)
+        return tuple(p for p in periods if lifecycleId is None or p.lifecycleId == lifecycleId)
+
+    def loadEffectiveExperts(self, cursor, periodId, now):
+        cursor.execute('SELECT subscription_id FROM public."Invoices" WHERE id=%s', (periodId,))
+        invoice = cursor.fetchone()
+        if not invoice or not invoice['subscription_id']:
+            raise SubscriptionAuthorityUnavailable('Purchased period missing')
+        _, periods, grants = self._acceptedPurchases(cursor, str(invoice['subscription_id']))
+        period = next((p for p in periods if p.id == str(periodId)), None)
+        if not period:
+            raise SubscriptionAuthorityUnavailable('Accepted period missing')
+        experts = list(period.experts)
+        for grant in sorted(grants, key=lambda g: (timestamp(g['acceptedAt']), g['invoiceId'])):
+            if (grant['periodId'] == period.id and timestamp(grant['acceptedAt']) <= timestamp(now)
+                    and (grant['revokedAt'] is None or timestamp(now) < grant['revokedAt'])):
+                if set(experts) & set(grant['experts']):
+                    raise SubscriptionAuthorityUnavailable('Overlapping expert grants')
+                experts.extend(grant['experts'])
+        if len(experts) > 4:
+            raise SubscriptionAuthorityUnavailable('Expert capacity exceeded')
+        return tuple(experts)
+
+    def loadNextSelection(self, cursor, subscriptionId, lifecycleId, cycleStart):
+        row, periods, _ = self._acceptedPurchases(cursor, subscriptionId)
+        cycleStart = timestamp(cycleStart)
+        for period in periods:
+            if period.lifecycleId == lifecycleId and period.start == cycleStart and (period.revokedAt is None or period.revokedAt > period.start):
+                return {'id': None, 'experts': list(period.experts), 'paid': True, 'invoiceId': period.invoiceId}
+        cursor.execute("""SELECT * FROM public.billing_events WHERE user_id=%s AND subscription_id=%s
+            AND event_type='subscription.next_selection' AND event_status='COMMITTED'
+            ORDER BY occurred_at DESC,id DESC""", (row['user_id'], row['id']))
+        selections = []
+        for event in cursor.fetchall():
+            value = metadata(event)['nextSelection']
+            if value.get('lifecycleId') != lifecycleId or timestamp(value.get('cycleStart')) != cycleStart:
+                continue
+            experts = value.get('experts')
+            if (not isinstance(experts, list) or not experts or len(set(experts)) != len(experts)
+                    or not set(experts) <= set(EXPERTS) or type(value.get('version')) is not int):
+                raise SubscriptionAuthorityUnavailable('Invalid next selection')
+            selections.append({'id': str(event['id']), **value, 'paid': False})
+        return max(selections, key=lambda s: s['version']) if selections else None
+
+    def saveNextSelection(self, cursor, subscriptionId, lifecycleId, cycleStart, expectedVersion, experts, *, now=None):
+        if getSubscriptionModelPhase() not in ('dual', 'v2', 'contracted'):
+            raise ValueError('SELECTION_PHASE_NOT_ALLOWED')
+        row, periods, _ = self._acceptedPurchases(cursor, subscriptionId)
+        cursor.execute('SELECT "isBanned" FROM public."Users" WHERE "userId"=%s', (row['user_id'],))
+        owner = cursor.fetchone()
+        if not owner or owner['isBanned']:
+            raise ValueError('SELECTION_OWNER_NOT_ELIGIBLE')
+        evaluated, cycleStart = self._now(cursor, now), timestamp(cycleStart)
+        current = next((p for p in periods if p.lifecycleId == lifecycleId and p.start <= evaluated < p.end and p.revokedAt is None), None)
+        if not current or current.end != cycleStart or row.get('erasure_pending') or not row['is_canonical']:
+            raise ValueError('SELECTION_CYCLE_MISMATCH')
+        effective = self.loadEffectiveExperts(cursor, current.id, evaluated)
+        if not isinstance(experts, (list, tuple)) or not experts or len(experts) != len(set(experts)) or not set(experts) <= set(effective):
+            raise ValueError('INVALID_EXPERT_REMOVAL')
+        previous = self.loadNextSelection(cursor, subscriptionId, lifecycleId, cycleStart)
+        if previous and previous.get('paid'):
+            raise ValueError('PAID_FUTURE_SELECTION_IMMUTABLE')
+        if type(expectedVersion) is not int or row['version'] != expectedVersion:
+            raise ValueError('STALE_SUBSCRIPTION_VERSION')
+        if previous and set(previous['experts']) == set(experts):
+            return previous
+        cursor.execute('UPDATE public.subscriptions SET version=version+1 WHERE id=%s AND version=%s RETURNING version', (subscriptionId, expectedVersion))
+        version = cursor.fetchone()['version']
+        value = jsonValue(dict(lifecycleId=lifecycleId, cycleStart=cycleStart, experts=list(experts), version=version))
+        eventId = self._event(cursor, row, 'subscription.next_selection',
+            f'subscription-selection:{subscriptionId}:{lifecycleId}:{cycleStart.isoformat()}:{version}', {'nextSelection': value})
+        # A changed unpaid selection closes its old quote/attempt atomically.
+        from api.services.billing.manualBillingRepository import ManualBillingRepository
+        cursor.execute('''SELECT * FROM public."Invoices" WHERE "userId"=%s AND subscription_id=%s
+            AND billing_reason='renewal' AND period_start=%s AND status IN ('UPCOMING','PAYMENT_PENDING') ORDER BY id FOR UPDATE''',
+            (row['user_id'], row['id'], cycleStart))
+        for invoice in cursor.fetchall():
+            ManualBillingRepository()._closeInvoice(cursor, invoice, 'EXPERT_SELECTION_CHANGED', now=evaluated)
+        return {'id': eventId, **value, 'paid': False}
+
+    def recordExpertGrant(self, cursor, row, invoice, attempt, evidence, periodId):
+        payload = jsonValue(dict(periodId=periodId, invoiceId=str(invoice['id']), attemptId=str(attempt['id']),
+            lifecycleId=metadata(attempt)['manualBilling']['lifecycleId'],
+            experts=metadata(attempt)['manualBilling']['domains'], acceptedAt=evidence.observedAt))
+        return self._event(cursor, row, 'subscription.expert_grant', 'expert-grant:' + str(invoice['id']),
+            {'expertGrant': payload}, invoiceId=str(invoice['id']))
 
     def archiveLegacySnapshot(self, cursor, row):
         self._lock(cursor, row['user_id'])
@@ -238,6 +399,66 @@ class SubscriptionModelRepository:
             if archiveValid and payload.get('resolution') in ('verified', 'consumed_dates_unknown') and self._stampMatches(row, owner, ownInvoices, ownEvents, others, payload):
                 return factsFromRecords(row, owner, ownInvoices, ownEvents, consumed=payload['trialConsumed'], otherSubscriptions=others)
         raise SubscriptionAuthorityUnavailable('Reviewed backfill is missing or stale')
+
+    def loadRuntimeFacts(self, cursor, row, now):
+        """Read explicit core facts and current owned money, never a cached label.
+
+        The migration verifier above remains frozen to its reviewed source. A
+        runtime write need not rewrite that immutable approval or pretend its
+        old financial fingerprint is still current. Trial history must have
+        an owned initialization/trial event or a valid reviewed archive.
+        """
+        from dataclasses import replace
+        from api.services.billing.manualBillingRepository import ManualBillingRepository
+        from api.services.subscriptions.subscriptionModel import TrialFacts
+        billing = ManualBillingRepository(self.connectionFactory)
+        cursor.execute('SELECT "userId","isBanned" FROM public."Users" WHERE "userId"=%s', (row['user_id'],))
+        owner = cursor.fetchone()
+        if not owner:
+            raise SubscriptionAuthorityUnavailable('Subscription owner missing')
+        facts = billing._purchaseFactsLocked(cursor, row, owner, now)
+        _, _, events = self._purchaseRecords(cursor, str(row['id']))
+        events = [e for e in events if str(e.get('subscription_id')) == str(row['id']) and e.get('event_status') == 'COMMITTED']
+        trialEvent = next((e for e in events if e['event_type'] == 'subscription.trial_started'), None)
+        initialized = any(e['event_type'] == 'subscription.model_initialized' for e in events)
+        reviewed, consumed, experts = False, False, ()
+        for stamp in (e for e in events if e['event_type'] == MODEL_EVENTS[1]):
+            payload = metadata(stamp).get('backfill', {})
+            archive = next((e for e in events if str(e['id']) == payload.get('archiveId') and e['event_type'] == MODEL_EVENTS[0]), None)
+            original = metadata(archive).get('archive', {}) if archive else {}
+            source = original.get('originalRow')
+            if (isinstance(source, dict) and source.get('user_id') == row['user_id'] and str(source.get('id')) == str(row['id'])
+                    and legacyRowHash(source) == original.get('legacyHash')
+                    and payload.get('resolution') in ('verified', 'consumed_dates_unknown')):
+                reviewed, consumed = True, bool(payload.get('trialConsumed'))
+                experts = tuple(billing._jsonList(source.get('subscribed_experts')))
+        if facts.periods:
+            if row.get('plan_code') != 'pro' or not row.get('lifecycle_id'):
+                raise SubscriptionAuthorityUnavailable('Paid core identity requires review')
+        elif not (initialized or reviewed):
+            raise SubscriptionAuthorityUnavailable('Trial history requires reviewed initialization')
+        if initialized and not reviewed and not trialEvent and not facts.periods:
+            state = billing._json(row.get('billing_state'))
+            cursor.execute('SELECT * FROM public.credit_balances WHERE user_id=%s', (row['user_id'],))
+            balance = cursor.fetchone()
+            if (row.get('current_period_start') or row.get('current_period_end') or state.get('trialConsumed')
+                    or state.get('churn_snapshot') or (balance and (balance.get('plan_tier') not in ('none', None)
+                    or balance.get('credit_period_id') or balance.get('period_start')))):
+                raise SubscriptionAuthorityUnavailable('Legacy entitlement history requires review')
+        if trialEvent and row.get('trial_started_at') is None and not facts.periods:
+            raise SubscriptionAuthorityUnavailable('Consumed trial core is incomplete')
+        trial = TrialFacts(consumed=consumed or trialEvent is not None or bool(facts.periods))
+        if row.get('trial_started_at') is not None and (trialEvent or reviewed):
+            experts = tuple(metadata(trialEvent).get('experts', ())) if trialEvent else experts
+            if not set(experts) <= set(EXPERTS):
+                raise SubscriptionAuthorityUnavailable('Unknown trial experts')
+            trial = TrialFacts(timestamp(row['trial_started_at']), timestamp(row.get('trial_ends_at')),
+                timestamp(row.get('trial_closed_at')), experts, True)
+        elif row.get('trial_started_at') is not None and not facts.periods:
+            raise SubscriptionAuthorityUnavailable('Trial experts require owned evidence')
+        elif not facts.periods and row.get('plan_code') == 'pro' and not consumed:
+            raise SubscriptionAuthorityUnavailable('Trial history is incomplete')
+        return replace(facts, trial=trial, planCode=row.get('plan_code'))
 
     def snapshotFactsLoader(self, userId, now=None):
         try:

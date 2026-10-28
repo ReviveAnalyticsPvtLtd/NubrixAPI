@@ -46,8 +46,9 @@ def test_migration_does_not_add_due_today_or_winback_types():
         assert forbidden not in sql
 
 
-def test_template_versions_cover_exactly_the_monthly_types():
+def test_template_versions_cover_all_supported_billing_types():
     assert set(_BILLING_NOTIFICATION_TEMPLATE_VERSIONS) == {
+        "annual_renewal_upcoming",
         "monthly_renewal_ready",
         "monthly_renewal_reminder",
         "monthly_subscription_expired",

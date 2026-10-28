@@ -73,6 +73,10 @@ class AnnualRenewalTask:
         Returns:
             dict: Counts for t30 and t7 operations.
         """
+        from api.services.subscriptions.subscriptionCompatibility import usesUnifiedSubscription
+        if usesUnifiedSubscription():
+            from api.services.subscriptions.subscriptionWorkerService import SubscriptionWorkerService
+            return SubscriptionWorkerService(self.client).execute(interval='year',reminders=True)
         logger.info("Annual renewal task started")
         t30Results = self._sweepT30()
         t7Results = self._sweepT7()

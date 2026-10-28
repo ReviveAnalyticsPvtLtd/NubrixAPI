@@ -48,3 +48,18 @@ def test_retry_rejects_missing_or_completed_request_without_queueing(capsys):
     ) == 1
     assert queued == []
     assert "cannot be retried" in capsys.readouterr().err
+
+
+def test_status_explicitly_reports_original_retention_without_resource_identifiers(capsys):
+    import json
+    repository = FakeRepository({'status':'COMPLETED','target_user_id':'private-user',
+        'resource_manifest':{'projectIds':['private-project']},
+        'retention_manifest':{'policyCode':'ORIGINAL_AUDITS_RETAINED',
+            'originalIdentifiersRetained':True,'originalMetadataRetained':True,
+            'retainedRecordCounts':{'billing_events':8},'retentionExpiresAt':None,'purgeScheduled':False}})
+    assert manage_user_erasure.main(['status','--request-id',REQUEST_ID],repository=repository)==0
+    output = capsys.readouterr().out
+    result = json.loads(output)
+    assert result['retention']['originalIdentifiersRetained'] is True
+    assert result['retention']['policyCode']=='ORIGINAL_AUDITS_RETAINED'
+    assert 'private-' not in output and repository.retried==[]

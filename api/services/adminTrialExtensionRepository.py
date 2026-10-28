@@ -121,6 +121,11 @@ class AdminTrialExtensionRepository:
         connection = self.connectionFactory()
         try:
             with connection.cursor(cursor_factory=RealDictCursor) as cursor:
+                from api.services.subscriptions.subscriptionCompatibility import usesUnifiedSubscription
+                if usesUnifiedSubscription():
+                    from api.services.billing.manualBillingRepository import ManualBillingRepository
+                    billing = ManualBillingRepository(self.connectionFactory)
+                    billing._lockUser(cursor, userId)
                 cursor.execute(
                     "select pg_advisory_xact_lock(hashtextextended(%s, 0))",
                     (userId,),
@@ -186,6 +191,10 @@ class AdminTrialExtensionRepository:
                     connection.commit()
                     return result
 
+                if usesUnifiedSubscription():
+                    cursor.execute('SELECT clock_timestamp() AS current_time')
+                    now = _asDatetime(cursor.fetchone()['current_time'])
+                    subscription = self._verifiedTrialProjection(cursor, billing, userId, now)
                 errorCode = self._eligibilityError(dict(subscription))
                 if errorCode is not None:
                     result = self._recordOutcomeFailure(
@@ -198,7 +207,7 @@ class AdminTrialExtensionRepository:
                 periodStart, newExpiry = calculateTrialWindow(
                     dict(subscription), now, days
                 )
-                creditPeriodEnd = now + relativedelta(months=1)
+                creditPeriodEnd = newExpiry if usesUnifiedSubscription() else now + relativedelta(months=1)
                 quota = int(self.freeQuotaProvider())
                 domainCount = max(1, int(subscription.get("domain_count") or 1))
                 subscriptionVersion = int(subscription.get("version") or 0) + 1
@@ -240,6 +249,8 @@ class AdminTrialExtensionRepository:
                         subscription["id"],
                     ),
                 )
+                if usesUnifiedSubscription():
+                    cursor.execute('UPDATE public.subscriptions SET trial_ends_at=%s WHERE id=%s', (newExpiry, subscription['id']))
                 cursor.execute(
                     """
                     insert into public.credit_balances (
@@ -317,6 +328,20 @@ class AdminTrialExtensionRepository:
             raise
         finally:
             connection.close()
+
+    @staticmethod
+    def _verifiedTrialProjection(cursor, billing, userId, now):
+        from api.services.subscriptions.subscriptionModel import evaluateSubscription
+        row = billing._canonical(cursor, userId)
+        facts = billing._modelRepository().loadRuntimeFacts(cursor, row, now)
+        snapshot = evaluateSubscription(facts, now)
+        if facts.periods:
+            return {**row, 'billing_mode':'paid', 'plan_type':'pro'}
+        trial = snapshot.trial
+        known = bool(trial and trial.closedAt is None)
+        return {**row, 'billing_mode':'none', 'plan_type':'free' if known else 'none',
+            'status':snapshot.status, 'current_period_start':trial.startedAt if trial else None,
+            'current_period_end':trial.endsAt if trial else None, 'domain_count':len(facts.trial.experts)}
 
     @staticmethod
     def _eligibilityError(subscription: dict) -> str | None:
@@ -413,7 +438,11 @@ class AdminTrialExtensionRepository:
                 if locator is None:
                     connection.commit()
                     return None
-
+                from api.services.subscriptions.subscriptionCompatibility import usesUnifiedSubscription
+                if usesUnifiedSubscription():
+                    from api.services.billing.manualBillingRepository import ManualBillingRepository
+                    billing = ManualBillingRepository(self.connectionFactory)
+                    billing._lockUser(cursor, locator['user_id'])
                 cursor.execute(
                     "select pg_advisory_xact_lock(hashtextextended(%s, 0))",
                     (locator["user_id"],),
@@ -430,6 +459,9 @@ class AdminTrialExtensionRepository:
                     (locator.get("subscription_id"), locator["user_id"]),
                 )
                 subscription = cursor.fetchone()
+                if usesUnifiedSubscription() and subscription is not None:
+                    cursor.execute('SELECT clock_timestamp() AS current_time')
+                    subscription = self._verifiedTrialProjection(cursor, billing, locator['user_id'], _asDatetime(cursor.fetchone()['current_time']))
                 cursor.execute(
                     f"""
                     select {EXTENSION_SELECT}

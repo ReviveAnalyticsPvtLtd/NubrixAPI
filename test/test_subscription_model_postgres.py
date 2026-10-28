@@ -15,10 +15,52 @@ from api.services.subscriptions.subscriptionModelBackfill import NEW_COLUMNS, bu
 from api.services.subscriptions.subscriptionModelRepository import SubscriptionModelRepository
 from api.services.subscriptions.subscriptionSnapshotService import SubscriptionSnapshotService
 from test.subscriptionBackfillFixtures import NOW, OWNER, SUB, source
+from test.subscriptionRuntimeFixtures import (  # noqa: F401
+    account, runtimeDb, postgres, query as runtimeQuery, NOW as RUNTIME_NOW,
+)
 
 ROOT = Path(__file__).resolve().parents[1]
 MIGRATION = ROOT / 'supabase/migrations/20261017211222_expand_subscription_model_v2.sql'
 pytestmark = pytest.mark.skipif(os.environ.get('RUN_MANUAL_BILLING_INTEGRATION') != '1', reason='Disposable PostgreSQL opt-in; skip is UNVERIFIED')
+
+
+@pytest.mark.parametrize('account', ['monthly_prepaid', 'annual_prepaid'], indirect=True)
+def test_lazy_worker_and_admin_reset_share_one_window_and_keep_reset_generation(account):
+    from dateutil.relativedelta import relativedelta
+    from api.services.credits.manualCreditRepository import ManualCreditRepository
+    from test.subscriptionRuntimeFixtures import renewal, capture
+    repo, _, initial, url = account
+    credits = ManualCreditRepository(repo)
+    mode = repo.getCoverageSnapshot(initial.userId, RUNTIME_NOW).billingMode
+    if mode == 'monthly_prepaid':
+        from api.services.billing.manualBillingContracts import CheckoutRequest
+        invoice = renewal(account)
+        attempt = repo.reserveCheckout(CheckoutRequest(initial.userId, 'renewal', mode, {'invoiceId': str(invoice['id'])}, expectedCatalogRevision=1))
+        capture(repo, attempt)
+    boundary = repo.getCoverageSnapshot(initial.userId, RUNTIME_NOW).currentPeriod.start + relativedelta(months=1)
+    runtimeQuery(url, 'UPDATE credit_balances SET used_tokens=700,remaining_tokens=monthly_token_quota-700,topup_tokens=500 WHERE user_id=%s', (initial.userId,))
+    from threading import Barrier
+    gate = Barrier(3)
+    def locked(action):
+        gate.wait(timeout=10)
+        def transaction(connection):
+            with connection.cursor(cursor_factory=RealDictCursor) as cursor:
+                repo._lockUser(cursor, initial.userId)
+                row = repo._canonical(cursor, initial.userId)
+                return action(cursor, row)
+        return repo._run(transaction)
+    with ThreadPoolExecutor(max_workers=3) as pool:
+        futures = [pool.submit(locked, lambda c, s: credits._balanceLocked(c, s, boundary)),
+            pool.submit(locked, lambda c, s: repo._activateDueCoverageLocked(c, s, boundary)),
+            pool.submit(locked, lambda c, s: credits.resetQuotaLocked(c, s, boundary))]
+        lazy, worker, reset = [f.result(timeout=30) for f in futures]
+    after = runtimeQuery(url, 'SELECT * FROM credit_balances WHERE user_id=%s', (initial.userId,), one=True)
+    assert str(after['credit_period_id']) == reset['after']['creditPeriodId']
+    assert (after['used_tokens'], after['remaining_tokens'], after['topup_tokens']) == (0, 20_000_000, 500)
+    repo.activateDueCoverage(initial.userId, boundary)
+    assert runtimeQuery(url, 'SELECT * FROM credit_balances WHERE user_id=%s', (initial.userId,), one=True) == after
+    markers = runtimeQuery(url, "SELECT metadata_json FROM billing_events WHERE user_id=%s AND event_type='credit.window_materialized' AND metadata_json->>'periodStart'=%s", (initial.userId, boundary.isoformat()))
+    assert len(markers) == 1
 
 
 @pytest.fixture

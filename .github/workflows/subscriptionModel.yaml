@@ -84,6 +84,9 @@ jobs:
             test/test_gap_remediation_postgres.py \
             test/test_live_billing_schema_postgres.py \
             test/test_subscription_model_postgres.py \
+            test/test_subscription_model_repository.py \
+            test/test_subscription_model_finalization.py \
+            test/test_subscription_erasure_postgres.py \
             --junitxml="$RUNNER_TEMP/subscription-postgres.xml"
       - name: Require executed PostgreSQL cases
         run: |

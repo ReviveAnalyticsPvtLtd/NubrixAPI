@@ -1173,6 +1173,11 @@ class ManagementService:
         return mapBillingModeToPlanType(billingMode, status)
 
     def _getCanonicalSubscription(self, userId: str) -> dict:
+        from api.services.subscriptions.subscriptionCompatibility import usesUnifiedSubscription, refreshSubscriptionProjection
+        if usesUnifiedSubscription():
+            projected = {}
+            refreshSubscriptionProjection(userId, projected)
+            return projected
         subscription = self.client.table("subscriptions") \
             .select(CANONICAL_SUBSCRIPTION_SELECT) \
             .eq("user_id", userId) \
@@ -1188,6 +1193,9 @@ class ManagementService:
         return subscription[0]
 
     def _refreshLifecycleSnapshot(self, userId: str, subscription: dict) -> int:
+        from api.services.subscriptions.subscriptionCompatibility import usesUnifiedSubscription, refreshSubscriptionProjection
+        if usesUnifiedSubscription():
+            return refreshSubscriptionProjection(userId, subscription)
         if subscription.get("billing_mode") == "monthly_prepaid":
             from api.services.billing.manualBillingRepository import getManualBillingRepository
             from api.services.subscriptions.entitlementService import EntitlementUnavailableError
@@ -1284,11 +1292,11 @@ class ManagementService:
             except Exception:
                 creditsView = None
             subscription = self._getCanonicalSubscription(userId)
+            subscriptionDaysLeft = self._refreshLifecycleSnapshot(userId, subscription)
             planFields = toApiPlanFields(subscription)
             expiryStr = subscription.get("current_period_end")
             if expiryStr == "None":
                 expiryStr = None
-            subscriptionDaysLeft = self._refreshLifecycleSnapshot(userId, subscription)
             currentStatus = self._mapSubscriptionStatusForProfile(subscription.get("status"))
             nextBilling = None
             if currentStatus == "ACTIVE":
@@ -1351,6 +1359,8 @@ class ManagementService:
                     **subscriptionDisplayFacts(subscription),
                 }
             }
+            if '_subscriptionSnapshot' in subscription:
+                profileResponse['subscription'] = profileResponse['plan'].pop('subscription')
             if refreshedAccessToken:
                 profileResponse["accessToken"] = refreshedAccessToken
             return profileResponse
@@ -1450,9 +1460,9 @@ class ManagementService:
                 .execute().data
             record = updatedUserRecord[0]
             subscription = self._getCanonicalSubscription(userId)
+            subscriptionDaysLeft = self._refreshLifecycleSnapshot(userId, subscription)
             planFields = toApiPlanFields(subscription)
             expiryStr = subscription.get("current_period_end")
-            subscriptionDaysLeft = self._refreshLifecycleSnapshot(userId, subscription)
             currentStatus = self._mapSubscriptionStatusForProfile(subscription.get("status"))
             nextBilling = None
             if currentStatus == "ACTIVE":
@@ -1482,6 +1492,8 @@ class ManagementService:
                     **subscriptionDisplayFacts(subscription),
                 }
             }
+            if '_subscriptionSnapshot' in subscription:
+                profileResponse['subscription'] = profileResponse['plan'].pop('subscription')
             return profileResponse
         except CustomException:
             raise

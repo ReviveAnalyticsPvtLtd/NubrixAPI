@@ -19,6 +19,7 @@ __all__ = [
     "TOKEN_TO_CREDIT_RATIO",
     "TOPUP_PACKS",
     "getTokenQuotaForPlan",
+    "getAllowanceQuota",
     "getOperationMinimum",
     "getTopupPacks",
     "getTopupPack",
@@ -29,6 +30,7 @@ __all__ = [
 from utils.logger import logger
 import json
 import os
+from typing import Literal
 
 
 _CREDIT_CONFIG_PATH = "config/credits.json"
@@ -113,6 +115,7 @@ def getTokenQuotaForPlan(planType: str, domainCount: int = 1) -> int:
         int: Monthly token quota. Defaults to 0 for unknown plans.
     """
     quotas = _getCreditConfig().get("quotas", {})
+    planType = {'annual': 'pro', 'free': 'trial'}.get(planType, planType)
     planInfo = quotas.get(planType, quotas.get("none", {}))
     if planInfo.get("scales_with_domains", False):
         try:
@@ -121,6 +124,13 @@ def getTokenQuotaForPlan(planType: str, domainCount: int = 1) -> int:
             domains = 1
         return planInfo.get("tokens_per_domain", 0) * domains
     return planInfo.get("monthly_tokens", 0)
+
+
+def getAllowanceQuota(kind: Literal['trial', 'paid'], domainCount: int) -> int:
+    """Strict allowance policy; product interval never changes its quantity."""
+    if kind not in ('trial', 'paid') or type(domainCount) is not int or not 1 <= domainCount <= 4:
+        raise ValueError('INVALID_ALLOWANCE_POLICY')
+    return int(getTokenQuotaForPlan('trial' if kind == 'trial' else 'pro', domainCount))
 
 
 def getOperationMinimum(operationType: str) -> int:

@@ -154,14 +154,16 @@ class NotificationDeliveryService:
                 now + datetime.timedelta(minutes=30),now + datetime.timedelta(minutes=5))
             summary['ambiguous'] += 1
             return
+        from api.services.subscriptions.subscriptionCompatibility import usesUnifiedSubscription
         subscription = self._findOne(
             "subscriptions",
             "id",
             delivery.get("subscription_id"),
+            ("id, user_id, erasure_pending, is_canonical, cancellation_requested_at" if usesUnifiedSubscription() else
             (
                 "id, user_id, current_period_start, current_period_end, "
                 "status, billing_mode, erasure_pending, renewal_opt_out, billing_state, is_canonical"
-            ),
+            )),
         )
         if subscription is None:
             self._cancel(delivery, workerId, "SUBSCRIPTION_NOT_FOUND", summary)
@@ -171,11 +173,13 @@ class NotificationDeliveryService:
         if billingDelivery:
             from api.services.notifications.billingNotificationService import isBillingNotificationEligible
             metadata = dict(delivery.get("metadata_json") or {})
-            invoice = self._findOne("Invoices", "id", metadata.get("invoiceId"), "id, status, period_start, period_end, metadata_json") if metadata.get("invoiceId") else None
+            invoice = self._findOne("Invoices", "id", metadata.get("invoiceId"), "id, userId, subscription_id, status, period_start, period_end, metadata_json") if metadata.get("invoiceId") else None
             if invoice and delivery.get('notification_type') == 'payment_receipt':
                 metadata['serviceRevoked'] = bool((invoice.get('metadata_json') or {}).get('manualBilling',{}).get('revokedAt'))
             snapshot = {"subscription":subscription, "invoice":invoice}
-            if not isBillingNotificationEligible(delivery, snapshot, now):
+            # Financial holds are classified by the locked submission fence;
+            # don't permanently cancel an otherwise-current milestone here.
+            if not isBillingNotificationEligible(delivery, snapshot, now,ignoreMoneyHold=True):
                 self._cancel(delivery, workerId, "SUBSCRIPTION_NOT_ELIGIBLE", summary)
                 return
         else:

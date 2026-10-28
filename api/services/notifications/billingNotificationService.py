@@ -23,6 +23,7 @@ from api.services.subscriptions.paymentValidationService import parseUtc
 
 
 SUPPORTED_BILLING_NOTIFICATION_TYPES = {
+    "annual_renewal_upcoming",
     "monthly_renewal_ready",
     "monthly_renewal_reminder",
     "monthly_subscription_expired",
@@ -33,10 +34,37 @@ SUPPORTED_BILLING_NOTIFICATION_TYPES = {
 }
 
 _SOLICITATION_TYPES = {
+    "annual_renewal_upcoming",
     "monthly_renewal_ready",
     "monthly_renewal_reminder",
     "monthly_subscription_expired",
 }
+
+
+def notificationSnapshot(snapshot: dict, now: datetime) -> dict:
+    """Project a private display copy from owned facts, without legacy writes.
+
+    Locked callers supply the typed snapshot from their transaction. Other
+    callers load it through the common authority service; caches never grant
+    notification eligibility in a unified phase.
+    """
+    from api.services.subscriptions.subscriptionCompatibility import usesUnifiedSubscription
+    if not usesUnifiedSubscription():
+        return snapshot
+    from api.services.subscriptions.subscriptionSnapshotService import getSubscriptionSnapshotService
+    row = dict(snapshot.get('subscription') or {})
+    owned = snapshot.get('subscriptionSnapshot') or getSubscriptionSnapshotService().get(row.get('user_id'), now)
+    if str(row.get('id')) != owned.subscriptionId:
+        raise ValueError('NOTIFICATION_SUBSCRIPTION_OWNER_MISMATCH')
+    current = owned.currentPeriod
+    deadline = current.end if current else owned.lastPaidEnd
+    row.update(status=owned.status, renewal_opt_out=owned.renewalOptOut,
+        lifecycle_id=owned.lifecycleId,
+        billing_mode={'month':'monthly_prepaid','year':'annual_prepaid'}.get(owned.billingInterval,'none'),
+        current_period_start=current.start if current else owned.trial.startedAt if owned.status=='trial' else None,
+        current_period_end=deadline if deadline else owned.trial.endsAt if owned.status=='trial' else None,
+        erasure_pending=bool(row.get('erasure_pending')) or owned.denialReason=='erasure_pending')
+    return {**snapshot, 'subscription':row, 'subscriptionSnapshot':owned}
 
 
 def _utc(now: datetime) -> datetime:
@@ -47,6 +75,8 @@ def _utc(now: datetime) -> datetime:
 
 def _lifecycleId(snapshot: dict) -> str:
     subscription = snapshot.get("subscription") or {}
+    if snapshot.get('subscriptionSnapshot') is not None:
+        return str(snapshot['subscriptionSnapshot'].lifecycleId or 'unknown')
     manualBilling = (subscription.get("billing_state") or {}).get("manualBilling") or {}
     return str(manualBilling.get("lifecycleId") or "unknown")
 
@@ -92,6 +122,7 @@ def buildBillingNotificationIntent(
         return None
     eventType = event.get("type") or event.get("notificationType") or ""
     current = _utc(now)
+    snapshot = notificationSnapshot(snapshot, current)
     subscription = snapshot.get("subscription") or {}
     if subscription.get("erasure_pending"):
         return None
@@ -111,6 +142,23 @@ def buildBillingNotificationIntent(
     cycleId = str(snapshot.get("cycleId") or "")
     periodEnd = _periodEnd(snapshot)
     optOut = bool(subscription.get("renewal_opt_out"))
+
+    owned = snapshot.get('subscriptionSnapshot')
+    if owned and eventType in _SOLICITATION_TYPES:
+        if (owned.denialReason in ('account_banned','erasure_pending')
+                or owned.nextPeriod is not None or owned.purchaseBlockReason=='recovery_required'):
+            return None
+
+    if eventType == 'annual_renewal_upcoming':
+        if (optOut or not owned or owned.billingInterval != 'year' or not owned.renewalAvailable
+                or not _invoiceUnpaid(snapshot) or not cycleId or periodEnd is None
+                or current >= periodEnd or not _withinWindow(current,periodEnd,30)
+                or _withinWindow(current,periodEnd,7)):
+            return None
+        return {'notificationType':eventType,'dedupeKey':f'annual:{lifecycleId}:{cycleId}:upcoming',
+            'userId':str(subscription['user_id']),'subscriptionId':str(subscription['id']),
+            'periodEnd':periodEnd.isoformat(),'metadata':{'lifecycleId':lifecycleId,'cycleId':cycleId,
+                'invoiceId':snapshot['invoice']['id'],'milestone':'upcoming'}}
 
     if eventType == "monthly_renewal_ready":
         if optOut or not _invoiceUnpaid(snapshot):
@@ -175,6 +223,7 @@ def buildBillingNotificationIntent(
                 "lifecycleId": lifecycleId,
                 "cycleId": cycleId,
                 "milestone": "expired",
+                **({'billingInterval':owned.billingInterval} if owned else {}),
             },
         }
 
@@ -237,6 +286,7 @@ def isBillingNotificationEligible(
     delivery: dict,
     snapshot: dict,
     now: datetime,
+    *, ignoreMoneyHold: bool = False,
 ) -> bool:
     """Re-check type-specific eligibility immediately before dispatch.
 
@@ -246,10 +296,21 @@ def isBillingNotificationEligible(
     remain deliverable subject only to erasure/privacy rules.
     """
     notificationType = (delivery or {}).get("notification_type") or ""
+    snapshot = notificationSnapshot(snapshot or {}, _utc(now))
     subscription = (snapshot or {}).get("subscription") or {}
     if subscription.get("erasure_pending"):
         return False
 
+    owned = snapshot.get('subscriptionSnapshot')
+    metadata = delivery.get('metadata_json') or {}
+    if owned and notificationType == 'monthly_cancellation_confirmation':
+        return (owned.renewalOptOut and metadata.get('lifecycleId') == owned.lifecycleId
+            and parseUtc(metadata.get('cancellationRequestedAt')) is not None
+            and parseUtc(metadata.get('cancellationRequestedAt')) == parseUtc(subscription.get('cancellation_requested_at'))
+            and parseUtc(metadata.get('finalPaidEnd')) == (owned.paidUntil or owned.lastPaidEnd)
+            and parseUtc(delivery.get('period_end')) == (owned.paidUntil or owned.lastPaidEnd)
+            and (ignoreMoneyHold or owned.purchaseBlockReason != 'recovery_required')
+            and not snapshot.get('unresolvedOwnedCapture'))
     if notificationType not in _SOLICITATION_TYPES:
         # Transactional confirmations describe committed facts: deliverable
         # even when the subscriber is now expired/cancelled.
@@ -257,21 +318,42 @@ def isBillingNotificationEligible(
 
     if bool(subscription.get("renewal_opt_out")):
         return False
+    if owned and (owned.nextPeriod is not None or owned.denialReason in ('account_banned','erasure_pending')
+            or (not ignoreMoneyHold and owned.purchaseBlockReason == 'recovery_required')):
+        return False
     current = _utc(now)
     periodEnd = _periodEnd(snapshot or {})
     deliveryEnd = parseUtc(delivery.get("period_end"))
     if periodEnd is None or deliveryEnd != periodEnd:
         return False
     metadata = delivery.get("metadata_json") or {}
+    if owned and metadata.get('lifecycleId') != owned.lifecycleId:
+        return False
     if metadata.get("lifecycleId") and metadata["lifecycleId"] != _lifecycleId(snapshot):
         return False
     # Received but unresolved money for this owned cycle holds every
     # solicitation; the caller decides whether a hold reschedules.
     if (snapshot or {}).get('unresolvedOwnedCapture'):
         return False
-    if notificationType in ("monthly_renewal_ready", "monthly_renewal_reminder"):
+    if notificationType in ("annual_renewal_upcoming", "monthly_renewal_ready", "monthly_renewal_reminder"):
+        invoice = snapshot.get('invoice') or {}
+        if owned:
+            frozen = (invoice.get('metadata_json') or {}).get('manualBilling') or {}
+            if (str(invoice.get('id')) != str(metadata.get('invoiceId'))
+                    or invoice.get('userId') != subscription.get('user_id')
+                    or str(invoice.get('subscription_id')) != owned.subscriptionId
+                    or frozen.get('lifecycleId') != owned.lifecycleId
+                    or parseUtc(invoice.get('period_start')) != periodEnd
+                    or type(frozen.get('revision')) is not int or frozen['revision'] < 1
+                    or metadata.get('invoiceRevision') != frozen.get('revision')
+                    or frozen.get('closedReason') or (invoice.get('metadata_json') or {}).get('repricingRequired')):
+                return False
         if current >= periodEnd:
             return False
+        if notificationType == 'annual_renewal_upcoming':
+            return (owned is not None and owned.billingInterval=='year'
+                and _withinWindow(current,periodEnd,30) and not _withinWindow(current,periodEnd,7)
+                and _invoiceUnpaid(snapshot))
         if not _withinWindow(current,periodEnd,7 if notificationType=='monthly_renewal_ready' else 1):
             return False
         if notificationType == "monthly_renewal_ready" and _withinWindow(current, periodEnd, 1):

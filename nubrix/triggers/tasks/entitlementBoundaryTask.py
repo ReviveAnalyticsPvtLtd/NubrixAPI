@@ -33,6 +33,10 @@ class EntitlementBoundaryTask:
         self._now = now or utcNow
 
     def execute(self) -> dict:
+        from api.services.subscriptions.subscriptionCompatibility import usesUnifiedSubscription
+        if usesUnifiedSubscription():
+            from api.services.subscriptions.subscriptionWorkerService import SubscriptionWorkerService
+            return SubscriptionWorkerService(self.client).execute(now=self._now())
         logger.info("Entitlement boundary task started")
         subscriptions = (
             self.client.table("subscriptions")

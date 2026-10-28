@@ -140,6 +140,7 @@ def test_no_due_today_or_period_start_email_types_exist():
     assert "monthly_period_started" not in mod.SUPPORTED_BILLING_NOTIFICATION_TYPES
     assert "monthly_renewal_failed" not in mod.SUPPORTED_BILLING_NOTIFICATION_TYPES
     assert set(mod.SUPPORTED_BILLING_NOTIFICATION_TYPES) == {
+        "annual_renewal_upcoming",
         "monthly_renewal_ready",
         "monthly_renewal_reminder",
         "monthly_subscription_expired",

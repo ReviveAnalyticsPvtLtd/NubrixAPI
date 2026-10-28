@@ -809,7 +809,8 @@ class SubscriptionService:
             if not userRecord.data:
                 raise Exception("User not found")
             subscription = self._getCanonicalSubscription(userId=userId, required=True)
-            if subscription.get("billing_mode") == "monthly_prepaid":
+            from api.services.subscriptions.subscriptionCompatibility import usesUnifiedSubscription
+            if usesUnifiedSubscription() or subscription.get("billing_mode") == "monthly_prepaid":
                 from api.services.billing.manualBillingRepository import getManualBillingRepository
                 return getManualBillingRepository().scheduleExpertRemoval(userId,normalizedDomains)
             subscription = self._reconcilePendingAdditions(subscription)
@@ -945,7 +946,11 @@ class SubscriptionService:
 
     def cancelSubscription(self, reason: str | None, token: str) -> dict:
         """
-        Explicit cancellation with mode-specific policy.
+        Opt out of renewal while preserving purchased service.
+
+        Unified phases use the owned preference operation for both billing
+        intervals, with an optional reason and an exact final paid timestamp.
+        Legacy/shadow phases retain the compatibility behavior below.
 
         Monthly: an explicit opt-out of future renewal with an optional
         reason. Keeps every already-paid day, voids unpaid renewal attempts,
@@ -973,7 +978,8 @@ class SubscriptionService:
             currentStatus = (subscription.get("status") or "").lower()
             billingMode = (subscription.get("billing_mode") or "none").lower()
 
-            if billingMode == "monthly_prepaid":
+            from api.services.subscriptions.subscriptionCompatibility import getSubscriptionModelPhase
+            if billingMode == "monthly_prepaid" or getSubscriptionModelPhase() in ('dual', 'v2', 'contracted'):
                 from api.services.billing.manualBillingRepository import getManualBillingRepository
                 row = getManualBillingRepository().setRenewalOptOut(userId, True, reason, "cancel:"+userId)
                 return {'cancelled':True, **row['preferenceResult']}
@@ -1040,7 +1046,10 @@ class SubscriptionService:
 
     def resumeRenewal(self, token: str) -> dict:
         """
-        Clear the monthly renewal opt-out before the final paid end.
+        Clear renewal opt-out before the final paid end.
+
+        Unified phases support both billing intervals and change only the
+        preference. Legacy/shadow retain the monthly preparation adapter.
 
         Never charges, never reactivates a void order, and never revives
         refunded coverage. A fresh invoice revision may be prepared when
@@ -1054,7 +1063,9 @@ class SubscriptionService:
             )
             userId = decodedToken.get("userId")
             subscription = self._getCanonicalSubscription(userId=userId, required=True)
-            if (subscription.get("billing_mode") or "").lower() != "monthly_prepaid":
+            from api.services.subscriptions.subscriptionCompatibility import getSubscriptionModelPhase
+            unified = getSubscriptionModelPhase() in ('dual', 'v2', 'contracted')
+            if not unified and (subscription.get("billing_mode") or "").lower() != "monthly_prepaid":
                 raise CustomException(
                     ValueError("Resume renewal is a monthly-only action"),
                     statusCode=403,
@@ -1064,7 +1075,7 @@ class SubscriptionService:
             repeated = not bool(subscription.get("renewal_opt_out"))
             row = getManualBillingRepository().setRenewalOptOut(userId, False, None, "resume:"+userId)
             end = parseUtc(row['finalPaidEnd'])
-            if not repeated and utcNow() >= parseUtc(row["current_period_end"]) - datetime.timedelta(days=7):
+            if not unified and not repeated and utcNow() >= parseUtc(row["current_period_end"]) - datetime.timedelta(days=7):
                 prepared = self.prepareRenewalInvoice(token)
                 row['preferenceResult']['invoiceId'] = prepared.get('invoiceId')
             return {**row['preferenceResult'], 'repeated':repeated, 'creditsRefilled':False}
@@ -1236,9 +1247,24 @@ class SubscriptionService:
                 raise ValueError('PROVIDER_ORDER_EVIDENCE_MISMATCH')
             payment = self.razorpayClient.payment.fetch(paymentId)
             result = self._finalizeManualCheckout(str(attempt['invoice_id']), orderId, paymentId, payment)
+            from api.services.subscriptions.subscriptionCompatibility import usesUnifiedSubscription, legacySubscriptionFields
+            if usesUnifiedSubscription():
+                from api.services.subscriptions.subscriptionSnapshotService import getSubscriptionSnapshotService
+                from api.services.billing.manualBillingPresentation import serializeSubscriptionSnapshot
+                try:
+                    snapshot = getSubscriptionSnapshotService().get(userId)
+                except Exception as exc:
+                    raise CustomException(exc, statusCode=503, errorCode='SUBSCRIPTION_AUTHORITY_UNAVAILABLE',
+                        uiMessage='Subscription access could not be verified. Please try again.') from exc
+                result['subscription'] = serializeSubscriptionSnapshot(snapshot)
             if result['finalized'] and purpose in ('initial_purchase', 'renewal'):
-                result['accessToken'] = self._reissueTokenWithUpdatedClaims(token, 'active',
-                    'annual' if frozen['billingMode'] == 'annual_prepaid' else 'pro')
+                from api.services.subscriptions.subscriptionCompatibility import getSubscriptionModelPhase
+                if getSubscriptionModelPhase() in ('dual', 'v2', 'contracted'):
+                    aliases = legacySubscriptionFields(snapshot)
+                    result['accessToken'] = self._reissueTokenWithUpdatedClaims(token, snapshot.status, aliases['planType'])
+                else:
+                    result['accessToken'] = self._reissueTokenWithUpdatedClaims(token, 'active',
+                        'annual' if frozen['billingMode'] == 'annual_prepaid' else 'pro')
             return result
         except CustomException:
             raise
@@ -1283,6 +1309,10 @@ class SubscriptionService:
             )
             userId = decodedToken.get("userId")
             subscription = self._getCanonicalSubscription(userId=userId, required=True)
+            from api.services.subscriptions.subscriptionCompatibility import getSubscriptionModelPhase
+            if getSubscriptionModelPhase() in ('dual', 'v2', 'contracted'):
+                from api.services.billing.manualBillingRepository import getManualBillingRepository
+                subscription = getManualBillingRepository().getRenewalContext(userId)
             billingMode = (subscription.get("billing_mode") or "").lower()
             if billingMode == "annual_prepaid":
                 from api.services.billing.manualBillingRepository import getManualBillingRepository
@@ -1349,6 +1379,10 @@ class SubscriptionService:
         self, userId: str, subscription: dict, prepared: dict
     ) -> str | None:
         """Persist the prepared monthly renewal invoice revision."""
+        from api.services.subscriptions.subscriptionCompatibility import getSubscriptionModelPhase
+        if getSubscriptionModelPhase() in ('dual', 'v2', 'contracted'):
+            from api.services.billing.manualBillingRepository import getManualBillingRepository
+            subscription = getManualBillingRepository().getRenewalContext(userId)
         nextPeriod = prepared.get("nextPeriod") or {}
         if not nextPeriod.get("start"):
             return
