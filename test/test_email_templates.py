@@ -286,7 +286,7 @@ def test_trialWarningMatchesDeployedCopy():
     assert message.textContent is None
     assert ('expires in <strong class="highlight">2 days</strong> '
             '(on <strong>November 9, 2026</strong>)') in message.htmlContent
-    assert 'href="https://www.nubrixai.com/billing"' in message.htmlContent
+    assert 'href="https://www.nubrixai.com/settings/manage-plan"' in message.htmlContent
     assert "Hi Asha! We hope" in message.htmlContent
     assert "© 2026 Nubrix AI. All rights reserved." in message.htmlContent
 
@@ -334,7 +334,7 @@ def test_actionUrlJoinsBaseWithOrWithoutTrailingSlash():
         assert "https://www.nubrixai.com/settings/manage-plan?renewalInvoiceId=inv_1" in message.textContent
         warning = renderTrialExpiryWarning(
             name="A", trialEndDate="2026-11-09T00:00:00Z", appUrl=appUrl, senderName="S")
-        assert 'href="https://www.nubrixai.com/billing"' in warning.htmlContent
+        assert 'href="https://www.nubrixai.com/settings/manage-plan"' in warning.htmlContent
 
 
 def test_formatAmountUsesCurrencyMinorUnits():
@@ -357,7 +357,7 @@ def test_formatDateMatchesIntlEnGbSeptemberAbbreviation():
 
 
 WELCOME_SUBJECT = "Welcome to Nubrix AI: your free trial has started"
-WELCOME_P1 = "Your Nubrix AI free trial is active. You can connect your data, build custom charts, schedule reports and run transformation threads with the experts you selected."
+WELCOME_P1 = "Your Nubrix AI free trial is active. It includes our full pack of industry experts, so you can connect your data, build custom charts, schedule reports and run transformation threads across all of them."
 WELCOME_P2 = "When the trial ends, your access simply pauses. No payment is taken unless you choose a plan, and your projects and settings stay intact if you upgrade."
 
 
@@ -383,7 +383,7 @@ def test_freeTrialWelcomeRendersApprovedCopy():
     assert f">{WELCOME_P1}</p>" in html
     assert f">{WELCOME_P2}</p>" in html
     assert re.search(r">Free trial ends</td><td[^>]*>9 Nov 2026, 10:00 UTC</td>", html)
-    assert re.search(r">Experts</td><td[^>]*>Banking, Supply Chain</td>", html)
+    assert re.search(r">Experts included</td><td[^>]*>Banking, Supply Chain</td>", html)
     assert html.index("Free trial ends") < html.index("Experts")
     assert 'href="https://www.nubrixai.com/dashboard"' in html
     assert ">Open your dashboard</a>" in html
@@ -395,7 +395,7 @@ def test_freeTrialWelcomeRendersApprovedCopy():
     ) in html
     assert message.textContent == "\n".join([
         WELCOME_SUBJECT, "", "Hello Asha,", "", WELCOME_P1, "", WELCOME_P2, "",
-        "Free trial ends: 9 Nov 2026, 10:00 UTC", "Experts: Banking, Supply Chain", "",
+        "Free trial ends: 9 Nov 2026, 10:00 UTC", "Experts included: Banking, Supply Chain", "",
         "Open your dashboard: https://www.nubrixai.com/dashboard", "",
         "Questions? Contact nubrixai@reviveanalytics.com.",
     ])

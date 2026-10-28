@@ -385,7 +385,7 @@ def renderTrialExpiryWarning(
     if not name:
         raise ValueError("INVALID_RECIPIENT_NAME")
     trialEnd = _parseDate(trialEndDate, "INVALID_TRIAL_END")
-    billingUrl = urljoin(_parseAppUrl(appUrl), "/billing")
+    planUrl = urljoin(_parseAppUrl(appUrl), "/settings/manage-plan")
     if now is None:
         now = datetime.datetime.now(datetime.timezone.utc)
     elif now.tzinfo is None:
@@ -426,7 +426,7 @@ def renderTrialExpiryWarning(
     </p>
 
     <div class="cta-container">
-      <a href="{_escape(billingUrl)}" class="button">Upgrade Your Plan</a>
+      <a href="{_escape(planUrl)}" class="button">Upgrade Your Plan</a>
     </div>
 
     <p>
@@ -449,7 +449,7 @@ def renderTrialExpiryWarning(
 
 _WELCOME_SUBJECT = "Welcome to Nubrix AI: your free trial has started"
 _WELCOME_PARAGRAPHS = [
-    "Your Nubrix AI free trial is active. You can connect your data, build custom charts, schedule reports and run transformation threads with the experts you selected.",
+    "Your Nubrix AI free trial is active. It includes our full pack of industry experts, so you can connect your data, build custom charts, schedule reports and run transformation threads across all of them.",
     "When the trial ends, your access simply pauses. No payment is taken unless you choose a plan, and your projects and settings stay intact if you upgrade.",
 ]
 
@@ -463,7 +463,7 @@ def renderFreeTrialWelcome(*, name: str, trialEndsAt, experts, appUrl: str) -> R
     facts = [("Free trial ends", _formatDate(trialEnd))]
     expertNames = ", ".join(_EXPERT_NAMES.get(code, str(code)) for code in experts or ())
     if expertNames:
-        facts.append(("Experts", expertNames))
+        facts.append(("Experts included", expertNames))
     return _renderShell(
         subject=_WELCOME_SUBJECT, heading="Your free trial has started", name=name,
         paragraphs=_WELCOME_PARAGRAPHS, facts=facts,
