@@ -24,6 +24,7 @@ __all__ = [
 
 from dataclasses import dataclass
 from datetime import datetime
+from api.services.subscriptions.subscriptionModel import SubscriptionSnapshotV2
 
 
 @dataclass(frozen=True)
@@ -146,6 +147,7 @@ class FinalizationResult:
     nextPeriod: CoveragePeriod | None
     anomalyId: str | None
     invoiceStatus: str | None = None
+    subscription: SubscriptionSnapshotV2 | None = None
 
 
 @dataclass(frozen=True)
