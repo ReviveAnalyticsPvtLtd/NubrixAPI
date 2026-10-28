@@ -49,7 +49,6 @@ def test_auth_verify_http_uses_actual_owned_snapshot_without_subscription_writes
     from api import commons
     from api.routers import authentication as routes
     from api.services.authenticationService import AuthenticationService
-    from api.services.credits.creditService import creditService
     from test.test_user_access_enforcement import FakeClient
     repo,_,initial,url = account
     if expired: expirePurchasedCoverage(account)
@@ -63,7 +62,6 @@ def test_auth_verify_http_uses_actual_owned_snapshot_without_subscription_writes
     monkeypatch.setattr(commons,'client',transport)
     monkeypatch.setattr(routes,'authenticationService',service)
     monkeypatch.setattr('api.services.billing.manualBillingRepository.getManualBillingRepository',lambda:repo)
-    monkeypatch.setattr(creditService,'getBalanceSnapshot',lambda _:None)
     before = query(url,'SELECT * FROM subscriptions WHERE user_id=%s',(initial.userId,),one=True)
     balance = query(url,'SELECT * FROM credit_balances WHERE user_id=%s',(initial.userId,),one=True)
     app = FastAPI()
@@ -73,7 +71,7 @@ def test_auth_verify_http_uses_actual_owned_snapshot_without_subscription_writes
     assert response.status_code==200
     body = response.json()
     assert body['userId']==initial.userId and body['onboarded'] is True
-    assert body['credits'] is None
+    assert 'credits' not in body
     snapshot = body['subscription']
     assert snapshot['schemaVersion']==2 and snapshot['status']==('expired' if expired else 'active')
     assert snapshot['accessAllowed'] is not expired and snapshot['purchaseAllowed'] is expired
