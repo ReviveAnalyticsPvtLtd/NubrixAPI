@@ -47,7 +47,7 @@ def test_verify_returns_live_owned_identity_and_snapshot_with_existing_envelope(
     assert result.status_code==200
     body = result.json()
     assert body['status']=='SUCCESS' and body['message']=='Token is valid and has not expired.'
-    assert body['credits']=={'owner':USER}
+    assert 'credits' not in body
     assert body['userId']==USER and body['email']==client.rows['Users'][0]['email']
     assert body['onboarded'] is False and body['currentWorkspaceId'] is None and body['profileImage'] is None
     snapshot = body['subscription']
@@ -86,7 +86,7 @@ def test_legacy_and_shadow_verify_keep_exact_compatibility_envelope(verification
     monkeypatch.setenv('SUBSCRIPTION_MODEL_PHASE',phase)
     service.client = None  # Unified account reads must not run here.
     body = http.get('/auth/verify',headers=headers).json()
-    assert body=={'status':'SUCCESS','message':'Token is valid and has not expired.','credits':{'owner':USER}}
+    assert body=={'status':'SUCCESS','message':'Token is valid and has not expired.'}
 
 
 def test_unavailable_snapshot_is_503_instead_of_success_with_missing_permissions(verification):
@@ -97,15 +97,16 @@ def test_unavailable_snapshot_is_503_instead_of_success_with_missing_permissions
     assert response.json()['detail']['errorCode']=='SUBSCRIPTION_AUTHORITY_UNAVAILABLE'
 
 
-def test_credit_outage_is_optional_and_does_not_hide_verified_subscription(verification,monkeypatch):
+def test_verify_never_reads_the_credit_balance(verification,monkeypatch):
+    # The balance is two locked transactions (~0.6 s) and no verify caller reads it; /credits/balance serves it.
     from api.services.credits.creditService import creditService
     http,headers,_,_,_ = verification
-    def unavailable(_): raise RuntimeError('synthetic credit outage')
-    monkeypatch.setattr(creditService,'getBalanceSnapshot',unavailable)
+    reads = []
+    monkeypatch.setattr(creditService,'getBalanceSnapshot',lambda user:reads.append(user) or {'owner':user})
     response = http.get('/auth/verify',headers=headers)
     assert response.status_code==200
-    assert response.json()['credits'] is None
-    assert response.json()['subscription']['status']=='expired'
+    assert reads==[]
+    assert 'credits' not in response.json() and response.json()['subscription']['status']=='expired'
 
 
 @pytest.mark.parametrize('restriction',['banned','missing','mismatched_session','erased'])
@@ -180,7 +181,6 @@ def test_verification_work_runs_off_the_event_loop(verification,monkeypatch):
     # Session verification makes blocking database calls; on the event loop they stall every other
     # request the worker holds, so a verify that queues behind them takes seconds.
     import asyncio
-    from api.services.credits.creditService import creditService
     http,headers,_,service,_ = verification
     seen = []
     def onLoop():
@@ -191,7 +191,6 @@ def test_verification_work_runs_off_the_event_loop(verification,monkeypatch):
             return False
     facts = service.getVerificationFacts
     monkeypatch.setattr(service,'getVerificationFacts',lambda user:(seen.append(('facts',onLoop())),facts(user))[1])
-    monkeypatch.setattr(creditService,'getBalanceSnapshot',lambda user:(seen.append(('credits',onLoop())),{'owner':user})[1])
     response = http.get('/auth/verify',headers=headers)
     assert response.status_code==200
-    assert seen==[('facts',False),('credits',False)]
+    assert seen==[('facts',False)]
