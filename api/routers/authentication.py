@@ -26,9 +26,11 @@ from api.models import (
 router = APIRouter()
 
 @router.get("/verify")
-async def verify(user: UserContext = Depends(verifyUser)):
+def verify(user: UserContext = Depends(verifyUser)):
     """
     Verify the live session and refresh its optional credit balance.
+    Synchronous on purpose: FastAPI runs it in the threadpool, so its blocking
+    database calls never stall the worker's event loop.
     Unified phases also return current account facts and verified subscription
     permissions; callers must not infer those permissions from stale JWT claims.
 
