@@ -331,6 +331,11 @@ class CreditService:
         from api.services.credits.manualCreditRepository import ManualCreditRepository
         return ManualCreditRepository().balanceSnapshot(userId)
 
+    @staticmethod
+    def _manualParts(manual: dict) -> dict:
+        return {"monthly": int(manual.get("remaining_tokens") or 0),
+                "topup": int(manual.get("topup_tokens") or 0), "rolled": False}
+
     def _ensureHash(self, userId: str) -> dict | None:
         """
         Guarantee the Redis hash exists for the user.
@@ -773,8 +778,7 @@ class CreditService:
         """
         manual = self._manualBalance(userId)
         if manual is not None:
-            return {"monthly": int(manual.get("remaining_tokens") or 0),
-                    "topup": int(manual.get("topup_tokens") or 0), "rolled": False}
+            return self._manualParts(manual)
         self._ensureHash(userId)
         state = self._peek(userId)
         if state is not None:
@@ -933,7 +937,8 @@ class CreditService:
                 return defaults
 
             tquota = row.get("monthly_token_quota", 0)
-            parts = self.getRemainingParts(userId)
+            # The authoritative read is two locked transactions; reuse it instead of reading again.
+            parts = self._manualParts(authoritative) if authoritative is not None else self.getRemainingParts(userId)
             if parts["monthly"] == -1:
                 monthlyRemaining = row.get("remaining_tokens", 0)
                 topup = row.get("topup_tokens", 0) or 0

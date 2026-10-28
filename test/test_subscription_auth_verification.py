@@ -174,3 +174,24 @@ def test_foreign_account_row_never_changes_the_authenticated_owner(verification)
     response = http.get('/auth/verify',headers=headers)
     assert response.status_code==503
     assert 'other@example.test' not in response.text
+
+
+def test_verification_work_runs_off_the_event_loop(verification,monkeypatch):
+    # Session verification makes blocking database calls; on the event loop they stall every other
+    # request the worker holds, so a verify that queues behind them takes seconds.
+    import asyncio
+    from api.services.credits.creditService import creditService
+    http,headers,_,service,_ = verification
+    seen = []
+    def onLoop():
+        try:
+            asyncio.get_running_loop()
+            return True
+        except RuntimeError:
+            return False
+    facts = service.getVerificationFacts
+    monkeypatch.setattr(service,'getVerificationFacts',lambda user:(seen.append(('facts',onLoop())),facts(user))[1])
+    monkeypatch.setattr(creditService,'getBalanceSnapshot',lambda user:(seen.append(('credits',onLoop())),{'owner':user})[1])
+    response = http.get('/auth/verify',headers=headers)
+    assert response.status_code==200
+    assert seen==[('facts',False),('credits',False)]
