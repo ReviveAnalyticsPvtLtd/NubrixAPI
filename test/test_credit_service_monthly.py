@@ -188,7 +188,7 @@ class TestCreditServiceMonthly(unittest.TestCase):
         self.assertNotIn("effectiveRemaining", snap)
 
     def test_snapshot_reads_the_authoritative_balance_once(self):
-        # Each authoritative read is two locked PostgreSQL transactions; /auth/verify pays for every one.
+        # Each authoritative read is two locked PostgreSQL transactions; every balance request pays for each one.
         svc = self._service()
         manual = {"plan_tier": "pro", "monthly_token_quota": 10000000, "used_tokens": 4800,
                   "remaining_tokens": 9995200, "topup_tokens": 0, "period_start": "2026-07-01T00:00:00+00:00",

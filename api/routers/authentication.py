@@ -28,7 +28,10 @@ router = APIRouter()
 @router.get("/verify")
 def verify(user: UserContext = Depends(verifyUser)):
     """
-    Verify the live session and refresh its optional credit balance.
+    Verify the live session.
+    The credit balance is not part of this response: every session check runs
+    verify, none reads the balance, and it costs two locked transactions. Use
+    GET /credits/balance for it.
     Synchronous on purpose: FastAPI runs it in the threadpool, so its blocking
     database calls never stall the worker's event loop.
     Unified phases also return current account facts and verified subscription
@@ -38,7 +41,7 @@ def verify(user: UserContext = Depends(verifyUser)):
         user: UserContext injected after token verification.
 
     Returns:
-        ORJSONResponse: Success status with credit balance snapshot.
+        ORJSONResponse: Success status, plus account facts and permissions in unified phases.
     """
     from api.services.subscriptions.subscriptionCompatibility import usesUnifiedSubscription
     verificationFacts = {}
@@ -52,15 +55,9 @@ def verify(user: UserContext = Depends(verifyUser)):
                 "message": exc.uiMessage,
                 "errorCode": exc.errorCode,
             }) from exc
-    try:
-        from api.services.credits.creditService import creditService
-        credits = creditService.getBalanceSnapshot(user.userId)
-    except Exception:
-        credits = None
     return ORJSONResponse(status_code=200, content={
         "status": "SUCCESS",
         "message": "Token is valid and has not expired.",
-        "credits": credits,
         **verificationFacts,
     })
 
