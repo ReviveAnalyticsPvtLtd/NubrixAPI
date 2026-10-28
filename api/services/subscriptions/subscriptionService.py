@@ -645,7 +645,10 @@ class SubscriptionService:
             else:
                 logger.warning(f"Free trial email not sent: {result.errorCode}")
         except Exception as exc:
-            logger.warning(f"Free trial email not sent: {type(exc).__name__}")
+            if isinstance(exc, RuntimeError) and str(exc) == "EMAIL_CONFIGURATION_MISSING":
+                logger.warning("Free trial email not sent: EMAIL_CONFIGURATION_MISSING")
+            else:
+                logger.warning(f"Free trial email not sent: {type(exc).__name__}")
 
     def activateFreeTrial(self, token: str) -> dict:
         """
@@ -680,7 +683,7 @@ class SubscriptionService:
             trialExpiry = activated['trial_ends_at' if unified else 'current_period_end']
             trialDurationDays = (trialExpiry - currentTime).days
             records = self.client.table("Users").select("fullName").eq("userId", userId).limit(1).execute()
-            name = records.data[0]["fullName"] if records.data else userEmail
+            name = (records.data[0]["fullName"] if records.data else None) or userEmail
             self._sendFreeTrialEmail(
                 email=userEmail,
                 name=name,

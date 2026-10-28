@@ -83,6 +83,9 @@ def _ok():
 SEND = {
     "trial": lambda sender: sender.sendTrialExpiry(_trialPayload()),
     "billing": lambda sender: sender.sendBilling(_billingPayload()),
+    "welcome": lambda sender: sender.sendFreeTrialWelcome(
+        "a@b.co", "Asha", "2026-11-09T10:00:00Z", ["banking"]
+    ),
 }
 
 
@@ -254,7 +257,7 @@ def test_defaultsComeFromEnvironment(monkeypatch):
     assert sender.senderEmail == "env@nubrix.test"
 
 
-@pytest.mark.parametrize("kind", ["trial", "billing"])
+@pytest.mark.parametrize("kind", ["trial", "billing", "welcome"])
 def test_sendBeforeValidateStillRequiresConfiguration(kind):
     post = _ok()
     sender = _sender(post)
