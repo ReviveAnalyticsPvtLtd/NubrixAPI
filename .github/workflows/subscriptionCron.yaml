@@ -27,7 +27,6 @@ jobs:
           PYTHONPATH: "."
           SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
           SUPABASE_KEY: ${{ secrets.SUPABASE_KEY }}
-          FREE_TRIAL_EXPIRY_WARNING_EMAIL_URL: ${{ secrets.FREE_TRIAL_EXPIRY_WARNING_EMAIL_URL }}
           RAZORPAY_KEY_ID: ${{ secrets.RAZORPAY_KEY_ID }}
           RAZORPAY_KEY_SECRET: ${{ secrets.RAZORPAY_KEY_SECRET }}
           GRACE_PERIOD_DAYS: "3"

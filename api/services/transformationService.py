@@ -69,10 +69,8 @@ class TransformationService:
 
     def _metadata_url(self, projectId: str) -> str:
         """Build the project metadata URL."""
-        fileUrlTemplate = os.environ.get("FILE_URL")
-        if fileUrlTemplate:
-            return fileUrlTemplate.format(projectId=projectId, fileName="metadata.json").replace(".parquet", "")
-        return f"https://rnyvgjoacnpvscanmhnj.supabase.co/storage/v1/object/public/AnalyticsHub/{projectId}/metadata.json"
+        fileUrlTemplate = os.environ["FILE_URL"]
+        return fileUrlTemplate.format(projectId=projectId, fileName="metadata.json").replace(".parquet", "")
 
     def _preview_cache_key(self, projectId: str, transformationId: str, messageId: str, tableName: str) -> str:
         """Return the Redis preview cache key."""

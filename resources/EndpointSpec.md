@@ -74,7 +74,7 @@ Register a new user.
 {
   "status": "SUCCESS",
   "userId": "62b43abe-f5b6-48ea-8231-35ee822bff71",
-  "profileImage": "https://rnyvgjoacnpvscanmhnj.supabase.co/.../default-avatar.png"
+  "profileImage": "https://<storage-host>/.../default-avatar.png"
 }
 ```
 
