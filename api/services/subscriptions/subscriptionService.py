@@ -624,38 +624,28 @@ class SubscriptionService:
         logger.info(f"Activated domains {activatedDomains} for user {userId} via {referenceId}")
 
     @staticmethod
-    def _sendFreeTrialEmail(email: str, name: str) -> None:
+    def _sendFreeTrialEmail(email: str, name: str, trialEndsAt, experts) -> None:
         """
-        Send free trial email to a user.
+        Send the free trial welcome email; never raises.
 
         Args:
             email (str): The email address of the user.
             name (str): The name of the user.
+            trialEndsAt: When the trial ends.
+            experts (list): The experts included in the trial.
         """
-        url = os.environ.get("FREE_TRIAL_EMAIL_URL")
-        if not url:
-            logger.warning("FREE_TRIAL_EMAIL_URL not configured, skipping free trial email.")
-            return
         try:
-            response = requests.post(
-                url=url,
-                json={
-                    "email": email,
-                    "name": name
-                },
-                headers={
-                    "Authorization": f"Bearer {os.environ.get('SUPABASE_KEY_OLD', '')}"
-                },
-                timeout=10
+            from api.services.notifications.brevoEmailSender import BrevoEmailSender
+
+            result = BrevoEmailSender().sendFreeTrialWelcome(
+                email, name, trialEndsAt, experts
             )
-            if response.status_code >= 400:
-                logger.warning(f"Free trial email failed to send to {email}, status={response.status_code}: {response.text}")
+            if result.outcome == "ACCEPTED":
+                logger.info(f"Free trial email accepted: {result.messageId}")
             else:
-                logger.info(f"Free trial email successfully dispatched to {email}")
-        except Exception as e:
-            exception = CustomException(e)
-            logger.error(f"Error while sending free trial email to {email}: {exception}")
-            raise exception
+                logger.warning(f"Free trial email not sent: {result.errorCode}")
+        except Exception as exc:
+            logger.warning(f"Free trial email not sent: {type(exc).__name__}")
 
     def activateFreeTrial(self, token: str) -> dict:
         """
@@ -691,7 +681,12 @@ class SubscriptionService:
             trialDurationDays = (trialExpiry - currentTime).days
             records = self.client.table("Users").select("fullName").eq("userId", userId).limit(1).execute()
             name = records.data[0]["fullName"] if records.data else userEmail
-            self._sendFreeTrialEmail(email=userEmail, name=name)
+            self._sendFreeTrialEmail(
+                email=userEmail,
+                name=name,
+                trialEndsAt=trialExpiry,
+                experts=list(experts),
+            )
             self._auditLog(userId, "free_trial.activated", status="TRIAL")
             try:
                 from api.services.credits.creditService import creditService

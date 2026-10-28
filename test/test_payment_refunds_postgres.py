@@ -949,20 +949,20 @@ def test_refund_email_skipped_without_canonical_subscription_is_logged(drafts,mo
 
 
 def dispatchRefundEmails(url, userId, monkeypatch):
-    """One real dispatch pass (claim, eligibility, locked submission fence, accept) with a recording edge."""
+    """One real dispatch pass (claim, eligibility, locked submission fence, accept) with a recording sender."""
     monkeypatch.setenv('DATABASE_URL', url)  # the subscription authority read during eligibility
     import psycopg2
-    from api.services.notifications.edgeEmailClient import EdgeSendResult
+    from api.services.notifications.brevoEmailSender import EmailSendResult
     from api.services.notifications.notificationDeliveryRepository import NotificationDeliveryRepository
     from api.services.notifications.notificationDeliveryService import NotificationDeliveryService
-    from test.test_notification_delivery_service import FakeEdgeClient, FakeLedger, FakeSupabase
+    from test.test_notification_delivery_service import FakeEmailSender, FakeLedger, FakeSupabase
     subscriptions=[{key:(str(value) if key=='id' else value) for key,value in row.items()} for row in query(url,
         'SELECT id,user_id,erasure_pending,is_canonical,cancellation_requested_at FROM subscriptions WHERE user_id=%s',(userId,))]
-    edge=FakeEdgeClient([EdgeSendResult(outcome='ACCEPTED',messageId='refund-message-'+str(uuid4())) for _ in range(10)])
+    sender=FakeEmailSender([EmailSendResult(outcome='ACCEPTED',messageId='refund-message-'+str(uuid4())) for _ in range(10)])
     service=NotificationDeliveryService(repository=NotificationDeliveryRepository(lambda: psycopg2.connect(url)),
-        edgeClient=edge,supabaseClient=FakeSupabase(subscriptions=subscriptions,
+        emailSender=sender,supabaseClient=FakeSupabase(subscriptions=subscriptions,
             users=[{'userId':userId,'email':'refund@example.test','fullName':'Refund Customer'}]),
         eventService=FakeLedger(),brevoClient=object(),now=lambda: datetime.now(timezone.utc))
     summary=service.dispatchBatch('refund-email-test')
     assert summary['errors']==0 and summary['failed']==0 and summary['cancelled']==0
-    return edge.payloads
+    return sender.payloads

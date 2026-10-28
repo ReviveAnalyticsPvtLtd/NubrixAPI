@@ -1,6 +1,6 @@
 from datetime import datetime, timezone
 
-from api.services.notifications.edgeEmailClient import EdgeSendResult
+from api.services.notifications.brevoEmailSender import EmailSendResult
 from api.services.notifications.notificationDeliveryService import (
     NotificationDeliveryService,
 )
@@ -136,7 +136,7 @@ class FakeRepository:
         return True
 
 
-class FakeEdgeClient:
+class FakeEmailSender:
     def __init__(self, results, validationError=None):
         self.results = list(results)
         self.validationError = validationError
@@ -185,7 +185,7 @@ class FakeBrevoClient:
 
 def _service(
     repository,
-    edgeClient,
+    emailSender,
     *,
     users=None,
     subscriptions=None,
@@ -194,7 +194,7 @@ def _service(
 ):
     return NotificationDeliveryService(
         repository=repository,
-        edgeClient=edgeClient,
+        emailSender=emailSender,
         supabaseClient=FakeSupabase(
             subscriptions=(
                 [_subscription()] if subscriptions is None else subscriptions
@@ -213,13 +213,13 @@ def _service(
 
 def test_globalValidationOccursBeforeClaimingRows():
     repository = FakeRepository([_delivery()])
-    edge = FakeEdgeClient([], validationError=RuntimeError("EDGE_VALIDATION_FAILED"))
+    sender = FakeEmailSender([], validationError=RuntimeError("EMAIL_CONFIGURATION_MISSING"))
 
     try:
-        _service(repository, edge).dispatchBatch("worker-a")
+        _service(repository, sender).dispatchBatch("worker-a")
         raise AssertionError("expected validation failure")
     except RuntimeError as error:
-        assert str(error) == "EDGE_VALIDATION_FAILED"
+        assert str(error) == "EMAIL_CONFIGURATION_MISSING"
 
     assert repository.claimCalls == 0
 
@@ -229,12 +229,12 @@ def test_heldBillingSolicitationIsRescheduledNotCancelled():
         period_end="2026-09-16T01:00:00+00:00", metadata_json={})
     repository = FakeRepository([delivery])
     repository.authorization = "HELD"
-    edge = FakeEdgeClient([])
-    service = _service(repository, edge, subscriptions=[_subscription(status="expired",
+    sender = FakeEmailSender([])
+    service = _service(repository, sender, subscriptions=[_subscription(status="expired",
         billing_mode="monthly_prepaid", current_period_end="2026-09-16T01:00:00+00:00")])
     result = service.dispatchBatch("worker-a")
     assert result["cancelled"] == 0 and repository.terminals == []
-    assert edge.payloads == []
+    assert sender.payloads == []
     assert len(repository.retries) == 1 and repository.retries[0][2] == "PAYMENT_HOLD"
 
 
@@ -246,35 +246,35 @@ def test_heldRefundEmailIsSentOnceNowThatItsTemplateShipped():
         delivery = _delivery(notification_type=notificationType, attempt_count=1, last_error_code="TEMPLATE_PENDING",
                              period_end="2026-09-16T01:00:00+00:00", metadata_json=facts)
         repository = FakeRepository([delivery])
-        edge = FakeEdgeClient([EdgeSendResult(outcome="ACCEPTED", messageId="refund-message")])
-        service = _service(repository, edge, subscriptions=[_subscription(status="expired", billing_mode="monthly_prepaid")])
+        sender = FakeEmailSender([EmailSendResult(outcome="ACCEPTED", messageId="refund-message")])
+        service = _service(repository, sender, subscriptions=[_subscription(status="expired", billing_mode="monthly_prepaid")])
         result = service.dispatchBatch("worker-a")
         assert result["accepted"] == 1 and result["retryScheduled"] == 0 and result["cancelled"] == 0
-        assert len(edge.payloads) == 1 and len(repository.accepted) == 1 and repository.retries == []
-        payload = edge.payloads[0]
+        assert len(sender.payloads) == 1 and len(repository.accepted) == 1 and repository.retries == []
+        payload = sender.payloads[0]
         assert payload["notificationType"] == notificationType and payload["metadata"] == facts
-        assert service.dispatchBatch("worker-a")["claimed"] == 0 and len(edge.payloads) == 1
+        assert service.dispatchBatch("worker-a")["claimed"] == 0 and len(sender.payloads) == 1
 
 
 def test_committedBillingReceiptDispatchesEvenAfterSubscriptionExpires():
     delivery = _delivery(notification_type="payment_receipt", metadata_json={"paymentId":"pay_123","amount":3000,"currency":"INR"})
     repository = FakeRepository([delivery])
-    edge = FakeEdgeClient([EdgeSendResult(outcome="ACCEPTED", messageId="receipt-message")])
-    service = _service(repository, edge, subscriptions=[_subscription(status="expired",billing_mode="monthly_prepaid")])
+    sender = FakeEmailSender([EmailSendResult(outcome="ACCEPTED", messageId="receipt-message")])
+    service = _service(repository, sender, subscriptions=[_subscription(status="expired",billing_mode="monthly_prepaid")])
     result = service.dispatchBatch("worker-a")
     assert result["accepted"] == 1 and result["cancelled"] == 0
-    assert edge.payloads[0]["notificationType"] == "payment_receipt"
-    assert edge.payloads[0]["metadata"]["paymentId"] == "pay_123"
+    assert sender.payloads[0]["notificationType"] == "payment_receipt"
+    assert sender.payloads[0]["metadata"]["paymentId"] == "pay_123"
 
 
 def test_acceptedResponsePersistsMessageIdAndSafeAudit():
     repository = FakeRepository([_delivery()])
-    edge = FakeEdgeClient([
-        EdgeSendResult(outcome="ACCEPTED", messageId="message-1")
+    sender = FakeEmailSender([
+        EmailSendResult(outcome="ACCEPTED", messageId="message-1")
     ])
     ledger = FakeLedger()
 
-    summary = _service(repository, edge, ledger=ledger).dispatchBatch("worker-a")
+    summary = _service(repository, sender, ledger=ledger).dispatchBatch("worker-a")
 
     assert summary["accepted"] == 1
     assert repository.accepted == [(
@@ -283,7 +283,7 @@ def test_acceptedResponsePersistsMessageIdAndSafeAudit():
         "message-1",
         NOW.isoformat(),
     )]
-    assert edge.payloads[0]["trackingTag"].startswith("nubrix_delivery:")
+    assert sender.payloads[0]["trackingTag"].startswith("nubrix_delivery:")
     assert all("email" not in event["metadata"] for event in ledger.events)
     assert [event["event_type"] for event in ledger.events] == [
         "email.expiry_warning.sending",
@@ -293,17 +293,17 @@ def test_acceptedResponsePersistsMessageIdAndSafeAudit():
 
 def test_transientFailureSchedulesExactFirstBackoff():
     repository = FakeRepository([_delivery(attempt_count=1)])
-    edge = FakeEdgeClient([
-        EdgeSendResult(outcome="RETRYABLE", errorCode="EDGE_HTTP_503")
+    sender = FakeEmailSender([
+        EmailSendResult(outcome="RETRYABLE", errorCode="BREVO_HTTP_503")
     ])
 
-    summary = _service(repository, edge).dispatchBatch("worker-a")
+    summary = _service(repository, sender).dispatchBatch("worker-a")
 
     assert summary["retryScheduled"] == 1
     assert repository.retries[0] == (
         "11111111-1111-4111-8111-111111111111",
         "worker-a",
-        "EDGE_HTTP_503",
+        "BREVO_HTTP_503",
         "2026-09-17T01:05:00+00:00",
         None,
     )
@@ -311,11 +311,11 @@ def test_transientFailureSchedulesExactFirstBackoff():
 
 def test_ambiguousFailurePollsBeforeThirtyMinuteResend():
     repository = FakeRepository([_delivery(attempt_count=1)])
-    edge = FakeEdgeClient([
-        EdgeSendResult(outcome="AMBIGUOUS", errorCode="AMBIGUOUS_SEND")
+    sender = FakeEmailSender([
+        EmailSendResult(outcome="AMBIGUOUS", errorCode="AMBIGUOUS_SEND")
     ])
 
-    summary = _service(repository, edge).dispatchBatch("worker-a")
+    summary = _service(repository, sender).dispatchBatch("worker-a")
 
     assert summary["ambiguous"] == 1
     assert repository.retries[0] == (
@@ -327,14 +327,14 @@ def test_ambiguousFailurePollsBeforeThirtyMinuteResend():
     )
 
 
-def test_missingUserCancelsWithoutCallingEdgeFunction():
+def test_missingUserCancelsWithoutCallingEmailSender():
     repository = FakeRepository([_delivery()])
-    edge = FakeEdgeClient([])
+    sender = FakeEmailSender([])
 
-    summary = _service(repository, edge, users=[]).dispatchBatch("worker-a")
+    summary = _service(repository, sender, users=[]).dispatchBatch("worker-a")
 
     assert summary["cancelled"] == 1
-    assert edge.payloads == []
+    assert sender.payloads == []
     args, kwargs = repository.terminals[0]
     assert args[:2] == (
         "11111111-1111-4111-8111-111111111111",
@@ -345,11 +345,11 @@ def test_missingUserCancelsWithoutCallingEdgeFunction():
 
 def test_seventhClaimIsTerminalizedWithoutAnotherPhysicalSend():
     repository = FakeRepository([_delivery(attempt_count=7)])
-    edge = FakeEdgeClient([])
+    sender = FakeEmailSender([])
 
-    summary = _service(repository, edge).dispatchBatch("worker-a")
+    summary = _service(repository, sender).dispatchBatch("worker-a")
 
-    assert edge.payloads == []
+    assert sender.payloads == []
     assert summary["failed"] == 1
     args, kwargs = repository.terminals[0]
     assert args[:2] == (
@@ -364,12 +364,12 @@ def test_oneUnexpectedRowFailureDoesNotStopLaterRows():
         _delivery("11111111-1111-4111-8111-111111111111"),
         _delivery("33333333-3333-4333-8333-333333333333"),
     ])
-    edge = FakeEdgeClient([
+    sender = FakeEmailSender([
         RuntimeError("private@example.test"),
-        EdgeSendResult(outcome="ACCEPTED", messageId="message-2"),
+        EmailSendResult(outcome="ACCEPTED", messageId="message-2"),
     ])
 
-    summary = _service(repository, edge).dispatchBatch("worker-a")
+    summary = _service(repository, sender).dispatchBatch("worker-a")
 
     assert summary["errors"] == 1
     assert summary["accepted"] == 1
@@ -381,12 +381,12 @@ def test_dispatch_claims_one_row_immediately_before_processing():
         _delivery("11111111-1111-4111-8111-111111111111"),
         _delivery("33333333-3333-4333-8333-333333333333"),
     ])
-    edge = FakeEdgeClient([
-        EdgeSendResult(outcome="ACCEPTED", messageId="message-1"),
-        EdgeSendResult(outcome="ACCEPTED", messageId="message-2"),
+    sender = FakeEmailSender([
+        EmailSendResult(outcome="ACCEPTED", messageId="message-1"),
+        EmailSendResult(outcome="ACCEPTED", messageId="message-2"),
     ])
 
-    summary = _service(repository, edge).dispatchBatch("worker-a", limit=2)
+    summary = _service(repository, sender).dispatchBatch("worker-a", limit=2)
 
     assert summary["claimed"] == 2
     assert repository.claimArguments == [
@@ -400,7 +400,7 @@ def test_ambiguous_retry_performs_final_tag_lookup_before_resend():
 
     delivery = _delivery(last_error_code="AMBIGUOUS_SEND", attempt_count=2)
     repository = FakeRepository([delivery])
-    edge = FakeEdgeClient([])
+    sender = FakeEmailSender([])
     tag = f"nubrix_delivery:{delivery['id']}"
     brevo = FakeBrevoClient(byTag={
         tag: ProviderEvent(
@@ -414,11 +414,11 @@ def test_ambiguous_retry_performs_final_tag_lookup_before_resend():
 
     summary = _service(
         repository,
-        edge,
+        sender,
         brevoClient=brevo,
     ).dispatchBatch("worker-a")
 
-    assert edge.payloads == []
+    assert sender.payloads == []
     assert repository.recoveredClaims == [(
         delivery["id"],
         "worker-a",
@@ -451,7 +451,7 @@ def test_reconciliationMarksAcceptedDeliveryDelivered():
 
     summary = _service(
         repository,
-        FakeEdgeClient([]),
+        FakeEmailSender([]),
         brevoClient=brevo,
     ).reconcileBatch()
 
@@ -473,7 +473,7 @@ def test_unresolvedAcceptedDeliveryAdvancesPollingWithoutDispatching():
 
     summary = _service(
         repository,
-        FakeEdgeClient([]),
+        FakeEmailSender([]),
         brevoClient=FakeBrevoClient(),
     ).reconcileBatch()
 
@@ -509,7 +509,7 @@ def test_ambiguousSendRecoversMessageIdBeforeApplyingProviderState():
 
     summary = _service(
         repository,
-        FakeEdgeClient([]),
+        FakeEmailSender([]),
         brevoClient=brevo,
     ).reconcileBatch()
 
@@ -529,7 +529,7 @@ def test_acceptedDeliveryTimesOutAfterSeventyTwoHours():
 
     summary = _service(
         repository,
-        FakeEdgeClient([]),
+        FakeEmailSender([]),
         brevoClient=FakeBrevoClient(),
     ).reconcileBatch()
 

@@ -224,6 +224,41 @@ def test_public_trial_activation_returns_committed_core_dates_and_preserves_allo
     assert query(factory,'SELECT * FROM credit_balances WHERE user_id=%s',(user,),True)==balance
 
 
+@pytest.mark.parametrize('failure',['raises','retryable'])
+def test_freeTrialActivationSurvivesEmailFailure(bootstrapAccount,monkeypatch,failure):
+    from types import SimpleNamespace
+    from unittest.mock import MagicMock
+    import requests
+    from jose import jwt
+    from loguru import logger
+    from api.services.billing import manualBillingRepository
+    from api.services.notifications.brevoEmailSender import BrevoEmailSender,EmailSendResult
+    from api.services.subscriptions.subscriptionService import SubscriptionService
+    repo,factory,user,_=bootstrapAccount
+    monkeypatch.setattr(manualBillingRepository,'getManualBillingRepository',lambda:repo)
+    email=user+'@example.test'
+    service=SubscriptionService.__new__(SubscriptionService)
+    service.client=MagicMock()
+    records=SimpleNamespace(data=[{'fullName':'Synthetic','userId':user,'email':email}])
+    service.client.table.return_value.select.return_value.eq.return_value.limit.return_value.execute.return_value=records
+    service._auditLog=MagicMock()
+    token=jwt.encode({'userId':user,'email':email},os.environ['SECRET_KEY'],'HS256')
+    sender=MagicMock(side_effect=requests.ConnectionError('down')) if failure=='raises' else MagicMock(
+        return_value=EmailSendResult('RETRYABLE',errorCode='BREVO_HTTP_503'))
+    monkeypatch.setattr(BrevoEmailSender,'sendFreeTrialWelcome',sender)
+    captured=[];sinkId=logger.add(captured.append,level='DEBUG')
+    try:
+        result=service.activateFreeTrial(token)
+    finally:
+        logger.remove(sinkId)
+    logged=''.join(str(record) for record in captured)
+    assert result['subscriptionStatus']=='TRIAL'
+    assert email not in logged and user+'@' not in logged
+    assert ('BREVO_HTTP_503' in logged) if failure=='retryable' else ('ConnectionError' in logged)
+    committed=query(factory,'SELECT * FROM subscriptions WHERE user_id=%s',(user,),True)
+    args=sender.call_args.args
+    assert args[0]==email and args[2]==committed['trial_ends_at'] and isinstance(args[3],list)
+
 @pytest.mark.parametrize('condition',['none','trial','paid'])
 def test_reviewed_existing_canonical_and_financial_records_are_read_without_rewrite(bootstrapStorage,monkeypatch,condition):
     from api.services.billing.manualBillingRepository import ManualBillingRepository

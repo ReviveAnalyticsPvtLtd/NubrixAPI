@@ -10,7 +10,10 @@ from api.services.notifications.brevoEventClient import (
     BrevoEventClient,
     ProviderEvent,
 )
-from api.services.notifications.edgeEmailClient import EdgeEmailClient, EdgeSendResult
+from api.services.notifications.brevoEmailSender import (
+    BrevoEmailSender,
+    EmailSendResult,
+)
 from api.services.notifications.notificationDeliveryRepository import (
     NotificationDeliveryRepository,
     getNotificationDeliveryRepository,
@@ -35,14 +38,14 @@ class NotificationDeliveryService:
     def __init__(
         self,
         repository: NotificationDeliveryRepository | None = None,
-        edgeClient: EdgeEmailClient | None = None,
+        emailSender: BrevoEmailSender | None = None,
         supabaseClient=None,
         eventService=None,
         brevoClient: BrevoEventClient | None = None,
         now=None,
     ):
         self.repository = repository or getNotificationDeliveryRepository()
-        self.edgeClient = edgeClient or EdgeEmailClient()
+        self.emailSender = emailSender or BrevoEmailSender()
         if supabaseClient is None:
             from api.commons import client
 
@@ -53,7 +56,7 @@ class NotificationDeliveryService:
         self.now = now or (lambda: datetime.datetime.now(datetime.timezone.utc))
 
     def dispatchBatch(self, workerId: str, limit: int = 50) -> dict:
-        self.edgeClient.validate()
+        self.emailSender.validate()
         summary = {
             "claimed": 0,
             "accepted": 0,
@@ -220,7 +223,7 @@ class NotificationDeliveryService:
                 "notificationType":delivery["notification_type"], "templateVersion":delivery["template_version"],
                 "email":email, "name":name, "periodEnd":str(delivery.get("period_end") or ""),
                 "metadata":metadata, "trackingTag":f"nubrix_delivery:{delivery['id']}"}
-            result = self.edgeClient.sendBilling(payload)
+            result = self.emailSender.sendBilling(payload)
             self._applySendResult(delivery,workerId,result,now,summary)
             return
 
@@ -234,7 +237,7 @@ class NotificationDeliveryService:
             "trialEndDate": intent["periodEnd"],
             "trackingTag": f"nubrix_delivery:{delivery['id']}",
         }
-        result = self.edgeClient.sendTrialExpiry(payload)
+        result = self.emailSender.sendTrialExpiry(payload)
         self._applySendResult(delivery, workerId, result, now, summary)
 
     def _reconcileAccepted(self, delivery: dict, summary: dict) -> None:
@@ -406,7 +409,7 @@ class NotificationDeliveryService:
         self,
         delivery: dict,
         workerId: str,
-        result: EdgeSendResult,
+        result: EmailSendResult,
         now: datetime.datetime,
         summary: dict,
     ) -> None:

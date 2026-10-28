@@ -69,9 +69,10 @@ def _environment():
         "DATABASE_URL": "postgresql://example.invalid/db",
         "SUPABASE_URL": "https://example.invalid",
         "SUPABASE_KEY": "secret",
-        "FREE_TRIAL_EXPIRY_WARNING_EMAIL_URL": "https://example.invalid/edge",
-        "SUPABASE_KEY_OLD": "secret",
         "BREVO_API_KEY": "secret",
+        "BREVO_SENDER_EMAIL": "sender@example.invalid",
+        "BREVO_SENDER_NAME": "Sender",
+        "DASHBOARD_BASE_URL": "https://dashboard.example.invalid",
         "REDIS_HOST": "localhost",
         "REDIS_PORT": "6379",
         "REDIS_PASSWORD": "secret",
@@ -171,14 +172,14 @@ def test_preflight_is_read_only_and_validates_every_dependency():
     from scripts.notificationDeliveryPreflight import runPreflight
 
     repository = _Repository()
-    edge = _Validator()
+    sender = _Validator()
     brevo = _Validator()
     redisClient = _Redis()
 
     result = runPreflight(
         environ=_environment(),
         repository=repository,
-        edgeClient=edge,
+        emailSender=sender,
         brevoClient=brevo,
         redisClient=redisClient,
         now=lambda: NOW,
@@ -188,14 +189,14 @@ def test_preflight_is_read_only_and_validates_every_dependency():
         "ok": True,
         "environment": "ok",
         "database": "ok",
-        "edgeFunction": "ok",
+        "emailSender": "ok",
         "brevoEvents": "ok",
         "redis": "ok",
         "scheduler": "ok",
     }
     assert repository.healthNow == NOW.isoformat()
     assert repository.claimValidated is True
-    assert edge.validated is True
+    assert sender.validated is True
     assert brevo.validated is True
     assert redisClient.pinged is True
 
@@ -206,7 +207,7 @@ def test_preflight_reports_missing_environment_without_secret_values():
     result = runPreflight(
         environ={},
         repository=_Repository(),
-        edgeClient=_Validator(),
+        emailSender=_Validator(),
         brevoClient=_Validator(),
         redisClient=_Redis(),
         now=lambda: NOW,
@@ -218,7 +219,7 @@ def test_preflight_reports_missing_environment_without_secret_values():
         "ok",
         "environment",
         "database",
-        "edgeFunction",
+        "emailSender",
         "brevoEvents",
         "redis",
         "scheduler",
@@ -272,7 +273,7 @@ def test_preflight_rejects_stale_scheduler_heartbeat():
     result = runPreflight(
         environ=_environment(),
         repository=_Repository(),
-        edgeClient=_Validator(),
+        emailSender=_Validator(),
         brevoClient=_Validator(),
         redisClient=_Redis(heartbeat="2026-09-17T00:56:59+00:00"),
         now=lambda: NOW,
