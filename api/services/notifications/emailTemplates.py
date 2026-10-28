@@ -8,6 +8,7 @@ __all__ = [
     "BILLING_TYPES",
     "RenderedEmail",
     "renderBillingMessage",
+    "renderFreeTrialWelcome",
     "renderTrialExpiryWarning",
 ]
 
@@ -17,6 +18,8 @@ import datetime
 import re
 from dataclasses import dataclass
 from urllib.parse import quote, urljoin, urlsplit, urlunsplit
+
+from api.services.billing.manualBillingPresentation import _EXPERT_NAMES
 
 
 BILLING_TYPES: tuple[str, ...] = (
@@ -111,6 +114,62 @@ def _parseAppUrl(appUrl):
     if parts.scheme not in ("http", "https") or not hostname or parts.username or parts.password:
         raise ValueError("INVALID_APP_URL")
     return urlunsplit(parts._replace(path=parts.path or "/"))
+
+
+def _renderShell(
+    *,
+    subject: str,
+    heading: str,
+    name: str,
+    paragraphs: list[str],
+    facts: list[tuple[str, str]],
+    actionLabel: str,
+    actionUrl: str,
+    baseUrl: str,
+    footerReason: str,
+) -> RenderedEmail:
+    """The one HTML/text layout shared by every message in the billing email style."""
+    rows = "".join(
+        f'<tr><td style="padding:8px 0;color:#64748b;font-size:14px;">{_escape(label)}</td>'
+        f'<td style="padding:8px 0;color:#0f172a;font-size:14px;font-weight:600;text-align:right;">{_escape(value)}</td></tr>'
+        for label, value in facts
+    )
+    factsTable = (
+        f'<table role="presentation" width="100%" cellpadding="0" cellspacing="0" style="border-top:1px solid #e2e8f0;border-bottom:1px solid #e2e8f0;margin:0 0 24px;">{rows}</table>'
+        if rows else ""
+    )
+    body = "".join(
+        f'<p style="margin:0 0 {24 if index == len(paragraphs) - 1 else 12}px;color:#334155;font-size:15px;line-height:1.6;">{_escape(paragraph)}</p>'
+        for index, paragraph in enumerate(paragraphs)
+    )
+    htmlContent = (
+        f'<!doctype html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>{_escape(subject)}</title></head>'
+        "<body style=\"margin:0;padding:0;background:#f1f5f9;font-family:-apple-system,'Segoe UI',Roboto,Helvetica,Arial,sans-serif;\">"
+        f'<div style="display:none;max-height:0;overflow:hidden;">{_escape(paragraphs[0])}</div>'
+        '<table role="presentation" width="100%" cellpadding="0" cellspacing="0" style="background:#f1f5f9;padding:32px 16px;"><tr><td align="center">'
+        '<table role="presentation" width="100%" cellpadding="0" cellspacing="0" style="max-width:560px;background:#ffffff;border-radius:12px;overflow:hidden;">'
+        '<tr><td style="background:#2563eb;padding:20px 32px;color:#ffffff;font-size:18px;font-weight:700;">Nubrix AI</td></tr>'
+        '<tr><td style="padding:32px;">'
+        f'<h1 style="margin:0 0 16px;color:#0f172a;font-size:22px;line-height:1.3;">{_escape(heading)}</h1>'
+        f'<p style="margin:0 0 12px;color:#334155;font-size:15px;line-height:1.6;">Hello {_escape(name)},</p>'
+        f'{body}'
+        f'{factsTable}'
+        '<table role="presentation" cellpadding="0" cellspacing="0"><tr><td style="border-radius:8px;background:#2563eb;">'
+        f'<a href="{_escape(actionUrl)}" style="display:inline-block;padding:12px 24px;color:#ffffff;font-size:15px;font-weight:600;text-decoration:none;">{_escape(actionLabel)}</a>'
+        '</td></tr></table>'
+        f'<p style="margin:24px 0 0;color:#64748b;font-size:13px;line-height:1.6;">Or open <a href="{_escape(baseUrl)}" style="color:#2563eb;">your Nubrix account</a>.</p>'
+        '</td></tr>'
+        '<tr><td style="padding:20px 32px;background:#f8fafc;color:#94a3b8;font-size:12px;line-height:1.6;">'
+        f'You are receiving this email {footerReason}. Questions? Contact '
+        f'<a href="mailto:{SUPPORT_EMAIL}" style="color:#64748b;">{SUPPORT_EMAIL}</a>.</td></tr>'
+        '</table></td></tr></table></body></html>'
+    )
+    textContent = "\n".join([
+        subject, "", f"Hello {name},", "", *[line for paragraph in paragraphs for line in (paragraph, "")],
+        *[f"{label}: {value}" for label, value in facts], "", f"{actionLabel}: {actionUrl}", "",
+        f"Questions? Contact {SUPPORT_EMAIL}.",
+    ])
+    return RenderedEmail(subject=subject, htmlContent=htmlContent, textContent=textContent)
 
 
 def renderBillingMessage(*, notificationType: str, name: str, metadata: dict, appUrl: str) -> RenderedEmail:
@@ -214,43 +273,11 @@ def renderBillingMessage(*, notificationType: str, name: str, metadata: dict, ap
         actionLabel, actionPath = "View billing history", "/settings/billing-details"
     actionUrl = urljoin(baseUrl, actionPath)
 
-    rows = "".join(
-        f'<tr><td style="padding:8px 0;color:#64748b;font-size:14px;">{_escape(label)}</td>'
-        f'<td style="padding:8px 0;color:#0f172a;font-size:14px;font-weight:600;text-align:right;">{_escape(value)}</td></tr>'
-        for label, value in facts
+    return _renderShell(
+        subject=subject, heading=subject, name=name, paragraphs=[text], facts=facts,
+        actionLabel=actionLabel, actionUrl=actionUrl, baseUrl=baseUrl,
+        footerReason="about your Nubrix AI subscription",
     )
-    factsTable = (
-        f'<table role="presentation" width="100%" cellpadding="0" cellspacing="0" style="border-top:1px solid #e2e8f0;border-bottom:1px solid #e2e8f0;margin:0 0 24px;">{rows}</table>'
-        if rows else ""
-    )
-    htmlContent = (
-        f'<!doctype html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>{_escape(subject)}</title></head>'
-        "<body style=\"margin:0;padding:0;background:#f1f5f9;font-family:-apple-system,'Segoe UI',Roboto,Helvetica,Arial,sans-serif;\">"
-        f'<div style="display:none;max-height:0;overflow:hidden;">{_escape(text)}</div>'
-        '<table role="presentation" width="100%" cellpadding="0" cellspacing="0" style="background:#f1f5f9;padding:32px 16px;"><tr><td align="center">'
-        '<table role="presentation" width="100%" cellpadding="0" cellspacing="0" style="max-width:560px;background:#ffffff;border-radius:12px;overflow:hidden;">'
-        '<tr><td style="background:#2563eb;padding:20px 32px;color:#ffffff;font-size:18px;font-weight:700;">Nubrix AI</td></tr>'
-        '<tr><td style="padding:32px;">'
-        f'<h1 style="margin:0 0 16px;color:#0f172a;font-size:22px;line-height:1.3;">{_escape(subject)}</h1>'
-        f'<p style="margin:0 0 12px;color:#334155;font-size:15px;line-height:1.6;">Hello {_escape(name)},</p>'
-        f'<p style="margin:0 0 24px;color:#334155;font-size:15px;line-height:1.6;">{_escape(text)}</p>'
-        f'{factsTable}'
-        '<table role="presentation" cellpadding="0" cellspacing="0"><tr><td style="border-radius:8px;background:#2563eb;">'
-        f'<a href="{_escape(actionUrl)}" style="display:inline-block;padding:12px 24px;color:#ffffff;font-size:15px;font-weight:600;text-decoration:none;">{_escape(actionLabel)}</a>'
-        '</td></tr></table>'
-        f'<p style="margin:24px 0 0;color:#64748b;font-size:13px;line-height:1.6;">Or open <a href="{_escape(baseUrl)}" style="color:#2563eb;">your Nubrix account</a>.</p>'
-        '</td></tr>'
-        '<tr><td style="padding:20px 32px;background:#f8fafc;color:#94a3b8;font-size:12px;line-height:1.6;">'
-        'You are receiving this email about your Nubrix AI subscription. Questions? Contact '
-        f'<a href="mailto:{SUPPORT_EMAIL}" style="color:#64748b;">{SUPPORT_EMAIL}</a>.</td></tr>'
-        '</table></td></tr></table></body></html>'
-    )
-    textContent = "\n".join([
-        subject, "", f"Hello {name},", "", text, "",
-        *[f"{label}: {value}" for label, value in facts], "", f"{actionLabel}: {actionUrl}", "",
-        f"Questions? Contact {SUPPORT_EMAIL}.",
-    ])
-    return RenderedEmail(subject=subject, htmlContent=htmlContent, textContent=textContent)
 
 
 _TRIAL_WARNING_STYLE = """
@@ -417,4 +444,29 @@ def renderTrialExpiryWarning(
         subject=f"⏳ Your Free Trial Ends in {daysLeft} Days",
         htmlContent=htmlContent,
         textContent=None,
+    )
+
+
+_WELCOME_SUBJECT = "Welcome to Nubrix AI: your free trial has started"
+_WELCOME_PARAGRAPHS = [
+    "Your Nubrix AI free trial is active. You can connect your data, build custom charts, schedule reports and run transformation threads with the experts you selected.",
+    "When the trial ends, your access simply pauses. No payment is taken unless you choose a plan, and your projects and settings stay intact if you upgrade.",
+]
+
+
+def renderFreeTrialWelcome(*, name: str, trialEndsAt, experts, appUrl: str) -> RenderedEmail:
+    name = str(name or "").strip()
+    if not name:
+        raise ValueError("INVALID_RECIPIENT_NAME")
+    trialEnd = _parseDate(trialEndsAt, "INVALID_TRIAL_END")
+    baseUrl = _parseAppUrl(appUrl)
+    facts = [("Free trial ends", _formatDate(trialEnd))]
+    expertNames = ", ".join(_EXPERT_NAMES.get(code, str(code)) for code in experts or ())
+    if expertNames:
+        facts.append(("Experts", expertNames))
+    return _renderShell(
+        subject=_WELCOME_SUBJECT, heading="Your free trial has started", name=name,
+        paragraphs=_WELCOME_PARAGRAPHS, facts=facts,
+        actionLabel="Open your dashboard", actionUrl=urljoin(baseUrl, "/dashboard"), baseUrl=baseUrl,
+        footerReason="because you started a Nubrix AI free trial",
     )

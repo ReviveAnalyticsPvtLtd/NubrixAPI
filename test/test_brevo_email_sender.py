@@ -262,3 +262,46 @@ def test_sendBeforeValidateStillRequiresConfiguration(kind):
     with pytest.raises(RuntimeError, match="^EMAIL_CONFIGURATION_MISSING$"):
         SEND[kind](sender)
     assert post.calls == []
+
+
+WELCOME_ARGS = ("a@b.co", "Asha", "2026-11-09T10:00:00Z", ["banking", "supplychain"])
+
+
+def test_freeTrialWelcomeHasNoTrackingTag():
+    post = _ok()
+    result = _sender(post).sendFreeTrialWelcome(*WELCOME_ARGS)
+    assert result.outcome == "ACCEPTED"
+    url, kwargs = post.calls[0]
+    assert url == "https://api.brevo.com/v3/smtp/email"
+    body = kwargs["json"]
+    assert "tags" not in body
+    assert "headers" not in body
+    assert body["to"] == [{"email": "a@b.co", "name": "Asha"}]
+    assert body["sender"] == {"email": "noreply@nubrix.test", "name": "Nubrix AI"}
+    assert body["subject"] == "Welcome to Nubrix AI: your free trial has started"
+    assert body["htmlContent"] and body["textContent"]
+    assert kwargs["headers"]["api-key"] == API_KEY
+
+
+def test_freeTrialWelcomeOutcomes():
+    assert _sender(_ok()).sendFreeTrialWelcome(*WELCOME_ARGS) == EmailSendResult(
+        outcome="ACCEPTED", messageId="<msg-1@brevo>"
+    )
+
+    post = _ok()
+    result = _sender(post).sendFreeTrialWelcome("not-an-email", "Asha", "2026-11-09T10:00:00Z", [])
+    assert result == EmailSendResult(outcome="PERMANENT", errorCode="INVALID_RECIPIENT")
+    assert post.calls == []
+
+    result = _sender(post).sendFreeTrialWelcome("a@b.co", "Asha", "garbage", [])
+    assert result == EmailSendResult(outcome="PERMANENT", errorCode="INVALID_TRIAL_END")
+    assert post.calls == []
+
+    result = _sender(RecordingPost(error=requests.Timeout("slow"))).sendFreeTrialWelcome(*WELCOME_ARGS)
+    assert result == EmailSendResult(outcome="AMBIGUOUS", errorCode="AMBIGUOUS_SEND")
+
+    result = _sender(RecordingPost(response=FakeResponse(503))).sendFreeTrialWelcome(*WELCOME_ARGS)
+    assert result.outcome == "RETRYABLE"
+
+    result = _sender(RecordingPost(response=FakeResponse(201, {}))).sendFreeTrialWelcome(*WELCOME_ARGS)
+    assert result == EmailSendResult(outcome="RETRYABLE", errorCode="PROVIDER_MESSAGE_ID_MISSING")

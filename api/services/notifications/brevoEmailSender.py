@@ -16,6 +16,7 @@ from api.services.notifications.emailTemplates import (
     BILLING_TYPES,
     RenderedEmail,
     renderBillingMessage,
+    renderFreeTrialWelcome,
     renderTrialExpiryWarning,
 )
 from utils.logger import logger
@@ -89,16 +90,33 @@ class BrevoEmailSender:
             return self._permanent(error)
         return self._send(request, rendered, billing=True)
 
+    def sendFreeTrialWelcome(self, email: str, name: str, trialEndsAt, experts) -> EmailSendResult:
+        self._requireConfiguration()
+        try:
+            email = str(email or "").strip()
+            if not _EMAIL.fullmatch(email):
+                raise ValueError("INVALID_RECIPIENT")
+            rendered = renderFreeTrialWelcome(
+                name=name, trialEndsAt=trialEndsAt, experts=experts, appUrl=self.appUrl
+            )
+        except ValueError as error:
+            return self._permanent(error)
+        return self._send(
+            {"email": email, "name": str(name).strip()}, rendered, billing=False
+        )
+
     def _send(self, request: dict, rendered: RenderedEmail, *, billing: bool) -> EmailSendResult:
-        deliveryId = request["deliveryId"]
+        """Tracking (``trackingTag``/``deliveryId``) is optional: untracked mail omits tags and headers."""
+        deliveryId = request.get("deliveryId")
         body = {
             "sender": {"email": self.senderEmail, "name": self.senderName},
             "to": [{"email": request["email"], "name": request["name"]}],
             "subject": rendered.subject,
             "htmlContent": rendered.htmlContent,
-            "tags": [request["trackingTag"]],
-            "headers": {"X-Mailin-custom": f"delivery_id:{deliveryId}"},
         }
+        if deliveryId:
+            body["tags"] = [request["trackingTag"]]
+            body["headers"] = {"X-Mailin-custom": f"delivery_id:{deliveryId}"}
         if rendered.textContent:
             body["textContent"] = rendered.textContent
         try:
@@ -113,10 +131,10 @@ class BrevoEmailSender:
                 timeout=self.timeoutSeconds,
             )
         except (requests.Timeout, requests.ConnectionError):
-            logger.warning(f"Brevo send outcome uncertain for delivery {deliveryId}")
+            logger.warning(f"Brevo send outcome uncertain for delivery {deliveryId or 'untracked'}")
             return EmailSendResult(outcome="AMBIGUOUS", errorCode="AMBIGUOUS_SEND")
         except requests.RequestException:
-            logger.warning(f"Brevo send request failed for delivery {deliveryId}")
+            logger.warning(f"Brevo send request failed for delivery {deliveryId or 'untracked'}")
             return EmailSendResult(outcome="RETRYABLE", errorCode="EMAIL_REQUEST_FAILED")
 
         status = int(response.status_code)
@@ -124,12 +142,12 @@ class BrevoEmailSender:
             messageId = self._messageId(response)
             if messageId:
                 return EmailSendResult(outcome="ACCEPTED", messageId=messageId)
-            logger.warning(f"Brevo accepted delivery {deliveryId} without a message id")
+            logger.warning(f"Brevo accepted delivery {deliveryId or 'untracked'} without a message id")
             if billing:
                 return EmailSendResult(outcome="AMBIGUOUS", errorCode="AMBIGUOUS_SEND")
             return EmailSendResult(outcome="RETRYABLE", errorCode="PROVIDER_MESSAGE_ID_MISSING")
 
-        logger.warning(f"Brevo rejected delivery {deliveryId} with status {status}")
+        logger.warning(f"Brevo rejected delivery {deliveryId or 'untracked'} with status {status}")
         errorCode = self._safeErrorCode(f"BREVO_HTTP_{status}")
         if status in {408, 429} or status >= 500:
             return EmailSendResult(outcome="RETRYABLE", errorCode=errorCode)

@@ -7,6 +7,7 @@ from api.services.notifications.emailTemplates import (
     BILLING_TYPES,
     RenderedEmail,
     renderBillingMessage,
+    renderFreeTrialWelcome,
     renderTrialExpiryWarning,
 )
 
@@ -353,3 +354,84 @@ def test_formatDateIsExplicitUtc():
 def test_formatDateMatchesIntlEnGbSeptemberAbbreviation():
     message = render("monthly_cancellation_confirmation", {"finalPaidEnd": "2026-09-05T00:05:00Z"})
     assert "Final paid access ends: 5 Sept 2026, 00:05 UTC" in message.textContent
+
+
+WELCOME_SUBJECT = "Welcome to Nubrix AI: your free trial has started"
+WELCOME_P1 = "Your Nubrix AI free trial is active. You can connect your data, build custom charts, schedule reports and run transformation threads with the experts you selected."
+WELCOME_P2 = "When the trial ends, your access simply pauses. No payment is taken unless you choose a plan, and your projects and settings stay intact if you upgrade."
+
+
+def welcome(**overrides):
+    kwargs = dict(
+        name="Asha",
+        trialEndsAt="2026-11-09T10:00:00Z",
+        experts=["banking", "supplychain"],
+        appUrl="https://www.nubrixai.com",
+    )
+    kwargs.update(overrides)
+    return renderFreeTrialWelcome(**kwargs)
+
+
+def test_freeTrialWelcomeRendersApprovedCopy():
+    message = welcome()
+    html = message.htmlContent
+    assert message.subject == WELCOME_SUBJECT
+    assert f"<title>{WELCOME_SUBJECT}</title>" in html
+    assert re.search(r"<h1[^>]*>Your free trial has started</h1>", html)
+    assert "Hello Asha," in html
+    assert f'<div style="display:none;max-height:0;overflow:hidden;">{WELCOME_P1}</div>' in html
+    assert f">{WELCOME_P1}</p>" in html
+    assert f">{WELCOME_P2}</p>" in html
+    assert re.search(r">Free trial ends</td><td[^>]*>9 Nov 2026, 10:00 UTC</td>", html)
+    assert re.search(r">Experts</td><td[^>]*>Banking, Supply Chain</td>", html)
+    assert html.index("Free trial ends") < html.index("Experts")
+    assert 'href="https://www.nubrixai.com/dashboard"' in html
+    assert ">Open your dashboard</a>" in html
+    assert 'Or open <a href="https://www.nubrixai.com/"' in html
+    assert ">your Nubrix account</a>." in html
+    assert (
+        "You are receiving this email because you started a Nubrix AI free trial. Questions? Contact "
+        '<a href="mailto:nubrixai@reviveanalytics.com" style="color:#64748b;">nubrixai@reviveanalytics.com</a>.'
+    ) in html
+    assert message.textContent == "\n".join([
+        WELCOME_SUBJECT, "", "Hello Asha,", "", WELCOME_P1, "", WELCOME_P2, "",
+        "Free trial ends: 9 Nov 2026, 10:00 UTC", "Experts: Banking, Supply Chain", "",
+        "Open your dashboard: https://www.nubrixai.com/dashboard", "",
+        "Questions? Contact nubrixai@reviveanalytics.com.",
+    ])
+    withSlash = welcome(appUrl="https://www.nubrixai.com/")
+    assert 'href="https://www.nubrixai.com/dashboard"' in withSlash.htmlContent
+    assert "Open your dashboard: https://www.nubrixai.com/dashboard" in withSlash.textContent
+
+
+def test_freeTrialWelcomeEscapesRecipientName():
+    message = welcome(name="<script>alert(\"x\")</script> & O'Neil")
+    assert "<script>" not in message.htmlContent
+    assert "Hello &lt;script&gt;alert(&quot;x&quot;)&lt;/script&gt; &amp; O&#39;Neil," in message.htmlContent
+    assert "Hello <script>alert(\"x\")</script> & O'Neil," in message.textContent
+
+
+def test_freeTrialWelcomeOmitsEmptyExperts():
+    for experts in ([], ()):
+        message = welcome(experts=experts)
+        assert "Experts" not in message.htmlContent
+        assert "Experts" not in message.textContent
+        assert "Free trial ends: 9 Nov 2026, 10:00 UTC" in message.textContent
+    unknown = welcome(experts=["banking", "mystery"])
+    assert "Banking, mystery" in unknown.textContent
+    parsed = welcome(trialEndsAt=datetime.datetime(2026, 11, 9, 10, 0, tzinfo=datetime.timezone.utc))
+    assert "Free trial ends: 9 Nov 2026, 10:00 UTC" in parsed.textContent
+
+
+def test_freeTrialWelcomeRejectsBadInput():
+    for kwargs, code in (
+        ({"name": "  "}, "INVALID_RECIPIENT_NAME"),
+        ({"name": ""}, "INVALID_RECIPIENT_NAME"),
+        ({"trialEndsAt": "not-a-date"}, "INVALID_TRIAL_END"),
+        ({"trialEndsAt": None}, "INVALID_TRIAL_END"),
+        ({"appUrl": "javascript:alert(1)"}, "INVALID_APP_URL"),
+        ({"appUrl": ""}, "INVALID_APP_URL"),
+    ):
+        with pytest.raises(ValueError) as error:
+            welcome(**kwargs)
+        assert str(error.value) == code
