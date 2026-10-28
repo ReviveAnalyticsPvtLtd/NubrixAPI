@@ -14,10 +14,10 @@ __all__ = ["ManualPaymentService", "manualPaymentService"]
 
 
 import hashlib
-import json
 import os
-from dataclasses import replace
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timezone
+
+from razorpay.errors import BadRequestError
 
 from api.services.billing.manualBillingContracts import (
     CheckoutIntent,
@@ -25,10 +25,10 @@ from api.services.billing.manualBillingContracts import (
     FinalizationResult,
     VerifiedPaymentEvidence,
 )
+from api.services.billing.paymentPolicy import orderPaymentOptions, paymentRulesEffectiveAt
+from api.services.billing.purchaseProvider import purchaseProviderOptions
 from utils.logger import logger
 
-
-MANUAL_CHECKOUT_TTL_SECONDS = int(os.environ.get("MANUAL_CHECKOUT_TTL_SECONDS", "1800"))
 
 _PURPOSE_ORDER_NOTE_TYPES = {
     "initial_purchase": "initial_subscription",
@@ -38,53 +38,17 @@ _PURPOSE_ORDER_NOTE_TYPES = {
 }
 
 
-class _OperationStore:
-    """In-memory exactly-once guard doubles for unit tests.
-
-    Production uses ManualBillingRepository: the same identities are enforced
-    through owner locks, immutable provider-payment identity, invoice state
-    and coverage/allocation identity inside one PostgreSQL transaction.
-    """
-
-    def __init__(self):
-        self.finalizations = {}
-        self.anomalies = []
-        self.intents = {}
-
-    def claimFinalization(self, invoiceId, operationKey, payload):
-        if operationKey in self.finalizations:
-            return None, self.finalizations[operationKey]
-        self.finalizations[operationKey] = payload
-        return invoiceId, payload
-
-    def findIntent(self, namespace):
-        return self.intents.get(namespace)
-
-    def saveIntent(self, namespace, intent):
-        self.intents[namespace] = intent
-
-    def recordAnomaly(self, anomaly):
-        self.anomalies.append(anomaly)
-
-
 class ManualPaymentService:
     def __init__(
         self,
         razorpayClient=None,
-        supabaseClient=None,
         repository=None,
-        store=None,
-        now=None,
     ):
         self.razorpayClient = razorpayClient
-        self.supabaseClient = supabaseClient
-        if repository is None and store is None:
+        if repository is None:
             from api.services.billing.manualBillingRepository import getManualBillingRepository
             repository = getManualBillingRepository()
         self.repository = repository
-        self.store = store
-        self.now = now or (lambda: datetime.now(timezone.utc))
-        self._intents = {}
 
     @classmethod
     def forProduction(cls, provider=None, repository=None):
@@ -92,348 +56,119 @@ class ManualPaymentService:
 
     def _createDurableCheckout(self, request):
         self.repository.ensureCanonicalSubscription(request.userId)
-        if request.purpose in ('initial_purchase', 'renewal'):
-            replay = self.repository.reserveCheckout(request, replayOnly=True)
-            if replay is not None and (replay.state in ('captured', 'expired', 'cancelled', 'superseded', 'failed')
-                    or request.purpose == 'initial_purchase' and replay.razorpayOrderId):
-                return replay
+        replay = self.repository.reserveCheckout(request, replayOnly=True)
+        if replay is not None and (replay.state in ('captured', 'expired', 'cancelled', 'superseded', 'failed')
+                or request.purpose != 'renewal' and replay.razorpayOrderId):
+            # A renewal replay with an Order is refreshed by inspecting the slot's live attempt below.
+            return replay
         from api.services.billing.manualBillingRecoveryService import ManualBillingRecoveryService
         recovery = ManualBillingRecoveryService(self.repository, self.razorpayClient)
-        pendingRows = self.repository.orderlessRecoveryRows(request.userId, request.purpose, request.billingMode)
-        if request.purpose == 'renewal':
-            pendingRows = self.repository.renewalRecoveryRows(request.userId, request.billingMode,
-                request.payload.get('invoiceId'))
+        # The initial purchase slot spans billing modes.
+        pendingRows = self.repository.orderlessRecoveryRows(request.userId, request.purpose,
+            None if request.purpose == 'initial_purchase' else request.billingMode)
         for pending in pendingRows:
             try:
                 recovery.recoverAttempt(pending)
             except Exception as exc:
                 raise RuntimeError('PROVIDER_STATUS_UNKNOWN' if pending.get('provider_order_id') else 'ORDER_ACK_UNKNOWN') from exc
-            if request.purpose == 'renewal':
-                updated = self.repository.attemptById(request.userId, str(pending['id']))
-                metadata = self.repository._json(updated.get('metadata_json'))
-                frozen = metadata.get('manualBilling', {})
-                observation = frozen.get('providerObservation', {})
-                if frozen.get('closedAt') and observation.get('hasPayments') and updated.get('payment_status') != 'captured':
-                    original = self.repository._intentFromAttemptRow(updated, metadata, request.userId, request.purpose)
-                    return replace(original, state='requires_reconciliation')
-        intent = self.repository.reserveCheckout(request)
+        # Provider reads happen before the owner lock (spec 4.3); the reservation re-reads the
+        # slot's live attempt under the lock and is busy if it changed since this snapshot.
+        live = self.repository.liveSlotAttempt(request)
+        inspection = inspected = None
+        if live is not None and live.get('provider_order_id'):
+            inspection = recovery.inspectAttempt(live)
+            if not inspection.complete:
+                raise RuntimeError('PAYMENT_SERVICE_BUSY')  # Nothing closed, nothing opened.
+            try:
+                # Finalize captured money first; a granted payment settles the slot.
+                recovery.applyObservation(live, inspection)
+            except RuntimeError as exc:
+                if str(exc) != 'PROVIDER_STATUS_UNKNOWN':
+                    raise
+                # Recorded; the slot decision treats an unclassified Order as busy,
+                # or refunded money on it as finalize-first.
+            inspected = self.repository.attemptById(request.userId, str(live['id']))
+            if not self._recordedOnlyThisSnapshot(live, inspected, inspection):
+                raise RuntimeError('PAYMENT_SERVICE_BUSY')  # Other evidence arrived meanwhile: never act on it.
+        evidence = {} if inspection is None else {'inspection': inspection, 'inspectedAttempt': inspected}
+        intent = self.repository.reserveCheckout(request, **evidence)
+        return self.openReservedCheckout(intent)
+
+    def _recordedOnlyThisSnapshot(self, before, after, snapshot):
+        """The attempt changed only as recording this snapshot explains (or its capture settled it,
+        or finalizing its capture closed it for a full refund)."""
+        from api.services.billing.manualBillingRepository import _utc
+        if after.get('payment_status') == 'captured':
+            return True
+        billing = self.repository._json(after.get('metadata_json')).get('manualBilling', {})
+        observed = billing.get('providerObservation', {})
+        if billing.get('closedReason') == 'PAYMENT_REFUNDED' and before.get('payment_status') != after.get('payment_status'):
+            return _utc(observed.get('checkedAt')) == snapshot.observedAt
+        expected = before.get('payment_status')
+        if snapshot.outcome == 'authorized' and expected in ('created', 'pending_provider_ack'):
+            expected = 'authorized'
+        return after.get('payment_status') == expected and _utc(observed.get('checkedAt')) == snapshot.observedAt
+
+    def openReservedCheckout(self, intent):
+        """Submit only an already committed original reservation."""
         if intent.razorpayOrderId or intent.state not in ('created', 'pending_provider_ack', 'authorized'):
             # Historical-key replays retain closed intent identity. They
             # must never submit or recover an unsubmitted cancelled order.
             return intent
         if self.razorpayClient is None:
             raise RuntimeError('PAYMENT_PROVIDER_NOT_CONFIGURED')
+        paymentRulesEffectiveAt()  # unset or invalid cutoff: no new Order may open
+        # The Order is told exactly the window recorded on the attempt at reservation.
+        options = orderPaymentOptions(intent.snapshot.get('captureWindowMinutes'))
+        providerOptions = purchaseProviderOptions()
         if not self.repository.claimProviderOrderCreation(intent.attemptId):
             from api.services.billing.manualBillingRecoveryService import ManualBillingRecoveryService
-            attempt = self.repository.attemptById(request.userId, intent.attemptId)
+            attempt = self.repository.attemptById(intent.userId, intent.attemptId)
+            if not attempt.get('provider_order_id') and attempt.get('payment_status') not in ('created', 'pending_provider_ack', 'authorized'):
+                # Replaced by a concurrent Pay before this Order was requested: nothing was sent.
+                raise RuntimeError('PAYMENT_SERVICE_BUSY')
             ManualBillingRecoveryService(self.repository, self.razorpayClient).recoverAttempt(attempt)
-            attempt = self.repository.attemptById(request.userId, intent.attemptId)
+            attempt = self.repository.attemptById(intent.userId, intent.attemptId)
             intent = self.repository._intentFromAttemptRow(attempt,
-                self.repository._json(attempt.get('metadata_json')), request.userId, request.purpose)
+                self.repository._json(attempt.get('metadata_json')), intent.userId, intent.purpose)
             if not intent.razorpayOrderId:
                 raise RuntimeError('ORDER_ACK_UNKNOWN')
             return intent
-        noteType = _PURPOSE_ORDER_NOTE_TYPES[request.purpose]
-        if request.purpose == 'renewal' and request.billingMode == 'annual_prepaid':
+        noteType = _PURPOSE_ORDER_NOTE_TYPES[intent.purpose]
+        if intent.purpose == 'renewal' and intent.billingMode == 'annual_prepaid':
             noteType = 'annual_renewal'
-        notes = {'userId': request.userId, 'invoiceId': intent.invoiceId,
-            'attemptId': intent.attemptId, 'type': noteType, 'purpose': request.purpose,
-            'billingMode': request.billingMode, 'domains': ', '.join(intent.snapshot.get('domains') or [])}
-        if request.purpose == 'topup':
+        notes = {'userId': intent.userId, 'invoiceId': intent.invoiceId,
+            'attemptId': intent.attemptId, 'type': noteType, 'purpose': intent.purpose,
+            'billingMode': intent.billingMode, 'domains': ', '.join(intent.snapshot.get('domains') or [])}
+        if intent.purpose == 'topup':
             notes.update(packId=intent.snapshot['packId'], tokens=str(intent.snapshot['tokens']))
+        payload = {'amount': intent.amount, 'currency': intent.currency, 'receipt': intent.attemptId, 'notes': notes}
+        payload['payment'] = options
         try:
-            order = self.razorpayClient.order.create({'amount': intent.amount, 'currency': intent.currency,
-                'receipt': intent.attemptId, 'notes': notes})
+            order = self.razorpayClient.order.create(payload, **providerOptions)
             if (not order.get('id') or int(order.get('amount', -1)) != intent.amount
                     or order.get('currency') != intent.currency):
                 raise ValueError('PROVIDER_ORDER_EVIDENCE_MISMATCH')
             return self.repository.bindProviderOrder(intent.attemptId, order)
+        except BadRequestError as exc:
+            # A provider 4xx proves no Order exists: close now, no recovery wait.
+            if not self.repository.closeUncreatedOrder(intent.attemptId, providerRejected=True):
+                # Another transaction may already have bound the Order. Never
+                # claim absence or overwrite that committed financial identity.
+                raise RuntimeError('ORDER_ACK_UNKNOWN') from exc
+            raise RuntimeError('PAYMENT_SERVICE_BUSY') from exc
         except Exception as exc:
             raise RuntimeError('ORDER_ACK_UNKNOWN') from exc
 
-    # -- idempotency helpers --------------------------------------------------
+    def createCheckout(self, request: CheckoutRequest) -> CheckoutIntent:
+        """Reserve durably before opening or reusing the provider Order."""
+        if not isinstance(request, CheckoutRequest):
+            raise TypeError('Production checkout requires CheckoutRequest')
+        return self._createDurableCheckout(request)
 
-    @staticmethod
-    def _payloadHash(payload: dict) -> str:
-        normalized = json.dumps(payload, sort_keys=True, separators=(",", ":"))
-        return hashlib.sha256(normalized.encode("utf-8")).hexdigest()
-
-    def _requestKeyNamespace(self, userId: str, purpose: str, requestKey: str) -> str:
-        return f"{purpose}:{userId}:{requestKey}"
-
-    # -- checkout --------------------------------------------------------------
-
-    def createCheckout(
-        self,
-        userId: str | CheckoutRequest,
-        purpose: str = None,
-        payload: dict = None,
-        requestKey: str = None,
-    ) -> CheckoutIntent:
-        """Create (or idempotently return) a customer-free checkout intent.
-
-        Reserves the durable intent BEFORE the provider call; if the order
-        acknowledgement is unknown the attempt stays pending_provider_ack for
-        reconciliation instead of creating a second charge opportunity.
-        """
-        if self.repository is not None:
-            if not isinstance(userId, CheckoutRequest):
-                raise TypeError('Production checkout requires CheckoutRequest')
-            return self._createDurableCheckout(userId)
-        if not requestKey:
-            raise ValueError("requestKey is required")
-        payloadHash = self._payloadHash(payload)
-        namespace = self._requestKeyNamespace(userId, purpose, requestKey)
-
-        existing = self.store.findIntent(namespace)
-        if existing is not None:
-            if existing.payloadHash != payloadHash:
-                raise ValueError(
-                    "IDEMPOTENCY_CONFLICT: same request key with a different payload"
-                )
-            return existing
-
-        amount = int(payload.get("amount") or 0)
-        currency = str(payload.get("currency") or "INR")
-        expiresAt = self._resolveAttemptExpiry(userId, purpose, payload)
-
-        attempt = CheckoutIntent(
-            attemptId=namespace,
-            invoiceId=str(payload.get("invoiceId") or "") or "",
-            userId=userId,
-            lifecycleId=str(payload.get("lifecycleId") or "") or "",
-            purpose=purpose,
-            billingMode=str(payload.get("billingMode") or "monthly_prepaid"),
-            payloadHash=payloadHash,
-            currency=currency,
-            state="created",
-            revision=int(payload.get("revision") or 1),
-            amount=amount,
-            expiresAt=expiresAt,
-            razorpayOrderId=None,
-            snapshot=dict(payload),
-        )
-        self._intents = None  # intents live in the shared store
-        self.store.saveIntent(namespace, attempt)
-
-        if self.razorpayClient is None:
-            return attempt
-
-        orderPayload = {
-            "amount": amount,
-            "currency": currency,
-            "notes": {
-                "userId": userId,
-                "type": _PURPOSE_ORDER_NOTE_TYPES.get(purpose, purpose),
-                "purpose": purpose,
-                "invoiceId": attempt.invoiceId,
-                "billingMode": attempt.billingMode,
-                "domains": ", ".join(payload.get("domains") or []),
-            },
-        }
-        receipt = payload.get("receipt")
-        if receipt:
-            orderPayload["receipt"] = receipt
-        # No customer_id, no token enrollment, no recurring fields. Ever.
-
-        try:
-            order = self.razorpayClient.order.create(orderPayload)
-        except Exception:
-            # The reserved intent persists (pending_provider_ack concept);
-            # creation failure must not create a second order opportunity on
-            # retry with the same key.
-            object.__setattr__(attempt, "state", "pending_provider_ack")
-            raise
-
-        object.__setattr__(attempt, "razorpayOrderId", order.get("id"))
-        object.__setattr__(attempt, "state", "pending_provider_ack")
-        return attempt
-
-    def recoverUnresolvedCheckout(
-        self,
-        userId: str,
-        purpose: str,
-        requestKey: str,
-    ) -> CheckoutIntent:
-        """Return the stored pending intent for an unresolved order creation.
-
-        Recovery resolves the original correlation through supported
-        provider evidence (reconciliation); it never blindly issues another
-        charge opportunity.
-        """
-        namespace = self._requestKeyNamespace(userId, purpose, requestKey)
-        existing = self.store.findIntent(namespace)
-        if existing is None:
-            raise ValueError(
-                f"No reserved intent for {namespace}: unknown order creation "
-                "is investigated money, not a new order"
-            )
-        return existing
-
-    def _resolveAttemptExpiry(
-        self, userId: str, purpose: str, payload: dict
-    ) -> datetime:
-        """Local attempt lifetime.
-
-        initial/topup: created + TTL. renewal/expert_addition: the earlier of
-        created + TTL and the current period end (monthly deadline).
-        """
-        now = self.now()
-        expiry = now + timedelta(seconds=MANUAL_CHECKOUT_TTL_SECONDS)
-        periodEnd = payload.get("currentPeriodEnd")
-        if purpose in ("renewal", "expert_addition") and periodEnd:
-            from api.services.subscriptions.paymentValidationService import parseUtc
-
-            parsedEnd = parseUtc(periodEnd)
-            if parsedEnd is not None and parsedEnd < expiry:
-                expiry = parsedEnd
-        return expiry
-
-    # -- shared finalization ----------------------------------------------------
-
-    def finalizeCapturedPayment(
-        self,
-        evidence: VerifiedPaymentEvidence,
-        attemptClosed: bool = False,
-    ) -> FinalizationResult:
-        """One authorized finalization per invoice.
-
-        Rules (audited design 8.1-8.3):
-        - authorized-only evidence never grants;
-        - missing capture timing is reconciliation, never created_at fallback;
-        - two distinct captures on one invoice grant once, excess money is a
-          tracked anomaly;
-        - failure after capture cannot downgrade the committed outcome;
-        - a capture against a closed attempt is a financial anomaly, never a
-          grant.
-        """
-        if self.repository is not None:
-            return self.repository.finalizeCapturedPayment(evidence)
-        invoiceId = evidence.invoiceId
-        operationKey = f"finalize:{invoiceId}"
-
-        financialStatus = (evidence.financialStatus or "").lower()
-
-        # Capture evidence gate: never infer capture time from created_at.
-        if financialStatus == "captured" and not evidence.timingVerified:
-            if evidence.provenCaptureAt is not None and evidence.timingKind != "payment_created_at_only":
-                pass  # verified by another admissible evidence kind
-            else:
-                return FinalizationResult(
-                    invoiceId=invoiceId,
-                    attemptId=evidence.attemptId,
-                    state="requires_reconciliation",
-                    creditState="pending",
-                    finalized=False,
-                    creditsRefilled=False,
-                    renewalOptOut=False,
-                    currentPeriod=None,
-                    nextPeriod=None,
-                    anomalyId=None,
-                )
-
-        if financialStatus != "captured":
-            if financialStatus in ("authorized", "created"):
-                return FinalizationResult(
-                    invoiceId=invoiceId,
-                    attemptId=evidence.attemptId,
-                    state="awaiting_capture",
-                    creditState="pending",
-                    finalized=False,
-                    creditsRefilled=False,
-                    renewalOptOut=False,
-                    currentPeriod=None,
-                    nextPeriod=None,
-                    anomalyId=None,
-                )
-            if financialStatus == "failed":
-                # failed is not a terminal money state: the same payment may
-                # capture later. A committed grant is never downgraded.
-                claimed, committed = self.store.claimFinalization(
-                    invoiceId, operationKey, {"paymentId": evidence.providerPaymentId, "state": "captured"}
-                )
-                if claimed is None and committed.get("state") == "captured":
-                    return self._resultFromCommitted(invoiceId, evidence, "already_finalized")
-                return FinalizationResult(
-                    invoiceId=invoiceId,
-                    attemptId=evidence.attemptId,
-                    state="payment_failed",
-                    creditState="pending",
-                    finalized=False,
-                    creditsRefilled=False,
-                    renewalOptOut=False,
-                    currentPeriod=None,
-                    nextPeriod=None,
-                    anomalyId=None,
-                )
-
-        # Captured evidence.
-        if attemptClosed:
-            self.store.recordAnomaly({
-                "kind": "capture_against_closed_attempt",
-                "invoiceId": invoiceId,
-                "paymentId": evidence.providerPaymentId,
-                "observedAt": evidence.observedAt.isoformat(),
-            })
-            return FinalizationResult(
-                invoiceId=invoiceId,
-                attemptId=evidence.attemptId,
-                state="requires_reconciliation",
-                creditState="pending",
-                finalized=False,
-                creditsRefilled=False,
-                renewalOptOut=False,
-                currentPeriod=None,
-                nextPeriod=None,
-                anomalyId=None,
-            )
-
-        claimed, committed = self.store.claimFinalization(
-            invoiceId,
-            operationKey,
-            {
-                "paymentId": evidence.providerPaymentId,
-                "state": "captured",
-                "amount": evidence.amount,
-                "currency": evidence.currency,
-            },
-        )
-        if claimed is None:
-            committedPayment = committed.get("paymentId")
-            if committedPayment != evidence.providerPaymentId:
-                # A second distinct capture for one invoice: grant once,
-                # track the excess funds.
-                self.store.recordAnomaly({
-                    "kind": "duplicate_capture_for_invoice",
-                    "invoiceId": invoiceId,
-                    "paymentId": evidence.providerPaymentId,
-                    "committedPaymentId": committedPayment,
-                    "amount": evidence.amount,
-                    "currency": evidence.currency,
-                })
-            return self._resultFromCommitted(invoiceId, evidence, "already_finalized")
-
-        return self._resultFromCommitted(invoiceId, evidence, "finalized")
-
-    def _resultFromCommitted(
-        self,
-        invoiceId: str,
-        evidence: VerifiedPaymentEvidence,
-        state: str,
-    ) -> FinalizationResult:
-        finalized = state in ("finalized", "already_finalized")
-        return FinalizationResult(
-            invoiceId=invoiceId,
-            attemptId=evidence.attemptId,
-            state=state,
-            creditState="pending_materialization",
-            finalized=True if finalized else False,
-            creditsRefilled=False,
-            renewalOptOut=False,
-            currentPeriod=None,
-            nextPeriod=None,
-            anomalyId=None,
-        )
+    def finalizeCapturedPayment(self, evidence: VerifiedPaymentEvidence) -> FinalizationResult:
+        """Grant or reserve a full refund under the repository's owner transaction."""
+        return self.repository.finalizeCapturedPayment(evidence)
 
     # -- provider evidence -------------------------------------------------------
 
@@ -466,6 +201,7 @@ class ManualPaymentService:
         payment entity carrying captured_at is treated as provider-attested
         evidence when the caller explicitly validated the fetch.
         """
+        from api.services.billing.captureRules import providerCreatedAt
         status = str(payment.get("status") or "").lower()
         capturedAt = payment.get("captured_at")
         provenCaptureAt = None
@@ -497,6 +233,7 @@ class ManualPaymentService:
             provenCaptureAt=provenCaptureAt,
             sourceEventId=sourceEventId,
             timingVerified=timingVerified,
+            paymentCreatedAt=providerCreatedAt(payment),
         )
 
 

@@ -839,9 +839,9 @@ class CreditService:
             'tokens': int(frozen['tokens']) if result['finalized'] else 0,
             'disposition': result['state'], 'anomalyId': result['anomalyId']}
 
-    def clawbackTopupTokens(self,userId,refundId,paymentId,refundAmount):
+    def clawbackTopupTokens(self,userId,refundId,paymentId,refundAmount,*,paymentEvidence=None):
         from api.services.credits.manualCreditRepository import ManualCreditRepository
-        return ManualCreditRepository().clawbackTopup(userId,refundId,paymentId,int(refundAmount))
+        return ManualCreditRepository().clawbackTopup(userId,refundId,paymentId,int(refundAmount),paymentEvidence=paymentEvidence)
 
     def reconcile(self, userId: str) -> None:
         """

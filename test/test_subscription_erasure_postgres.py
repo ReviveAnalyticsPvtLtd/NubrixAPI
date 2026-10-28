@@ -28,7 +28,20 @@ def erasureDb(runtimeDb):
         cursor.execute((root/'supabase/migrations/20260823190224_create_user_erasure_workflow.sql').read_text())
         for path in (root/'supabase/migrations').glob('*_complete_subscription_erasure_retention.sql'):
             cursor.execute(path.read_text())
+        # The legacy fixture allowlist installs additive storage before this
+        # fixture's retention schema. Reapply its idempotent archive extension.
+        for path in (root/'supabase/migrations').glob('*_add_editable_purchase_checkout.sql'):
+            cursor.execute(path.read_text())
     return runtimeDb
+
+
+def test_retained_sources_are_the_payment_storage_tables(erasureDb):
+    definition = query(erasureDb,"""SELECT pg_get_constraintdef(oid) AS definition FROM pg_constraint
+        WHERE conname='retained_user_records_source_table_check'""",one=True)['definition']
+    for table in ('billing_events','Invoices','payment_slots','payment_slot_controls','payment_operations'):
+        assert "'"+table+"'" in definition
+    for retired in ('subscription_purchase_checkout_controls','subscription_purchase_operations'):
+        assert retired not in definition
 
 
 def startErasure(url,user):
@@ -147,8 +160,8 @@ def test_recovery_of_stale_original_snapshot_is_financial_only(account):
     runErasure(url,initial.userId)
     payment = {'id':'pay-'+intent.attemptId,'order_id':order,'amount':intent.amount,'currency':'INR','status':'captured'}
     provider = SimpleNamespace(order=SimpleNamespace(
-        fetch=lambda _:dict(id=order,amount=intent.amount,currency='INR',status='paid'),
-        payments=lambda *_:{'items':[payment]}))
+        fetch=lambda _,**options:dict(id=order,amount=intent.amount,currency='INR',status='paid'),
+        payments=lambda *_,**options:{'items':[payment]}))
     assert ManualBillingRecoveryService(repo,provider).recoverAttempt(before)==1
     assert repo.attemptForOrder(order)['user_id'] is None
     assert query(url,'SELECT user_id FROM credit_balances WHERE user_id=%s',(initial.userId,))==[]

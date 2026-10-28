@@ -89,6 +89,9 @@ class SqlConnection:
             return _now().isoformat()
         self.connection.create_function("clock_timestamp", 0, wallClock)
         self.connection.create_function("pg_advisory_xact_lock", 1, lambda _: 1)
+        self.connection.create_function('to_regclass', 1, lambda name:
+            name if self.connection.execute('SELECT 1 FROM sqlite_master WHERE type=\'table\' AND name=?',
+                                            (name.split('.')[-1],)).fetchone() else None)
 
     def cursor(self, **kwargs):
         return SqlCursor(self.connection.cursor())
@@ -400,17 +403,6 @@ def test_monthly_attempt_ttl_can_replace_known_expired_order(database):
     with patch(__name__ + '.NOW', NOW+timedelta(minutes=31)):
         replacement=repository.reserveCheckoutIntent(USER,'renewal','renewal-key','snapshot-hash',snapshot)
     assert replacement.attemptId != attempt.attemptId and replacement.revision==2
-
-
-def test_expert_cancellation_closes_bundle_under_same_capture_lock(database):
-    repository,path=database
-    repository.finalizeCapturedPayment(seed_payment(database))
-    seed_payment(database,'expert_addition','invoice-two','order-two',['telecom'])
-    result=repository.cancelExpertAddition(USER,'telecom')
-    assert result['closedAttemptDomains']==['telecom']
-    with sqlTransaction(path) as connection:
-        assert connection.execute('SELECT status FROM "Invoices" WHERE id=\'invoice-two\'').fetchone()[0]=='VOID'
-        assert connection.execute('SELECT payment_status FROM billing_events WHERE provider_order_id=\'order-two\'').fetchone()[0]=='cancelled'
 
 
 def test_production_checkout_and_browser_finalizer_use_same_repository(database):

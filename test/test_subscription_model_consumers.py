@@ -322,13 +322,15 @@ def test_reconciliation_still_recovers_money_before_closing_checkouts(monkeypatc
     repository = SimpleNamespace(expireStaleCheckouts=lambda:calls.append('expire') or {})
     monkeypatch.setattr('api.services.billing.manualBillingRepository.getManualBillingRepository',lambda:repository)
     monkeypatch.setattr(ManualBillingRecoveryService,'execute',lambda self:calls.append('recover') or {})
+    monkeypatch.setattr('api.services.billing.paymentOperationWorker.PaymentOperationWorker.execute',
+        lambda self:calls.append('purchase') or {})
     monkeypatch.setattr(ManualCreditRepository,'recoverUsage',lambda self:{})
     task = ReconciliationTask.__new__(ReconciliationTask)
     task.razorpayClient = object()
     task._reconcileStaleAttempts = lambda:{'resolved':0,'errors':0}
     task._generateAnomalyReport = lambda:{'totalAnomalies':0}
     task.execute()
-    assert calls == ['recover','expire']
+    assert calls == ['recover','purchase','expire']
 
 
 def test_cancellation_notice_with_old_paid_end_cannot_dispatch(unified):

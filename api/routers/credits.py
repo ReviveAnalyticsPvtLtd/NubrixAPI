@@ -32,7 +32,7 @@ _TOPUP_ERROR_STATUS = {
 
 
 @router.get("/balance")
-async def getCreditBalance(user: UserContext = Depends(verifyUser)):
+def getCreditBalance(user: UserContext = Depends(verifyUser)):
     """
     Return the current credit balance for the authenticated user.
 
@@ -62,7 +62,7 @@ async def getCreditBalance(user: UserContext = Depends(verifyUser)):
 
 
 @router.get("/usage")
-async def getCreditUsage(user: UserContext = Depends(verifyUser)):
+def getCreditUsage(user: UserContext = Depends(verifyUser)):
     """
     Return a summary of recent token usage for the authenticated user.
 
@@ -219,7 +219,7 @@ def getTopupPacks(token=Depends(verifyToken)):
 
 
 @router.post("/topup/order")
-async def createTopupOrder(
+def createTopupOrder(
     request: CreateTopupOrderRequest,
     token=Depends(verifyToken),
     requestKey: str | None = Header(default=None, alias="Idempotency-Key", min_length=1, max_length=128)
@@ -257,7 +257,7 @@ async def createTopupOrder(
 
 
 @router.post("/topup/verify")
-async def verifyTopupPayment(
+def verifyTopupPayment(
     payload: VerifyTopupPaymentRequest,
     token=Depends(verifyToken)
 ):

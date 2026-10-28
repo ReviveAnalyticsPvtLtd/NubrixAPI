@@ -521,18 +521,6 @@ class SubscriptionService:
             raise Exception(f"Invalid domains: {', '.join(invalidDomains)}")
         return normalizedDomains
 
-    def _normalizeSingleDomain(self, domain: str) -> str:
-        """
-        Normalize and validate a single domain value.
-
-        Args:
-            domain (str): Raw domain input.
-
-        Returns:
-            str: Normalized domain value.
-        """
-        return self._normalizeAndValidateDomains([domain])[0]
-
     _STALE_ORDER_THRESHOLD_MINUTES = 30
 
     def _reconcilePendingAdditions(self, subscription: dict) -> dict:
@@ -687,9 +675,6 @@ class SubscriptionService:
             )
             userId = decodedToken.get("userId")
             userEmail = decodedToken.get("email")
-            currentTime = datetime.datetime.now(datetime.timezone.utc)
-            trialDurationDays = 12
-            trialExpiry = currentTime + datetime.timedelta(days=trialDurationDays)
             experts = ["banking", "manufacturing", "supplychain", "telecom"]
             from api.services.billing.manualBillingRepository import getManualBillingRepository
             repository = getManualBillingRepository()
@@ -699,7 +684,11 @@ class SubscriptionService:
             except ValueError as exc:
                 raise CustomException(exc, statusCode=409,
                     uiMessage="A free trial is not available for this account.") from exc
-            trialExpiry = activated['current_period_end']
+            from api.services.subscriptions.subscriptionCompatibility import getSubscriptionModelPhase
+            unified = getSubscriptionModelPhase() in ('dual', 'v2', 'contracted')
+            currentTime = activated['trial_started_at' if unified else 'current_period_start']
+            trialExpiry = activated['trial_ends_at' if unified else 'current_period_end']
+            trialDurationDays = (trialExpiry - currentTime).days
             records = self.client.table("Users").select("fullName").eq("userId", userId).limit(1).execute()
             name = records.data[0]["fullName"] if records.data else userEmail
             self._sendFreeTrialEmail(email=userEmail, name=name)
@@ -904,45 +893,6 @@ class SubscriptionService:
 
 
 
-
-    def cancelPendingAddition(self, domain: str, token: str) -> dict:
-        """
-        Cancel an unpaid pending domain addition durably.
-
-        The whole shared-order bundle for the original order is closed with
-        a cancelled state (evidence preserved), so a later capture can never
-        activate experts from that attempt. A newly priced attempt may be
-        created for any remaining desired selection.
-
-        Args:
-            domain (str): The domain to cancel.
-            token (str): Authorization token.
-
-        Returns:
-            dict: Cancellation result with the closed bundle evidence.
-        """
-        try:
-            normalizedDomain = self._normalizeSingleDomain(domain)
-            decodedToken = jwt.decode(
-                token,
-                os.environ["SECRET_KEY"],
-                algorithms=["HS256"]
-            )
-            userId = decodedToken.get("userId")
-            userRecord = self.client.table("Users") \
-                .select("userId") \
-                .eq("userId", userId) \
-                .execute()
-            if not userRecord.data:
-                raise Exception("User not found")
-            from api.services.billing.manualBillingRepository import getManualBillingRepository
-            return getManualBillingRepository().cancelExpertAddition(userId, normalizedDomain)
-        except CustomException:
-            raise
-        except ValueError as error:
-            raise CustomException(error, statusCode=409, uiMessage=str(error)) from error
-        except Exception as error:
-            raise CustomException(error) from error
 
     def cancelSubscription(self, reason: str | None, token: str) -> dict:
         """
@@ -1193,6 +1143,12 @@ class SubscriptionService:
                     CheckoutRequest(userId, purpose, mode, payload, requestKey, currency=currency,
                                     requiresExistingAttempt=requiresExistingAttempt, expectedCatalogRevision=expectedCatalogRevision))
             except (RuntimeError, TimeoutError, ConnectionError) as exc:
+                if str(exc) == 'PAYMENT_SERVICE_BUSY':
+                    raise CustomException(exc, statusCode=503, errorCode='PAYMENT_SERVICE_BUSY',
+                        uiMessage='Payment service is busy. Please try again in a moment.') from exc
+                if str(exc) == 'PAYMENT_ACTIONS_UNAVAILABLE':
+                    raise CustomException(exc, statusCode=503, errorCode='PAYMENT_ACTIONS_UNAVAILABLE',
+                        uiMessage='Payments are temporarily unavailable. Please try again in a moment.') from exc
                 raise CustomException(exc, statusCode=503,
                     uiMessage='Checkout creation is being reconciled. Please try again later.') from exc
             identity = self._resolveCheckoutIdentity(userId, decoded.get('email'))
@@ -1287,11 +1243,14 @@ class SubscriptionService:
         if paymentEntity.get("order_id") != orderId or paymentEntity.get("id") != paymentId:
             raise ValueError("PAYMENT_ORDER_MISMATCH")
         from api.services.billing.manualPaymentService import ManualPaymentService
+        from api.services.billing.captureRules import providerCreatedAt
+        # The signed webhook payload or authenticated fetch carries the provider's payment start time.
         result = ManualPaymentService.forProduction(self.razorpayClient, repository).finalizeCapturedPayment(VerifiedPaymentEvidence(
             str(attempt["id"]), str(invoiceId), attempt["user_id"], orderId, paymentId,
             frozen.get("purpose", "erased_checkout") if attempt['user_id'] is None else frozen["purpose"], str(paymentEntity.get("currency") or ""),
             str(paymentEntity.get("status") or "").lower(), "server_observation",
-            int(paymentEntity.get("amount") or 0), now or utcNow(), None, None, False))
+            int(paymentEntity.get("amount") or 0), now or utcNow(), None, None, False,
+            paymentCreatedAt=providerCreatedAt(paymentEntity)))
         from api.services.billing.manualBillingPresentation import serializeFinalizationResult
         return serializeFinalizationResult(result)
 

@@ -24,6 +24,7 @@ from datetime import datetime, timedelta, timezone
 import psycopg2
 from psycopg2.extras import Json, RealDictCursor
 
+from api.services.billing.paymentPolicy import captureWindowMinutes
 from api.services.billing.manualBillingContracts import (
     CheckoutIntent,
     CheckoutProviderSnapshot,
@@ -76,6 +77,19 @@ def _isoText(value):
     return value.isoformat() if isinstance(value, datetime) else value
 
 
+def _commitNotificationIntentLocked(cursor, intent: dict, occurredAt: datetime | None = None) -> None:
+    """Commit one customer email intent in the caller's transaction, once per dedupe key.
+
+    The notification bridge delivers it. An intent already committed under the key is left as it is;
+    ``occurredAt`` defaults to the database clock.
+    """
+    cursor.execute('''insert into public.billing_events(id,user_id,subscription_id,event_category,
+        event_type,event_status,idempotency_key,metadata_json,occurred_at)
+        values(%s,%s,%s,'notification','email.billing_intent.committed','COMMITTED',%s,%s,coalesce(%s::timestamptz,clock_timestamp()))
+        on conflict(idempotency_key) where idempotency_key is not null do nothing''',
+        (str(uuid.uuid4()),intent['userId'],intent['subscriptionId'],'notification:'+intent['dedupeKey'],Json(intent),occurredAt))
+
+
 def _payloadHash(payload: dict) -> str:
     normalized = json.dumps(payload, sort_keys=True, separators=(",", ":"))
     return hashlib.sha256(normalized.encode("utf-8")).hexdigest()
@@ -119,7 +133,7 @@ class ManualBillingRepository:
         except (ValueError, KeyError, TypeError) as exc:
             from api.services.subscriptions.subscriptionModel import SubscriptionAuthorityUnavailable
             raise SubscriptionAuthorityUnavailable('Owned historical service requires review') from exc
-        unresolved, attempts = unresolvedMoneyFacts(invoices, events)
+        unresolved, attempts = unresolvedMoneyFacts(invoices, events, now)
         current = next((p for p in effective if p.start <= now < p.end and (p.revokedAt is None or now < p.revokedAt)), None)
         selection = model.loadNextSelection(cursor, str(subscription['id']), lifecycle, current.end) if current else None
         return SubscriptionFacts(subscription['user_id'], str(subscription['id']), lifecycle,
@@ -170,14 +184,6 @@ class ManualBillingRepository:
                 return self._purchaseContextLocked(cursor, row, coverage, evaluated)
         return self._run(operation)
 
-    def _pendingExpertAttemptsLocked(self, cursor, subscription, periodId):
-        cursor.execute("""SELECT * FROM public.billing_events WHERE user_id=%s AND subscription_id=%s
-            AND event_category='payment_attempt' AND payment_status IN ('created','pending_provider_ack','authorized')
-            ORDER BY id FOR UPDATE""", (subscription['user_id'], subscription['id']))
-        return [a for a in cursor.fetchall() if self._json(a.get('metadata_json')).get('manualBilling', {}).get('purpose') == 'expert_addition'
-                and self._json(a['metadata_json'])['manualBilling'].get('servicePeriodId') == periodId
-                and not self._json(a['metadata_json'])['manualBilling'].get('closedAt')]
-
     def __init__(self, connectionFactory=None):
         self.connectionFactory = connectionFactory or defaultConnectionFactory
 
@@ -221,6 +227,24 @@ class ManualBillingRepository:
                     (Json({'lastRecoveryAt':_now().isoformat(),'lastRecoveryOutcome':outcome or 'checked'}),eventId))
         return self._run(operation)
 
+    def recentCaptureRecoveryRows(self,limit=50):
+        """Bounded fair minute inventory, independent of writes caused by ordinary status polls."""
+        if type(limit) is not int or not 1 <= limit <= 100:
+            raise ValueError('INVALID_CAPTURE_RECOVERY_LIMIT')
+        def operation(connection):
+            with connection.cursor(cursor_factory=RealDictCursor) as cursor:
+                cursor.execute('''SELECT * FROM public.billing_events WHERE event_category='payment_attempt'
+                    AND metadata_json->'manualBilling' IS NOT NULL AND payment_status<>'captured'
+                    AND (payment_status IN ('created','pending_provider_ack','authorized')
+                      OR (metadata_json->'manualBilling'->>'closedAt' IS NOT NULL
+                        AND metadata_json->'manualBilling'->>'closureReconciledAt' IS NULL))
+                    AND (metadata_json->>'lastRecoveryAt' IS NULL
+                      OR (metadata_json->>'lastRecoveryAt')::timestamptz<=clock_timestamp()-interval '45 seconds')
+                    ORDER BY coalesce((metadata_json->>'lastRecoveryAt')::timestamptz,attempted_at,created_at),id
+                    LIMIT %s''',(limit,))
+                return list(cursor.fetchall())
+        return self._run(operation)
+
     def _refreshFinancialOwnerLocked(self,cursor,eventId,owner):
         """Erasure can commit between the optimistic owner read and its lock."""
         cursor.execute('SELECT user_id FROM public.billing_events WHERE id=%s',(eventId,))
@@ -233,7 +257,14 @@ class ManualBillingRepository:
             self._lockUser(cursor,None)
         return {**owner,'user_id':current['user_id']}
 
-    def markClosedAttemptReconciled(self, attemptId):
+    def recordClosedAttemptScan(self, attemptId, snapshot):
+        """Settle a closed attempt's recovery scan from one complete provider listing of its Order.
+
+        A superseded attempt stays in the scan until recover_until (its newest payment's provider
+        created_at plus the attempt's capture window); a payment started later extends it, since
+        Razorpay can late-authorize until then. Other closures end on an empty unpaid listing.
+        Returns True when the closure is now reconciled.
+        """
         def operation(connection):
             with connection.cursor(cursor_factory=RealDictCursor) as cursor:
                 cursor.execute('select user_id from public.billing_events where id=%s',(attemptId,))
@@ -245,12 +276,52 @@ class ManualBillingRepository:
                 if owner['user_id'] is not None:
                     self._canonical(cursor,owner['user_id'])
                 cursor.execute('select metadata_json from public.billing_events where id=%s for update',(attemptId,))
-                row = cursor.fetchone()
-                metadata = self._json(row['metadata_json'])
-                if metadata.get('manualBilling',{}).get('closedAt'):
-                    metadata['manualBilling']['closureReconciledAt'] = _now().isoformat()
-                    cursor.execute('update public.billing_events set metadata_json=%s where id=%s',(Json(metadata),attemptId))
+                metadata = self._json(cursor.fetchone()['metadata_json'])
+                billing = metadata.get('manualBilling', {})
+                if not billing.get('closedAt') or billing.get('closureReconciledAt'):
+                    return False
+                if not snapshot.complete or snapshot.attemptId != str(attemptId):
+                    return False
+                cursor.execute('select clock_timestamp() as current_time')
+                now = _utc(cursor.fetchone()['current_time'])
+                if billing.get('closedReason') in self._SLOT_CLOSURES:
+                    if now < self._supersededRecoverUntilLocked(cursor, attemptId, billing, snapshot):
+                        return False
+                elif snapshot.outcome != 'unpaid' or snapshot.payments:
+                    return False
+                billing['closureReconciledAt'] = now.isoformat()
+                cursor.execute('update public.billing_events set metadata_json=%s where id=%s',(Json(metadata),attemptId))
+                return True
         return self._run(operation)
+
+    # Closures that leave a payable Order behind: scanned until recover_until (spec 4.3, 4.4).
+    _SLOT_CLOSURES = ('SUPERSEDED', 'SLOT_SETTLED', 'PAYMENT_REFUNDED')
+
+    def _supersededRecoverUntilLocked(self, cursor, attemptId, billing, snapshot):
+        from api.services.billing.purchaseCheckoutRepository import _storagePresent
+        from api.services.billing.paymentSlots import checkoutTtlSeconds, supersededRecoverUntil
+        minutes = int(billing.get('captureWindowMinutes') or captureWindowMinutes())
+        window = timedelta(minutes=minutes)
+        started = [datetime.fromtimestamp(p['created_at'], timezone.utc) for p in snapshot.payments
+                   if isinstance(p.get('created_at'), (int, float)) and not isinstance(p.get('created_at'), bool)]
+        recorded = _utc(billing.get('providerObservation', {}).get('latestPaymentCreatedAt'))
+        latest = max([*started, *([recorded] if recorded else [])], default=None)
+        follows = latest + window if latest else None
+        if _storagePresent(cursor):
+            cursor.execute('select recover_until from public.payment_slot_controls where attempt_id=%s for update', (attemptId,))
+            control = cursor.fetchone()
+            if control is not None:
+                until = _utc(control['recover_until'])
+                if follows is not None and (until is None or follows > until):
+                    # A payment started after the one recover_until was based on: keep scanning for it.
+                    cursor.execute('''update public.payment_slot_controls set recover_until=%s,
+                        operation_revision=operation_revision+1,updated_at=clock_timestamp() where attempt_id=%s''',
+                        (follows, attemptId))
+                    until = follows
+                if until is not None:
+                    return until
+        return supersededRecoverUntil(_utc(billing['closedAt']), _utc(billing.get('expiresAt')), latest,
+                                      minutes, checkoutTtlSeconds())
 
     def orderlessRecoveryRows(self, userId, purpose, mode):
         def operation(connection):
@@ -260,23 +331,207 @@ class ManualBillingRepository:
                     and payment_status='pending_provider_ack' order by id''', (userId,))
                 return [row for row in cursor.fetchall()
                         if self._json(row.get('metadata_json')).get('manualBilling', {}).get('purpose') == purpose
-                        and self._json(row.get('metadata_json')).get('manualBilling', {}).get('billingMode') == mode]
+                        and (mode is None or self._json(row.get('metadata_json')).get('manualBilling', {}).get('billingMode') == mode)]
         return self._run(operation)
 
-    def renewalRecoveryRows(self, userId, mode, invoiceId):
+    _LIVE_STATUSES = ('created', 'pending_provider_ack', 'authorized')
+
+    def _requestSlotLocked(self, cursor, request, subscription, now):
+        """(kind, key) of the slot a request buys in; key None when the request names no payable slot.
+
+        Renewal of the next term uses ISO(current term end); a renewal whose period already started
+        with no current term buys the open Pro term, like a repurchase (spec 4.1). The caller supplies
+        that period-start <= now check, since slotKey has no clock.
+        """
+        from api.services.billing.paymentSlots import slotKey, slotKind
+        kind = slotKind(request.purpose)
+        try:
+            if request.purpose == 'renewal':
+                cursor.execute('select period_start from public."Invoices" where id=%s and "userId"=%s',
+                               (request.payload.get('invoiceId'), request.userId))
+                invoice = cursor.fetchone()
+                start = _utc(invoice.get('period_start')) if invoice else None
+                if start is None:
+                    return kind, None
+                return kind, slotKey('renewal', currentTermEnd=start if start > now else None, renewalPeriodStart=start)
+            if request.purpose == 'expert_addition':
+                if self._usesPurchaseAuthority():
+                    period = self._coverageSnapshotLocked(cursor, subscription, now, materialize=False).currentPeriod
+                    end = period.end if period else None
+                else:
+                    end = _utc(subscription.get('current_period_end'))
+                if end is None or end <= now:
+                    return kind, None
+                return kind, slotKey('expert_addition', currentTermEnd=end, renewalPeriodStart=None)
+            return kind, slotKey(request.purpose, currentTermEnd=None, renewalPeriodStart=None)
+        except ValueError:
+            return kind, None
+
+    def _slotEntriesLocked(self, cursor, userId):
+        """Every payment attempt of the owner as (row, metadata, frozen)."""
+        cursor.execute('''select * from public.billing_events where user_id=%s
+            and event_category='payment_attempt' order by id''', (userId,))
+        entries = []
+        for row in cursor.fetchall():
+            metadata = self._json(row.get('metadata_json'))
+            entries.append((row, metadata, metadata.get('manualBilling', {})))
+        return entries
+
+    @staticmethod
+    def _inSlot(entries, kind, key, now, settled=None):
+        """The slot's attempts at ``now``.
+
+        A renewal reserved before its term end E keeps key ISO(E); once E has passed unpaid that
+        term is the open Pro term, so its attempts join the open slot (spec 4.1, 5 case 4b). A paid
+        term is never the open term: ``settled`` holds the keys of settled slots (what the storage
+        guard checks); without slot storage a captured attempt marks the term paid.
+        """
+        from api.services.billing.paymentSlots import attemptSlotKey, effectiveSlotKey, slotKind
+        keyed = []
+        for entry in entries:
+            row, _, frozen = entry
+            try:
+                if slotKind(frozen.get('purpose')) != kind:
+                    continue
+            except ValueError:
+                continue
+            keyed.append((attemptSlotKey(frozen, _utc(row.get('attempted_at'))), entry))
+        paid = {own for own, (row, _, _) in keyed if own != key and (
+            own in settled if settled is not None else row.get('payment_status') == 'captured')}
+        return [entry for own, entry in keyed
+                if own == key or (own not in paid and effectiveSlotKey(own, now) == key)]
+
+    @classmethod
+    def _liveEntry(cls, entries):
+        """The newest open attempt: the single live position of its slot."""
+        live = [entry for entry in entries if entry[0].get('payment_status') in cls._LIVE_STATUSES and not entry[2].get('closedAt')]
+        live.sort(key=lambda entry: (_utc(entry[0].get('attempted_at')) or datetime.min.replace(tzinfo=timezone.utc),
+                                     str(entry[0]['id'])))
+        return live[-1] if live else None
+
+    def liveSlotAttempt(self, request):
+        """The request slot's live attempt, read before provider inspection; no provider I/O happens here."""
         def operation(connection):
             with connection.cursor(cursor_factory=RealDictCursor) as cursor:
-                cursor.execute('''select e.* from public.billing_events e
-                    join public."Invoices" i on i.id=e.invoice_id
-                    where e.user_id=%s and i."userId"=%s and e.invoice_id=%s
-                    and e.event_category='payment_attempt' order by e.id''',
-                    (userId, userId, invoiceId))
-                return [row for row in cursor.fetchall()
-                    if self._json(row.get('metadata_json')).get('manualBilling', {}).get('purpose') == 'renewal'
-                    and self._json(row.get('metadata_json')).get('manualBilling', {}).get('billingMode') == mode
-                    and (row.get('payment_status') != 'created' or row.get('provider_order_id'))
-                    and row.get('payment_status') != 'captured']
+                self._lockUser(cursor, request.userId)
+                subscription = self._canonical(cursor, request.userId)
+                cursor.execute('select clock_timestamp() as current_time')
+                now = _utc(cursor.fetchone()['current_time'])
+                kind, key = self._requestSlotLocked(cursor, request, subscription, now)
+                if key is None:
+                    return None
+                live = self._liveEntry(self._inSlot(self._slotEntriesLocked(cursor, request.userId), kind, key, now,
+                                                    self._settledSlotKeysLocked(cursor, request.userId, kind)))
+                return live[0] if live else None
         return self._run(operation)
+
+    @staticmethod
+    def _slotMoneyInFlight(entries, excluded, now):
+        """The newest other attempt of the slot whose money may capture any second (spec 4.3 step 3)."""
+        from api.services.subscriptions.subscriptionModelBackfill import paymentInFlight
+        held = [entry for entry in entries if str(entry[0]['id']) not in excluded and paymentInFlight(entry[0], now)]
+        held.sort(key=lambda entry: (_utc(entry[0].get('attempted_at')) or datetime.min.replace(tzinfo=timezone.utc),
+                                     str(entry[0]['id'])))
+        return held[-1] if held else None
+
+    def _confirmingIntent(self, request, entry):
+        """Wait on an earlier payment: its public summary only, nothing that could reopen checkout."""
+        from dataclasses import replace
+        from api.services.billing.manualBillingPresentation import purchaseSelectionLabel
+        row, metadata, frozen = entry
+        intent = self._intentFromAttemptRow(row, metadata, request.userId, frozen.get('purpose') or request.purpose)
+        return replace(intent, state='confirming_earlier_payment', earlierPayment={
+            'selectionLabel': purchaseSelectionLabel(frozen), 'amount': int(row['amount']), 'currency': row['currency']})
+
+    def _slotDecisionLocked(self, cursor, request, entries, payloadHash, same, inspection, now,
+                            inspectedAttempt=None, beforeReuse=None):
+        """Spec 4.3 under the owner lock for every purpose: (intent, None), (None, replaced row) or (None, None) to open.
+
+        ``entries`` are the slot's attempts, ``same(frozen)`` says whether an attempt froze this request,
+        ``inspection`` is the provider snapshot taken before the lock and ``inspectedAttempt`` the attempt
+        row as it stood once that snapshot was recorded. Any later evidence makes Pay busy.
+        Money in flight on another attempt of the slot holds every open, reuse or replace
+        outcome as ``confirming_earlier_payment`` on that attempt (spec 4.3 step 3).
+        """
+        from api.services.billing.paymentSlots import LiveAttempt, decideAfterFinalize, decidePay
+        current = self._liveEntry(entries)
+        if inspection is not None and (current is None or str(current[0]['id']) != inspection.attemptId):
+            inspected = next((entry for entry in entries if str(entry[0]['id']) == inspection.attemptId), None)
+            if inspected and inspected[0].get('payment_status') == 'captured':
+                # The earlier payment was finalized first and settled the slot.
+                return self._intentFromAttemptRow(inspected[0], inspected[1], request.userId,
+                                                  inspected[2].get('purpose') or request.purpose), None
+            if not (inspected and current is None and inspected[2].get('closedReason') == 'PAYMENT_REFUNDED'
+                    and self._capturesRecordedLocked(cursor, inspection)):
+                raise RuntimeError('PAYMENT_SERVICE_BUSY')  # The live attempt changed since it was inspected.
+            # Finalized first and returned in full: Pay continues as with no live attempt (spec 4.3).
+        if current is None:
+            held = self._slotMoneyInFlight(entries, set(), now)
+            return (self._confirmingIntent(request, held), None) if held else (None, None)
+        row, metadata, frozen = current
+        if inspection is not None:
+            checked = _utc(frozen.get('providerObservation', {}).get('checkedAt'))
+            recorded = (self._json(inspectedAttempt.get('metadata_json')).get('manualBilling', {})
+                .get('providerObservation', {}) if inspectedAttempt is not None else {})
+            # Only evidence recorded after the inspection (browser verify, webhook, recovery) makes Pay busy.
+            # An attempt that was already 'authorized' when inspected is decided from the snapshot: a dead or
+            # auto-refunded authorization must free Pay (spec 5 case 4), a fresh one confirms.
+            if ((checked and checked > inspection.observedAt)
+                    or (inspectedAttempt is not None and (row.get('payment_status') != inspectedAttempt.get('payment_status')
+                        or checked != _utc(recorded.get('checkedAt'))))):
+                raise RuntimeError('PAYMENT_SERVICE_BUSY')
+        expiresAt = _utc(frozen.get('expiresAt')) or now
+        window = frozen.get('captureWindowMinutes')
+        isSame = same(frozen)
+        if not row.get('provider_order_id') and row.get('payment_status') == 'created' and not frozen.get('orderCreationClaimedAt'):
+            action = 'reuse' if isSame and now < expiresAt else 'replace'  # Order creation never started: no money.
+        else:
+            liveAttempt = LiveAttempt(str(row['id']), str(frozen.get('payloadHash')), expiresAt, row.get('provider_order_id'))
+            # ``same`` also compares what the hash does not cover (renewal invoice revision, catalog
+            # revision): a request that differs only there must still never match the frozen hash.
+            decisionHash = liveAttempt.payloadHash if isSame else 'changed:' + payloadHash
+            action = decidePay(liveAttempt, decisionHash, inspection, now, window).action
+            if action == 'finalize_first':
+                for payment in inspection.payments:
+                    if payment.get('status') != 'captured':
+                        continue
+                    cursor.execute("""select 1 from public.billing_events where provider_payment_id=%s
+                        and event_type='payment.capture' """, (payment.get('id'),))
+                    if not cursor.fetchone():
+                        raise RuntimeError('PAYMENT_SERVICE_BUSY')
+                # Finalized without settling the slot: the payments still in play decide.
+                action = decideAfterFinalize(liveAttempt, decisionHash, inspection, now, window).action
+        if action == 'busy':
+            raise RuntimeError('PAYMENT_SERVICE_BUSY')
+        if action == 'confirming':
+            return self._confirmingIntent(request, current), None
+        held = self._slotMoneyInFlight(entries, {str(row['id'])}, now)
+        if held:
+            # Neither reuse nor replace while an earlier payment in this slot may still capture.
+            return self._confirmingIntent(request, held), None
+        intent = self._intentFromAttemptRow(row, metadata, request.userId, frozen.get('purpose') or request.purpose)
+        if action == 'reuse':
+            if not row.get('provider_order_id'):
+                # Reusing an attempt without an Order opens one: the worker must be able to refund it.
+                from api.services.billing.purchaseCheckoutRepository import requirePaymentWorkerLocked
+                requirePaymentWorkerLocked(cursor)
+            if beforeReuse is not None:
+                beforeReuse(row)
+            self._bindCheckoutRequestLocked(cursor, request, payloadHash, row)
+            return intent, None
+        return None, row
+
+    @staticmethod
+    def _capturesRecordedLocked(cursor, inspection):
+        """Every payment the snapshot shows as captured (or since refunded) has its finalized record."""
+        for payment in inspection.payments:
+            if payment.get('status') not in ('captured', 'refunded'):
+                continue
+            cursor.execute("""select 1 from public.billing_events where provider_payment_id=%s
+                and event_type='payment.capture' """, (payment.get('id'),))
+            if not cursor.fetchone():
+                return False
+        return True
 
     def recordProviderObservation(self, attemptId, snapshot):
         def operation(connection):
@@ -299,13 +554,31 @@ class ManualBillingRepository:
                 metadata = self._json(attempt.get('metadata_json'))
                 billing = metadata.setdefault('manualBilling', {})
                 previous = billing.get('providerObservation', {})
+                if previous.get('outcome') == 'captured' and snapshot.outcome != 'captured':
+                    return  # A later non-capture is not proof that captured money vanished.
                 if previous.get('checkedAt') and _utc(previous['checkedAt']) > snapshot.observedAt:
                     return
                 if previous.get('hasPayments') and not snapshot.payments and snapshot.outcome == 'unpaid':
                     return
+                started = [datetime.fromtimestamp(p['created_at'], timezone.utc) for p in snapshot.payments
+                    if isinstance(p.get('created_at'), (int, float)) and not isinstance(p.get('created_at'), bool)]
+                latest = max([*started, *([_utc(previous['latestPaymentCreatedAt'])] if previous.get('latestPaymentCreatedAt') else [])], default=None)
                 billing['providerObservation'] = {'orderId': snapshot.providerOrderId,
                     'outcome': snapshot.outcome, 'checkedAt': snapshot.observedAt.isoformat(),
                     'complete': snapshot.complete, 'hasPayments': bool(snapshot.payments)}
+                statuses = {p.get('status') for p in snapshot.payments}
+                if snapshot.complete and not statuses - {'created', 'authorized', 'captured', 'failed', 'refunded'}:
+                    billing['providerObservation']['authorizationActive'] = 'authorized' in statuses
+                elif 'authorizationActive' in previous:
+                    billing['providerObservation']['authorizationActive'] = previous['authorizationActive']
+                elif previous.get('complete') and previous.get('outcome') in ('unpaid', 'processing', 'refunded'):
+                    billing['providerObservation']['authorizationActive'] = False
+                elif previous.get('outcome') == 'authorized' or attempt['payment_status'] == 'authorized':
+                    # Upgrade legacy observations without losing a closed Order's known authorization.
+                    billing['providerObservation']['authorizationActive'] = True
+                if latest is not None:
+                    # Bounds how long a superseded Order can still late-authorize (provider time).
+                    billing['providerObservation']['latestPaymentCreatedAt'] = latest.isoformat()
                 status = attempt['payment_status']
                 if snapshot.outcome == 'authorized' and not billing.get('closedAt') and status in ('created', 'pending_provider_ack'):
                     status = 'authorized'
@@ -313,12 +586,14 @@ class ManualBillingRepository:
                     (Json(metadata), status, attemptId))
         return self._run(operation)
 
-    def closeUncreatedOrder(self, attemptId):
+    def closeUncreatedOrder(self, attemptId, providerRejected=False):
         """Close after a complete zero-match receipt lookup and a grace period.
 
         This is operational absence evidence, never capture-timing proof.
-        Retain the receipt: subsequently discovered money is an anomaly on
-        this closed attempt, not a grant on the replacement checkout.
+        Retain the receipt: later money follows the payment-created-at rules
+        for this attempt and its slot, never the replacement's identity.
+        ``providerRejected`` is a provider 4xx on creation, which proves no
+        Order exists, so the grace period is skipped.
         """
         def operation(connection):
             with connection.cursor(cursor_factory=RealDictCursor) as cursor:
@@ -339,14 +614,15 @@ class ManualBillingRepository:
                 now = _utc(cursor.fetchone()['current_time'])
                 claimed = _utc(billing.get('orderCreationClaimedAt') or attempt.get('attempted_at'))
                 if (attempt.get('provider_order_id') or attempt['payment_status'] == 'captured'
-                        or not claimed or now < claimed + timedelta(minutes=32) or invoice['status'] == 'PAID'):
+                        or not claimed or (not providerRejected and now < claimed + timedelta(minutes=32)) or invoice['status'] == 'PAID'):
                     return False
                 if billing.get('closedAt'):
                     billing['closureReconciledAt'] = now.isoformat()
                     cursor.execute('update public.billing_events set metadata_json=%s where id=%s', (Json(metadata), attemptId))
                     return True
                 billing.update(closedAt=now.isoformat(), closedReason='ORDER_NOT_CREATED',
-                    zeroOrderLookupAt=now.isoformat(), closureReconciledAt=now.isoformat())
+                    closureReconciledAt=now.isoformat())
+                billing['providerOrderRejectedAt' if providerRejected else 'zeroOrderLookupAt'] = now.isoformat()
                 cursor.execute("update public.billing_events set payment_status='failed',event_status='failed',metadata_json=%s where id=%s",
                     (Json(metadata), attemptId))
                 if billing.get('purpose') != 'renewal':
@@ -364,13 +640,13 @@ class ManualBillingRepository:
         def operation(connection):
             with connection.cursor(cursor_factory=RealDictCursor) as cursor:
                 self._lockUser(cursor, userId)
+                unified = self._usesPurchaseAuthority()
+                fields = '*' if unified else '''id, user_id, billing_mode, status, plan_type,
+                    current_period_start, current_period_end, renewal_due_at, auto_renew_enabled,
+                    payment_collection_mode, default_currency, version, erasure_pending, is_canonical'''
                 cursor.execute(
-                    """
-                    select id, user_id, billing_mode, status, plan_type,
-                           current_period_start, current_period_end,
-                           renewal_due_at, auto_renew_enabled,
-                           payment_collection_mode, default_currency,
-                           version, erasure_pending, is_canonical
+                    f"""
+                    select {fields}
                     from public.subscriptions
                     where user_id = %s and is_canonical = true
                     limit 1
@@ -383,7 +659,12 @@ class ManualBillingRepository:
                 cursor.execute("select id from public.subscriptions where user_id=%s limit 1", (userId,))
                 if cursor.fetchone() is not None:
                     raise ValueError("CANONICAL_BACKFILL_REQUIRED")
-                cursor.execute(
+                if unified:
+                    cursor.execute('''insert into public.subscriptions
+                        (id,user_id,default_currency,is_canonical) VALUES(%s,%s,'INR',true) RETURNING *''',
+                        (str(uuid.uuid4()),userId))
+                else:
+                    cursor.execute(
                     """
                     insert into public.subscriptions (
                         id, user_id, billing_mode, status, plan_type,
@@ -401,9 +682,11 @@ class ManualBillingRepository:
                     (str(uuid.uuid4()), userId),
                 )
                 created = cursor.fetchone()
-                if self._usesPurchaseAuthority():
+                if unified:
+                    from api.services.subscriptions.subscriptionModelBackfill import observedStorageShape
                     self._modelRepository()._event(cursor, created, 'subscription.model_initialized',
-                        'subscription-initialized:'+str(created['id']), {'schemaVersion':2})
+                        'subscription-initialized:'+str(created['id']),
+                        {'schemaVersion':2,'storageShape':observedStorageShape(created)})
                 return dict(created)
 
         return self._run(operation)
@@ -425,9 +708,8 @@ class ManualBillingRepository:
                         raise ValueError('INVALID_TRIAL_EXPERTS')
                     end = now + timedelta(days=12)
                     cursor.execute('''UPDATE public.subscriptions SET plan_code='pro',trial_started_at=%s,trial_ends_at=%s,
-                        billing_mode='none',status='trial',plan_type='free',current_period_start=%s,current_period_end=%s,
-                        subscribed_experts=%s,domain_count=%s,version=version+1,updated_at=%s WHERE id=%s RETURNING *''',
-                        (now,end,now,end,Json(list(domains)),len(domains),now,subscription['id']))
+                        version=version+1,updated_at=%s WHERE id=%s RETURNING *''',
+                        (now,end,now,subscription['id']))
                     activated = cursor.fetchone()
                     self._modelRepository()._event(cursor, activated, 'subscription.trial_started',
                         'subscription-trial:'+str(subscription['id']), {'experts':list(domains), 'startedAt':now, 'endsAt':end})
@@ -548,15 +830,16 @@ class ManualBillingRepository:
                 or int(quote.get('revision') or 1) != int(frozen.get('revision') or 1)):
             raise ValueError('INVOICE_REVISION_CONFLICT')
 
-    def reserveCheckout(self, request: CheckoutRequest, *, replayOnly=False) -> CheckoutIntent | None:
+    def reserveCheckout(self, request: CheckoutRequest, *, replayOnly=False, inspection=None,
+                        inspectedAttempt=None) -> CheckoutIntent | None:
         """Freeze server pricing, invoice and attempt in one owner transaction.
 
         Existing attempts replay before any catalog read. New invoice prices
         are read under a shared catalog lock in this same owner transaction.
-        A changed initial selection with a fresh/no key supersedes unpaid
-        invoices in the reservation transaction; old money stays auditable.
-        replayOnly resolves request identity without reserving or pricing;
-        unrelated live-intent conflicts are checked after provider recovery.
+        For every purpose the slot's live attempt is opened, reused,
+        replaced or waited on (spec 4.3) from ``inspection``, a provider
+        snapshot taken before the owner lock; without one an Order-backed
+        live attempt is busy. replayOnly resolves request identity only.
         """
         from api.services.billing import billingEngine
         from dateutil.relativedelta import relativedelta
@@ -580,6 +863,8 @@ class ManualBillingRepository:
         if request.currency not in ('INR', 'USD'):
             raise ValueError('BILLING_CURRENCY_UNSUPPORTED')
         if request.purpose == 'initial_purchase':
+            # The frozen selection, not the draft revision: re-saving the same selection reuses its Order.
+            # The draft revision CAS is enforced separately by guardInitialPurchaseLocked.
             identity['currency'] = request.currency
         payload_hash = _payloadHash(identity)
 
@@ -588,23 +873,26 @@ class ManualBillingRepository:
                     frozen.get('payloadHash') == legacy_hash and
                     (frozen.get('currency') or 'INR') == request.currency)
 
+        slot = {}
+
         def lookup(cursor, now, subscription, matchOnly=False):
+            if request.purpose == 'initial_purchase' and request.requestKey is not None:
+                cursor.execute('''select * from public.billing_events where user_id=%s and idempotency_key=%s
+                    and event_type='checkout.request.bound' ''',
+                    (request.userId, f'{request.purpose}:{request.userId}:{request.requestKey}'))
+                if cursor.fetchone():
+                    bound = self._checkoutRequestReplayLocked(cursor, request, payload_hash)
+                    return self._intentFromAttemptRow(bound, self._json(bound.get('metadata_json')),
+                        request.userId, request.purpose), None
             if request.purpose == 'renewal':
                 bound = self._checkoutRequestReplayLocked(cursor, request, payload_hash)
                 if bound:
                     self._validateRenewalAttemptLocked(cursor, request, subscription, bound, now)
                     return self._intentFromAttemptRow(bound, self._json(bound.get('metadata_json')),
-                        request.userId, request.purpose), []
-            cursor.execute('''select * from public.billing_events where user_id=%s
-                and event_category='payment_attempt' order by id''', (request.userId,))
-            rows = []
-            for row in cursor.fetchall():
-                metadata = self._json(row.get('metadata_json'))
-                frozen = metadata.get('manualBilling', {})
-                if frozen.get('purpose') != request.purpose or (
-                        request.purpose != 'initial_purchase' and frozen.get('billingMode') != request.billingMode):
-                    continue
-                rows.append((row, metadata, frozen))
+                        request.userId, request.purpose), None
+            entries = self._slotEntriesLocked(cursor, request.userId)
+            rows = [(row, metadata, frozen) for row, metadata, frozen in entries if frozen.get('purpose') == request.purpose
+                    and (request.purpose == 'initial_purchase' or frozen.get('billingMode') == request.billingMode)]
             # A historical key must replay/conflict before inspecting any
             # newer live selection, independent of UUID ordering.
             for row, metadata, frozen in rows:
@@ -617,46 +905,38 @@ class ManualBillingRepository:
                         continue
                     if request.purpose == 'renewal':
                         self._validateRenewalAttemptLocked(cursor, request, subscription, row, now)
-                    return self._intentFromAttemptRow(row, metadata, request.userId, request.purpose), []
-            replacements = []
-            for row, metadata, frozen in rows:
-                expiry = _utc(frozen.get('expiresAt'))
-                live = (row.get('payment_status') in ('created', 'pending_provider_ack', 'authorized')
-                        and (expiry is not None and expiry > now or
-                             row.get('payment_status') == 'pending_provider_ack' and not row.get('provider_order_id')
-                             or request.purpose in ('initial_purchase', 'renewal') and self._checkoutMoneyPending(row, frozen, now)))
-                if (request.purpose == 'renewal' and str(row.get('invoice_id')) == str(request.payload.get('invoiceId'))
-                        and row.get('payment_status') == 'captured' and frozen.get('payloadHash') == payload_hash):
-                    self._bindCheckoutRequestLocked(cursor, request, payload_hash, row)
-                    return self._intentFromAttemptRow(row, metadata, request.userId, request.purpose), []
-                if request.requestKey is None and live and hashMatches(frozen):
-                    if request.purpose == 'renewal':
-                        self._validateRenewalAttemptLocked(cursor, request, subscription, row, now)
-                    return self._intentFromAttemptRow(row, metadata, request.userId, request.purpose), []
-                if matchOnly:
-                    continue
-                if (not live and (request.purpose == 'initial_purchase' or request.purpose == 'renewal'
-                        and str(row.get('invoice_id')) == str(request.payload.get('invoiceId')))
-                        and row.get('payment_status') in ('created', 'pending_provider_ack', 'authorized')
-                        and not self._mayExpireCheckoutAttempt(row, now)):
-                    # Recheck evidence under the owner lock before replacement.
-                    raise RuntimeError('PROVIDER_STATUS_UNKNOWN')
-                if request.purpose == 'initial_purchase' and live:
-                    if (hashMatches(frozen) or (frozen.get('currency') or 'INR') != request.currency
-                            or self._checkoutMoneyPending(row, frozen, now) or (
-                            row.get('payment_status') == 'pending_provider_ack' and not row.get('provider_order_id'))):
-                        # Unsettled money and unknown creation must be recovered
-                        # before opening another payment opportunity.
-                        raise ValueError('LIVE_INITIAL_CHECKOUT_CONFLICT')
-                    replacements.append(row)
-                if (request.purpose == 'renewal' and live
-                        and str(row.get('invoice_id')) == str(request.payload.get('invoiceId'))):
-                    if frozen.get('payloadHash') != payload_hash:
-                        raise ValueError('LIVE_RENEWAL_CHECKOUT_CONFLICT')
-                    self._validateRenewalAttemptLocked(cursor, request, subscription, row, now)
-                    self._bindCheckoutRequestLocked(cursor, request, payload_hash, row)
-                    return self._intentFromAttemptRow(row, metadata, request.userId, request.purpose), []
-            return None, replacements
+                    return self._intentFromAttemptRow(row, metadata, request.userId, request.purpose), None
+            if matchOnly:
+                return None, None
+            revision = None
+            if request.purpose == 'renewal':
+                for row, metadata, frozen in rows:
+                    if (str(row.get('invoice_id')) == str(request.payload.get('invoiceId'))
+                            and row.get('payment_status') == 'captured' and frozen.get('payloadHash') == payload_hash):
+                        # The renewal invoice was already paid: replay that settlement.
+                        self._bindCheckoutRequestLocked(cursor, request, payload_hash, row)
+                        return self._intentFromAttemptRow(row, metadata, request.userId, request.purpose), None
+                cursor.execute('select metadata_json from public."Invoices" where id=%s and "userId"=%s',
+                               (request.payload.get('invoiceId'), request.userId))
+                invoice = cursor.fetchone()
+                revision = int(self._json(invoice.get('metadata_json')).get('manualBilling', {}).get('revision') or 1) if invoice else None
+            kind, key = self._requestSlotLocked(cursor, request, subscription, now)
+            slot.update(key=key, entries=self._inSlot(entries, kind, key, now,
+                self._settledSlotKeysLocked(cursor, request.userId, kind)) if key is not None else [])
+
+            def same(frozen):
+                if not hashMatches(frozen):
+                    return False
+                if request.purpose == 'renewal':
+                    # A revised renewal invoice is a different payload: its stale attempt is replaced (spec 4.3).
+                    return int(frozen.get('revision') or 1) == revision
+                return (request.expectedCatalogRevision is None
+                        or frozen.get('catalogRevision') in (None, request.expectedCatalogRevision))
+
+            beforeReuse = ((lambda row: self._validateRenewalAttemptLocked(cursor, request, subscription, row, now))
+                           if request.purpose == 'renewal' else None)
+            return self._slotDecisionLocked(cursor, request, slot['entries'], payload_hash, same, inspection, now,
+                                            inspectedAttempt, beforeReuse)
 
         def transaction(connection, reference=None, lookupOnly=False):
             with connection.cursor(cursor_factory=RealDictCursor) as cursor:
@@ -667,11 +947,16 @@ class ManualBillingRepository:
                     raise ValueError('BILLING_CURRENCY_CONFLICT')
                 cursor.execute('select clock_timestamp() as current_time')
                 now = _utc(cursor.fetchone()['current_time'])
-                existing, replacements = lookup(cursor, now, subscription, matchOnly=replayOnly)
+                if request.purpose == 'initial_purchase':
+                    from api.services.billing.purchaseCheckoutRepository import guardInitialPurchaseLocked
+                    guardInitialPurchaseLocked(self, cursor, request, subscription, now)
+                existing, replaced = lookup(cursor, now, subscription, matchOnly=replayOnly)
                 if existing is not None or lookupOnly:
                     return existing
                 if request.requiresExistingAttempt:
                     raise ValueError('PRICING_CONTEXT_REQUIRED')
+                from api.services.billing.purchaseCheckoutRepository import requirePaymentWorkerLocked
+                requirePaymentWorkerLocked(cursor)  # No new Order opens while nobody can recover or refund it.
                 coverage = self._coverageSnapshotLocked(cursor, subscription, now, materialize=True)
                 if self._usesPurchaseAuthority() and request.purpose != 'initial_purchase':
                     subscription = self._purchaseContextLocked(cursor, subscription, coverage, now)
@@ -679,28 +964,15 @@ class ManualBillingRepository:
                     raise ValueError('CHECKOUT_OWNER_NOT_ELIGIBLE')
                 if request.purpose == 'renewal' and (request.billingMode == 'annual_prepaid' or self._usesPurchaseAuthority()) and coverage.nextPeriod:
                     raise ValueError('RENEWAL_ALREADY_PAID')
-                if self._usesPurchaseAuthority() and request.purpose == 'renewal':
-                    # A fresh empty provider observation permits the existing
-                    # same-invoice retry policy. Close that original attempt
-                    # under the owner lock before checking account-wide money.
-                    cursor.execute('''select * from public.billing_events where user_id=%s
-                        and invoice_id=%s and event_category='payment_attempt'
-                        and payment_status in ('created','pending_provider_ack') order by id for update''',
-                        (request.userId, request.payload.get('invoiceId')))
-                    for attempt in cursor.fetchall():
-                        frozen = self._json(attempt.get('metadata_json')).get('manualBilling', {})
-                        expiry = _utc(frozen.get('expiresAt'))
-                        if (frozen.get('purpose') == 'renewal' and expiry and expiry <= now
-                                and self._mayExpireCheckoutAttempt(attempt, now)):
-                            self._expireCheckoutAttemptLocked(cursor, attempt, now, reconciled=True)
-                    cursor.execute('SELECT "isBanned" FROM public."Users" WHERE "userId"=%s', (request.userId,))
-                    if self._purchaseFactsLocked(cursor, subscription, cursor.fetchone(), now).moneyUnresolved:
-                        raise ValueError('RECOVERY_REQUIRED')
                 if request.purpose == 'initial_purchase':
                     if self._usesPurchaseAuthority():
+                        from dataclasses import replace as withFacts
                         from api.services.subscriptions.subscriptionModel import evaluatePurchaseEligibility
                         cursor.execute('SELECT "isBanned" FROM public."Users" WHERE "userId"=%s', (request.userId,))
-                        allowed, block = evaluatePurchaseEligibility(self._purchaseFactsLocked(cursor, subscription, cursor.fetchone(), now), now)
+                        facts = self._purchaseFactsLocked(cursor, subscription, cursor.fetchone(), now)
+                        # In-flight money of this slot was decided above; owed refunds and other slots never block.
+                        allowed, block = evaluatePurchaseEligibility(withFacts(facts, moneyUnresolved=False,
+                            recoverableCheckout=None), now)
                         if not allowed:
                             raise ValueError({'recovery_required': 'RECOVERY_REQUIRED', 'current_coverage': 'EXISTING_PAID_COVERAGE',
                                 'account_restricted': 'CHECKOUT_OWNER_NOT_ELIGIBLE'}[block])
@@ -753,7 +1025,10 @@ class ManualBillingRepository:
                     current = subscription.get('subscribed_experts') or []
                     current = json.loads(current) if isinstance(current, str) else current
                     if set(selected) & set(current) or len(set(selected) | set(current)) > 4:
-                        raise ValueError('EXPERT_SELECTION_CONFLICT')
+                        raise ValueError('INVALID_EXPERT_SELECTION')
+                if slot.get('key') is None:
+                    # Refused before anything is retired, priced or written.
+                    raise ValueError('PAYMENT_SLOT_UNAVAILABLE')
                 ttl = int(os.environ.get('MANUAL_CHECKOUT_TTL_SECONDS', '1800'))
                 if ttl <= 0:
                     raise ValueError('INVALID_CHECKOUT_TTL')
@@ -785,6 +1060,9 @@ class ManualBillingRepository:
                         'billingMode': request.billingMode, 'domains': selected, 'revision': revision,
                         'catalogRevision': catalog.revision,
                         'coverageState': 'estimated', 'expiresAt': deadline.isoformat()}
+                    billing.update(capturePolicy='automatic', captureWindowMinutes=captureWindowMinutes())
+                    if request.purchaseDraftRevision is not None:
+                        billing.update(purchaseDraftRevision=request.purchaseDraftRevision)
                     if self._usesPurchaseAuthority() and request.purpose == 'expert_addition':
                         billing['servicePeriodId'] = coverage.currentPeriod.invoiceId
                     if request.purpose == 'topup':
@@ -801,20 +1079,16 @@ class ManualBillingRepository:
                         'metadata_json': {'manualBilling': billing, 'domains': selected, 'billingMode': request.billingMode}}
                     if request.purpose == 'topup':
                         invoice['metadata_json'].update(tokens=billing['tokens'], packId=billing['packId'])
-                    if replacements:
-                        replacedIds = sorted({str(row['invoice_id']) for row in replacements})
-                        for invoiceId in replacedIds:
-                            cursor.execute('select * from public."Invoices" where id=%s and "userId"=%s for update',
-                                (invoiceId, request.userId))
-                            oldInvoice = cursor.fetchone()
-                            if not oldInvoice or str(oldInvoice['status']).upper() not in ('UPCOMING','PAYMENT_PENDING'):
-                                raise ValueError('CHECKOUT_CLOSED')
-                            self._closeInvoice(cursor, oldInvoice, 'SUPERSEDED_BY_REQUEST',
-                                now=now, replacementInvoiceId=invoice['id'])
-                        invoice['metadata_json']['manualBilling']['replacesInvoiceIds'] = replacedIds
+                    if replaced is not None and self._json(replaced.get('metadata_json')).get('manualBilling', {}).get('purpose') != 'renewal':
+                        # Only an invoice the replacement voids; a renewal invoice persists.
+                        invoice['metadata_json']['manualBilling']['replacesInvoiceIds'] = [str(replaced['invoice_id'])]
+                    self._retireReplacedLocked(cursor, subscription, replaced, now, invoice['id'])
                     cursor.execute('insert into public."Invoices" (' + ','.join('"' + key + '"' for key in invoice) +
                         ') values (' + ','.join('%s' for _ in invoice) + ')',
                         [Json(value) if isinstance(value, (dict, list)) else value for value in invoice.values()])
+                else:
+                    # Renewal: the invoice persists and only its attempt is replaced.
+                    self._retireReplacedLocked(cursor, subscription, replaced, now, invoice['id'])
                 frozen = self._json(invoice.get('metadata_json')).get('manualBilling', {})
                 snapshot = {'subscriptionId': str(subscription['id']), 'invoiceId': str(invoice['id']),
                     'lifecycleId': lifecycle, 'cycleId': str(invoice.get('period_start')), 'revision': revision,
@@ -823,17 +1097,50 @@ class ManualBillingRepository:
                     'periodEnd': _isoText(invoice.get('period_end')), 'expiresAt': deadline.isoformat(),
                     'tokens': frozen.get('tokens'), 'packId': frozen.get('packId'), 'requestKey': request.requestKey or str(uuid.uuid4())}
                 snapshot['catalogRevision'] = self._json(invoice.get('pricing_reference_snapshot_json')).get('catalogRevision')
+                snapshot['invoicePricing'] = {key: invoice[key] for key in self._PRICING_FIELDS if key in invoice}
                 if self._usesPurchaseAuthority():
                     snapshot.update(servicePeriodId=frozen.get('servicePeriodId'),
                         selectionEventId=frozen.get('selectionEventId'), selectionVersion=frozen.get('selectionVersion'))
-                return self._reserveCheckoutIntentLocked(cursor, subscription, request.userId, request.purpose,
+                snapshot.update(capturePolicy='automatic', captureWindowMinutes=captureWindowMinutes())
+                if request.purchaseDraftRevision is not None:
+                    snapshot.update(purchaseDraftRevision=request.purchaseDraftRevision)
+                snapshot['slotKey'] = slot['key']
+                intent = self._reserveCheckoutIntentLocked(cursor, subscription, request.userId, request.purpose,
                     snapshot['requestKey'], payload_hash, snapshot, now)
+                from api.services.billing import purchaseCheckoutRepository as slots
+                slots.bindPurchaseControlLocked(cursor, request, intent, slot['key'])
+                # A started unpaid term's attempts belong to the open slot: one slot instance settles.
+                slots.adoptStartedTermControlsLocked(cursor, intent.attemptId,
+                    [str(row['id']) for row, _, _ in slot['entries']])
+                if replaced is not None:
+                    try:
+                        slots.supersedeAttemptLocked(cursor, str(replaced['id']), intent.attemptId, now)
+                    except ValueError as exc:
+                        if str(exc) != 'PAYMENT_SUPERSESSION_INVALID':
+                            raise
+                        raise RuntimeError('PAYMENT_SERVICE_BUSY') from None  # The transaction rolls back.
+                return intent
         existing = self._run(lambda connection: transaction(connection, lookupOnly=True))
         if existing is not None or replayOnly:
             return existing
         if request.requiresExistingAttempt:
             raise ValueError('PRICING_CONTEXT_REQUIRED')
         return self._run(lambda connection: transaction(connection))
+
+    def _retireReplacedLocked(self, cursor, subscription, replaced, now, replacementInvoiceId):
+        """Free the slot's single live position before the replacement attempt is inserted.
+
+        Supersession itself is bound once the replacement's attempt and control exist.
+        """
+        if replaced is None:
+            return
+        from api.services.billing.purchaseCheckoutRepository import retireSupersededAttemptLocked
+        try:
+            retireSupersededAttemptLocked(cursor, replaced, now, replacementInvoiceId)
+        except ValueError:
+            raise RuntimeError('PAYMENT_SERVICE_BUSY') from None
+        # The compatibility projection of a replaced expert set never activates.
+        self._releaseAdditionsLocked(cursor, subscription, {str(replaced['id'])}, now, 'superseded')
 
     def subscriptionCurrency(self, userId):
         def operation(connection):
@@ -983,8 +1290,10 @@ class ManualBillingRepository:
         """Make an issued invoice payable without recalculating its price.
 
         The existing explicit selection-change recovery is the only repricing
-        transition: its previous attempts are closed, its revision increments,
-        and the replacement snapshot freezes under the catalog lock.
+        transition: its revision increments and the replacement snapshot freezes
+        under the catalog lock. It waits (RENEWAL_REPRICING_DEFERRED) while an
+        attempt on the invoice holds an authorized payment; an earlier-revision
+        attempt without money stays until the next Pay replaces it.
         """
         def operation(connection):
             with connection.cursor(cursor_factory=RealDictCursor) as cursor:
@@ -1010,11 +1319,18 @@ class ManualBillingRepository:
                 if metadata.get('repricingRequired'):
                     if str(invoice['status']).upper() != 'EXPIRED':
                         raise ValueError('INVOICE_REVISION_CONFLICT')
-                    cursor.execute('''select 1 from public.billing_events where invoice_id=%s
-                        and event_category='payment_attempt'
-                        and payment_status in ('created','pending_provider_ack','authorized','captured') limit 1''', (invoiceId,))
-                    if cursor.fetchone():
+                    from api.services.subscriptions.subscriptionModelBackfill import paymentInFlight
+                    cursor.execute('''select * from public.billing_events where invoice_id=%s
+                        and event_category='payment_attempt' order by id for update''', (invoiceId,))
+                    attempts = cursor.fetchall()
+                    if any(attempt.get('payment_status') == 'captured' for attempt in attempts):
                         raise ValueError('INVOICE_REVISION_CONFLICT')
+                    cursor.execute('select clock_timestamp() as current_time')
+                    checked = _utc(cursor.fetchone()['current_time'])
+                    if any(paymentInFlight(attempt, checked) for attempt in attempts):
+                        # An authorized payment may capture any second against this revision: the
+                        # scheduler retries once it captures or passes its capture window.
+                        raise RuntimeError('RENEWAL_REPRICING_DEFERRED')
                     fields, selection = self._annualRenewalPricing(connection, subscription,
                         _utc(invoice['period_start']), _utc(invoice['period_end']))
                     manual = dict(metadata.get('manualBilling') or {})
@@ -1149,62 +1465,19 @@ class ManualBillingRepository:
                 return {'currentDomains':current,'pendingRemovals':pending,'effectiveAt':end.isoformat()}
         return self._run(operation)
 
-    def _closeInvoice(self,cursor,invoice,reason,*,now=None,replacementInvoiceId=None):
+    def _closeInvoice(self,cursor,invoice,reason,*,now=None,replacementInvoiceId=None,preserveAuthorization=False):
         closure = {'closedAt':(now or _now()).isoformat(), 'closedReason':reason}
         if replacementInvoiceId is not None:
             closure['supersededByInvoiceId'] = str(replacementInvoiceId)
         metadata=self._json(invoice.get('metadata_json'))
         metadata.setdefault('manualBilling',{}).update(closure)
         cursor.execute('update public."Invoices" set status=\'VOID\',metadata_json=%s where id=%s',(Json(metadata),invoice['id']))
-        cursor.execute("select id,metadata_json from public.billing_events where invoice_id=%s and event_category='payment_attempt' and payment_status in ('created','pending_provider_ack','authorized') order by id for update", (invoice['id'],))
+        cursor.execute("select id,metadata_json,payment_status from public.billing_events where invoice_id=%s and event_category='payment_attempt' and payment_status in ('created','pending_provider_ack','authorized') order by id for update", (invoice['id'],))
         for row in cursor.fetchall():
             old = self._json(row.get('metadata_json'))
             old.setdefault('manualBilling', {}).update(closure)
-            cursor.execute("update public.billing_events set payment_status='cancelled',event_status='cancelled',metadata_json=%s where id=%s", (Json(old), row['id']))
-
-    def cancelExpertAddition(self,userId,domain):
-        def operation(connection):
-            with connection.cursor(cursor_factory=RealDictCursor) as cursor:
-                self._lockUser(cursor,userId)
-                subscription=self._canonical(cursor,userId)
-                if self._usesPurchaseAuthority():
-                    coverage = self._coverageSnapshotLocked(cursor, subscription, _now(), materialize=False)
-                    if not coverage.currentPeriod:
-                        raise ValueError('NO_CANCELLABLE_EXPERT_ATTEMPT')
-                    candidates = [a for a in self._pendingExpertAttemptsLocked(cursor, subscription, coverage.currentPeriod.invoiceId)
-                        if domain in self._json(a['metadata_json'])['manualBilling'].get('domains', [])]
-                    if len(candidates) != 1:
-                        raise ValueError('NO_CANCELLABLE_EXPERT_ATTEMPT')
-                    attempt = candidates[0]
-                    cursor.execute('SELECT * FROM public."Invoices" WHERE id=%s AND "userId"=%s AND subscription_id=%s FOR UPDATE',
-                        (attempt['invoice_id'], userId, subscription['id']))
-                    invoice = cursor.fetchone()
-                    if not invoice or invoice['status'] == 'PAID':
-                        raise ValueError('EXPERT_ALREADY_PAID_OR_MISSING')
-                    self._closeInvoice(cursor, invoice, 'EXPERT_ADDITION_CANCELLED')
-                    return {'domain': domain, 'cancelled': True,
-                        'closedAttemptDomains': self._json(attempt['metadata_json'])['manualBilling']['domains'],
-                        'orderId': attempt['provider_order_id']}
-                pending=subscription.get('pending_additions') or []
-                pending=json.loads(pending) if isinstance(pending,str) else list(pending)
-                target=next((item for item in pending if item['domain']==domain and item.get('state')=='awaiting_payment'),None)
-                if target is None: raise ValueError('NO_CANCELLABLE_EXPERT_ATTEMPT')
-                attemptId=target.get('attemptId')
-                if not attemptId: raise ValueError('EXPERT_ATTEMPT_IDENTITY_MISSING')
-                cursor.execute('select invoice_id,payment_status from public.billing_events where id=%s',(attemptId,))
-                attempt=cursor.fetchone()
-                cursor.execute('select * from public."Invoices" where id=%s for update',(attempt['invoice_id'],))
-                invoice=cursor.fetchone()
-                if invoice['status']=='PAID': raise ValueError('EXPERT_ALREADY_PAID')
-                self._closeInvoice(cursor,invoice,'EXPERT_ADDITION_CANCELLED')
-                closed=[]
-                for item in pending:
-                    if item.get('attemptId')==attemptId:
-                        item.update(state='cancelled',cancelledAt=_now().isoformat())
-                        closed.append(item['domain'])
-                cursor.execute('update public.subscriptions set pending_additions=%s,version=version+1 where id=%s',(Json(pending),subscription['id']))
-                return {'domain':domain,'cancelled':True,'closedAttemptDomains':closed,'orderId':target.get('orderId')}
-        return self._run(operation)
+            status = 'authorized' if preserveAuthorization and row['payment_status'] == 'authorized' else 'cancelled'
+            cursor.execute("update public.billing_events set payment_status=%s,event_status=%s,metadata_json=%s where id=%s", (status,status,Json(old), row['id']))
 
     def reserveCheckoutIntent(
         self,
@@ -1230,13 +1503,6 @@ class ManualBillingRepository:
             metadata['manualBilling']['closureReconciledAt'] = now.isoformat()
         cursor.execute("update public.billing_events set payment_status='expired',event_status='expired',metadata_json=%s where id=%s",
             (Json(metadata),attempt['id']))
-
-    def _checkoutMoneyPending(self, attempt, billing, now):
-        observation = billing.get('providerObservation', {})
-        if attempt.get('payment_status') == 'authorized' or observation.get('outcome') in ('processing', 'authorized', 'unknown', 'captured'):
-            return True
-        expiry = _utc(billing.get('expiresAt'))
-        return bool(expiry and expiry <= now and observation.get('hasPayments'))
 
     def _mayExpireCheckoutAttempt(self, attempt, now):
         from api.services.billing.checkoutRecoveryPolicy import mayExpireCheckout
@@ -1272,13 +1538,13 @@ class ManualBillingRepository:
         cursor.execute('update public."Invoices" set status=%s,metadata_json=%s where id=%s',('EXPIRED',Json(metadata),invoiceId))
         return True
 
-    def _releaseExpiredAdditionsLocked(self, cursor, subscription, attemptIds, now):
-        """Expert-addition holds of lapsed attempts must not block a new selection."""
+    def _releaseAdditionsLocked(self, cursor, subscription, attemptIds, now, state='expired'):
+        """Close the compatibility projection of expert-addition attempts that lapsed or were replaced."""
         pending=self._jsonList(subscription.get('pending_additions'))
         released=False
         for item in pending:
             if item.get('attemptId') in attemptIds and item.get('state') == 'awaiting_payment':
-                item.update(state='expired',expiredAt=now.isoformat())
+                item.update(state=state,**{state+'At':now.isoformat()})
                 released=True
         if released:
             cursor.execute('update public.subscriptions set pending_additions=%s where id=%s',(Json(pending),subscription['id']))
@@ -1314,7 +1580,7 @@ class ManualBillingRepository:
                         and self._mayExpireCheckoutAttempt(attempt, now)]
                     for attempt in expired:
                         self._expireCheckoutAttemptLocked(cursor,attempt,now)
-                    self._releaseExpiredAdditionsLocked(cursor,subscription,{str(attempt['id']) for attempt in expired},now)
+                    self._releaseAdditionsLocked(cursor,subscription,{str(attempt['id']) for attempt in expired},now)
                     closed=sum(self._expireCheckoutInvoiceLocked(cursor,str(attempt['invoice_id']),now)
                         for attempt in expired if attempt.get('invoice_id'))
                     return len(expired),closed
@@ -1348,6 +1614,14 @@ class ManualBillingRepository:
         }
         if self._usesPurchaseAuthority():
             manualBilling.update({k: snapshot.get(k) for k in ('servicePeriodId', 'selectionEventId', 'selectionVersion')})
+        manualBilling.update(capturePolicy=snapshot.get('capturePolicy', 'automatic'),
+            captureWindowMinutes=snapshot.get('captureWindowMinutes') or captureWindowMinutes())
+        if snapshot.get('purchaseDraftRevision') is not None:
+            manualBilling['purchaseDraftRevision'] = snapshot['purchaseDraftRevision']
+        if snapshot.get('slotKey') is not None:
+            manualBilling['slotKey'] = snapshot['slotKey']  # The slot this attempt holds the live position of.
+        if snapshot.get('invoicePricing') is not None:
+            manualBilling['invoicePricing'] = snapshot['invoicePricing']  # What this attempt's money pays for.
 
         namespaceKey = f"{purpose}:{userId}:{requestKey}"
         if str(subscription['id']) != str(snapshot.get('subscriptionId')) or subscription.get('erasure_pending'):
@@ -1426,9 +1700,7 @@ class ManualBillingRepository:
         # The invoice this reservation is about to use stays open.
         for expiredInvoiceId in expiredInvoiceIds-{str(snapshot.get('invoiceId'))}:
             self._expireCheckoutInvoiceLocked(cursor,expiredInvoiceId,now)
-        if purpose != 'expert_addition':
-            # An expert_addition reservation releases these itself below.
-            self._releaseExpiredAdditionsLocked(cursor,subscription,expiredAttemptIds,now)
+        self._releaseAdditionsLocked(cursor,subscription,expiredAttemptIds,now)
 
         subscriptionId = snapshot.get("subscriptionId")
         invoiceId = snapshot.get("invoiceId")
@@ -1440,21 +1712,13 @@ class ManualBillingRepository:
                 subscription = self._purchaseContextLocked(cursor, subscription, coverage, now)
                 if snapshot.get('servicePeriodId') != coverage.currentPeriod.invoiceId:
                     raise ValueError('EXPERT_PERIOD_MISMATCH')
-            current=subscription.get('subscribed_experts') or []
-            current=json.loads(current) if isinstance(current,str) else list(current)
-            pending=subscription.get('pending_additions') or []
-            pending=json.loads(pending) if isinstance(pending,str) else list(pending)
-            for item in pending:
-                if item.get('attemptId') in expiredAttemptIds and item.get('state')=='awaiting_payment':
-                    item.update(state='expired',expiredAt=now.isoformat())
-            openDomains={item.get('domain') for item in pending if item.get('state')=='awaiting_payment'}
-            if self._usesPurchaseAuthority():
-                openDomains = {d for a in self._pendingExpertAttemptsLocked(cursor, subscription, coverage.currentPeriod.invoiceId)
-                    for d in self._json(a['metadata_json'])['manualBilling']['domains']}
-            if not domains or set(domains)&(set(current)|openDomains) or len(set(current)|openDomains|set(domains))>4:
-                raise ValueError('EXPERT_SELECTION_CONFLICT')
+            current=self._jsonList(subscription.get('subscribed_experts'))
+            # One attempt carries the full requested set; an earlier set in this slot was replaced, never added to.
+            if not domains or set(domains)&set(current) or len(set(current)|set(domains))>4:
+                raise ValueError('INVALID_EXPERT_SELECTION')
             if not _utc(subscription.get('current_period_end')) or _utc(subscription['current_period_end']) <= now:
                 raise ValueError('EXPERT_PAID_PERIOD_ENDED')
+            pending=self._jsonList(subscription.get('pending_additions'))
             pending.extend({'domain':domain,'attemptId':attemptId,'state':'awaiting_payment'} for domain in domains)
             cursor.execute('update public.subscriptions set pending_additions=%s where id=%s',(Json(pending),subscription['id']))
         cursor.execute(
@@ -1495,7 +1759,7 @@ class ManualBillingRepository:
             """
             select id, user_id, subscription_id, invoice_id,
                    payment_status, provider_order_id,
-                   metadata_json
+                   metadata_json, attempted_at, created_at
             from public.billing_events
             where id = %s
             limit 1
@@ -1538,6 +1802,7 @@ class ManualBillingRepository:
             expiresAt=expiresAt,
             razorpayOrderId=row.get("provider_order_id"),
             snapshot=dict(billing),
+            attemptStartedAt=_utc(row.get("attempted_at") or row.get("created_at")),
         )
 
     def bindProviderOrder(self, attemptId: str, order: dict) -> CheckoutIntent:
@@ -1581,6 +1846,8 @@ class ManualBillingRepository:
                     raise ValueError(
                         f"Attempt {attemptId} is not bindable (closed or missing)"
                     )
+                from api.services.billing.purchaseCheckoutRepository import bindControlledOrderLocked
+                bindControlledOrderLocked(cursor, attemptId, order['id'])
                 if row['user_id'] is None:
                     return self._intentFromAttemptRow(row,self._json(row.get('metadata_json')),None,'erased_checkout')
                 cursor.execute('update public."Invoices" set razorpay_order_id=%s where id=%s and "userId"=%s',
@@ -1671,6 +1938,17 @@ class ManualBillingRepository:
     def finalizeCapturedPayment(
         self, evidence: VerifiedPaymentEvidence
     ) -> FinalizationResult:
+        """Idempotent per provider payment, under the owner lock (spec 4.4).
+
+        A captured payment either grants its own attempt's frozen snapshot and settles the slot,
+        or is recorded for one automatic full refund in this same transaction. Payments started
+        before the rules cutover (or evidence without the provider's created_at) keep today's
+        handling. No provider network call happens here.
+        """
+        from dataclasses import replace as normalized
+        # Providers may spell currencies in either case; matching, records and refunds use one spelling.
+        evidence = normalized(evidence, currency=str(evidence.currency or '').upper())
+
         def operation(connection):
             with connection.cursor(cursor_factory=RealDictCursor) as cursor:
                 self._lockUser(cursor, evidence.userId)
@@ -1699,30 +1977,425 @@ class ManualBillingRepository:
                 if (str(attempt.get('invoice_id')) != evidence.invoiceId or
                     str(attempt.get('subscription_id')) != str(subscription['id']) or
                     attempt.get('provider_order_id') != evidence.providerOrderId or
-                    frozen.get('purpose') != evidence.purpose or
-                    int(attempt.get('amount') or 0) != evidence.amount or
-                    str(attempt.get('currency')).upper() != evidence.currency.upper()):
-                    raise ValueError('PAYMENT_EVIDENCE_MISMATCH')
+                    frozen.get('purpose') != evidence.purpose):
+                    raise ValueError('PAYMENT_EVIDENCE_MISMATCH')  # Not this attempt's payment: nothing to bind.
+                # The money itself against the attempt's own snapshot (spec 4.4 row 1).
+                matches = (int(attempt.get('amount') or 0) == evidence.amount
+                           and str(attempt.get('currency')).upper() == evidence.currency)
                 if evidence.financialStatus != 'captured':
+                    if not matches:
+                        raise ValueError('PAYMENT_EVIDENCE_MISMATCH')
+                    if evidence.financialStatus == 'authorized' and attempt['payment_status'] in ('created', 'pending_provider_ack', 'authorized'):
+                        previous = frozen.get('providerObservation', {})
+                        if previous.get('outcome') != 'captured' and not frozen.get('closedAt'):
+                            attemptMetadata = self._json(attempt.get('metadata_json'))
+                            attemptBilling = attemptMetadata.setdefault('manualBilling', {})
+                            # A validated fetched payment proves authorization,
+                            # but is not a complete listing of all Order payments.
+                            if previous.get('outcome') != 'captured' and (
+                                    not previous.get('checkedAt') or _utc(previous['checkedAt']) <= evidence.observedAt):
+                                attemptBilling['providerObservation'] = {'orderId': evidence.providerOrderId,
+                                    'outcome': 'authorized', 'checkedAt': evidence.observedAt.isoformat(),
+                                    'complete': False, 'hasPayments': True, 'authorizationActive': True}
+                                started = evidence.paymentCreatedAt or _utc(previous.get('latestPaymentCreatedAt'))
+                                if started is not None:
+                                    attemptBilling['providerObservation']['latestPaymentCreatedAt'] = started.isoformat()
+                            cursor.execute('update public.billing_events set payment_status=%s,metadata_json=%s where id=%s',
+                                ('authorized', Json(attemptMetadata), evidence.attemptId))
                     return self._result(cursor,invoice, subscription, 'awaiting_capture', evidence.attemptId)
                 # A payment identity is global; a separate grant identity is per invoice.
                 cursor.execute('select * from public.billing_events where provider_payment_id = %s for update', (evidence.providerPaymentId,))
                 capture = cursor.fetchone()
-                if capture:
-                    if str(capture.get('invoice_id')) != evidence.invoiceId or capture['user_id'] != evidence.userId:
-                        raise ValueError('PAYMENT_ALREADY_BOUND')
-                    state = 'already_finalized' if invoice['status'] == 'PAID' and invoice.get('razorpayPaymentId') == evidence.providerPaymentId else 'requires_reconciliation'
-                    return self._result(cursor,invoice, subscription, state, evidence.attemptId, anomalyId=capture['id'] if state == 'requires_reconciliation' else None)
-                captureId = str(uuid.uuid4())
-                cursor.execute('''insert into public.billing_events
-                    (id,user_id,subscription_id,invoice_id,event_category,event_type,event_status,provider,
-                     provider_order_id,provider_payment_id,amount,currency,idempotency_key,metadata_json,occurred_at)
-                    values (%s,%s,%s,%s,'reconciliation','payment.capture','OBSERVED','razorpay',%s,%s,%s,%s,%s,%s,%s)''',
-                    (captureId,evidence.userId,subscription['id'],evidence.invoiceId,evidence.providerOrderId,
-                     evidence.providerPaymentId,evidence.amount,evidence.currency,'capture:'+evidence.providerPaymentId,
-                     Json({'timingKind':evidence.timingKind,'provenCaptureAt':evidence.provenCaptureAt.isoformat() if evidence.provenCaptureAt else None}), evidence.observedAt))
-                return self._evaluateCaptureLocked(cursor, subscription, invoice, attempt, evidence, captureId, existingCoverage)
+                if capture and (str(capture.get('invoice_id')) != evidence.invoiceId or capture['user_id'] != evidence.userId):
+                    raise ValueError('PAYMENT_ALREADY_BOUND')
+                return self._decideCaptureLocked(cursor, subscription, invoice, attempt, evidence, capture,
+                                                 existingCoverage, matches)
         return self._run(operation)
+
+    _EARLIEST = datetime.min.replace(tzinfo=timezone.utc)
+    _LATEST = datetime.max.replace(tzinfo=timezone.utc)
+    _PRICING_FIELDS = ('amount', 'total_amount', 'amount_before_tax', 'tax_amount', 'currency', 'tax_breakdown_json',
+                       'tax_rule_version', 'place_of_supply_snapshot', 'pricing_version', 'pricing_reference_snapshot_json')
+
+    def _captureRulesClockLocked(self, cursor, evidence):
+        """(cutover, missing facts). The capture rules need the provider's payment created_at, the slot
+        storage and a configured cutover; without them a payment keeps today's handling and ``missing``
+        names what was absent, so it is never mistaken for a genuine pre-cutover anomaly."""
+        from api.services.billing.paymentPolicy import paymentRulesEffectiveAt
+        from api.services.billing.purchaseCheckoutRepository import _storagePresent
+        missing = []
+        if evidence.paymentCreatedAt is None:
+            missing.append('created_at')
+        if not _storagePresent(cursor):
+            missing.append('slot_storage')
+        try:
+            cutoff = paymentRulesEffectiveAt()
+        except RuntimeError:
+            cutoff = None
+            missing.append('cutover')
+        if missing:
+            from utils.logger import logger
+            logger.warning('Captured payment kept today\'s handling, capture rules facts missing: attempt={} payment={} missing={}',
+                           evidence.attemptId, evidence.providerPaymentId, ','.join(missing))
+            return None, missing
+        return cutoff, []
+
+    def _dbNow(self, cursor):
+        cursor.execute('select clock_timestamp() as current_time')
+        return _utc(cursor.fetchone()['current_time'])
+
+    def _decideCaptureLocked(self, cursor, subscription, invoice, attempt, evidence, capture, existingCoverage, matches):
+        """Spec 4.4 in order: attention, replay, legacy, then the slot facts decide refund or grant.
+
+        A refund needs no snapshot (it returns the captured amount); only a grant needs the attempt's
+        frozen snapshot, so its completeness is checked once the rules say grant.
+        """
+        from dataclasses import replace as withFacts
+        from api.services.billing.captureRules import CaptureFacts, attemptClosureTime, classifyCapture
+        cutoff, missing = self._captureRulesClockLocked(cursor, evidence)
+        facts = CaptureFacts(evidenceMatches=matches, alreadyFinalized=capture is not None,
+            paymentCreatedAt=evidence.paymentCreatedAt if cutoff else self._EARLIEST,
+            rulesEffectiveAt=cutoff or self._LATEST, slotSettledByOther=False, ownerClosed=False,
+            attemptClosedAt=None, deliverable=True)
+        outcome, _ = classifyCapture(facts)
+        if outcome == 'replay':
+            return self._replayCaptureLocked(cursor, subscription, invoice, evidence, capture)
+        rulesFacts = ('RULES_FACTS_MISSING' if missing else
+                      'PRE_CUTOVER' if evidence.paymentCreatedAt < cutoff else 'CAPTURE_RULES')
+        if outcome == 'attention':
+            return self._captureNeedsAttentionLocked(cursor, subscription, invoice, evidence, capture,
+                                                     'PAYMENT_EVIDENCE_MISMATCH', rulesFacts, missing)
+        captureId = self._recordCaptureLocked(cursor, subscription, evidence, rulesFacts, missing)
+        if outcome == 'legacy':
+            result = self._evaluateCaptureLocked(cursor, subscription, invoice, attempt, evidence, captureId, existingCoverage)
+            if result.finalized:
+                self._settleLegacyGrantLocked(cursor, subscription, attempt, evidence.providerPaymentId)
+            return result
+        frozen = self._json(attempt.get('metadata_json')).get('manualBilling', {})
+        now = self._dbNow(cursor)
+        control, slot, instanceSettled = self._captureSlotLocked(cursor, attempt, frozen, now)
+        if control is None:
+            # No slot can be derived for a pre-rollout attempt: escalate once instead of failing every retry.
+            return self._markAttentionLocked(cursor, subscription, invoice, evidence, captureId, 'PAYMENT_SLOT_UNAVAILABLE')
+        captureAt = (evidence.provenCaptureAt if evidence.timingVerified else None) or evidence.observedAt
+        facts = withFacts(facts,
+            slotSettledByOther=(instanceSettled or slot['settled_payment_id'] not in (None, evidence.providerPaymentId)
+                or (str(invoice['status']).upper() == 'PAID'
+                    and invoice.get('razorpayPaymentId') not in (None, evidence.providerPaymentId))),
+            ownerClosed=self._ownerClosedLocked(cursor, subscription),
+            attemptClosedAt=attemptClosureTime(_utc(frozen.get('expiresAt')), _utc(frozen.get('closedAt')),
+                                               _utc(control.get('closed_at'))),
+            deliverable=self._captureDeliverableLocked(cursor, subscription, invoice, evidence, frozen, captureAt))
+        outcome, reason = classifyCapture(facts)
+        if outcome == 'refund':
+            return self._refundCaptureLocked(cursor, subscription, invoice, attempt, evidence, captureId, reason, now)
+        if not self._snapshotDescribesPayment(invoice, attempt, frozen):
+            # It would win, but its own frozen snapshot cannot say what was paid for: never guess a grant.
+            return self._markAttentionLocked(cursor, subscription, invoice, evidence, captureId, 'FROZEN_SNAPSHOT_INCOMPLETE')
+        return self._grantSnapshotLocked(cursor, subscription, invoice, attempt, evidence, captureId, control, captureAt, now)
+
+    def _recordCaptureLocked(self, cursor, subscription, evidence, rulesFacts=None, missing=()):
+        captureId = str(uuid.uuid4())
+        metadata = {'timingKind':evidence.timingKind,
+                    'provenCaptureAt':evidence.provenCaptureAt.isoformat() if evidence.provenCaptureAt else None,
+                    'paymentCreatedAt':evidence.paymentCreatedAt.isoformat() if evidence.paymentCreatedAt else None}
+        if rulesFacts:
+            metadata['rulesFacts'] = rulesFacts  # CAPTURE_RULES, PRE_CUTOVER or RULES_FACTS_MISSING
+        if missing:
+            metadata['rulesFactsMissing'] = list(missing)
+        cursor.execute('''insert into public.billing_events
+            (id,user_id,subscription_id,invoice_id,event_category,event_type,event_status,provider,
+             provider_order_id,provider_payment_id,amount,currency,idempotency_key,metadata_json,occurred_at)
+            values (%s,%s,%s,%s,'reconciliation','payment.capture','OBSERVED','razorpay',%s,%s,%s,%s,%s,%s,%s)''',
+            (captureId,evidence.userId,subscription['id'],evidence.invoiceId,evidence.providerOrderId,
+             evidence.providerPaymentId,evidence.amount,evidence.currency,'capture:'+evidence.providerPaymentId,
+             Json(metadata), evidence.observedAt))
+        return captureId
+
+    def _captureNeedsAttentionLocked(self, cursor, subscription, invoice, evidence, capture, reason, rulesFacts=None, missing=()):
+        """Provider money that cannot be proven to be this attempt's: escalated, never granted or refunded."""
+        if capture:
+            return self._result(cursor, invoice, subscription, 'requires_reconciliation', evidence.attemptId, anomalyId=capture['id'])
+        captureId = self._recordCaptureLocked(cursor, subscription, evidence, rulesFacts, missing)
+        return self._markAttentionLocked(cursor, subscription, invoice, evidence, captureId, reason)
+
+    def _markAttentionLocked(self, cursor, subscription, invoice, evidence, captureId, reason):
+        """needs_attention: REQUIRES_RECONCILIATION (the obligation report's actionable case)."""
+        cursor.execute('update public.billing_events set event_status=%s,failure_reason=%s where id=%s',
+                       ('REQUIRES_RECONCILIATION', reason, captureId))
+        from utils.logger import logger
+        logger.error('Captured payment needs attention: attempt={} payment={} reason={}',
+                     evidence.attemptId, evidence.providerPaymentId, reason)
+        return self._result(cursor, invoice, subscription, 'requires_reconciliation', evidence.attemptId, anomalyId=captureId)
+
+    def _replayCaptureLocked(self, cursor, subscription, invoice, evidence, capture):
+        if capture['event_status'] == 'REFUND_RESERVED':
+            return self._result(cursor, invoice, subscription, 'refund_pending', evidence.attemptId)
+        state = 'already_finalized' if invoice['status'] == 'PAID' and invoice.get('razorpayPaymentId') == evidence.providerPaymentId else 'requires_reconciliation'
+        return self._result(cursor,invoice, subscription, state, evidence.attemptId, anomalyId=capture['id'] if state == 'requires_reconciliation' else None)
+
+    @classmethod
+    def _snapshotDescribesPayment(cls, invoice, attempt, frozen):
+        """The attempt's frozen snapshot says exactly what its money buys (amount, currency, selection)."""
+        billing = cls._json(invoice.get('metadata_json')).get('manualBilling', {})
+        amount, currency = int(attempt.get('amount') or 0), attempt.get('currency')
+        sameInvoice = int(invoice.get('total_amount') or 0) == amount and invoice.get('currency') == currency
+        if frozen.get('purpose') == 'renewal':
+            if sameInvoice and int(billing.get('revision') or 1) == int(frozen.get('revision') or 1):
+                return True
+            # A renewal on an older invoice revision is granted as frozen on its attempt.
+            pricing = frozen.get('invoicePricing') or {}
+            return (int(pricing.get('total_amount') or -1) == amount and pricing.get('currency') == currency
+                    and bool(frozen.get('domains')))
+        return (sameInvoice and billing.get('purpose') == frozen.get('purpose')
+                and set(billing.get('domains') or []) == set(frozen.get('domains') or []))
+
+    def _captureSlotLocked(self, cursor, attempt, frozen, now):
+        """(control, slot row, settled instance) for the attempt; (None, None, False) when no slot can be derived.
+
+        A reused pre-rollout attempt is bound first (account default). When a slot instance of its key
+        was settled after the attempt was reserved, the attempt lived alongside it: its capture is a
+        duplicate, recorded through a fresh unsettled slot row (a settled slot takes no new control).
+        """
+        from api.services.billing.paymentSlots import attemptSlotKey, effectiveSlotKey, slotKind
+        from api.services.billing.purchaseCheckoutRepository import openSlotLocked
+        cursor.execute('select * from public.payment_slot_controls where attempt_id=%s for update', (attempt['id'],))
+        control = cursor.fetchone()
+        instanceSettled = False
+        if control is None:
+            key = effectiveSlotKey(attemptSlotKey(frozen, _utc(attempt.get('attempted_at'))), now)
+            if key is None or frozen.get('purpose') not in ('initial_purchase', 'renewal', 'expert_addition', 'topup'):
+                return None, None, False
+            kind = slotKind(frozen.get('purpose'))
+            cursor.execute('''select 1 from public.payment_slots where user_id=%s and kind=%s and slot_key=%s
+                and settled_payment_id is not null and settled_at>=%s limit 1''',
+                (attempt['user_id'], kind, key, attempt.get('attempted_at')))
+            instanceSettled = cursor.fetchone() is not None
+            slotId = openSlotLocked(cursor, attempt['user_id'], kind, key)
+            control = self._bindControlLocked(cursor, attempt, frozen, slotId)
+        cursor.execute('select * from public.payment_slots where slot_id=%s for update', (control['slot_id'],))
+        return control, cursor.fetchone(), instanceSettled
+
+    @staticmethod
+    def _bindControlLocked(cursor, attempt, frozen, slotId):
+        policy = 'automatic' if frozen.get('capturePolicy') == 'automatic' else 'account_default'
+        cursor.execute('''insert into public.payment_slot_controls
+            (attempt_id,slot_id,invoice_id,user_id,purpose,draft_revision,provider_order_id,capture_policy)
+            values(%s,%s,%s,%s,%s,%s,%s,%s) returning *''', (attempt['id'], slotId, attempt['invoice_id'], attempt['user_id'],
+            frozen.get('purpose'), frozen.get('purchaseDraftRevision') if frozen.get('purpose') == 'initial_purchase' else None,
+            attempt.get('provider_order_id'), policy))
+        return cursor.fetchone()
+
+    def _ownerClosedLocked(self, cursor, subscription):
+        """Account erased or banned, or erasure pending (spec 4.4 row 5)."""
+        if subscription.get('erasure_pending'):
+            return True
+        cursor.execute('select "isBanned" from public."Users" where "userId"=%s', (subscription['user_id'],))
+        owner = cursor.fetchone()
+        if not owner or owner.get('isBanned'):
+            return True
+        cursor.execute("select to_regclass('public.user_erasure_requests') as relation")
+        if not cursor.fetchone()['relation']:
+            return False
+        cursor.execute("select 1 from public.user_erasure_requests where target_user_id=%s and status<>'COMPLETED' limit 1",
+                       (subscription['user_id'],))
+        return cursor.fetchone() is not None
+
+    def _captureDeliverableLocked(self, cursor, subscription, invoice, evidence, frozen, captureAt):
+        """False only when nothing is left to deliver: an expert addition whose term has ended, or a
+        Pro term (renewal, or a purchase) that a paid term already covers."""
+        purpose = frozen.get('purpose')
+        if purpose == 'topup':
+            return True
+        if purpose == 'expert_addition':
+            added = list(frozen.get('domains') or [])
+            if self._usesPurchaseAuthority():
+                period = self._coverageSnapshotLocked(cursor, subscription, evidence.observedAt, materialize=False).currentPeriod
+                if (not period or frozen.get('servicePeriodId') != period.invoiceId
+                        or frozen.get('lifecycleId') != period.lifecycleId or _utc(invoice.get('period_end')) != period.end):
+                    return False
+                current = list(period.domains)
+            else:
+                end = _utc(subscription.get('current_period_end'))
+                lifecycle = self._json(subscription.get('billing_state')).get('manualBilling', {}).get('lifecycleId')
+                if not end or end <= captureAt or _utc(invoice.get('period_end')) != end or frozen.get('lifecycleId') != lifecycle:
+                    return False
+                current = self._jsonList(subscription.get('subscribed_experts'))
+            return bool(added) and not set(added) & set(current) and len(set(current) | set(added)) <= 4
+        from dateutil.relativedelta import relativedelta
+        if purpose == 'initial_purchase':
+            start = captureAt
+            end = start + (relativedelta(years=1) if frozen.get('billingMode') == 'annual_prepaid' else relativedelta(months=1))
+        else:
+            start, end = _utc(invoice.get('period_start')), _utc(invoice.get('period_end'))
+            if start is None or end is None:
+                return False
+        for paid in self._paidInvoicesLocked(cursor, subscription):
+            billing = self._json(paid.get('metadata_json')).get('manualBilling', {})
+            paidStart, paidEnd = _utc(paid.get('period_start')), _utc(paid.get('period_end'))
+            if (str(paid['id']) != str(invoice['id']) and billing.get('purpose') in ('initial_purchase', 'renewal')
+                    and not billing.get('revokedAt') and billing.get('coverageState') != 'revoked'
+                    and paidStart and paidEnd and paidStart < end and start < paidEnd):
+                return False  # A later (or overlapping) term is already paid.
+        return True
+
+    def _refundCaptureLocked(self, cursor, subscription, invoice, attempt, evidence, captureId, reason, now):
+        """Record the capture as never granted and reserve its one full refund in this transaction."""
+        from api.services.billing.paymentOperationRepository import reserveRefund
+        cursor.execute('update public.billing_events set event_status=%s,failure_reason=%s where id=%s',
+                       ('REFUND_RESERVED', reason.upper(), captureId))
+        # An Order that took money takes no other payment: an attempt still open ends here.
+        self._closeSlotAttemptLocked(cursor, subscription, attempt, 'PAYMENT_REFUNDED', now)
+        reserveRefund(cursor, attemptId=str(attempt['id']), paymentId=evidence.providerPaymentId,
+                      amount=evidence.amount, currency=evidence.currency, reason=reason)
+        return self._result(cursor, invoice, subscription, 'refund_pending', evidence.attemptId)
+
+    def _closeSlotAttemptLocked(self, cursor, subscription, attempt, reason, now, keepInvoiceId=None):
+        """End an attempt that can no longer win its slot: close it (and its single-use invoice) and its
+        control. Its Order stays in the recovery scan until recover_until; a later capture is refunded."""
+        from api.services.billing.paymentSlots import checkoutTtlSeconds, supersededRecoverUntil
+        from api.services.billing.purchaseCheckoutRepository import _storagePresent
+        cursor.execute('select * from public.billing_events where id=%s for update', (attempt['id'],))
+        row = cursor.fetchone()
+        if row.get('payment_status') == 'captured':
+            return  # The granted attempt keeps its control; a duplicate on its Order changes neither.
+        billing = self._json(row.get('metadata_json')).get('manualBilling', {})
+        if row.get('payment_status') in self._LIVE_STATUSES and not billing.get('closedAt'):
+            if billing.get('purpose') != 'renewal' and str(row.get('invoice_id')) != str(keepInvoiceId):
+                cursor.execute('select * from public."Invoices" where id=%s for update', (row['invoice_id'],))
+                invoice = cursor.fetchone()
+                if invoice and str(invoice['status']).upper() in ('UPCOMING', 'PAYMENT_PENDING'):
+                    self._closeInvoice(cursor, invoice, reason, now=now)
+                    cursor.execute('select * from public.billing_events where id=%s', (row['id'],))
+                    row = cursor.fetchone()
+            metadata = self._json(row.get('metadata_json'))
+            billing = metadata.setdefault('manualBilling', {})
+            if not billing.get('closedAt'):
+                billing.update(closedAt=now.isoformat(), closedReason=reason)
+                billing.pop('closureReconciledAt', None)
+                cursor.execute("update public.billing_events set payment_status='cancelled',event_status='cancelled',metadata_json=%s where id=%s",
+                               (Json(metadata), row['id']))
+            if subscription is not None and billing.get('purpose') == 'expert_addition':
+                self._releaseAdditionsLocked(cursor, subscription, {str(row['id'])}, now, state='superseded')
+        if not _storagePresent(cursor):
+            return
+        cursor.execute('select * from public.payment_slot_controls where attempt_id=%s for update', (row['id'],))
+        control = cursor.fetchone()
+        if control is None or control['closed_at'] is not None:
+            return
+        recoverUntil = supersededRecoverUntil(now, _utc(billing.get('expiresAt')),
+            _utc(billing.get('providerObservation', {}).get('latestPaymentCreatedAt')),
+            int(billing.get('captureWindowMinutes') or captureWindowMinutes()), checkoutTtlSeconds())
+        cursor.execute('''update public.payment_slot_controls set operation_revision=operation_revision+1,
+            closed_at=%s,closed_reason=%s,recover_until=%s,updated_at=clock_timestamp() where attempt_id=%s''',
+            (now, reason, recoverUntil, row['id']))
+
+    def _alignInvoiceToAttemptLocked(self, cursor, invoice, attempt, frozen):
+        """The invoice records exactly what the granted attempt froze: a closed invoice reopens for its
+        payment, and a renewal on an older revision gets that revision's price, tax and selection back."""
+        metadata = self._json(invoice.get('metadata_json'))
+        billing = metadata.setdefault('manualBilling', {})
+        fields = {}
+        if str(invoice['status']).upper() not in ('UPCOMING', 'PAYMENT_PENDING'):
+            closure = {key: billing.pop(key) for key in ('closedAt', 'closedReason', 'supersededByInvoiceId') if key in billing}
+            if closure:
+                billing['reopenedAfterClosure'] = closure
+        if frozen.get('purpose') == 'renewal' and (int(billing.get('revision') or 1) != int(frozen.get('revision') or 1)
+                or int(invoice.get('total_amount') or 0) != int(attempt.get('amount') or 0)):
+            pricing = frozen['invoicePricing']
+            fields.update({key: pricing[key] for key in self._PRICING_FIELDS if key in pricing})
+            billing.update(revision=int(frozen.get('revision') or 1), domains=list(frozen.get('domains') or []))
+            billing.update({key: frozen[key] for key in ('selectionEventId', 'selectionVersion') if key in frozen})
+            if 'renewalDomains' in metadata:
+                metadata['renewalDomains'] = list(frozen.get('domains') or [])
+        if 'repricingRequired' in metadata or 'repricingReason' in metadata:
+            metadata.pop('repricingRequired', None)
+            metadata.pop('repricingReason', None)
+        if invoice.get('razorpay_order_id') != attempt.get('provider_order_id'):
+            fields['razorpay_order_id'] = attempt.get('provider_order_id')
+        fields['metadata_json'] = metadata
+        values = [Json(value) if isinstance(value, (dict, list)) else value for value in fields.values()]
+        cursor.execute('update public."Invoices" set ' + ','.join('"' + key + '"=%s' for key in fields)
+                       + ' where id=%s', (*values, invoice['id']))
+        invoice.update(fields)
+
+    def _grantSnapshotLocked(self, cursor, subscription, invoice, attempt, evidence, captureId, control, captureAt, now):
+        """Grant the attempt's own frozen snapshot through the existing finalizers, then settle the slot."""
+        frozen = self._json(attempt.get('metadata_json')).get('manualBilling', {})
+        if frozen.get('purpose') == 'renewal':
+            # One paid invoice per term: a re-frozen revision of the same term closes unpaid. A renewal
+            # grant either finalizes or raises, so nothing is closed for a payment that does not grant.
+            cursor.execute('''select * from public."Invoices" where "userId"=%s and subscription_id=%s
+                and billing_reason='renewal' and period_start=%s and id<>%s
+                and status in ('UPCOMING','PAYMENT_PENDING','EXPIRED') order by id for update''',
+                (subscription['user_id'], subscription['id'], invoice.get('period_start'), invoice['id']))
+            for unpaid in cursor.fetchall():
+                self._closeInvoice(cursor, unpaid, 'RENEWAL_PAID', now=now)
+        self._alignInvoiceToAttemptLocked(cursor, invoice, attempt, frozen)
+        result = self._grantCaptureLocked(cursor, subscription, invoice, attempt, evidence, captureId,
+                                          self._json(invoice.get('metadata_json')), frozen, captureAt)
+        if result.finalized:
+            self._settleSlotLocked(cursor, subscription, attempt, control, evidence.providerPaymentId, now)
+        return result
+
+    def _settledSlotKeysLocked(self, cursor, userId, kind):
+        """Keys of the owner's settled slots of ``kind``; None without slot storage."""
+        from api.services.billing.purchaseCheckoutRepository import _storagePresent
+        if not _storagePresent(cursor):
+            return None
+        cursor.execute('''select slot_key from public.payment_slots where user_id=%s and kind=%s
+            and settled_payment_id is not null''', (userId, kind))
+        return {row['slot_key'] for row in cursor.fetchall()}
+
+    def _settleSlotLocked(self, cursor, subscription, attempt, control, paymentId, now):
+        """Settle the winning attempt's slot instance; every other attempt in it ends (spec 4.4 last row).
+
+        Attempts reserved before slots existed that can still capture join the slot closed first, so a
+        later capture on them is a duplicate. The next purchase opens a new slot row.
+        """
+        from api.services.billing.paymentSlots import checkoutTtlSeconds, supersededRecoverUntil
+        cursor.execute('''select attempt_id from public.payment_slot_controls where slot_id=%s and attempt_id<>%s
+            order by attempt_id for update''', (control['slot_id'], attempt['id']))
+        for peer in [row['attempt_id'] for row in cursor.fetchall()]:
+            cursor.execute('select * from public.billing_events where id=%s', (peer,))
+            row = cursor.fetchone()
+            if row and row.get('payment_status') != 'captured':
+                self._closeSlotAttemptLocked(cursor, subscription, row, 'SLOT_SETTLED', now, keepInvoiceId=attempt['invoice_id'])
+        cursor.execute('select kind,slot_key from public.payment_slots where slot_id=%s', (control['slot_id'],))
+        slot = cursor.fetchone()
+        entries = self._inSlot(self._slotEntriesLocked(cursor, attempt['user_id']), slot['kind'], slot['slot_key'], now,
+                               self._settledSlotKeysLocked(cursor, attempt['user_id'], slot['kind']))
+        for row, _, frozen in entries:
+            if str(row['id']) == str(attempt['id']) or row.get('payment_status') == 'captured' or not row.get('provider_order_id'):
+                continue
+            cursor.execute('select 1 from public.payment_slot_controls where attempt_id=%s', (row['id'],))
+            if cursor.fetchone():
+                continue
+            closedAt = _utc(frozen.get('closedAt')) or now
+            until = supersededRecoverUntil(closedAt, _utc(frozen.get('expiresAt')),
+                _utc(frozen.get('providerObservation', {}).get('latestPaymentCreatedAt')),
+                int(frozen.get('captureWindowMinutes') or captureWindowMinutes()), checkoutTtlSeconds())
+            live = row.get('payment_status') in self._LIVE_STATUSES and not frozen.get('closedAt')
+            if live or until > now:
+                self._bindControlLocked(cursor, row, frozen, control['slot_id'])
+                self._closeSlotAttemptLocked(cursor, subscription, row, 'SLOT_SETTLED', now, keepInvoiceId=attempt['invoice_id'])
+        cursor.execute('''update public.payment_slots set settled_payment_id=%s,settled_at=%s
+            where slot_id=%s and settled_payment_id is null returning slot_id''', (paymentId, now, control['slot_id']))
+        if cursor.fetchone() is None:
+            raise RuntimeError('PAYMENT_SLOT_ALREADY_SETTLED')
+
+    def _settleLegacyGrantLocked(self, cursor, subscription, attempt, paymentId):
+        """A grant under today's handling still settles a bound slot, so no later capture grants twice."""
+        from api.services.billing.purchaseCheckoutRepository import _storagePresent
+        if not _storagePresent(cursor):
+            return
+        cursor.execute('select * from public.payment_slot_controls where attempt_id=%s for update', (attempt['id'],))
+        control = cursor.fetchone()
+        if control is None:
+            return
+        cursor.execute('select settled_payment_id from public.payment_slots where slot_id=%s for update', (control['slot_id'],))
+        if cursor.fetchone()['settled_payment_id'] is None:
+            self._settleSlotLocked(cursor, subscription, attempt, control, paymentId, self._dbNow(cursor))
 
     def _evaluateCaptureLocked(self, cursor, subscription, invoice, attempt, evidence, captureId, existingCoverage):
         """Apply the original-purchase rules to one recorded capture under the owner lock.
@@ -1808,6 +2481,12 @@ class ManualBillingRepository:
         if reason:
             cursor.execute('update public.billing_events set event_status = %s, failure_reason = %s where id = %s', ('REQUIRES_RECONCILIATION',reason,captureId))
             return self._result(cursor,invoice,subscription,'requires_reconciliation',evidence.attemptId,anomalyId=captureId)
+        return self._grantCaptureLocked(cursor, subscription, invoice, attempt, evidence, captureId, metadata, frozen, captureAt)
+
+    def _grantCaptureLocked(self, cursor, subscription, invoice, attempt, evidence, captureId, metadata, frozen, captureAt):
+        """The existing finalizers (coverage, experts, credits, top-up tokens, receipts, lifecycle events),
+        driven by the attempt's frozen snapshot. ``metadata`` is the invoice metadata to update."""
+        billing = metadata.setdefault('manualBilling', {})
         if evidence.purpose == 'expert_addition':
             return self._finalizeExpertCapture(cursor,invoice,subscription,attempt,evidence,captureId,metadata)
         if evidence.purpose == 'topup':
@@ -1871,6 +2550,10 @@ class ManualBillingRepository:
         and staff-entered or recheck-time observations never count as timing.
         """
         stored = self._json(capture.get('metadata_json'))
+        if str(capture.get('event_status') or '').upper() == 'REFUND_RESERVED':
+            return None, 'CAPTURE_REFUND_RESERVED'  # Being returned in full: never re-decided for a grant.
+        if stored.get('rulesFacts') == 'CAPTURE_RULES':
+            return None, 'CAPTURE_RULES_ATTENTION'  # Decided by the capture rules, not today's rules.
         if stored.get('reconsideredAt') or stored.get('timingKind') == 'provider_captured_at':
             return None, 'RECHECK_ALREADY_APPLIED'
         if not (evidence.timingVerified and evidence.provenCaptureAt and evidence.timingKind == 'provider_captured_at'):
@@ -1910,13 +2593,19 @@ class ManualBillingRepository:
                       reconsideredAt=evidence.observedAt.isoformat())
         cursor.execute('update public.billing_events set metadata_json=%s where id=%s', (Json(stored), str(capture['id'])))
         result = self._evaluateCaptureLocked(cursor, subscription, invoice, attempt, evidence, str(capture['id']), existingCoverage)
+        if result.finalized:
+            self._settleLegacyGrantLocked(cursor, subscription, attempt, evidence.providerPaymentId)
         if result.state == 'requires_reconciliation':
             cursor.execute('select failure_reason from public.billing_events where id=%s', (str(capture['id']),))
             return result, cursor.fetchone()['failure_reason']
         return result, None
 
     def _recordErasedCapture(self,cursor,attempt,evidence):
-        """Retain received-money evidence after anonymisation; grant no access."""
+        """Retain received-money evidence after anonymisation; grant no access.
+
+        Under the capture rules the money is returned in full (account closed, or a duplicate of a
+        settled slot) through the retained refund authority; older payments stay for review.
+        """
         cursor.execute('select * from public."Invoices" where id=%s for update',(evidence.invoiceId,))
         invoice=cursor.fetchone()
         if (not invoice or invoice['userId'] is not None or str(attempt['invoice_id'])!=evidence.invoiceId
@@ -1932,15 +2621,77 @@ class ManualBillingRepository:
                 or existing.get('provider_order_id')!=evidence.providerOrderId
                 or int(existing.get('amount') or 0)!=evidence.amount or existing.get('currency')!=evidence.currency):
             raise ValueError('PAYMENT_ALREADY_BOUND')
-        anomalyId=str(existing['id']) if existing else str(uuid.uuid4())
-        if not existing:
-            cursor.execute('''insert into public.billing_events(id,invoice_id,event_category,event_type,event_status,
-                provider_order_id,provider_payment_id,amount,currency,idempotency_key,failure_reason,metadata_json,occurred_at)
-                values(%s,%s,'reconciliation','payment.capture','REQUIRES_RECONCILIATION',%s,%s,%s,%s,%s,'ERASED_ACCOUNT',%s,%s)''',
-                (anomalyId,evidence.invoiceId,evidence.providerOrderId,evidence.providerPaymentId,evidence.amount,
-                 evidence.currency,'capture:'+evidence.providerPaymentId,Json({}),evidence.observedAt))
+        if existing:
+            refunding = existing['event_status'] == 'REFUND_RESERVED'
+            return FinalizationResult(evidence.invoiceId,evidence.attemptId,'refund_pending' if refunding else 'requires_reconciliation',
+                'unchanged',False,False,True,None,None,None if refunding else str(existing['id']))
+        reason = self._erasedRefundReasonLocked(cursor, attempt, evidence)
+        anomalyId=str(uuid.uuid4())
+        cursor.execute('''insert into public.billing_events(id,invoice_id,event_category,event_type,event_status,
+            provider_order_id,provider_payment_id,amount,currency,idempotency_key,failure_reason,metadata_json,occurred_at)
+            values(%s,%s,'reconciliation','payment.capture',%s,%s,%s,%s,%s,%s,%s,%s,%s)''',
+            (anomalyId,evidence.invoiceId,'REFUND_RESERVED' if reason else 'REQUIRES_RECONCILIATION',
+             evidence.providerOrderId,evidence.providerPaymentId,evidence.amount,
+             evidence.currency,'capture:'+evidence.providerPaymentId,reason.upper() if reason else 'ERASED_ACCOUNT',
+             Json({'erasureRequestId':self._json(attempt.get('metadata_json')).get('erasureRequestId'),
+                   'paymentCreatedAt':evidence.paymentCreatedAt.isoformat() if evidence.paymentCreatedAt else None}),
+             evidence.observedAt))
+        if reason:
+            from api.services.billing.paymentOperationRepository import reserveRefund
+            reserveRefund(cursor, attemptId=str(attempt['id']), paymentId=evidence.providerPaymentId,
+                          amount=evidence.amount, currency=evidence.currency, reason=reason)
+            return FinalizationResult(evidence.invoiceId,evidence.attemptId,'refund_pending','unchanged',
+                False,False,True,None,None,None)
         return FinalizationResult(evidence.invoiceId,evidence.attemptId,'requires_reconciliation','unchanged',
             False,False,True,None,None,anomalyId)
+
+    def _erasedRefundReasonLocked(self, cursor, attempt, evidence):
+        """The capture rules for an erased owner: always a full refund; None keeps today's handling."""
+        from api.services.billing.captureRules import CaptureFacts, attemptClosureTime, classifyCapture
+        cutoff, _ = self._captureRulesClockLocked(cursor, evidence)
+        if cutoff is None or evidence.paymentCreatedAt < cutoff:
+            return None
+        cursor.execute('select * from public.payment_slot_controls where attempt_id=%s for update', (attempt['id'],))
+        control = cursor.fetchone()
+        if control is None:
+            control = self._bindRetainedControlLocked(cursor,attempt)
+        if control is None or control['provider_order_id'] != attempt.get('provider_order_id'):
+            return None  # No retained control to refund through: kept for review.
+        cursor.execute('select settled_payment_id from public.payment_slots where slot_id=%s for update', (control['slot_id'],))
+        settled = cursor.fetchone()['settled_payment_id']
+        frozen = self._json(attempt.get('metadata_json')).get('manualBilling', {})
+        outcome, reason = classifyCapture(CaptureFacts(True, False, evidence.paymentCreatedAt, cutoff,
+            settled not in (None, evidence.providerPaymentId), True,
+            attemptClosureTime(_utc(frozen.get('expiresAt')), _utc(frozen.get('closedAt')), _utc(control.get('closed_at'))),
+            True))
+        return reason if outcome == 'refund' else None
+
+    def _bindRetainedControlLocked(self,cursor,attempt):
+        """Refund-only control from exact immutable originals; never create a historical archive."""
+        from api.services.billing.paymentSlots import slotKind
+        requestId=self._json(attempt.get('metadata_json')).get('erasureRequestId')
+        cursor.execute('SELECT private.exact_retained_payment_attempt(%s,%s,%s) AS proven',
+                       (attempt['id'],attempt['invoice_id'],requestId))
+        if not cursor.fetchone()['proven']:
+            return None
+        cursor.execute('''SELECT original_record FROM private.retained_user_records
+            WHERE source_table='billing_events' AND source_id=%s AND request_id=%s''',(attempt['id'],requestId))
+        original=cursor.fetchone()['original_record']['metadata_json']['manualBilling']
+        purpose=original['purpose']
+        kind,key=slotKind(purpose),'retained:'+str(attempt['id'])
+        cursor.execute('''INSERT INTO public.payment_slots(slot_id,user_id,kind,slot_key,erasure_request_id)
+            VALUES(%s,NULL,%s,%s,%s) ON CONFLICT(slot_id) DO NOTHING''',(attempt['id'],kind,key,requestId))
+        cursor.execute('SELECT * FROM public.payment_slots WHERE slot_id=%s FOR UPDATE',(attempt['id'],))
+        slot=cursor.fetchone()
+        if (slot['user_id'] is not None or str(slot['erasure_request_id'])!=str(requestId)
+                or slot['kind']!=kind or slot['slot_key']!=key or slot['settled_payment_id'] is not None):
+            raise ValueError('RETAINED_PAYMENT_SLOT_CONFLICT')
+        cursor.execute('''INSERT INTO public.payment_slot_controls(attempt_id,slot_id,invoice_id,user_id,purpose,
+            provider_order_id,capture_policy,closed_at,closed_reason,erasure_request_id)
+            VALUES(%s,%s,%s,NULL,%s,%s,%s,clock_timestamp(),'ACCOUNT_CLOSED',%s) RETURNING *''',
+            (attempt['id'],attempt['id'],attempt['invoice_id'],purpose,attempt['provider_order_id'],
+             original.get('capturePolicy') or 'account_default',requestId))
+        return cursor.fetchone()
 
     def activateDueCoverage(self, userId: str, now: datetime) -> FinalizationResult:
         def operation(connection):
@@ -2286,6 +3037,8 @@ class ManualBillingRepository:
         if cursor.fetchone() is None: raise ValueError('TOPUP_BALANCE_MISSING')
         cursor.execute('update public.credit_balances set topup_tokens=topup_tokens+%s,balance_version=balance_version+1,updated_at=%s where user_id=%s',
             (tokens,evidence.observedAt,evidence.userId))
+        from api.services.credits.manualCreditRepository import ManualCreditRepository
+        ManualCreditRepository(self).applyPendingTopupRefundsLocked(cursor,invoice,attempt,evidence)
         cursor.execute('update public."Invoices" set status=\'PAID\',"razorpayPaymentId"=%s,"paidAt"=%s where id=%s',
             (evidence.providerPaymentId,evidence.observedAt,invoice['id']))
         cursor.execute("update public.billing_events set payment_status='captured',event_status='captured',completed_at=%s where id=%s",
@@ -2409,11 +3162,7 @@ class ManualBillingRepository:
         intent = {'userId':subscription['user_id'], 'subscriptionId':str(subscription['id']),
             'notificationType':notificationType, 'dedupeKey':dedupeKey,
             'periodEnd':str(metadata.get('periodEnd') or subscription.get('current_period_end') or ''), 'metadata':metadata}
-        cursor.execute('''insert into public.billing_events(id,user_id,subscription_id,event_category,
-            event_type,event_status,idempotency_key,metadata_json,occurred_at)
-            values(%s,%s,%s,'notification','email.billing_intent.committed','COMMITTED',%s,%s,%s)
-            on conflict(idempotency_key) where idempotency_key is not null do nothing''',
-            (str(uuid.uuid4()),subscription['user_id'],subscription['id'],'notification:'+dedupeKey,Json(intent),_now()))
+        _commitNotificationIntentLocked(cursor,intent,_now())
         cursor.execute('select id,metadata_json from public.billing_events where idempotency_key=%s for update',('notification:'+dedupeKey,))
         existing = cursor.fetchone()
         old = self._json(existing['metadata_json'])

@@ -4,12 +4,15 @@ import json
 
 from api.services.billing.manualBillingContracts import CheckoutProviderSnapshot, VerifiedPaymentEvidence
 from api.services.billing.checkoutRecoveryPolicy import classifyCheckoutProviderOutcome
+from api.services.billing.captureRules import providerCreatedAt
 
 
 class ManualBillingRecoveryService:
-    def __init__(self, repository, provider):
+    def __init__(self, repository, provider, requestOptions=None):
         self.repository = repository
         self.provider = provider
+        from api.services.billing.purchaseProvider import purchaseProviderOptions
+        self.requestOptions = dict(purchaseProviderOptions() if requestOptions is None else requestOptions)
 
     @staticmethod
     def _pages(fetch, parameters=None):
@@ -33,12 +36,12 @@ class ManualBillingRecoveryService:
         complete = False
         outcome = 'unknown'
         try:
-            order = self.provider.order.fetch(orderId)
+            order = self.provider.order.fetch(orderId,**self.requestOptions)
             if (not isinstance(order, dict) or order.get('id') != orderId
                     or int(order.get('amount', -1)) != int(attempt['amount'])
                     or order.get('currency') != attempt['currency']):
                 raise ValueError('RECOVERY_ORDER_EVIDENCE_MISMATCH')
-            payments = tuple(self._pages(lambda params: self.provider.order.payments(orderId, params)))
+            payments = tuple(self._pages(lambda params: self.provider.order.payments(orderId, params,**self.requestOptions)))
             if any(not payment.get('id') or payment.get('order_id') != orderId
                     or int(payment.get('amount', -1)) != int(attempt['amount'])
                     or payment.get('currency') != attempt['currency'] for payment in payments):
@@ -56,7 +59,7 @@ class ManualBillingRecoveryService:
         if not orderId:
             matches = []
             listed = False
-            for order in self._pages(self.provider.order.all, {'receipt':str(attempt['id'])}):
+            for order in self._pages(lambda params:self.provider.order.all(params,**self.requestOptions), {'receipt':str(attempt['id'])}):
                 listed = True
                 notes = order.get('notes') or {}
                 if (order.get('receipt') == str(attempt['id'])
@@ -75,6 +78,11 @@ class ManualBillingRecoveryService:
             orderId = order['id']
             attempt = {**attempt, 'provider_order_id': orderId}
         snapshot = self.inspectAttempt(attempt)
+        results = self.applyObservation(attempt, snapshot)
+        return sum(result.state != 'awaiting_capture' for result in results)
+
+    def applyObservation(self, attempt, snapshot):
+        """Persist one inspection and settle only its verified captured money."""
         self.repository.recordProviderObservation(str(attempt['id']), snapshot)
         if snapshot.outcome == 'unknown':
             raise RuntimeError('PROVIDER_STATUS_UNKNOWN')
@@ -82,23 +90,23 @@ class ManualBillingRecoveryService:
         metadata = json.loads(metadata) if isinstance(metadata,str) else metadata
         frozen = metadata.get('manualBilling',{})
         # No timestamp on a payment entity is treated as proof of capture time.
-        resolved = 0
+        results = []
         for payment in snapshot.payments:
             if payment.get('status') != 'captured':
                 continue
-            if payment.get('order_id') != orderId:
+            if payment.get('order_id') != attempt['provider_order_id']:
                 raise ValueError('RECOVERY_PAYMENT_ORDER_MISMATCH')
+            # The authenticated Order payment listing carries each payment's provider created_at.
             evidence = VerifiedPaymentEvidence(str(attempt['id']),str(attempt['invoice_id']),
-                attempt['user_id'],orderId,payment['id'],frozen.get('purpose','erased_checkout'),payment['currency'],
+                attempt['user_id'],attempt['provider_order_id'],payment['id'],frozen.get('purpose','erased_checkout'),payment['currency'],
                 'captured','server_observation',int(payment['amount']),snapshot.observedAt,
-                None,None,False)
-            result = self.repository.finalizeCapturedPayment(evidence)
-            resolved += int(result.state != 'awaiting_capture')
-        if frozen.get('closedAt') and snapshot.outcome == 'unpaid' and not snapshot.payments:
-            # A successful complete provider listing settles cancellation wording;
-            # a later capture is still audited against the original cutoff.
-            self.repository.markClosedAttemptReconciled(str(attempt['id']))
-        return resolved
+                None,None,False,paymentCreatedAt=providerCreatedAt(payment))
+            results.append(self.repository.finalizeCapturedPayment(evidence))
+        if frozen.get('closedAt'):
+            # A complete listing may end the closed attempt's scan: an empty one for an ordinary
+            # closure, recover_until for a superseded one (a later capture is still finalized).
+            self.repository.recordClosedAttemptScan(str(attempt['id']), snapshot)
+        return tuple(results)
 
     def recoverRefund(self, intent):
         metadata = intent['metadata_json']
@@ -122,9 +130,15 @@ class ManualBillingRecoveryService:
                 resolved += 1
         return resolved
 
+    def executeRecentCaptures(self):
+        return self._recoverRows(self.repository.recentCaptureRecoveryRows())
+
     def execute(self):
+        return self._recoverRows(self.repository.pendingRecoveryRows())
+
+    def _recoverRows(self, rows):
         summary = {'resolved':0,'errors':0,'checked':0,'noProgress':0}
-        for row in self.repository.pendingRecoveryRows():
+        for row in rows:
             outcome='failed'
             try:
                 resolved = (self.recoverAttempt(row) if row['event_category'] == 'payment_attempt'

@@ -16,6 +16,35 @@ from psycopg2.extras import Json
 from api.services.billing.manualBillingContracts import VerifiedPaymentEvidence, RefundQuote
 from api.services.billing.manualBillingRepository import ManualBillingRepository
 
+
+def test_verified_authorization_is_durable_without_paid_coverage(postgres):
+    from dataclasses import replace
+    from api.services.billing.manualBillingContracts import CheckoutRequest
+    user = 'authorization-' + str(uuid.uuid4())
+    with psycopg2.connect(postgres) as connection:
+        with connection.cursor() as cursor:
+            cursor.execute('INSERT INTO public."Users"("userId") VALUES(%s)', (user,))
+    repository = ManualBillingRepository(lambda: psycopg2.connect(postgres))
+    repository.ensureCanonicalSubscription(user)
+    intent = repository.reserveCheckout(CheckoutRequest(user, 'initial_purchase', 'monthly_prepaid',
+        {'domains': ['banking']}, 'authorization', expectedCatalogRevision=1))
+    order = 'order-' + str(uuid.uuid4())
+    repository.bindProviderOrder(intent.attemptId, {'id': order})
+    evidence = VerifiedPaymentEvidence(intent.attemptId, intent.invoiceId, user, order,
+        'payment-' + str(uuid.uuid4()), 'initial_purchase', intent.currency, 'authorized',
+        'server_observation', intent.amount, datetime.now(timezone.utc), None, None, False)
+    authorized = repository.finalizeCapturedPayment(evidence)
+    assert not authorized.finalized and authorized.state == 'awaiting_capture'
+    attempt = repository.attemptById(user, intent.attemptId)
+    assert attempt['payment_status'] == 'authorized'
+    observation = repository._json(attempt['metadata_json'])['manualBilling']['providerObservation']
+    assert observation['outcome'] == 'authorized' and not observation['complete']
+    assert not repository.getCoverageSnapshot(user).accessAllowed
+    captured = repository.finalizeCapturedPayment(replace(evidence, financialStatus='captured'))
+    assert captured.finalized
+    repository.finalizeCapturedPayment(evidence)
+    assert repository.attemptById(user, intent.attemptId)['payment_status'] == 'captured'
+
 pytestmark = pytest.mark.skipif(os.environ.get("RUN_MANUAL_BILLING_INTEGRATION") != "1", reason="Disposable PostgreSQL opt-in required; skipped is UNVERIFIED")
 ROOT = Path(__file__).resolve().parents[1]
 NOW = datetime.now(timezone.utc)
@@ -88,6 +117,11 @@ def postgres():
             cursor.execute("DO $$ BEGIN IF NOT EXISTS (SELECT 1 FROM pg_publication WHERE pubname='supabase_realtime') THEN CREATE PUBLICATION supabase_realtime; END IF; END $$")
             catalogMigration = next((ROOT/'supabase/migrations').glob('*_create_pricing_catalog.sql'))
             cursor.execute(catalogMigration.read_text(encoding='utf-8'))
+            # The recovery/refund worker deploys with the backend; Pay requires its fresh heartbeat.
+            # Module-scoped setup uses this beat; test/conftest.py refreshes it before every test.
+            cursor.execute('''DO $$ BEGIN IF to_regclass('private.payment_recovery_runtime') IS NOT NULL THEN
+                INSERT INTO private.payment_recovery_runtime(singleton,worker_seen_at) VALUES(true,clock_timestamp())
+                ON CONFLICT(singleton) DO UPDATE SET worker_seen_at=EXCLUDED.worker_seen_at; END IF; END $$''')
         connection.commit()
     finally: connection.close()
     return url
@@ -759,27 +793,23 @@ def test_topup_clawback_races_usage_without_losing_the_unfunded_obligation(payme
             assert cursor.fetchone()[0]==100
 
 
-def test_distinct_expert_captures_respect_the_catalogue_limit(payment):
+def test_one_expert_addition_carries_the_full_set_within_the_catalogue_limit(payment):
     from api.services.billing.manualBillingContracts import CheckoutRequest
     repository,evidence,url=payment
     repository.finalizeCapturedPayment(evidence)
-    def reserve(domain):
-        return repository.reserveCheckout(CheckoutRequest(evidence.userId,'expert_addition','monthly_prepaid',
-            {'domains':[domain]},'add-'+domain,expectedCatalogRevision=1))
+    # One attempt per checkout carries every expert being added together (spec 4.1).
+    attempt=repository.reserveCheckout(CheckoutRequest(evidence.userId,'expert_addition','monthly_prepaid',
+        {'domains':['telecom','manufacturing','supplychain']},'add-all',expectedCatalogRevision=1))
+    order='expert-order-'+str(uuid.uuid4())
+    repository.bindProviderOrder(attempt.attemptId,{'id':order})
+    capture=VerifiedPaymentEvidence(attempt.attemptId,attempt.invoiceId,evidence.userId,
+        order,'expert-pay-'+str(uuid.uuid4()),'expert_addition','INR','captured',
+        'server_observation',attempt.amount,NOW+timedelta(minutes=1),None,None,False)
     with ThreadPoolExecutor(max_workers=2) as pool:
-        attempts=list(pool.map(reserve,['telecom','manufacturing','supplychain']))
-    captures=[]
-    for attempt in attempts:
-        order='expert-order-'+str(uuid.uuid4())
-        repository.bindProviderOrder(attempt.attemptId,{'id':order})
-        captures.append(VerifiedPaymentEvidence(attempt.attemptId,attempt.invoiceId,evidence.userId,
-            order,'expert-pay-'+str(uuid.uuid4()),'expert_addition','INR','captured',
-            'server_observation',attempt.amount,NOW+timedelta(minutes=1),None,None,False))
-    with ThreadPoolExecutor(max_workers=3) as pool:
-        results=list(pool.map(repository.finalizeCapturedPayment,captures))
-    assert all(result.finalized for result in results)
+        results=list(pool.map(repository.finalizeCapturedPayment,[capture,capture]))
+    assert sorted(result.state for result in results)==['already_finalized','expert_activated']
     assert set(repository.getCoverageSnapshot(evidence.userId).currentPeriod.domains)=={'banking','telecom','manufacturing','supplychain'}
-    with pytest.raises(ValueError,match='EXPERT_SELECTION_CONFLICT'):
+    with pytest.raises(ValueError,match='INVALID_EXPERT_SELECTION'):
         repository.reserveCheckout(CheckoutRequest(evidence.userId,'expert_addition','monthly_prepaid',
             {'domains':['telecom']},'duplicate-new-key',expectedCatalogRevision=1))
 

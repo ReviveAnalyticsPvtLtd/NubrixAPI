@@ -311,7 +311,8 @@ def test_historical_subscription_money_fences_apply_and_replay(modelDb, mutation
     repo.applyReviewedDecision(approved, now=NOW)
     assert repo.checkReviewedDecision(approved, now=NOW) == 'already_applied'
     snapshot = SubscriptionSnapshotService(repo.snapshotFactsLoader).get(OWNER['userId'], NOW)
-    assert not snapshot.purchaseAllowed and snapshot.purchaseBlockReason == 'recovery_required'
+    # Historical money is a review fence, never a purchase block (spec 4.3 step 3).
+    assert snapshot.purchaseAllowed and snapshot.purchaseBlockReason is None
     with closing(factory()) as db, db, db.cursor() as cursor:
         if mutation == 'add_attempt':
             cursor.execute('''INSERT INTO billing_events(user_id,subscription_id,invoice_id,event_category,event_type,payment_status)

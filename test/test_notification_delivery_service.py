@@ -238,6 +238,24 @@ def test_heldBillingSolicitationIsRescheduledNotCancelled():
     assert len(repository.retries) == 1 and repository.retries[0][2] == "PAYMENT_HOLD"
 
 
+def test_heldRefundEmailIsSentOnceNowThatItsTemplateShipped():
+    """A refund email held by the earlier build (TEMPLATE_PENDING, attempt returned) is sent on its next claim."""
+    for notificationType in ("payment_refund_started", "payment_refund_completed"):
+        facts = {"amount": 472000, "currency": "INR", "reason": "duplicate", "purpose": "renewal",
+                 "startedAt": "2026-09-16T01:00:00+00:00"}
+        delivery = _delivery(notification_type=notificationType, attempt_count=1, last_error_code="TEMPLATE_PENDING",
+                             period_end="2026-09-16T01:00:00+00:00", metadata_json=facts)
+        repository = FakeRepository([delivery])
+        edge = FakeEdgeClient([EdgeSendResult(outcome="ACCEPTED", messageId="refund-message")])
+        service = _service(repository, edge, subscriptions=[_subscription(status="expired", billing_mode="monthly_prepaid")])
+        result = service.dispatchBatch("worker-a")
+        assert result["accepted"] == 1 and result["retryScheduled"] == 0 and result["cancelled"] == 0
+        assert len(edge.payloads) == 1 and len(repository.accepted) == 1 and repository.retries == []
+        payload = edge.payloads[0]
+        assert payload["notificationType"] == notificationType and payload["metadata"] == facts
+        assert service.dispatchBatch("worker-a")["claimed"] == 0 and len(edge.payloads) == 1
+
+
 def test_committedBillingReceiptDispatchesEvenAfterSubscriptionExpires():
     delivery = _delivery(notification_type="payment_receipt", metadata_json={"paymentId":"pay_123","amount":3000,"currency":"INR"})
     repository = FakeRepository([delivery])

@@ -15,7 +15,7 @@ from psycopg2.extras import Json, RealDictCursor
 
 from api.adminErrors import AdminApiError
 from api.services.userErasureRetention import (
-    assertErasureLease, retentionAvailable, prepareRetention, archiveOriginals,
+    assertErasureLease, retentionAvailable, prepareRetention, archiveOriginals, purchaseErasureInventory,
     operationalMetadata, PROTECTED_EVENTS,
 )
 
@@ -30,6 +30,22 @@ ERASURE_STEP_NAMES = (
     "delete_database_data",
     "verify_and_finalize",
 )
+
+
+def preparePaymentControlsForErasure(cursor, userId):
+    """Establish owned recovery authority before archiving/detaching legacy Orders."""
+    from api.services.billing.manualBillingRepository import ManualBillingRepository, _now
+    with cursor.connection.cursor(cursor_factory=RealDictCursor) as financial:
+        financial.execute('''SELECT a.* FROM public.billing_events a JOIN public."Invoices" i ON i.id=a.invoice_id
+            WHERE a.user_id=%s AND i."userId"=%s AND a.event_category='payment_attempt'
+            AND a.provider_order_id IS NOT NULL AND a.amount>0 AND a.currency=i.currency
+            AND a.amount=coalesce(i.total_amount,i.amount)
+            AND NOT EXISTS(SELECT 1 FROM public.payment_slot_controls c WHERE c.attempt_id=a.id)
+            ORDER BY a.id FOR UPDATE OF a''', (userId,userId))
+        billing = ManualBillingRepository()
+        for attempt in financial.fetchall():
+            frozen = billing._json(attempt.get('metadata_json')).get('manualBilling', {})
+            billing._captureSlotLocked(financial,attempt,frozen,_now())
 
 REQUEST_SELECT = """
     id, target_user_id, subject_fingerprint, requested_by, idempotency_key,
@@ -483,6 +499,7 @@ class UserErasureRepository:
                     "projectIds": projectIds,
                     "workspaceIds": workspaceIds,
                     "billingCredentials": [],
+                    "purchaseStorage": purchaseErasureInventory(cursor, userId),
                 }
         finally:
             connection.close()
@@ -554,9 +571,22 @@ class UserErasureRepository:
                 if not unified:
                     cursor.execute('select pg_advisory_xact_lock(%s)',(_advisoryKey(userId),))
                 retained = retentionAvailable(cursor)
+                purchases = purchaseErasureInventory(cursor, userId)
+                if purchases.get('unresolvedPurchaseOperations'):
+                    raise AdminApiError(409, 'PURCHASE_OPERATIONS_UNRESOLVED')
+                if not retained and any(purchases.get(table) for table in
+                        ('payment_slots', 'payment_slot_controls', 'payment_operations')):
+                    raise AdminApiError(409, 'SUBSCRIPTION_ERASURE_RETENTION_PENDING')
                 if retained:
                     assertErasureLease(cursor,requestId,workerId,userId)
+                    if 'payment_slot_controls' in purchases:
+                        preparePaymentControlsForErasure(cursor,userId)
+                        purchases = purchaseErasureInventory(cursor,userId)
                     archiveOriginals(cursor,requestId,userId)
+                    for table in ('payment_operations', 'payment_slot_controls', 'payment_slots'):
+                        if table in purchases:
+                            cursor.execute(f'''UPDATE public.{table} SET user_id=NULL,erasure_request_id=%s
+                                WHERE user_id=%s''', (requestId, userId))
                     cursor.execute('''DELETE FROM public.billing_events WHERE event_type=ANY(%s)
                         AND (user_id=%s OR subscription_id IN (SELECT id FROM public.subscriptions WHERE user_id=%s))''',
                         (list(PROTECTED_EVENTS),userId,userId))
@@ -667,6 +697,7 @@ class UserErasureRepository:
                 self._deleteByUser(cursor, "Projects", '"ownerUserId"', userId)
                 self._deleteByUser(cursor, "Workspaces", '"ownerId"', userId)
                 self._deleteByUser(cursor, "credit_balances", "user_id", userId)
+                self._deleteByUser(cursor, 'subscription_purchase_drafts', 'user_id', userId)
                 self._deleteByUser(
                     cursor, "credit_balances_backup_pre_019", "user_id", userId
                 )
@@ -695,6 +726,10 @@ class UserErasureRepository:
             ("WebhookEvents", "user_id"),
             ("admin_free_trial_extensions", "user_id"),
             ("admin_free_trial_reductions", "user_id"),
+            ('subscription_purchase_drafts', 'user_id'),
+            ('payment_slots', 'user_id'),
+            ('payment_slot_controls', 'user_id'),
+            ('payment_operations', 'user_id'),
         )
         residuals = {}
         connection = self.connectionFactory()

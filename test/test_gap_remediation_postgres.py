@@ -38,16 +38,34 @@ def initial_checkout_user(postgres):
     return repo, user
 
 
+def emptyOrder(intent):
+    """A fresh, complete provider listing taken before the owner lock: no payment on the Order."""
+    from api.services.billing.manualBillingContracts import CheckoutProviderSnapshot
+    from api.services.billing.manualBillingRepository import _now
+    return CheckoutProviderSnapshot(intent.attemptId, intent.razorpayOrderId, 'unpaid', _now(), True,
+                                    intent.amount, intent.currency, ())
+
+
 @pytest.mark.parametrize('replacement_key', [None, 'changed-selection'])
 def test_two_sessions_replace_initial_checkout_once(postgres, replacement_key):
     repo, user = initial_checkout_user(postgres)
     with patch('api.services.billing.billingEngine._getMonthlyBasePrice', return_value=REFERENCE):
         first = repo.reserveCheckout(CheckoutRequest(user, 'initial_purchase', 'monthly_prepaid', {'domains': ['banking']}, 'original', expectedCatalogRevision=1))
-        repo.bindProviderOrder(first.attemptId, {'id': 'original-' + str(uuid.uuid4())})
+        first = repo.bindProviderOrder(first.attemptId, {'id': 'original-' + str(uuid.uuid4())})
         changed = CheckoutRequest(user, 'initial_purchase', 'monthly_prepaid', {'domains': ['telecom']}, replacement_key, expectedCatalogRevision=1)
+        inspected = emptyOrder(first)
+        def replace(_):
+            try:
+                return repo.reserveCheckout(changed, inspection=inspected)
+            except RuntimeError as exc:
+                return str(exc)
         with ThreadPoolExecutor(max_workers=2) as pool:
-            results = list(pool.map(repo.reserveCheckout, [changed, changed]))
-    assert results[0].attemptId == results[1].attemptId != first.attemptId
+            results = list(pool.map(replace, range(2)))
+    opened = [r for r in results if not isinstance(r, str)]
+    assert len({r.attemptId for r in opened}) == 1 and opened[0].attemptId != first.attemptId
+    # A shared request key replays the replacement. A keyless second session sees a live attempt
+    # that changed since its inspection: busy, never a second replacement.
+    assert [r for r in results if isinstance(r, str)] == ([] if replacement_key else ['PAYMENT_SERVICE_BUSY'])
     with psycopg2.connect(postgres) as db:
         with db.cursor() as sql:
             sql.execute("select payment_status,count(*) from public.billing_events where user_id=%s and event_category='payment_attempt' group by payment_status", (user,))
@@ -64,12 +82,12 @@ def test_two_sessions_replace_vs_original_capture_cannot_grant_both(postgres):
         money = VerifiedPaymentEvidence(first.attemptId, first.invoiceId, user, first.razorpayOrderId,
             'payment-' + str(uuid.uuid4()), 'initial_purchase', 'INR', 'captured', 'server_observation',
             first.amount, NOW, NOW, None, True)
+        inspected = emptyOrder(first)
         def replace_checkout():
-            try:
-                return repo.reserveCheckout(CheckoutRequest(user, 'initial_purchase', 'monthly_prepaid', {'domains': ['telecom']}, 'changed', expectedCatalogRevision=1))
-            except ValueError as exc:
-                assert str(exc) == 'EXISTING_PAID_COVERAGE'
-                return None
+            intent = repo.reserveCheckout(CheckoutRequest(user, 'initial_purchase', 'monthly_prepaid', {'domains': ['telecom']},
+                'changed', expectedCatalogRevision=1), inspection=inspected)
+            # A capture that settled the slot first is returned as the completed earlier purchase.
+            return None if intent.attemptId == first.attemptId and intent.state == 'captured' else intent
         with ThreadPoolExecutor(max_workers=2) as pool:
             replacement = pool.submit(replace_checkout)
             capture = pool.submit(repo.finalizeCapturedPayment, money)
@@ -89,8 +107,9 @@ def test_two_sessions_replace_vs_original_capture_cannot_grant_both(postgres):
 class OrderProvider:
     def __init__(self):
         self.orders={};self.lock=Lock();self.fail=True
-        self.order=SimpleNamespace(create=self.create,all=self.list,payments=lambda *args:{'items':[]})
-    def create(self,payload):
+        self.order=SimpleNamespace(create=self.create,all=self.list,payments=lambda *args,**options:{'items':[]},
+            fetch=lambda key,**options:{**self.orders[key],'status':'created'})
+    def create(self,payload,**options):
         with self.lock:
             if self.fail:
                 self.fail=False
@@ -98,7 +117,7 @@ class OrderProvider:
             order={**payload,'id':'order-'+str(uuid.uuid4())}
             self.orders[order['id']]=order
             return order
-    def list(self,params):
+    def list(self,params,**options):
         with self.lock: return {'items':[row.copy() for row in self.orders.values() if row['receipt']==params['receipt']]}
 
 
@@ -124,41 +143,6 @@ def test_two_sessions_retry_zero_order_failure_creates_one_replacement(postgres)
         with db.cursor() as sql:
             sql.execute("select payment_status,count(*) from public.billing_events where user_id=%s and event_category='payment_attempt' group by payment_status",(user,))
             assert dict(sql.fetchall())=={'failed':1,'pending_provider_ack':1}
-
-
-def test_two_sessions_cancel_addition_does_not_lose_other_reservation(payment):
-    repo,initial,url=payment;repo.finalizeCapturedPayment(initial)
-    def reserve(domain,key):
-        return repo.reserveCheckout(CheckoutRequest(initial.userId,'expert_addition','monthly_prepaid',{'domains':[domain]},key,expectedCatalogRevision=1))
-    with patch('api.services.billing.billingEngine._getMonthlyBasePrice',return_value=REFERENCE):
-        first=reserve('telecom','first')
-        with ThreadPoolExecutor(max_workers=2) as pool:
-            cancel=pool.submit(repo.cancelExpertAddition,initial.userId,'telecom')
-            other=pool.submit(reserve,'manufacturing','other')
-            cancel.result();second=other.result()
-    row=canonical_row(url,initial.userId)
-    states={item['attemptId']:item['state'] for item in row['pending_additions']}
-    assert states[first.attemptId]=='cancelled' and states[second.attemptId]=='awaiting_payment'
-
-
-def test_two_sessions_cancel_vs_capture_cannot_overwrite_activated_addition(payment):
-    repo,initial,url=payment;repo.finalizeCapturedPayment(initial)
-    with patch('api.services.billing.billingEngine._getMonthlyBasePrice',return_value=REFERENCE):
-        intent=repo.reserveCheckout(CheckoutRequest(initial.userId,'expert_addition','monthly_prepaid',{'domains':['telecom']},'addition',expectedCatalogRevision=1))
-    order='order-'+str(uuid.uuid4());repo.bindProviderOrder(intent.attemptId,{'id':order})
-    money=VerifiedPaymentEvidence(intent.attemptId,intent.invoiceId,initial.userId,order,'pay-'+str(uuid.uuid4()),'expert_addition','INR','captured','server_observation',intent.amount,NOW,None,None,False)
-    def cancel():
-        try:return repo.cancelExpertAddition(initial.userId,'telecom')
-        except ValueError:return None
-    with ThreadPoolExecutor(max_workers=2) as pool:
-        closed=pool.submit(cancel);captured=pool.submit(repo.finalizeCapturedPayment,money)
-        closed.result();result=captured.result()
-    row=canonical_row(url,initial.userId)
-    state=next(item['state'] for item in row['pending_additions'] if item['attemptId']==intent.attemptId)
-    if result.finalized:
-        assert state=='activated' and 'telecom' in row['subscribed_experts']
-    else:
-        assert result.state=='requires_reconciliation' and state=='cancelled' and 'telecom' not in row['subscribed_experts']
 
 
 def test_two_sessions_refund_replay_after_reserve_submits_once(payment,monkeypatch):

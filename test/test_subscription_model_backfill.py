@@ -92,16 +92,37 @@ def test_expert_addition_authority_waits_for_the_owned_grant_migration():
     assert buildBackfillProposal(row, owner, invoices, events, now=NOW)['resolution'] == 'needs_review'
 
 
-def test_unknown_money_cannot_be_projected_as_a_fresh_purchase():
+def _attempt(row, owner, purpose='initial_purchase', status='authorized', **frozen):
+    metadata = {'manualBilling': {'purpose': purpose, **frozen}} if purpose else {}
+    return dict(id='attempt-' + str(purpose) + '-' + status, user_id=owner['userId'], subscription_id=row['id'],
+                invoice_id='invoice', event_category='payment_attempt', event_type='checkout',
+                event_status=status, payment_status=status, metadata_json=metadata)
+
+
+@pytest.mark.parametrize('purpose', ['initial_purchase', 'renewal'])
+def test_only_in_flight_pro_term_money_holds_a_fresh_purchase(purpose):
     row, owner, invoices, events = source()
-    events.append(dict(id='attempt', user_id=owner['userId'], subscription_id=row['id'],
-                       invoice_id='invoice', event_category='payment_attempt', event_type='checkout',
-                       event_status='created', payment_status='pending_provider_ack', metadata_json={}))
     proposal = buildBackfillProposal(row, owner, invoices, events, now=NOW)
-    facts = factsFromRecords(row | proposal['patch'], owner, invoices, events, consumed=False)
-    snapshot = evaluateSubscription(facts, NOW)
-    assert snapshot.status == 'none' and not snapshot.purchaseAllowed
-    assert snapshot.purchaseBlockReason == 'recovery_required'
+    def snapshot(*attempts):
+        return evaluateSubscription(factsFromRecords(row | proposal['patch'], owner, invoices, [*events, *attempts],
+                                                     consumed=False, now=NOW), NOW)
+    fresh = (NOW - timedelta(minutes=10)).isoformat()
+    held = snapshot(_attempt(row, owner, purpose, providerObservation={'outcome': 'authorized',
+                                                                      'latestPaymentCreatedAt': fresh}))
+    assert not held.purchaseAllowed and held.purchaseBlockReason == 'recovery_required'
+    assert held.recoverableCheckout.attemptId == 'attempt-' + purpose + '-authorized'
+    # The authorization is past its capture window: Razorpay returns it, nothing is in flight.
+    dead = (NOW - timedelta(minutes=46)).isoformat()
+    assert snapshot(_attempt(row, owner, purpose, providerObservation={'outcome': 'authorized',
+                                                                      'latestPaymentCreatedAt': dead})).purchaseAllowed
+    # Unknown, created-only or closed-label attempts, other slots and historical rows never block buying.
+    for attempt in (_attempt(row, owner, purpose, 'pending_provider_ack'), _attempt(row, owner, purpose, 'failed'),
+                    _attempt(row, owner, purpose, 'expired'), _attempt(row, owner, purpose, 'cancelled'),
+                    _attempt(row, owner, purpose, 'created', providerObservation={'outcome': 'processing'}),
+                    _attempt(row, owner, 'topup', providerObservation={'outcome': 'authorized', 'latestPaymentCreatedAt': fresh}),
+                    _attempt(row, owner, 'expert_addition', providerObservation={'outcome': 'authorized', 'latestPaymentCreatedAt': fresh}),
+                    _attempt(row, owner, None)):
+        assert snapshot(attempt).purchaseAllowed, attempt
 
 
 def test_inventory_and_backfill_do_not_fall_back_to_application_dsn(monkeypatch, capsys):
@@ -128,21 +149,6 @@ def test_historical_row_consumption_cannot_be_reviewed_without_a_proof_reference
     historical = records[0] | {'id': '10000000-0000-4000-8000-000000000009', 'is_canonical': False}
     proposal = buildBackfillProposal(*records, now=NOW, otherSubscriptions=[historical], trialReview={'consumed': True})
     assert proposal['resolution'] == 'needs_review'
-
-
-@pytest.mark.parametrize('status', ['failed', 'expired', 'cancelled'])
-def test_terminal_attempt_label_without_closure_proof_does_not_allow_a_second_purchase(status):
-    row, owner, invoices, events = source()
-    attempt = dict(id='attempt', user_id=owner['userId'], subscription_id=row['id'], invoice_id='invoice',
-        event_category='payment_attempt', event_type='checkout', payment_status=status,
-        provider_order_id='old-order', metadata_json={})
-    proposal = buildBackfillProposal(row, owner, invoices, [attempt], now=NOW)
-    facts = factsFromRecords(row | proposal['patch'], owner, invoices, [attempt], consumed=False)
-    snapshot = evaluateSubscription(facts, NOW)
-    assert not snapshot.purchaseAllowed and snapshot.purchaseBlockReason == 'recovery_required'
-    attempt['metadata_json'] = {'manualBilling': {'closedAt': NOW.isoformat(), 'closureReconciledAt': NOW.isoformat()}}
-    cleared = factsFromRecords(row | proposal['patch'], owner, invoices, [attempt], consumed=False)
-    assert evaluateSubscription(cleared, NOW).purchaseAllowed
 
 
 def test_empty_subscription_labels_with_credit_history_require_review():
@@ -189,7 +195,7 @@ def test_malformed_nested_metadata_becomes_an_inspectable_discrepancy(location, 
     assert proposal['reasons'] == ['INVALID_MANUAL_BILLING_METADATA']
 
 
-def test_historical_subscription_money_is_an_account_guard_and_review_fence():
+def test_historical_subscription_money_is_a_review_fence_not_a_purchase_block():
     from api.services.subscriptions.subscriptionModelRepository import SubscriptionModelRepository
     row, owner, _, _ = source()
     old = row | {'id': '10000000-0000-4000-8000-000000000009', 'is_canonical': False}
@@ -204,15 +210,16 @@ def test_historical_subscription_money_is_an_account_guard_and_review_fence():
     empty = buildBackfillProposal(row, owner, [], [], now=NOW, otherSubscriptions=others, trialReview=review)
     assert proposal['evidenceHash'] != empty['evidenceHash']
     facts = factsFromRecords(row | proposal['patch'], owner, invoices, events,
-        consumed=True, otherSubscriptions=others)
-    snapshot = evaluateSubscription(facts, NOW)
-    assert not snapshot.purchaseAllowed and snapshot.purchaseBlockReason == 'recovery_required'
+        consumed=True, otherSubscriptions=others, now=NOW)
+    # A historical anomaly without a frozen purpose never blocks buying (spec 4.3 step 3).
+    assert evaluateSubscription(facts, NOW).purchaseAllowed
     attempt['payment_status'] = 'failed'
     attempt['metadata_json'] = {'manualBilling': {'closedAt': NOW.isoformat(), 'closureReconciledAt': NOW.isoformat()}}
     currentInvoices, currentEvents, _ = SubscriptionModelRepository._related(row, [row, old], [invoice], [attempt])
     changed = buildBackfillProposal(row, owner, currentInvoices, currentEvents, now=NOW, otherSubscriptions=others, trialReview=review)
     assert changed['evidenceHash'] != proposal['evidenceHash']
-    cleared = factsFromRecords(row | changed['patch'], owner, currentInvoices, currentEvents, consumed=True, otherSubscriptions=others)
+    cleared = factsFromRecords(row | changed['patch'], owner, currentInvoices, currentEvents, consumed=True,
+                               otherSubscriptions=others, now=NOW)
     assert evaluateSubscription(cleared, NOW).purchaseAllowed
 
 

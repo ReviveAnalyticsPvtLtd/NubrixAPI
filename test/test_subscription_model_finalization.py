@@ -520,18 +520,6 @@ def test_captured_addition_uses_owned_attempt_and_original_period_preserving_usa
     assert grant['metadata_json']['expertGrant']['periodId'] == intent.invoiceId
 
 
-def test_closing_one_addition_closes_owned_unpaid_bundle_without_pending_array(account):
-    repo, model, intent, url = account
-    addition = repo.reserveCheckout(CheckoutRequest(intent.userId, 'expert_addition', 'monthly_prepaid',
-        {'domains': ['telecom', 'supplychain']}, expectedCatalogRevision=1))
-    repo.bindProviderOrder(addition.attemptId, {'id': 'order-close-' + addition.attemptId})
-    query(url, "UPDATE subscriptions SET pending_additions='[]' WHERE user_id=%s", (intent.userId,))
-    result = repo.cancelExpertAddition(intent.userId, 'telecom')
-    assert set(result['closedAttemptDomains']) == {'telecom', 'supplychain'}
-    assert query(url, 'SELECT status FROM "Invoices" WHERE id=%s', (addition.invoiceId,), one=True)['status'] == 'VOID'
-    assert repo.getCoverageSnapshot(intent.userId, NOW).currentPeriod.domains == ('banking', 'manufacturing')
-
-
 def test_paid_future_experts_do_not_inherit_current_addition(account):
     repo, model, intent, url = account
     invoice = renewal(account)
@@ -708,7 +696,7 @@ def test_delayed_legacy_boundary_worker_cannot_clear_credits_from_stale_expiry_c
     assert query(url, 'SELECT * FROM credit_balances WHERE user_id=%s', (original.userId,), one=True) == before
 
 
-def test_failed_old_renewal_without_reconciled_closure_blocks_another_provider_order(account):
+def test_failed_old_renewal_without_reconciled_closure_does_not_block_a_repurchase(account):
     from api.services.billing.manualPaymentService import ManualPaymentService
     from test.test_customer_free_payments import StrictFakeRazorpayClient
     repo, model, original, url = account
@@ -720,10 +708,10 @@ def test_failed_old_renewal_without_reconciled_closure_blocks_another_provider_o
     query(url, "UPDATE billing_events SET payment_status='failed',event_status='failed' WHERE id=%s", (old.attemptId,))
     expirePurchasedCoverage(account, staleCache=False)
     before = len(provider.order.createdPayloads)
-    with pytest.raises(ValueError, match='RECOVERY_REQUIRED'):
-        service.createCheckout(CheckoutRequest(original.userId, 'initial_purchase', 'annual_prepaid',
-            {'domains': ['telecom']}, expectedCatalogRevision=1))
-    assert len(provider.order.createdPayloads) == before
+    # A failed payment is not money in flight: only an authorized one in the same slot holds Pay.
+    repurchase = service.createCheckout(CheckoutRequest(original.userId, 'initial_purchase', 'annual_prepaid',
+        {'domains': ['telecom']}, expectedCatalogRevision=1))
+    assert repurchase.razorpayOrderId and len(provider.order.createdPayloads) == before + 1
 
 
 def test_accepted_first_purchase_closes_explicit_trial_at_capture(account):
@@ -895,7 +883,7 @@ def test_expired_session_can_create_and_verify_fresh_purchase_through_http(accou
     provider = StrictFakeRazorpayClient()
     service = SubscriptionService.__new__(SubscriptionService)
     createOrder = provider.order.create
-    def uniqueOrder(payload):
+    def uniqueOrder(payload, **options):
         order = createOrder(payload)
         provider.order.orders.pop(order['id'])
         order['id'] = 'order-http-' + original.userId + '-' + order['id']

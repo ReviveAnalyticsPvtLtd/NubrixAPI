@@ -11,6 +11,11 @@ from typing import Literal
 import requests
 
 
+# Types whose templates ship in billingEmail with this backend: a billingEmail deployed before them
+# answers UNSUPPORTED_NOTIFICATION_TYPE, so they retry (usual backoff) instead of failing for good.
+_RETRY_UNTIL_TEMPLATE_SHIPS = frozenset({"payment_refund_started", "payment_refund_completed"})
+
+
 @dataclass(frozen=True)
 class EdgeSendResult:
     outcome: Literal["ACCEPTED", "RETRYABLE", "PERMANENT", "AMBIGUOUS"]
@@ -103,6 +108,9 @@ class EdgeEmailClient:
         errorCode = self._safeErrorCode(responsePayload, f"EDGE_HTTP_{status}")
         if billing and errorCode == 'AMBIGUOUS_SEND':
             return EdgeSendResult(outcome='AMBIGUOUS',errorCode='AMBIGUOUS_SEND')
+        if (billing and errorCode == "UNSUPPORTED_NOTIFICATION_TYPE"
+                and payload.get("notificationType") in _RETRY_UNTIL_TEMPLATE_SHIPS):
+            return EdgeSendResult(outcome="RETRYABLE", errorCode=errorCode)
         if status in {408, 429} or status >= 500:
             return EdgeSendResult(
                 outcome="RETRYABLE",

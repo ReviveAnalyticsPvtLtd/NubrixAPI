@@ -8,22 +8,6 @@ from test.test_manual_payment_entrypoints import evidence
 from test.test_support_refund_http import refund_client, payload
 
 
-def test_public_cancel_closes_attempt_and_unbound_bundle_only(checkout_client, checkout_database):
-    from api.services.billing.manualPaymentService import ManualPaymentService
-    client, provider, path = checkout_client
-    repo, _ = checkout_database
-    manual = ManualPaymentService.forProduction(provider, repo)
-    initial = manual.createCheckout(request('initial', mode='annual_prepaid'))
-    manual.finalizeCapturedPayment(evidence(initial))
-    first = repo.reserveCheckout(request('bundle-one', mode='annual_prepaid', purpose='expert_addition', domains=('telecom',)))
-    other = repo.reserveCheckout(request('bundle-two', mode='annual_prepaid', purpose='expert_addition', domains=('manufacturing',)))
-    response = client.post('/cancelPendingAddition', json={'domain':'telecom'})
-    assert response.status_code == 200
-    assert response.json()['data']['closedAttemptDomains'] == ['telecom']
-    assert repo.attemptById(USER, first.attemptId)['payment_status'] == 'cancelled'
-    assert repo.attemptById(USER, other.attemptId)['payment_status'] == 'created'
-
-
 def test_annual_remove_finalizes_observed_expert_money_once(checkout_client, checkout_database, monkeypatch):
     from api.services.billing.manualPaymentService import ManualPaymentService
     client, provider, path = checkout_client

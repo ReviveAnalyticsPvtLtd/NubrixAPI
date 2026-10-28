@@ -460,7 +460,7 @@ async def getReport(projectId: str, tableName: str, token = Depends(verifyToken)
         raiseHttpException(e)
     
 @router.get("/getUserProfile")
-async def getUserProfile(token = Depends(verifyToken)):
+def getUserProfile(token = Depends(verifyToken)):
     """
     Retrieve user profile details.
 

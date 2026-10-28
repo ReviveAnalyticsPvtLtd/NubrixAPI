@@ -50,10 +50,43 @@ def serializePeriod(period):
 HIDDEN_CHECKOUT_METHODS = ('emi', 'cardless_emi', 'paylater')
 
 
+_EXPERT_NAMES = {'banking': 'Banking', 'manufacturing': 'Manufacturing', 'supplychain': 'Supply Chain', 'telecom': 'Telecom'}
+
+
+def purchaseSelectionLabel(snapshot):
+    """Customer wording for a frozen selection; never an invoice or attempt identity."""
+    names = [_EXPERT_NAMES.get(domain, str(domain)) for domain in snapshot.get('domains') or []]
+    interval = 'annual' if snapshot.get('billingMode') == 'annual_prepaid' else 'monthly'
+    experts = names[0] if len(names) == 1 else ', '.join(names[:-1]) + ' and ' + names[-1] if names else ''
+    purpose = snapshot.get('purpose')
+    if purpose == 'topup':
+        return 'a credit top-up'
+    if purpose == 'expert_addition':
+        return 'adding ' + experts if experts else 'adding experts'
+    plan = 'Pro ' + interval + (' renewal' if purpose == 'renewal' else '')
+    return plan + ' with ' + experts if experts else plan
+
+
+def _authorizationInFlight(intent):
+    """The evidence and window payment status waits on: past created_at + window the payment is dead."""
+    from api.services.billing.manualBillingRepository import _now
+    from api.services.subscriptions.subscriptionModelBackfill import paymentInFlight
+    return paymentInFlight({'event_category': 'payment_attempt', 'payment_status': 'authorized',
+        'metadata_json': {'manualBilling': intent.snapshot}, 'attempted_at': intent.attemptStartedAt}, _now())
+
+
 def serializeCheckoutIntent(intent, publicKey, identity=None):
+    # Only money that may still capture holds Pay (spec 4.3): created-only payments leave the Order
+    # payable, and a dead authorization retires this replay so the next Pay replaces it.
     state = {'created':'payment_pending', 'pending_provider_ack':'payment_pending',
-        'authorized':'awaiting_capture', 'provider_processing':'awaiting_capture', 'captured':'already_finalized',
-        'expired':'expired', 'cancelled':'cancelled', 'superseded':'superseded'}.get(intent.state,'requires_reconciliation')
+        'authorized':'awaiting_capture', 'provider_processing':'payment_pending', 'captured':'already_finalized',
+        'expired':'expired', 'cancelled':'cancelled', 'superseded':'superseded',
+        'confirming_earlier_payment':'confirming_earlier_payment'}.get(intent.state,'requires_reconciliation')
+    if intent.state == 'authorized' and not _authorizationInFlight(intent):
+        state = 'expired'
+    if state == 'confirming_earlier_payment':
+        # Only the earlier payment's summary: no Order, key or identity that could reopen checkout on it.
+        return {'state': state, 'attemptId': intent.attemptId, 'earlierPayment': dict(intent.earlierPayment or {})}
     deadline = None if intent.billingMode == 'annual_prepaid' and intent.expiresAt.year == 9999 else intent.expiresAt.isoformat()
     return {**(identity or {}), 'userId':intent.userId, 'invoiceId':intent.invoiceId,
         'attemptId':intent.attemptId, 'razorpayOrderId':intent.razorpayOrderId, 'orderId':intent.razorpayOrderId,

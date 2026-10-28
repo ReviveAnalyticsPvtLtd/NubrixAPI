@@ -1,7 +1,6 @@
 from test.pricingFixtures import catalog_source
 import hashlib
 import hmac
-import asyncio
 import json
 import os
 import sys
@@ -49,6 +48,12 @@ if not hasattr(joseStub, "JWTError"):
 razorpayStub = sys.modules.setdefault("razorpay", types.ModuleType("razorpay"))
 if not hasattr(razorpayStub, "Client"):
     razorpayStub.Client = lambda *a, **k: MagicMock()
+if not hasattr(razorpayStub, "errors"):
+    razorpayStub.errors = types.ModuleType("razorpay.errors")
+for errorName in ("GatewayError", "ServerError", "BadRequestError"):
+    if not hasattr(razorpayStub.errors, errorName):
+        setattr(razorpayStub.errors, errorName, type(errorName, (Exception,), {}))
+sys.modules.setdefault("razorpay.errors", razorpayStub.errors)
 
 
 class TestTopupPricingSnapshot(unittest.TestCase):
@@ -100,7 +105,9 @@ class TestTopupEligibilityAndOrder(unittest.TestCase):
         svc.razorpayClient = MagicMock()
         from api.services.billing.manualBillingContracts import CheckoutIntent
         from datetime import datetime,timezone,timedelta
-        def reserve(request):
+        def reserve(request, replayOnly=False, **evidence):
+            if replayOnly:
+                return None
             from api.services.billing.billingEngine import computeTopupSnapshot
             snap = computeTopupSnapshot(request.payload['packId'], request.billingMode)
             payload = {'invoiceId': 'inv_1', 'lifecycleId': 'test-life',
@@ -111,6 +118,8 @@ class TestTopupEligibilityAndOrder(unittest.TestCase):
             return repository.intent
         repository=MagicMock()
         repository.reserveCheckout.side_effect=reserve
+        repository.orderlessRecoveryRows.return_value=[]
+        repository.liveSlotAttempt.return_value=None
         repository.claimProviderOrderCreation.return_value=True
         from dataclasses import replace
         repository.bindProviderOrder.side_effect = lambda attempt, order: replace(repository.intent, razorpayOrderId=order['id'])
@@ -221,7 +230,7 @@ class TestTopupEligibilityAndOrder(unittest.TestCase):
         self.assertEqual(result["credits"], 500.0)
         self.assertEqual(result["invoiceId"], "inv_1")
         mkInv.assert_not_called()
-        svc.reservationRepository.reserveCheckout.assert_called_once()
+        self.assertEqual(svc.reservationRepository.reserveCheckout.call_args_list[-1].kwargs, {})
         attach.assert_not_called()
 
         notes = svc.razorpayClient.order.create.call_args[0][0]["notes"]
@@ -295,7 +304,7 @@ class TestCreditReadContracts(unittest.TestCase):
             "api.services.credits.creditService.creditService.getBalanceSnapshot",
             return_value=self._snapshot(),
         ):
-            response = asyncio.run(getCreditBalance(user=user))
+            response = getCreditBalance(user=user)
 
         data = json.loads(response.body)["data"]
         self.assertEqual(
@@ -325,7 +334,7 @@ class TestCreditReadContracts(unittest.TestCase):
             "api.services.credits.langfuseUsageService.getUsageBreakdown",
             return_value=breakdown,
         ):
-            response = asyncio.run(getCreditUsage(user=user))
+            response = getCreditUsage(user=user)
 
         data = json.loads(response.body)["data"]
         self.assertEqual(data["monthlyTokens"], {"total": 10_000_000, "used": 2_500_000})
@@ -374,14 +383,15 @@ class TestTopupWebhooks(unittest.TestCase):
 
 
 
-    def test_refund_of_a_topup_payment_claws_back(self):
+    def test_processed_refund_of_a_topup_payment_requests_granted_only_clawback(self):
         svc = self._service()
         with self._razorpay({"userId": "u1", "type": "credit_topup"}), \
              patch("api.services.credits.creditService.creditService.clawbackTopupTokens",
-                   return_value={"clawed": True, "tokens": 2500000}) as claw, \
+                   return_value={"clawed": True, "tokens": 2500000, "status": "clawed_back"}) as claw, \
              patch.object(svc, "_auditLog"):
             svc._handleRefundProcessed(self._refund())
-        claw.assert_called_once_with("u1", "rfnd_1", "pay_abc", 99950)
+        claw.assert_called_once_with("u1", "rfnd_1", "pay_abc", 99950,
+            paymentEvidence={"id":"pay_abc","notes":{"userId":"u1","type":"credit_topup"}})
 
     def test_refund_of_a_subscription_payment_moves_no_tokens(self):
         svc = self._service()
@@ -391,14 +401,16 @@ class TestTopupWebhooks(unittest.TestCase):
             svc._handleRefundProcessed(self._refund())
         claw.assert_not_called()
 
-    def test_refund_still_audits_when_the_payment_fetch_fails(self):
+    def test_processed_refund_retries_when_the_payment_fetch_fails(self):
+        from utils.webhookExceptions import RetryableWebhookError
         svc = self._service()
         with self._razorpay(fetchRaises=True), \
              patch("api.services.credits.creditService.creditService.clawbackTopupTokens") as claw, \
              patch.object(svc, "_auditLog") as audit:
-            svc._handleRefundProcessed(self._refund())
+            with self.assertRaises(RetryableWebhookError):
+                svc._handleRefundProcessed(self._refund())
         claw.assert_not_called()
-        audit.assert_called()
+        audit.assert_not_called()
 
 
 class TestStuckPurchaseSweep(unittest.TestCase):

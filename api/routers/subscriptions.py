@@ -10,18 +10,143 @@ __all__ = ["router"]
 
 
 from utils.exceptionHandler import CustomException, raiseHttpException
-from api.models import VerifySubscriptionRequest, CreateSubscriptionRequest, AddDomainsRequest, VerifyDomainUpgradeRequest, RemoveDomainRequest, CancelPendingAdditionRequest, CancelSubscriptionRequest, RefundRequest, CreateAnnualRenewalSessionRequest, VerifyAnnualRenewalPaymentRequest, PrepareRenewalInvoiceRequest, CreateRenewalSessionRequest, VerifyRenewalPaymentRequest, ResumeRenewalRequest
+from api.models import VerifySubscriptionRequest, CreateSubscriptionRequest, AddDomainsRequest, VerifyDomainUpgradeRequest, RemoveDomainRequest, CancelSubscriptionRequest, RefundRequest, CreateAnnualRenewalSessionRequest, VerifyAnnualRenewalPaymentRequest, PrepareRenewalInvoiceRequest, CreateRenewalSessionRequest, VerifyRenewalPaymentRequest, ResumeRenewalRequest
 from api.services.subscriptions.subscriptionService import subscriptionService
 from fastapi.responses import ORJSONResponse
 from fastapi import APIRouter, Depends, Header, Request, HTTPException
 from fastapi.security import HTTPAuthorizationCredentials
 from api.commons import verifyToken
-from api.models import SubscriptionPricingPreviewRequest
+from api.models import SubscriptionPricingPreviewRequest, SavePurchaseDraftRequest, SubmitPurchaseDraftRequest
 
 router = APIRouter()
 """
 Router for subscription-related endpoints.
 """
+
+
+def _purchaseDraftResponse(token, request=None):
+    import os
+    from dataclasses import asdict
+    from jose import jwt, JWTError
+    from api.services.billing.purchaseDraftService import PurchaseDraftService
+    from api.services.billing.purchaseCheckoutRepository import getPurchaseCheckoutRepository
+    headers = {'Cache-Control': 'private, no-store'}
+    try:
+        userId = jwt.decode(token, os.environ['SECRET_KEY'], algorithms=['HS256']).get('userId')
+        if not isinstance(userId, str) or not userId:
+            raise JWTError('Missing identity')
+    except JWTError:
+        return ORJSONResponse({'message': 'Authentication required.', 'errorCode': 'AUTHENTICATION_REQUIRED'},
+                              status_code=401, headers=headers)
+    service = PurchaseDraftService(getPurchaseCheckoutRepository())
+    try:
+        result = service.get(userId) if request is None else service.save(userId, request)
+        return ORJSONResponse({'schemaVersion': 1, **asdict(result)}, headers=headers)
+    except ValueError as exc:
+        code = str(exc)
+        if code in ('EDITABLE_CHECKOUT_DISABLED', 'PURCHASE_DRAFT_STALE', 'PURCHASE_DRAFT_NOT_ALLOWED'):
+            body = {'message': 'Please reload your plan selection.', 'errorCode': code}
+            if code == 'PURCHASE_DRAFT_STALE':
+                try:
+                    body['editor'] = {'schemaVersion': 1, **asdict(service.get(userId))}
+                except Exception:
+                    return ORJSONResponse({'message': 'Plan selection is temporarily unavailable.',
+                        'errorCode': 'PURCHASE_STORAGE_UNAVAILABLE'}, status_code=503, headers=headers)
+            return ORJSONResponse(body, status_code=403 if code == 'PURCHASE_DRAFT_NOT_ALLOWED' else 409, headers=headers)
+        from utils.logger import logger
+        logger.exception('Purchase draft authority was invalid')
+    except Exception:
+        from utils.logger import logger
+        logger.exception('Purchase draft storage unavailable')
+    return ORJSONResponse({'message': 'Plan selection is temporarily unavailable.',
+                          'errorCode': 'PURCHASE_STORAGE_UNAVAILABLE'}, status_code=503, headers=headers)
+
+
+@router.get('/purchase-draft')
+def getPurchaseDraft(token=Depends(verifyToken)):
+    return _purchaseDraftResponse(token)
+
+
+@router.put('/purchase-draft')
+def savePurchaseDraft(request: SavePurchaseDraftRequest, token=Depends(verifyToken)):
+    return _purchaseDraftResponse(token, request)
+
+
+PAYMENT_SERVICE_BUSY_MESSAGE = 'Payment service is busy. Please try again in a moment.'
+
+
+def _purchaseSubmitResponse(token, request, key):
+    import os
+    from jose import jwt, JWTError
+    from api.services.billing.purchaseCheckoutRepository import getPurchaseCheckoutRepository
+    from api.services.billing.purchaseCheckoutService import PurchaseCheckoutService
+    headers = {'Cache-Control': 'private, no-store'}
+    try:
+        userId = jwt.decode(token, os.environ['SECRET_KEY'], algorithms=['HS256']).get('userId')
+        if not isinstance(userId, str) or not userId:
+            raise JWTError('Missing identity')
+    except JWTError:
+        return ORJSONResponse({'message': 'Authentication required.', 'errorCode': 'AUTHENTICATION_REQUIRED'}, status_code=401, headers=headers)
+    try:
+        service = PurchaseCheckoutService(getPurchaseCheckoutRepository(), subscriptionService.razorpayClient)
+        # A confirming_earlier_payment checkout is an ordinary 200: the client waits and polls.
+        result = service.submit(userId, request.draftRevision, request.contact, request.pricingContext, request.expectedCatalogRevision, key)
+        return ORJSONResponse(result, headers=headers)
+    except ValueError as exc:
+        code = str(exc)
+        if code in ('PURCHASE_ACTIONS_UNAVAILABLE', 'PURCHASE_DRAFT_STALE', 'PURCHASE_DRAFT_NOT_ALLOWED', 'IDEMPOTENCY_CONFLICT',
+                    'PRICING_CHANGED', 'PRICING_CONTEXT_REQUIRED', 'PRICING_CONTEXT_EXPIRED', 'PRICING_CONTEXT_INVALID',
+                    'INVALID_REQUEST_KEY', 'EXISTING_PAID_COVERAGE', 'CHECKOUT_OWNER_NOT_ELIGIBLE', 'BILLING_CURRENCY_CONFLICT'):
+            return ORJSONResponse({'message': 'Please reload and review your purchase.', 'errorCode': code},
+                status_code=422 if code == 'INVALID_REQUEST_KEY' else 403 if code in ('PURCHASE_DRAFT_NOT_ALLOWED','CHECKOUT_OWNER_NOT_ELIGIBLE') else 409, headers=headers)
+        from utils.logger import logger
+        logger.exception('Purchase action authority was invalid')
+    except RuntimeError as exc:
+        if str(exc) == 'PAYMENT_SERVICE_BUSY':
+            return ORJSONResponse({'message': PAYMENT_SERVICE_BUSY_MESSAGE, 'errorCode': 'PAYMENT_SERVICE_BUSY'},
+                                  status_code=503, headers=headers)
+        if str(exc) == 'PAYMENT_ACTIONS_UNAVAILABLE':
+            return ORJSONResponse({'message': 'Payments are temporarily unavailable. Please try again in a moment.',
+                                   'errorCode': 'PAYMENT_ACTIONS_UNAVAILABLE'}, status_code=503, headers=headers)
+        from utils.logger import logger
+        logger.exception('Purchase action unavailable')
+    except Exception:
+        from utils.logger import logger
+        logger.exception('Purchase action unavailable')
+    return ORJSONResponse({'message': 'Your purchase is being reconciled. Please check its status.',
+                          'errorCode': 'PURCHASE_ACTION_UNAVAILABLE'}, status_code=503, headers=headers)
+
+
+@router.post('/purchase-draft/checkout')
+def submitPurchaseDraft(request: SubmitPurchaseDraftRequest,
+        key: str | None = Header(default=None, alias='Idempotency-Key'), token=Depends(verifyToken)):
+    return _purchaseSubmitResponse(token, request, key)
+
+
+@router.get('/payment-status')
+def getPaymentStatus(token=Depends(verifyToken)):
+    """The signed-in owner's checkout, refunds and support reference (spec 4.7); never cached."""
+    import os
+    from jose import jwt, JWTError
+    from api.services.billing.manualBillingRepository import getManualBillingRepository
+    from api.services.billing.purchaseCheckoutStatusService import PurchaseCheckoutStatusService
+
+    headers = {'Cache-Control': 'private, no-store'}
+    try:
+        userId = jwt.decode(token, os.environ['SECRET_KEY'], algorithms=['HS256']).get('userId')
+        if not isinstance(userId, str) or not userId:
+            raise JWTError('Missing identity')
+    except JWTError:
+        return ORJSONResponse({'message': 'Authentication required.', 'errorCode': 'AUTHENTICATION_REQUIRED'},
+                              status_code=401, headers=headers)
+    try:
+        service = PurchaseCheckoutStatusService(getManualBillingRepository(), subscriptionService.razorpayClient)
+        return ORJSONResponse(service.refresh(userId), headers=headers)
+    except Exception:
+        from utils.logger import logger
+        logger.exception('Payment status refresh failed')
+    return ORJSONResponse({'message': 'Payment status is temporarily unavailable.',
+                          'errorCode': 'PURCHASE_STATUS_UNAVAILABLE'}, status_code=503, headers=headers)
 
 
 @router.get("/pricing")
@@ -66,7 +191,7 @@ def previewPricing(request: SubscriptionPricingPreviewRequest, token=Depends(ver
 
 
 @router.get("/activateFreeTrial")
-async def activateFreeTrial(token=Depends(verifyToken)):
+def activateFreeTrial(token=Depends(verifyToken)):
     """
     Activate a free trial for a user.
 
@@ -91,7 +216,7 @@ async def activateFreeTrial(token=Depends(verifyToken)):
 
 
 @router.post("/createSubscription")
-async def createSubscription(request: CreateSubscriptionRequest, token=Depends(verifyToken),
+def createSubscription(request: CreateSubscriptionRequest, token=Depends(verifyToken),
     requestKey: str | None = Header(default=None, alias="Idempotency-Key", min_length=1, max_length=128)
 ):
     """
@@ -118,7 +243,7 @@ async def createSubscription(request: CreateSubscriptionRequest, token=Depends(v
 
 
 @router.post("/verifySubscription")
-async def verifySubscription(
+def verifySubscription(
     payload: VerifySubscriptionRequest,
     token=Depends(verifyToken)
 ):
@@ -133,7 +258,7 @@ async def verifySubscription(
         ORJSONResponse: Verification result.
     """
     try:
-        result = subscriptionService.verifySubscription(payload=payload.dict(), token=token)
+        result = subscriptionService.verifySubscription(payload=payload.model_dump(), token=token)
         return ORJSONResponse(
             status_code=200,
             content={
@@ -147,7 +272,7 @@ async def verifySubscription(
 
 
 @router.post("/addDomains")
-async def addDomains(payload: AddDomainsRequest, token=Depends(verifyToken),
+def addDomains(payload: AddDomainsRequest, token=Depends(verifyToken),
     requestKey: str | None = Header(default=None, alias="Idempotency-Key", min_length=1, max_length=128)
 ):
     """
@@ -177,7 +302,7 @@ async def addDomains(payload: AddDomainsRequest, token=Depends(verifyToken),
 
 
 @router.post("/verifyDomainUpgrade")
-async def verifyDomainUpgrade(
+def verifyDomainUpgrade(
     payload: VerifyDomainUpgradeRequest,
     token=Depends(verifyToken)
 ):
@@ -206,7 +331,7 @@ async def verifyDomainUpgrade(
 
 
 @router.post("/removeDomain")
-async def removeDomain(payload: RemoveDomainRequest, token=Depends(verifyToken)):
+def removeDomain(payload: RemoveDomainRequest, token=Depends(verifyToken)):
     """
     Schedule a domain removal at the end of the current billing cycle.
 
@@ -231,33 +356,8 @@ async def removeDomain(payload: RemoveDomainRequest, token=Depends(verifyToken))
         raiseHttpException(e)
 
 
-@router.post("/cancelPendingAddition")
-async def cancelPendingAddition(payload: CancelPendingAdditionRequest, token=Depends(verifyToken)):
-    """
-    Cancel a pending domain addition request.
-
-    Args:
-        payload (CancelPendingAdditionRequest): Domain to cancel.
-        token: Authorization token dependency.
-
-    Returns:
-        ORJSONResponse: Cancellation result.
-    """
-    try:
-        result = subscriptionService.cancelPendingAddition(domain=payload.domain, token=token)
-        return ORJSONResponse(
-            status_code=200,
-            content={
-                "status": "SUCCESS",
-                "message": "Pending domain addition cancelled.",
-                "data": result
-            }
-        )
-    except CustomException as e:
-        raiseHttpException(e)
-
 @router.post("/cancelSubscription")
-async def cancelSubscription(payload: CancelSubscriptionRequest, token=Depends(verifyToken)):
+def cancelSubscription(payload: CancelSubscriptionRequest, token=Depends(verifyToken)):
     """
     Cancel the authenticated user's subscription at the end
     of the current billing cycle.
@@ -284,7 +384,7 @@ async def cancelSubscription(payload: CancelSubscriptionRequest, token=Depends(v
 
 
 @router.post("/refund")
-async def refund(payload: RefundRequest, token=Depends(verifyToken)):
+def refund(payload: RefundRequest, token=Depends(verifyToken)):
     """
     Initiate a refund for a Razorpay payment.
 
@@ -315,7 +415,7 @@ async def refund(payload: RefundRequest, token=Depends(verifyToken)):
 
 
 @router.get("/invoices")
-async def getInvoices(token=Depends(verifyToken)):
+def getInvoices(token=Depends(verifyToken)):
     """
     Retrieve all invoices for the authenticated user.
 
@@ -339,7 +439,7 @@ async def getInvoices(token=Depends(verifyToken)):
 
 
 @router.post("/prepareRenewalInvoice")
-async def prepareRenewalInvoice(
+def prepareRenewalInvoice(
     _request: PrepareRenewalInvoiceRequest | None = None,
     token=Depends(verifyToken),
 ):
@@ -365,7 +465,7 @@ async def prepareRenewalInvoice(
 
 
 @router.post("/createRenewalPaymentSession")
-async def createRenewalPaymentSession(
+def createRenewalPaymentSession(
     request: CreateRenewalSessionRequest,
     token=Depends(verifyToken),
     requestKey: str | None = Header(default=None, alias="Idempotency-Key", min_length=1, max_length=128)
@@ -391,7 +491,7 @@ async def createRenewalPaymentSession(
 
 
 @router.post("/verifyRenewalPayment")
-async def verifyRenewalPayment(
+def verifyRenewalPayment(
     payload: VerifyRenewalPaymentRequest,
     token=Depends(verifyToken),
 ):
@@ -424,7 +524,7 @@ async def verifyRenewalPayment(
 
 
 @router.post("/resumeRenewal")
-async def resumeRenewal(
+def resumeRenewal(
     _request: ResumeRenewalRequest | None = None,
     token=Depends(verifyToken),
 ):
@@ -449,7 +549,7 @@ async def resumeRenewal(
 
 
 @router.post("/createAnnualRenewalPaymentSession")
-async def createAnnualRenewalPaymentSession(
+def createAnnualRenewalPaymentSession(
     request: CreateAnnualRenewalSessionRequest,
     token=Depends(verifyToken),
     requestKey: str | None = Header(default=None, alias="Idempotency-Key", min_length=1, max_length=128)
@@ -481,7 +581,7 @@ async def createAnnualRenewalPaymentSession(
 
 
 @router.post("/verifyAnnualRenewalPayment")
-async def verifyAnnualRenewalPayment(
+def verifyAnnualRenewalPayment(
     payload: VerifyAnnualRenewalPaymentRequest,
     token=Depends(verifyToken)
 ):

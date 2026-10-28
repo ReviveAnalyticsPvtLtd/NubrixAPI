@@ -176,7 +176,7 @@ def test_remove_domain_revoked_coverage_does_not_block():
         "api/services/subscriptions/subscriptionService.py"
     ).read_text(encoding="utf-8")
     block = source[source.index("def removeDomain"):]
-    block = block[:block.index("def cancelPendingAddition")]
+    block = block[:block.index("def cancelSubscription")]
     assert "revoked" in block or "coverageState" in block, (
         "the paid-future immutability check must ignore revoked (refunded) "
         "future coverage"

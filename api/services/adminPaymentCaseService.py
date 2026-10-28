@@ -103,6 +103,9 @@ class AdminPaymentCaseRepository:
                 if request.action == "recheck":
                     if str(capture.get("event_status") or "").upper() == "FINALIZED":
                         raise PaymentCaseConflict("PAYMENT_CASE_ALREADY_FINALIZED")
+                    if str(capture.get("event_status") or "").upper() == "REFUND_RESERVED":
+                        # The capture rules are returning this money in full; it is never re-decided for a grant.
+                        raise PaymentCaseConflict("PAYMENT_CASE_REFUND_RESERVED")
                     cursor.execute('select "isBanned" as banned from public."Users" where "userId"=%s', (owner,))
                     user = cursor.fetchone()
                     if owner is None:

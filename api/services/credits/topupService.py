@@ -233,6 +233,8 @@ class TopupService:
                 uiMessage='Unknown credit top-up pack.', errorCode='TOPUP_PACK_UNKNOWN')
         result = service._reservedCheckout({'userId': userId, 'email': email}, 'topup',
             subscription['billing_mode'], {'packId': packId}, requestKey, expectedCatalogRevision=expectedCatalogRevision)
+        if result.get('state') == 'confirming_earlier_payment':
+            return result  # Only the earlier payment's summary; the client waits and polls.
         result['credits'] = creditMath.tokensToCredits(result['tokens'], TOKEN_TO_CREDIT_RATIO)
         return result
 

@@ -3,6 +3,7 @@ export const BILLING_TYPES = [
   "monthly_renewal_ready", "monthly_renewal_reminder", "monthly_subscription_expired",
   "payment_receipt", "monthly_cancellation_confirmation",
   "subscription_refund_initiated", "subscription_refund_processed",
+  "payment_refund_started", "payment_refund_completed",
 ] as const;
 type BillingType = typeof BILLING_TYPES[number];
 export type BillingRequest = {
@@ -41,6 +42,8 @@ export function renderBillingMessage(request: BillingRequest, appUrl: string) {
     monthly_cancellation_confirmation: ["Monthly renewal cancelled", "We have stopped renewal bills and reminders. Your already-paid access continues until its final paid end. Cancellation does not automatically issue a refund."],
     subscription_refund_initiated: ["Your approved refund has been initiated", "Support approved the unused-time refund. The affected service access has ended; processing at the payment provider is tracked separately."],
     subscription_refund_processed: ["Your approved refund has been processed", "The payment provider has processed your approved unused-time refund. Bank posting times may vary."],
+    payment_refund_started: ["Your refund is on its way", ""],
+    payment_refund_completed: ["Your refund has been processed", ""],
   };
   let [subject, defaultText] = messages[request.notificationType];
   const metadata = request.metadata;
@@ -54,8 +57,21 @@ export function renderBillingMessage(request: BillingRequest, appUrl: string) {
   }
   const topup = request.notificationType === "payment_receipt" && metadata.purpose === "topup";
   const refund = request.notificationType.startsWith("subscription_refund_");
+  // Automatic full refunds of a payment that was never granted: amount and dates only, never an identity.
+  const paymentRefund = request.notificationType.startsWith("payment_refund_");
   let text = defaultText;
-  if (topup) text = "Your purchased top-up credits have been stored. This payment does not extend subscription access or refill your subscription allowance.";
+  if (paymentRefund) {
+    if (metadata.amount === undefined || !metadata.startedAt) throw new Error("INVALID_REFUND_FACTS");
+    const started = new Date(String(metadata.startedAt));
+    if (Number.isNaN(started.getTime())) throw new Error("INVALID_REFUND_FACTS");
+    const amount = formatAmount(metadata);
+    const why = REFUND_REASONS[String(metadata.reason ?? "")] ?? "";
+    text = (request.notificationType === "payment_refund_started"
+      ? `A refund of ${amount} is on its way — started ${formatDate(started)}.`
+      : `The payment provider has processed your refund of ${amount}, started ${formatDate(started)}.`) +
+      (why ? ` ${why}` : "") + " Bank posting times may vary.";
+  }
+  else if (topup) text = "Your purchased top-up credits have been stored. This payment does not extend subscription access or refill your subscription allowance.";
   else if (request.notificationType === "payment_receipt" && metadata.serviceRevoked === true)
     text = "This receipt records your payment history. The affected service has since ended or been refunded; this receipt does not restore subscription access.";
   else if (refund && metadata.currentAccessPreserved === true)
@@ -72,12 +88,7 @@ export function renderBillingMessage(request: BillingRequest, appUrl: string) {
     if (Number.isNaN(date.getTime())) throw new Error("INVALID_SERVICE_DATE");
     fact(label, formatDate(date));
   };
-  if (metadata.amount !== undefined) {
-    const currency = String(metadata.currency ?? "");
-    if (!Number.isSafeInteger(metadata.amount) || Number(metadata.amount) < 0 || !/^[A-Z]{3}$/.test(currency)) throw new Error("INVALID_AMOUNT");
-    const digits = new Intl.NumberFormat("en", {style:"currency", currency}).resolvedOptions().maximumFractionDigits ?? 2;
-    fact(refund ? "Refund amount" : "Invoice amount", `${currency} ${(Number(metadata.amount) / 10 ** digits).toFixed(digits)}`);
-  }
+  if (metadata.amount !== undefined) fact(refund || paymentRefund ? "Refund amount" : "Invoice amount", formatAmount(metadata));
   if (Array.isArray(metadata.domains) && !topup) fact("Experts", metadata.domains.join(", "));
   if (topup) fact("Purchased credits", metadata.tokens);
   if (!topup) {
@@ -92,10 +103,14 @@ export function renderBillingMessage(request: BillingRequest, appUrl: string) {
   dateFact("Renewal payment deadline", metadata.renewalDeadline);
   dateFact("Checkout session deadline", metadata.checkoutSessionDeadline);
   if (refund) dateFact("Service cutoff", metadata.cutoff);
+  if (paymentRefund) {
+    dateFact("Refund started", metadata.startedAt);
+    dateFact("Refund completed", metadata.completedAt);
+  }
 
   // Each email opens the app page that handles it.
   let invoiceId = "";
-  if (metadata.invoiceId) {
+  if (metadata.invoiceId && !paymentRefund) {
     invoiceId = String(metadata.invoiceId);
     if (!/^[A-Za-z0-9_-]{1,128}$/.test(invoiceId)) throw new Error("INVALID_INVOICE_ID");
   }
@@ -137,6 +152,22 @@ export function renderBillingMessage(request: BillingRequest, appUrl: string) {
 }
 
 const SUPPORT_EMAIL = "nubrixai@reviveanalytics.com";
+
+// Why an automatic refund happens, by the capture rules' reason; nothing else from metadata is shown.
+const REFUND_REASONS: Record<string, string> = {
+  duplicate: "You paid more than once for the same purchase, so the extra payment is returned in full.",
+  paid_after_close: "This payment was made after its checkout had closed, so it is returned in full.",
+  not_deliverable: "This purchase could no longer be provided, so the payment is returned in full.",
+  account_closed: "Your account is closed, so the payment is returned in full.",
+};
+
+// e.g. "INR 4720.00": the currency's own minor-unit digits.
+function formatAmount(metadata: Record<string, unknown>): string {
+  const currency = String(metadata.currency ?? "");
+  if (!Number.isSafeInteger(metadata.amount) || Number(metadata.amount) < 0 || !/^[A-Z]{3}$/.test(currency)) throw new Error("INVALID_AMOUNT");
+  const digits = new Intl.NumberFormat("en", {style:"currency", currency}).resolvedOptions().maximumFractionDigits ?? 2;
+  return `${currency} ${(Number(metadata.amount) / 10 ** digits).toFixed(digits)}`;
+}
 
 // e.g. "6 Nov 2026, 12:00 UTC" — explicit zone, since recipients live in different time zones.
 function formatDate(date: Date): string {

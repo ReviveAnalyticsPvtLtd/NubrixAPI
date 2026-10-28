@@ -84,6 +84,7 @@ class CheckoutRequest:
     currency: str = "INR"
     requiresExistingAttempt: bool = False
     expectedCatalogRevision: int | None = None
+    purchaseDraftRevision: int | None = None
 
 
 @dataclass(frozen=True)
@@ -102,6 +103,10 @@ class CheckoutIntent:
     expiresAt: datetime
     razorpayOrderId: str | None
     snapshot: dict
+    # Set only with state 'confirming_earlier_payment': {selectionLabel, amount, currency}.
+    earlierPayment: dict | None = None
+    # When the attempt started: bounds an authorization with no recorded provider time (paymentInFlight).
+    attemptStartedAt: datetime | None = None
 
 
 @dataclass(frozen=True)
@@ -132,6 +137,9 @@ class VerifiedPaymentEvidence:
     provenCaptureAt: datetime | None
     sourceEventId: str | None
     timingVerified: bool
+    # Provider payment.created_at (signed webhook payload, authenticated fetch or Order payment listing).
+    # It decides the capture rules (spec 4.4); evidence without it keeps today's handling.
+    paymentCreatedAt: datetime | None = None
 
 
 @dataclass(frozen=True)

@@ -119,3 +119,13 @@ def test_transactionsMigrationDropsNothing():
     sql = _transactionsSql()
     lowered = sql.lower()
     assert "drop column" not in lowered
+
+
+def test_purchaseCheckoutChecksAssertedByNameAreNamedExplicitly():
+    """The PostgreSQL rejection tests match these names; none may rely on a generated name."""
+    sql = _normalized(_migrationText("*_add_editable_purchase_checkout.sql"))
+    for name in ("payment_slots_kind_check", "payment_slot_controls_capture_policy_check",
+                 "payment_slot_controls_draft_initial_check", "payment_slot_controls_superseded_reason_check",
+                 "payment_operations_kind_check", "payment_operations_reason_check",
+                 "payment_operations_dedupe_key_check"):
+        assert f"constraint {name} check(" in sql, name

@@ -134,7 +134,17 @@ def test_redact_masks_values():
 # --- backfill script --------------------------------------------------------------
 
 
-def test_backfill_dry_run_reports_candidates_conflicts_and_fields():
+@pytest.fixture
+def backfill_clock(monkeypatch):
+    class FixtureClock(datetime):
+        @classmethod
+        def now(cls, tz=None):
+            value = datetime(2026, 10, 6, 12, tzinfo=timezone.utc)
+            return value.astimezone(tz) if tz else value.replace(tzinfo=None)
+    monkeypatch.setattr('scripts.manual_billing_backfill.datetime', FixtureClock)
+
+
+def test_backfill_dry_run_reports_candidates_conflicts_and_fields(backfill_clock):
     subscriptionRows = [
         {
             "id": "sub-a",
@@ -172,7 +182,7 @@ def test_backfill_dry_run_reports_candidates_conflicts_and_fields():
     assert report["candidates"][0]["new_fields"]["billing_mode"] == "monthly_prepaid"
 
 
-def test_backfill_conflicting_paid_rows_are_reported_not_guessed():
+def test_backfill_conflicting_paid_rows_are_reported_not_guessed(backfill_clock):
     subscriptionRows = [
         {
             "id": "sub-x",

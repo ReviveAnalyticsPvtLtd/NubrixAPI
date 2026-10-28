@@ -15,7 +15,9 @@ def test_reconciliation_expires_lapsed_checkouts_after_provider_recovery():
     task._generateAnomalyReport = lambda: {'totalAnomalies': 0}
     with patch('api.services.billing.manualBillingRepository.getManualBillingRepository', return_value=repository), \
             patch('api.services.billing.manualBillingRecoveryService.ManualBillingRecoveryService', recovery), \
-            patch('api.services.credits.manualCreditRepository.ManualCreditRepository'):
+            patch('api.services.credits.manualCreditRepository.ManualCreditRepository'), \
+            patch('api.services.billing.paymentOperationWorker.PaymentOperationWorker.execute',
+                side_effect=lambda:calls.append('purchase') or {}):
         result = task.execute()
-    assert calls == ['recover', 'expire']
+    assert calls == ['recover', 'purchase', 'expire']
     assert result['checkoutExpiry'] == {'attemptsExpired': 2, 'invoicesExpired': 1}

@@ -129,21 +129,24 @@ def test_fresh_travel_context_resumes_original_owned_currency(checkout_client):
     assert len(provider.order.createdPayloads) == 1
 
 
-def test_foreign_currency_new_key_cannot_supersede_live_initial_order(checkout_client, monkeypatch):
+def test_foreign_currency_new_key_replaces_empty_live_initial_order(checkout_client, monkeypatch):
     from api.services.billing.pricingContext import issuePricingContext
     from test.test_manual_billing_runtime import USER
     client, provider, path = checkout_client
     monkeypatch.setattr('api.services.billing.billingEngine._getMonthlyBasePrice',
                         lambda currency='INR': {'amount': 1739, 'currency': currency, 'plan_id': 'unit_plan'})
-    client.post('/createSubscription', json={'domains': ['banking'], 'contact': ''},
-                headers={'Idempotency-Key': 'india'})
+    india = client.post('/createSubscription', json={'domains': ['banking'], 'contact': ''},
+                        headers={'Idempotency-Key': 'india'}).json()
     changed = client.post('/createSubscription', json={'domains': ['banking'], 'contact': '',
         'pricingContext': issuePricingContext(USER, 'USD', 'hosting', catalogRevision=1)}, headers={'Idempotency-Key': 'travel-new'})
-    assert changed.status_code == 409
-    body = changed.json()
-    assert (body.get('detail') or body)['errorCode'] == 'LIVE_INITIAL_CHECKOUT_CONFLICT'
-    assert counts(path) == (1, 1)
-    assert len(provider.order.createdPayloads) == 1
+    # No money is moving on the INR Order, so Pay replaces it with the newly priced Order.
+    assert changed.status_code == 200
+    assert changed.json()['currency'] == 'USD' and changed.json()['attemptId'] != india['attemptId']
+    assert counts(path) == (2, 2)
+    assert len(provider.order.createdPayloads) == 2
+    replay = client.post('/createSubscription', json={'domains': ['banking'], 'contact': ''},
+                         headers={'Idempotency-Key': 'india'})
+    assert replay.json()['attemptId'] == india['attemptId'] and replay.json()['state'] == 'cancelled'
 
 
 @pytest.mark.parametrize('context', ['fresh', 'expired', 'missing'])

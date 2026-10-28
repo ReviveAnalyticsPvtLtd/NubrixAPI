@@ -134,7 +134,7 @@ def test_two_browser_keys_reserve_one_renewal_and_recover_one_order(actualSchema
     provider = StrictFakeRazorpayClient()
     service = ManualPaymentService.forProduction(provider,repository)
     first = service.createCheckout(original)
-    provider.order.payments = lambda order,params=None: {'items':[]}
+    provider.order.payments = lambda order,params=None,**options: {'items':[]}
     second = service.createCheckout(adopted)
     assert first.razorpayOrderId == second.razorpayOrderId
     assert len(provider.order.createdPayloads) == 1
