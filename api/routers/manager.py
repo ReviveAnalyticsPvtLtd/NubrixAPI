@@ -22,7 +22,7 @@ from api.models import (
     EditMetadata,
     RenameProject
 )
-from api.commons import verifyToken, requireCredits, UserContext
+from api.commons import verifyToken, verifyUser, requireCredits, requireProjectOwner, UserContext
 
 router = APIRouter()
 """
@@ -180,17 +180,18 @@ async def deleteWorkspace(workspaceId: str, token = Depends(verifyToken)):
         raiseHttpException(e)
 
 @router.patch("/updateBookmark")
-async def updateBookmark(updateBookmarkDetails: UpdateProjectState, token = Depends(verifyToken)):
+async def updateBookmark(updateBookmarkDetails: UpdateProjectState, user: UserContext = Depends(verifyUser)):
     """
     Update the bookmark status of a project.
 
     Args:
         updateBookmarkDetails (UpdateProjectState): Details for updating bookmark status.
-        token: Authorization token dependency.
+        user: UserContext injected after session verification.
 
     Returns:
         ORJSONResponse: Success or error message.
     """
+    await asyncio.to_thread(requireProjectOwner, updateBookmarkDetails.projectId, user)
     try:
         managementService.updateBookmark(updateBookmarkDetails = updateBookmarkDetails)
         return ORJSONResponse(status_code = 200, content = {"status": "SUCCESS", "message": "Project bookmark status updated successfully"})
@@ -198,17 +199,18 @@ async def updateBookmark(updateBookmarkDetails: UpdateProjectState, token = Depe
         raiseHttpException(e)
     
 @router.patch("/updateArchive")
-async def updateArchive(updateArchiveDetails: UpdateProjectState, token = Depends(verifyToken)):
+async def updateArchive(updateArchiveDetails: UpdateProjectState, user: UserContext = Depends(verifyUser)):
     """
     Update the archive status of a project.
 
     Args:
         updateArchiveDetails (UpdateProjectState): Details for updating archive status.
-        token: Authorization token dependency.
+        user: UserContext injected after session verification.
 
     Returns:
         ORJSONResponse: Success or error message.
     """
+    await asyncio.to_thread(requireProjectOwner, updateArchiveDetails.projectId, user)
     try:
         managementService.updateArchive(updateArchiveDetails = updateArchiveDetails)
         return ORJSONResponse(status_code = 200, content = {"status": "SUCCESS", "message": "Project archive status updated successfully"})
@@ -216,17 +218,18 @@ async def updateArchive(updateArchiveDetails: UpdateProjectState, token = Depend
         raiseHttpException(e)
     
 @router.patch("/updateTrash")
-async def updateTrash(updateTrashDetails: UpdateProjectState, token = Depends(verifyToken)):
+async def updateTrash(updateTrashDetails: UpdateProjectState, user: UserContext = Depends(verifyUser)):
     """
     Update the trash status of a project.
 
     Args:
         updateTrashDetails (UpdateProjectState): Details for updating trash status.
-        token: Authorization token dependency.
+        user: UserContext injected after session verification.
 
     Returns:
         ORJSONResponse: Success or error message.
     """
+    await asyncio.to_thread(requireProjectOwner, updateTrashDetails.projectId, user)
     try:
         managementService.updateTrash(updateTrashDetails = updateTrashDetails)
         return ORJSONResponse(status_code = 200, content = {"status": "SUCCESS", "message": "Project trash status updated successfully"})
@@ -245,6 +248,7 @@ async def generateMetadata(projectId: str, user: UserContext = Depends(requireCr
     Returns:
         ORJSONResponse: Generated metadata and insights or error message.
     """
+    await asyncio.to_thread(requireProjectOwner, projectId, user)
     try:
         jsonData = managementService.generateMetadata(projectId=projectId, userId=user.userId)
         return ORJSONResponse(status_code = 200, content = {"status": "SUCCESS", "metadata": jsonData})
@@ -265,6 +269,7 @@ async def generateKpis(projectId: str, preserveCharted: bool = False, user: User
     Returns:
         ORJSONResponse: Generated metadata and insights or error message.
     """
+    await asyncio.to_thread(requireProjectOwner, projectId, user)
     try:
         jsonData = managementService.generateInsightsForProject(projectId=projectId, preserveCharted=preserveCharted, userId=user.userId)
         response = {"status": "SUCCESS"}
@@ -274,17 +279,18 @@ async def generateKpis(projectId: str, preserveCharted: bool = False, user: User
         raiseHttpException(e)
     
 @router.get("/getInsights/{projectId}")
-async def getInsights(projectId: str, token = Depends(verifyToken)):
+async def getInsights(projectId: str, user: UserContext = Depends(verifyUser)):
     """
     Retrieve insights and their status for a given project.
 
     Args:
         projectId (str): The ID of the project.
-        token: Authorization token dependency.
+        user: UserContext injected after session verification.
 
     Returns:
         ORJSONResponse: Project metadata or error message.
     """
+    await asyncio.to_thread(requireProjectOwner, projectId, user)
     try:
         newJson = managementService.getInsights(projectId = projectId)
         return ORJSONResponse(status_code = 200, content = newJson) 
@@ -292,17 +298,18 @@ async def getInsights(projectId: str, token = Depends(verifyToken)):
         raiseHttpException(e)
 
 @router.get("/getMetadata/{projectId}")
-async def getMetadata(projectId: str, token = Depends(verifyToken)):
+async def getMetadata(projectId: str, user: UserContext = Depends(verifyUser)):
     """
     Retrieve metadata for a given project.
 
     Args:
         projectId (str): The ID of the project.
-        token: Authorization token dependency.
+        user: UserContext injected after session verification.
 
     Returns:
         ORJSONResponse: Project metadata or error message.
     """
+    await asyncio.to_thread(requireProjectOwner, projectId, user)
     try:
         newJson = managementService.getMetadata(projectId = projectId)
         return ORJSONResponse(status_code = 200, content = newJson) 
@@ -310,17 +317,18 @@ async def getMetadata(projectId: str, token = Depends(verifyToken)):
         raiseHttpException(e)
 
 @router.put("/editMetadata")
-async def editMetadata(modifiedMetadata: EditMetadata, token = Depends(verifyToken)):
+async def editMetadata(modifiedMetadata: EditMetadata, user: UserContext = Depends(verifyUser)):
     """
     Edit the metadata for a project.
 
     Args:
         modifiedMetadata (EditMetadata): The modified metadata details.
-        token: Authorization token dependency.
+        user: UserContext injected after session verification.
 
     Returns:
         ORJSONResponse: Updated metadata or error message.
     """
+    await asyncio.to_thread(requireProjectOwner, modifiedMetadata.projectId, user)
     try:
         jsonData = managementService.editMetadata(modifiedMetadata = modifiedMetadata)
         return ORJSONResponse(status_code = 200, content = {"status": "SUCCESS", "metadata": jsonData})
@@ -328,7 +336,7 @@ async def editMetadata(modifiedMetadata: EditMetadata, token = Depends(verifyTok
         raiseHttpException(e)
 
 @router.patch("/toggleTableActive/{projectId}/{tableName}")
-async def toggleTableActive(projectId: str, tableName: str, token = Depends(verifyToken)):
+async def toggleTableActive(projectId: str, tableName: str, user: UserContext = Depends(verifyUser)):
     """
     Toggle the isActive flag for a table in a project's metadata.
 
@@ -338,6 +346,7 @@ async def toggleTableActive(projectId: str, tableName: str, token = Depends(veri
         404 - Table not found in metadata.
         500 - Failed to update table active state.
     """
+    await asyncio.to_thread(requireProjectOwner, projectId, user)
     try:
         result = managementService.toggleTableActive(projectId=projectId, tableName=tableName)
         return ORJSONResponse(status_code=200, content={"status": "SUCCESS", **result})
@@ -345,17 +354,18 @@ async def toggleTableActive(projectId: str, tableName: str, token = Depends(veri
         raiseHttpException(e)
 
 @router.delete("/deleteProject")
-async def deleteProject(projectId: str, token = Depends(verifyToken)):
+async def deleteProject(projectId: str, user: UserContext = Depends(verifyUser)):
     """
     Delete a project by its ID.
 
     Args:
         projectId (str): The ID of the project to delete.
-        token: Authorization token dependency.
+        user: UserContext injected after session verification.
 
     Returns:
         ORJSONResponse: Success or error message.
     """
+    await asyncio.to_thread(requireProjectOwner, projectId, user)
     try:
         managementService.deleteProject(projectId = projectId)
         return ORJSONResponse(status_code = 200, content = {"status": "SUCCESS", "message": "Project deleted successfully"})
@@ -363,7 +373,7 @@ async def deleteProject(projectId: str, token = Depends(verifyToken)):
         raiseHttpException(e)
 
 @router.patch("/renameProject")
-async def renameProject(renameDetails: RenameProject, token = Depends(verifyToken)):
+async def renameProject(renameDetails: RenameProject, user: UserContext = Depends(verifyUser)):
     """
     Rename an existing project.
 
@@ -375,8 +385,9 @@ async def renameProject(renameDetails: RenameProject, token = Depends(verifyToke
         422 - Invalid project name.
         500 - Failed to rename project. Try again later.
     """
+    await asyncio.to_thread(requireProjectOwner, renameDetails.projectId, user)
     try:
-        managementService.renameProject(renameDetails=renameDetails, token=token)
+        managementService.renameProject(renameDetails=renameDetails, token=user.token)
         return ORJSONResponse(
             status_code=200,
             content={
@@ -388,17 +399,18 @@ async def renameProject(renameDetails: RenameProject, token = Depends(verifyToke
         raiseHttpException(e)
     
 @router.get("/listTriggers/{projectId}")
-async def listTriggers(projectId: str, token = Depends(verifyToken)):
+async def listTriggers(projectId: str, user: UserContext = Depends(verifyUser)):
     """
     List all triggers for a given project.
 
     Args:
         projectId (str): The ID of the project.
-        token: Authorization token dependency.
+        user: UserContext injected after session verification.
 
     Returns:
         ORJSONResponse: List of triggers or error message.
     """
+    await asyncio.to_thread(requireProjectOwner, projectId, user)
     try:
         triggers = managementService.listTriggers(projectId = projectId)
         return ORJSONResponse(status_code = 200, content = {"status": "SUCCESS", "triggers": triggers})  
@@ -423,17 +435,18 @@ async def listTriggers(token = Depends(verifyToken)):
         raiseHttpException(e)
     
 @router.post("/generateReport/{projectId}")
-async def generateReport(projectId: str, token = Depends(verifyToken)):
+async def generateReport(projectId: str, user: UserContext = Depends(verifyUser)):
     """
     Generate a report for a given project.
 
     Args:
         projectId (str): The ID of the project.
-        token: Authorization token dependency.
+        user: UserContext injected after session verification.
 
     Returns:
         ORJSONResponse: Generated report HTML content or error message.
     """
+    await asyncio.to_thread(requireProjectOwner, projectId, user)
     try:
         reports = managementService.generateReport(projectId = projectId)
         return ORJSONResponse(status_code = 200, content = {"status": "SUCCESS", "reportHtmlContent": reports})
@@ -441,18 +454,19 @@ async def generateReport(projectId: str, token = Depends(verifyToken)):
         raiseHttpException(e)
     
 @router.get("/getReport/{projectId}/{tableName}")
-async def getReport(projectId: str, tableName: str, token = Depends(verifyToken)):
+async def getReport(projectId: str, tableName: str, user: UserContext = Depends(verifyUser)):
     """
     Retrieve a report for a specific table in a project.
 
     Args:
         projectId (str): The ID of the project.
         tableName (str): The name of the table.
-        token: Authorization token dependency.
+        user: UserContext injected after session verification.
 
     Returns:
         HTMLResponse: HTML content of the report or error message.
     """
+    await asyncio.to_thread(requireProjectOwner, projectId, user)
     try:
         htmlContent = managementService.getReport(projectId = projectId, tableName = tableName)
         return HTMLResponse(status_code = 200, content = htmlContent)  
@@ -551,7 +565,7 @@ async def viewTable(
     tableName: str,
     page: int = Query(default=1, ge=1),
     pageSize: int = Query(default=100, ge=1, le=500),
-    token = Depends(verifyToken),
+    user: UserContext = Depends(verifyUser),
 ):
     """
     Read a parquet table from Supabase storage and return paginated rows.
@@ -559,6 +573,7 @@ async def viewTable(
     Uses Polars lazy scan so only the requested row range is materialised —
     a 10M-row table returns page 1 as fast as a 1k-row table.
     """
+    await asyncio.to_thread(requireProjectOwner, projectId, user)
     try:
         import polars as pl
 
