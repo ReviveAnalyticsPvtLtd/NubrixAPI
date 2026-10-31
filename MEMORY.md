@@ -145,7 +145,7 @@ These were added during the refactor and then reverted because they broke produc
 | `SupabaseClientProxy` in `commons.py` | Added lazy-init wrapper around `create_client` — unnecessary, direct client works fine |
 | Async auth deps in `commons.py` | Changed `verifyToken` etc. to `async def` — changed behavior, no benefit |
 | Redis session caching in `commons.py` | Could serve stale tokens, added complexity |
-| `verifyProjectOwnership` / `verifyMultipartProjectOwnership` in `commons.py` | Overengineered auth layer — routers use `verifyToken` |
+| `verifyProjectOwnership` / `verifyMultipartProjectOwnership` in `commons.py` | Overengineered auth layer — routers use `verifyToken`. Superseded: every route taking a project ID now calls the one synchronous `requireProjectOwner` check |
 | `requireTenantSlot` / `releaseTenantSlot` in `commons.py` | Per-tenant concurrency caps — could deadlock, unnecessary |
 | CORS `ALLOWED_ORIGINS` env logic in `main.py` | `["*"]` was working fine |
 | `supervisord.conf` split into compute/billing queues | Single celery worker was fine, split added complexity |

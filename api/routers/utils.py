@@ -24,7 +24,7 @@ from fastapi.security import HTTPAuthorizationCredentials
 from api.services.utilityService import utilityService
 from nubrix.triggers.celery import celeryApp
 from fastapi.responses import ORJSONResponse
-from api.commons import verifyToken, requireCredits, UserContext
+from api.commons import verifyToken, verifyUser, requireCredits, requireProjectOwner, UserContext
 import asyncio
 
 router = APIRouter()
@@ -72,6 +72,7 @@ async def getInsightsFromImage(imageToInsights: ImageToInsightsModel, user: User
         ORJSONResponse: Structured JSON with diagnostic_insights, prescriptive_actions,
             and missing_data.
     """
+    await asyncio.to_thread(requireProjectOwner, imageToInsights.projectId, user)
     try:
         insights = utilityService.getInsightsFromImage(imageToInsights=imageToInsights, userId=user.userId)
         return ORJSONResponse(status_code=200, content=insights)
@@ -79,17 +80,18 @@ async def getInsightsFromImage(imageToInsights: ImageToInsightsModel, user: User
         raiseHttpException(e)
 
 @router.get("/getDashboardInsights/{projectId}")
-async def getDashboardInsights(projectId: str, token = Depends(verifyToken)):
+async def getDashboardInsights(projectId: str, user: UserContext = Depends(verifyUser)):
     """
     Retrieve all persisted dashboard insights for a project.
 
     Args:
         projectId (str): The project identifier.
-        token: Authorization token dependency.
+        user: UserContext injected after session verification.
 
     Returns:
         ORJSONResponse: List of insight records with status lifecycle.
     """
+    await asyncio.to_thread(requireProjectOwner, projectId, user)
     try:
         records = utilityService.getDashboardInsights(projectId=projectId)
         return ORJSONResponse(status_code=200, content={"insights": records})
@@ -97,17 +99,18 @@ async def getDashboardInsights(projectId: str, token = Depends(verifyToken)):
         raiseHttpException(e)
 
 @router.patch("/updateDashboardInsightStatus")
-async def updateDashboardInsightStatus(body: UpdateDashboardInsightStatus, token = Depends(verifyToken)):
+async def updateDashboardInsightStatus(body: UpdateDashboardInsightStatus, user: UserContext = Depends(verifyUser)):
     """
     Update the lifecycle status of a persisted dashboard insight.
 
     Args:
         body (UpdateDashboardInsightStatus): Model containing projectId, insightId, and new status.
-        token: Authorization token dependency.
+        user: UserContext injected after session verification.
 
     Returns:
         ORJSONResponse: The updated insight record.
     """
+    await asyncio.to_thread(requireProjectOwner, body.projectId, user)
     try:
         record = utilityService.updateDashboardInsightStatus(
             projectId=body.projectId,

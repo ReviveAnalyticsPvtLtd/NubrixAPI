@@ -15,10 +15,11 @@ from api.models import (
     DeleteTable
 )
 from utils.exceptionHandler import CustomException, raiseHttpException
+import asyncio
 from fastapi import APIRouter, Depends, UploadFile, File, Form
 from api.services.dataLoadService import dataLoadService
 from fastapi.responses import ORJSONResponse
-from api.commons import verifyToken, requireCredits, UserContext
+from api.commons import verifyUser, requireCredits, requireProjectOwner, UserContext
 from typing import Annotated
 
 router = APIRouter()
@@ -40,6 +41,7 @@ async def loadCsvData(projectId: Annotated[str, Form()], files: list[UploadFile]
     Returns:
         ORJSONResponse: Success with generated metadata for the new tables.
     """
+    await asyncio.to_thread(requireProjectOwner, projectId, user)
     try:
         metadata = await dataLoadService.loadCsvData(projectId=projectId, files=files, userId=user.userId)
         return ORJSONResponse(status_code=200, content={"status": "SUCCESS", "metadata": metadata})
@@ -60,6 +62,7 @@ async def loadExcelData(projectId: Annotated[str, Form()], files: list[UploadFil
     Returns:
         ORJSONResponse: Success with generated metadata for the new tables.
     """
+    await asyncio.to_thread(requireProjectOwner, projectId, user)
     try:
         metadata = await dataLoadService.loadExcelData(projectId=projectId, files=files, userId=user.userId)
         return ORJSONResponse(status_code=200, content={"status": "SUCCESS", "metadata": metadata})
@@ -80,6 +83,7 @@ async def loadPdfData(projectId: Annotated[str, Form()], files: list[UploadFile]
     Returns:
         ORJSONResponse: Success with generated metadata for the new tables.
     """
+    await asyncio.to_thread(requireProjectOwner, projectId, user)
     try:
         metadata = await dataLoadService.loadPdfData(projectId=projectId, files=files, userId=user.userId)
         return ORJSONResponse(status_code=200, content={"status": "SUCCESS", "metadata": metadata})
@@ -99,6 +103,7 @@ async def loadMySql(connection: LoadMySQLorPostgreSQL, user: UserContext = Depen
     Returns:
         ORJSONResponse: Success with generated metadata for the new table.
     """
+    await asyncio.to_thread(requireProjectOwner, connection.projectId, user)
     try:
         metadata = dataLoadService.loadMySql(connection=connection, userId=user.userId)
         return ORJSONResponse(status_code=200, content={"status": "SUCCESS", "metadata": metadata})
@@ -118,6 +123,7 @@ async def loadPostgreSQL(connection: LoadMySQLorPostgreSQL, user: UserContext = 
     Returns:
         ORJSONResponse: Success with generated metadata for the new table.
     """
+    await asyncio.to_thread(requireProjectOwner, connection.projectId, user)
     try:
         metadata = dataLoadService.loadPostgreSQL(connection=connection, userId=user.userId)
         return ORJSONResponse(status_code=200, content={"status": "SUCCESS", "metadata": metadata})
@@ -137,6 +143,7 @@ async def loadMongoDB(connection: LoadMongoDB, user: UserContext = Depends(requi
     Returns:
         ORJSONResponse: Success with generated metadata for the new table.
     """
+    await asyncio.to_thread(requireProjectOwner, connection.projectId, user)
     try:
         metadata = dataLoadService.loadMongoDB(connection=connection, userId=user.userId)
         return ORJSONResponse(status_code=200, content={"status": "SUCCESS", "metadata": metadata})
@@ -144,17 +151,18 @@ async def loadMongoDB(connection: LoadMongoDB, user: UserContext = Depends(requi
         raiseHttpException(e)
 
 @router.delete("/deleteTable")
-async def deleteTable(tableDetails: DeleteTable, token = Depends(verifyToken)):
+async def deleteTable(tableDetails: DeleteTable, user: UserContext = Depends(verifyUser)):
     """
     Delete a table from the data source.
 
     Args:
         tableDetails (DeleteTable): Details of the table to delete.
-        token: Authorization token dependency.
+        user: UserContext injected after session verification.
 
     Returns:
         ORJSONResponse: Success or error message.
     """
+    await asyncio.to_thread(requireProjectOwner, tableDetails.projectId, user)
     try:
         dataLoadService.deleteTable(tableDetails = tableDetails)
         return ORJSONResponse(status_code = 200, content = {"status": "SUCCESS", "message": "Table deleted successfully"})
