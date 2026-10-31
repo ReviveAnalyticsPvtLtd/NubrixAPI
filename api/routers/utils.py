@@ -39,6 +39,18 @@ def _websocketTokenIsValid(credentials: HTTPAuthorizationCredentials) -> bool:
     except Exception:
         return False
 
+
+def _finalTaskStatus(task) -> dict:
+    if task.status != "SUCCESS":
+        return {"taskId": task.task_id, "status": "FAILURE", "taskResponseCode": None}
+    responseCode = task.get()
+    taskFailed = isinstance(responseCode, int) and responseCode >= 400
+    return {
+        "taskId": task.task_id,
+        "status": "FAILURE" if taskFailed else "SUCCESS",
+        "taskResponseCode": responseCode,
+    }
+
 @router.post("/getSpeechTranscript")
 async def getSpeechTranscript(speechToText: SpeechToTextModel, user: UserContext = Depends(requireCredits("speech_to_text"))):
     """
@@ -167,11 +179,7 @@ async def getTaskStatus(websocket: WebSocket):
         if not _websocketTokenIsValid(credentials):
             await websocket.close(code=status.WS_1008_POLICY_VIOLATION)
             return
-        await websocket.send_json({
-            "taskId": r.task_id,
-            "status": r.status,
-            "taskResponseCode": r.get()
-        })
+        await websocket.send_json(_finalTaskStatus(r))
         await websocket.close()
     except WebSocketDisconnect:
         pass
