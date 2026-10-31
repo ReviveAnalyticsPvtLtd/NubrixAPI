@@ -35,7 +35,7 @@ Router for utility-related endpoints.
 
 def _websocketTokenIsValid(credentials: HTTPAuthorizationCredentials) -> bool:
     try:
-        return bool(verifyToken(token=credentials))
+        return bool(verifyToken(credentials))
     except Exception:
         return False
 
