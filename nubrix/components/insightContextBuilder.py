@@ -12,6 +12,7 @@ __all__ = ["InsightContextBuilder"]
 
 
 from utils.exceptionHandler import CustomException
+from utils.projectStorage import readJson
 from urllib.request import urlopen
 from utils.logger import logger
 from api.commons import client
@@ -55,8 +56,7 @@ class InsightContextBuilder:
             files = self.client.storage.from_(self.config.storageBucket).list(path=projectId)
             if fileName not in [x.get("name") for x in files]:
                 return None
-            fileUrl = os.environ["FILE_URL"].format(projectId=projectId, fileName=fileName).replace(".parquet", "") + f"?cb={int(time.time())}"
-            return json.loads(urlopen(fileUrl).read())
+            return readJson(projectId, fileName)
         except Exception:
             return None
 
