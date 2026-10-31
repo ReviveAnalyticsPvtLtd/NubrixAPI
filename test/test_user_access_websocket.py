@@ -1,9 +1,18 @@
 import asyncio
 
+import pytest
+from celery import Celery, states
 from fastapi import HTTPException, status
 
 from api import commons
 from api.routers import utils as utilsRouter
+
+taskResults = Celery(
+    "task-status-test",
+    broker="memory://",
+    backend="cache+memory://",
+    set_as_current=False,
+)
 
 
 class FakeWebSocket:
@@ -85,3 +94,62 @@ def test_task_status_refuses_invalid_session_before_sending_status(monkeypatch):
 
     assert websocket.sent == []
     assert websocket.closeCodes == [status.WS_1008_POLICY_VIOLATION]
+
+
+def run_task_status(monkeypatch, taskId):
+    websocket = FakeWebSocket()
+    monkeypatch.setattr(
+        commons,
+        "_verifyTokenInternal",
+        lambda credentials, checkExpiry: credentials.credentials,
+    )
+    monkeypatch.setattr(
+        utilsRouter.celeryApp,
+        "AsyncResult",
+        lambda _taskId: taskResults.AsyncResult(taskId),
+    )
+
+    asyncio.run(utilsRouter.getTaskStatus(websocket))
+
+    return websocket
+
+
+def test_task_status_sends_final_failure_for_failed_task(monkeypatch):
+    taskResults.backend.mark_as_failure("failed-task", ValueError("private failure detail"))
+
+    websocket = run_task_status(monkeypatch, "failed-task")
+
+    assert websocket.sent == [
+        {"status": "RUNNING"},
+        {"taskId": "failed-task", "status": "FAILURE", "taskResponseCode": None},
+    ]
+    assert websocket.closeCodes == [status.WS_1000_NORMAL_CLOSURE]
+
+
+def test_task_status_sends_final_failure_for_revoked_task(monkeypatch):
+    taskResults.backend.mark_as_revoked("revoked-task", "revoked")
+
+    websocket = run_task_status(monkeypatch, "revoked-task")
+
+    assert websocket.sent == [
+        {"status": "RUNNING"},
+        {"taskId": "revoked-task", "status": "FAILURE", "taskResponseCode": None},
+    ]
+    assert websocket.closeCodes == [status.WS_1000_NORMAL_CLOSURE]
+
+
+@pytest.mark.parametrize(
+    ("responseCode", "finalStatus"),
+    [(200, "SUCCESS"), (399, "SUCCESS"), (400, "FAILURE"), (500, "FAILURE")],
+)
+def test_task_status_reads_final_status_from_task_response_code(monkeypatch, responseCode, finalStatus):
+    taskId = f"finished-task-{responseCode}"
+    taskResults.backend.store_result(taskId, responseCode, states.SUCCESS)
+
+    websocket = run_task_status(monkeypatch, taskId)
+
+    assert websocket.sent == [
+        {"status": "RUNNING"},
+        {"taskId": taskId, "status": finalStatus, "taskResponseCode": responseCode},
+    ]
+    assert websocket.closeCodes == [status.WS_1000_NORMAL_CLOSURE]
