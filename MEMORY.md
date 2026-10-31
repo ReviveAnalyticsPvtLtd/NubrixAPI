@@ -32,21 +32,21 @@ This file documents changes made to the NubrixAI Analytics Hub API codebase.
 ### 2. Subprocess Sandbox — Code Execution (`utils/codeExecutor.py`, `utils/sandbox_launcher.py`)
 
 - **Subprocess-based**: LLM-generated code runs in a fresh subprocess (`subprocess.Popen` with `close_fds=True`). No fork, no inherited Redis/HTTP sockets, no deadlock.
-- **No RLIMIT caps**: `RLIMIT_AS` / `RLIMIT_CPU` removed — they crashed polars import in containers. Isolation is via subprocess + restricted builtins.
-- **Restricted builtins**: `__import__` whitelisted to `polars`, `json`, `math`, `datetime`, `numpy`, `pandas`, etc. No `open`, `subprocess`, `os`.
-- **Project-scoped fetchers**: `safe_fetch_data` / `safe_fetch_data_pl` / `safe_scan_data` reject cross-tenant access.
+- **No RLIMIT caps**: `RLIMIT_AS` / `RLIMIT_CPU` removed — they crashed polars import in containers. Isolation is a separate uid per run and a child that holds no credentials.
+- **Restricted builtins**: `__import__` whitelisted to `polars`, `json`, `math`, `datetime`, `numpy`, `pandas`, etc. No `open`, `subprocess`, `os`. These only catch mistakes: pandas and NumPy expose `os`, file reads and HTTP reads.
+- **Project-scoped fetchers**: `safe_fetch_data` / `safe_fetch_data_pl` / `safe_scan_data` give a clear error for another project. The boundary is the parent, which reads tables for the child over a private pipe pair (`utils/sandboxRunner.py`).
 - **Timeout**: Configurable via `CODE_EXEC_TIMEOUT_SECONDS` env (default `0` = no timeout). Set to N to re-enable N-second cap.
 - **Concurrency**: Soft per-project Redis ZSET semaphore (default 50/project).
 
 ### 3. Subprocess Transformation Executor (`nubrix/components/transformationExecutor.py`, `utils/transform_launcher.py`, `utils/inspect_launcher.py`)
 
 - **Subprocess-based**: Transformation code runs in a fresh subprocess (same `close_fds=True` pattern). Replaced multiprocessing fork which deadlocked on inherited Redis sockets.
-- **Temp-file IPC**: Child writes `final_df` as parquet to a temp file; parent reads it. No multiprocessing Queue pickle overhead.
+- **Temp-file IPC**: Child writes `final_df` as parquet to a file in its run folder; parent reads it. No multiprocessing Queue pickle overhead.
 - **Polars preview**: `executeAndPreview` uses `pl.read_parquet(...).head(100).to_dicts()` — only loads 100 rows, not full table.
 - **Accepts**: `pl.LazyFrame` (auto-collects), `pl.DataFrame` (via `.to_arrow()`), `pd.DataFrame` (via `pa.Table.from_pandas`).
 - **Timeout**: Configurable via `TRANSFORMATION_TIMEOUT_SECONDS` env (default `0` = no timeout).
 - **Restricted imports**: Same whitelist as sandbox.
-- **Project-scoped fetchers**: `fetch_data` / `fetch_data_pl` / `scan_data` raise `PermissionError` for any other project, as in the code execution sandbox. Rebinding `projectId` in generated code doesn't change the allowed project.
+- **Project-scoped fetchers**: `fetch_data` / `fetch_data_pl` / `scan_data` raise `PermissionError` for any other project, as in the code execution sandbox. Rebinding `projectId` in generated code doesn't change the allowed project, and the parent reads only the project it started the run for.
 
 ### 4. Workflow Auto-Routing (`nubrix/workflows/reportingToolWorkflow.py`, `parallelReportingToolWorkflow.py`)
 
