@@ -1571,6 +1571,11 @@ Trigger a forecasts Celery task.
 }
 ```
 
+The task reads `emptykegsdata` and replaces `forecasts` in an external PostgreSQL database, so the login needs both
+rights. Its connection comes from `FORECAST_DB_USER`, `FORECAST_DB_PASSWORD`, `FORECAST_DB_HOST`, `FORECAST_DB_PORT`
+and `FORECAST_DB_NAME`, all required. If any is missing or the port is not a number, this route still returns 200 and
+the task then fails with an error naming the variable, before it connects.
+
 ---
 
 ### 10.6 `WS /api/latest/utils/ws/getTaskStatus?token={jwt}&taskId={taskId}`
