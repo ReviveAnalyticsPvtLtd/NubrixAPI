@@ -1,7 +1,7 @@
 """
 transform_launcher.py — subprocess entry point for transformation code execution.
 
-Reads JSON from stdin: {"projectId": ..., "code": ..., "result_path": ...}
+Reads JSON from stdin: {"projectId": ..., "code": ..., "result_path": ..., "channel": ...}
 Executes the code, writes final_df as parquet to result_path.
 Writes error traceback to stderr if anything fails.
 """
@@ -33,11 +33,14 @@ def main():
         sys.exit(1)
 
     from utils.initMethods import fetch_data, fetch_data_pl, scan_data, serializer
+    from utils.sandboxRunner import connectTableChannel
     import pandas as pd
     import numpy as np
     import datetime
     import math
     import re
+
+    connectTableChannel(input_data["channel"])
 
     _ALLOWED_MODULES = frozenset({
         "pandas", "numpy", "datetime", "math", "re", "time",

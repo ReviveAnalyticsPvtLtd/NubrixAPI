@@ -4,9 +4,10 @@ transformationExecutor.py
 This module executes generated transformation code and persists approved
 transformed tables.
 
-Production design: every code execution runs in a forked child process.
-The child writes its result to a temp file and the parent reads it back,
-avoiding the multiprocessing Queue pickle overhead for large DataFrames.
+Production design: every code execution runs in a subprocess started by
+utils/sandboxRunner.py. The child writes its result to a temp file and the
+parent reads it back, avoiding the multiprocessing Queue pickle overhead for
+large DataFrames.
 No hard timeout/SIGKILL is enforced by default; set TRANSFORMATION_TIMEOUT_SECONDS
 env var to re-enable one.
 """
@@ -18,11 +19,10 @@ __all__ = ["TransformationExecutor"]
 
 from utils.exceptionHandler import CustomException
 from utils.initMethods import fetch_data, fetch_data_pl, scan_data, serializer
+from utils.sandboxRunner import runSandbox
 from api.commons import client
 from utils.logger import logger
 import multiprocessing as mp
-import subprocess
-import sys
 import pandas as pd
 import numpy as np
 import datetime
@@ -32,7 +32,6 @@ import math
 import io
 import os
 import re
-import tempfile
 import polars as pl
 
 # Module-level Redis connection pool for reuse
@@ -103,41 +102,6 @@ def _sandbox_globals(projectId: str) -> dict:
     return g
 
 
-def _run_subprocess(launcher_name: str, payload: dict, timeoutSeconds: int) -> tuple[str, str, int]:
-    """Run a launcher script in a subprocess with close_fds=True (no inherited sockets)."""
-    repo_root = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-    launcher_path = os.path.join(repo_root, "utils", launcher_name)
-    # Generated code can read its whole environment: pass only what a table read uses.
-    inherit_envs = (
-        "PATH", "PYTHONPATH", "HOME", "LANG", "LC_ALL", "TZ",
-        "REDIS_HOST", "REDIS_PORT", "REDIS_PASSWORD", "REDIS_DB",
-        "SUPABASE_URL", "SUPABASE_KEY",
-        "POLARS_MAX_THREADS", "OPENBLAS_NUM_THREADS",
-        "DF_CACHE_MAX_BYTES", "DF_CACHE_MAX_ENTRIES",
-    )
-    clean_env = {k: os.environ[k] for k in inherit_envs if k in os.environ}
-    clean_env["PYTHONPATH"] = repo_root + os.pathsep + clean_env.get("PYTHONPATH", "")
-    proc = subprocess.Popen(
-        [sys.executable, "-s", launcher_path],
-        stdin=subprocess.PIPE,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        text=True,
-        env=clean_env,
-        close_fds=True,
-    )
-    try:
-        if timeoutSeconds and timeoutSeconds > 0:
-            stdout, stderr = proc.communicate(input=json.dumps(payload), timeout=timeoutSeconds)
-        else:
-            stdout, stderr = proc.communicate(input=json.dumps(payload))
-    except subprocess.TimeoutExpired:
-        proc.kill()
-        stdout, stderr = proc.communicate()
-        stderr += f"\nExecution timed out after {timeoutSeconds} seconds.\n"
-    return stdout, stderr, proc.returncode
-
-
 class TransformationExecutor:
     """
     Execute pandas/polars transformation code and persist approved transformed tables.
@@ -163,32 +127,20 @@ class TransformationExecutor:
 
     def _execute_code(self, projectId: str, pythonCode: str) -> pd.DataFrame:
         """Execute generated code and return `final_df` (validation run, result discarded)."""
-        fd, result_path = tempfile.mkstemp(suffix=".parquet", prefix="transform_")
-        os.close(fd)
-        try:
-            _, stderr, rc = _run_subprocess(
-                "transform_launcher.py",
-                {"projectId": projectId, "code": pythonCode, "result_path": result_path},
-                self.timeoutSeconds,
-            )
-            if rc != 0:
-                raise ValueError(stderr.strip() or "Transformation execution failed.")
-            if not os.path.exists(result_path) or os.path.getsize(result_path) == 0:
-                raise ValueError("Transformation produced no final_df.")
-            return pd.read_parquet(result_path)
-        finally:
-            try:
-                os.unlink(result_path)
-            except Exception:
-                pass
+        return pd.read_parquet(io.BytesIO(self._run_transformation(projectId, pythonCode)))
+
+    def _run_transformation(self, projectId: str, pythonCode: str) -> bytes:
+        """Run transformation code and return the parquet bytes of `final_df`."""
+        _, stderr, rc, parquetBytes = runSandbox("transform_launcher.py", projectId, pythonCode, self.timeoutSeconds)
+        if rc != 0:
+            raise ValueError(stderr.strip() or "Transformation execution failed.")
+        if not parquetBytes:
+            raise ValueError("Transformation produced no final_df.")
+        return parquetBytes
 
     def executeInspection(self, projectId: str, pythonCode: str) -> str:
         """Execute inspection code in the sandbox and return stdout + stderr."""
-        stdout, stderr, rc = _run_subprocess(
-            "inspect_launcher.py",
-            {"projectId": projectId, "code": pythonCode},
-            self.timeoutSeconds,
-        )
+        stdout, stderr, rc, _ = runSandbox("inspect_launcher.py", projectId, pythonCode, self.timeoutSeconds)
         if rc != 0 and stderr:
             return f"Stdout:\n{stdout}\nStderr/Errors:\n{stderr}"
         return stdout if stdout else "Inspection executed successfully with no output."
@@ -200,32 +152,14 @@ class TransformationExecutor:
         """
         try:
             self._validate_table_name(tableName)
-            fd, result_path = tempfile.mkstemp(suffix=".parquet", prefix="transform_")
-            os.close(fd)
-            try:
-                _, stderr, rc = _run_subprocess(
-                    "transform_launcher.py",
-                    {"projectId": projectId, "code": pythonCode, "result_path": result_path},
-                    self.timeoutSeconds,
-                )
-                if rc != 0:
-                    raise ValueError(stderr.strip() or "Transformation execution failed.")
-                if not os.path.exists(result_path) or os.path.getsize(result_path) == 0:
-                    raise ValueError("Transformation produced no final_df.")
-                with open(result_path, "rb") as f:
-                    parquetBytes = f.read()
-                previewRecords = (
-                    pl.read_parquet(io.BytesIO(parquetBytes))
-                    .head(100)
-                    .to_dicts()
-                )
-                previewRows = json.loads(json.dumps(previewRecords, default=serializer))
-                return previewRows, parquetBytes
-            finally:
-                try:
-                    os.unlink(result_path)
-                except Exception:
-                    pass
+            parquetBytes = self._run_transformation(projectId, pythonCode)
+            previewRecords = (
+                pl.read_parquet(io.BytesIO(parquetBytes))
+                .head(100)
+                .to_dicts()
+            )
+            previewRows = json.loads(json.dumps(previewRecords, default=serializer))
+            return previewRows, parquetBytes
         except Exception as e:
             exception = CustomException(e, statusCode=400, uiMessage=str(e))
             logger.error(exception)

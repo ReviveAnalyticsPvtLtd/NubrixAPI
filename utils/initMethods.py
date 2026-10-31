@@ -29,8 +29,8 @@ import redis
 import threading
 from collections import OrderedDict
 from utils.logger import logger
-from utils.projectStorage import readTableBytes
-from typing import Iterable
+from utils.projectStorage import downloadTable, objectUrl, readTableBytes
+from typing import Callable, Iterable
 
 try:
     import pyarrow as pa
@@ -93,6 +93,17 @@ def _redis_pool() -> redis.ConnectionPool:
 _DF_CACHE: "OrderedDict[tuple[str, str], tuple[pa.Table, int]]" = OrderedDict()
 _DF_CACHE_BYTES = 0
 _DF_CACHE_LOCK = threading.Lock()
+
+_REDIS_MAX_ROWS = 100000
+
+# Set in sandbox children, where the parent process supplies tables.
+_TABLE_SOURCE: "Callable[[str], pa.Table] | None" = None
+
+
+def use_table_source(source: "Callable[[str], pa.Table]") -> None:
+    """Make every cold read in this process go to `source`, which takes a table name."""
+    global _TABLE_SOURCE
+    _TABLE_SOURCE = source
 
 
 def _df_bytes(table: "pa.Table") -> int:
@@ -302,7 +313,7 @@ def _fetch_data_from_redis(redis_key: str) -> "pa.Table | None":
 
 def _store_to_redis(redis_key: str, table: "pa.Table") -> None:
     num_rows = table.num_rows
-    if num_rows > 100000:
+    if num_rows > _REDIS_MAX_ROWS:
         # Skip caching entirely for large/massive tables to prevent Redis OOM
         return
 
@@ -319,6 +330,48 @@ def _store_to_redis(redis_key: str, table: "pa.Table") -> None:
         r.set(name=redis_key, value=sink.getvalue().to_pybytes(), ex=ttl)
     except Exception:
         pass
+
+
+def _load_table(projectId: str, tableName: str) -> "pa.Table":
+    """Arrow LRU → table source in a sandbox child, Redis → Supabase everywhere else."""
+    cache_key = (projectId, tableName)
+    table = _cache_get(cache_key)
+    if table is None:
+        if _TABLE_SOURCE is not None:
+            table = _TABLE_SOURCE(tableName)
+        else:
+            redis_key = f"{projectId}::{tableName}"
+            table = _fetch_data_from_redis(redis_key)
+            if table is None:
+                # Cold path: scan without pushdown so the cached table is always the
+                # complete dataset. Filter translation + pushdown live in
+                # ``_apply_filters_in_arrow_if_possible`` for in-memory use.
+                table = _fetch_data_from_supabase(projectId, tableName)
+                _store_to_redis(redis_key, table)
+        _cache_put(cache_key, table)
+    return table
+
+
+def spool_table(projectId: str, tableName: str, pathStem: str) -> str:
+    """Write a table to disk for a sandbox child and return its path.
+
+    Reads Redis then Supabase like `fetch_data`, but keeps a cold read as parquet
+    on disk, so a big table is never held or decoded here. It skips this process's
+    Arrow LRU, which a write through another worker can leave stale.
+    """
+    objectUrl(projectId, f"{tableName}.parquet")  # Refuses a bad name before it reaches Redis or the disk.
+    redis_key = f"{projectId}::{tableName}"
+    table = _fetch_data_from_redis(redis_key)
+    if table is not None:
+        path = f"{pathStem}.arrow"
+        with pa.OSFile(path, "wb") as sink, pa.ipc.new_file(sink, table.schema) as writer:
+            writer.write_table(table)
+        return path
+    path = f"{pathStem}.parquet"
+    downloadTable(projectId, tableName, path)
+    if pq.read_metadata(path).num_rows <= _REDIS_MAX_ROWS:
+        _store_to_redis(redis_key, pq.read_table(path))
+    return path
 
 
 def fetch_data(projectId: str, tableName: str, baseFilters: list | None = None, *args):
@@ -340,19 +393,8 @@ def fetch_data(projectId: str, tableName: str, baseFilters: list | None = None, 
     for arg in args:
         if isinstance(arg, list):
             filters.extend(arg)
-    cache_key = (projectId, tableName)
-    redis_key = f"{projectId}::{tableName}"
 
-    table: pa.Table | None = _cache_get(cache_key)
-    if table is None:
-        table = _fetch_data_from_redis(redis_key)
-        if table is None:
-            # Cold path: scan without pushdown so the cached table is always the
-            # complete dataset. Filter translation + pushdown live in
-            # ``_apply_filters_in_arrow_if_possible`` for in-memory use.
-            table = _fetch_data_from_supabase(projectId, tableName)
-            _store_to_redis(redis_key, table)
-        _cache_put(cache_key, table)
+    table = _load_table(projectId, tableName)
 
     if filters:
         table = _apply_filters_in_arrow_if_possible(table, tableName, filters)
@@ -368,15 +410,7 @@ def fetch_data_pl(projectId: str, tableName: str) -> "pl.DataFrame":
     """
     if pl is None:
         raise RuntimeError("polars is not installed.")
-    cache_key = (projectId, tableName)
-    table = _cache_get(cache_key)
-    if table is None:
-        table = _fetch_data_from_redis(f"{projectId}::{tableName}")
-        if table is None:
-            table = _fetch_data_from_supabase(projectId, tableName)
-            _store_to_redis(f"{projectId}::{tableName}", table)
-        _cache_put(cache_key, table)
-    return pl.from_arrow(table)
+    return pl.from_arrow(_load_table(projectId, tableName))
 
 
 def scan_data(projectId: str, tableName: str) -> "pl.LazyFrame":

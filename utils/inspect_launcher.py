@@ -1,7 +1,7 @@
 """
 inspect_launcher.py — subprocess entry point for transformation inspection.
 
-Reads JSON from stdin: {"projectId": ..., "code": ...}
+Reads JSON from stdin: {"projectId": ..., "code": ..., "channel": ...}
 Executes the code and writes stdout to stdout, stderr to stderr.
 """
 
@@ -30,11 +30,14 @@ def main():
         sys.exit(1)
 
     from utils.initMethods import fetch_data, fetch_data_pl, scan_data, serializer
+    from utils.sandboxRunner import connectTableChannel
     import pandas as pd
     import numpy as np
     import datetime
     import math
     import re
+
+    connectTableChannel(input_data["channel"])
 
     _ALLOWED_MODULES = frozenset({
         "pandas", "numpy", "datetime", "math", "re", "time",
