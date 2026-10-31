@@ -14,7 +14,7 @@ import asyncio
 from api.services.dashboardService import dashboardService
 from fastapi.responses import ORJSONResponse
 from fastapi import APIRouter, Depends
-from api.commons import verifyUser, requireProjectOwner, UserContext
+from api.commons import verifyUser, requireProjectOwner, requireTrialOrAbove, UserContext
 from api.models import (
     DeleteDashboardElement,
     ExportToDashboard,
@@ -98,6 +98,9 @@ async def getData(details: GetData, user: UserContext = Depends(verifyUser)):
         ORJSONResponse: Page data or error message.
     """
     await asyncio.to_thread(requireProjectOwner, details.projectId, user)
+    # A plain read runs no compute, and every dashboard render makes one.
+    if details.filters or details.refresh:
+        await asyncio.to_thread(requireTrialOrAbove, user)
     try:
         pageInfo = dashboardService.getData(details = details)
         return ORJSONResponse(status_code = 200, content = {"status": "SUCCESS", "pageData": pageInfo})
@@ -162,7 +165,7 @@ async def getAllColumns(projectId: str, user: UserContext = Depends(verifyUser))
         raiseHttpException(e)
     
 @router.get("/dashboardRefresh/{projectId}")
-async def dashboardRefresh(projectId: str, user: UserContext = Depends(verifyUser)):
+async def dashboardRefresh(projectId: str, user: UserContext = Depends(requireTrialOrAbove)):
     await asyncio.to_thread(requireProjectOwner, projectId, user)
     try:
         result = dashboardService.pullDataInParallel(projectId = projectId)

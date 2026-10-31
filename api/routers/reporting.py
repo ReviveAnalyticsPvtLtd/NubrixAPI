@@ -23,7 +23,7 @@ from api.models import GenerateChartInput, PanelChartDetails, GenerateChartsInPa
 from api.services.reportingService import reportingService
 from fastapi.responses import ORJSONResponse
 from fastapi import APIRouter, Depends
-from api.commons import verifyUser, requireCredits, requireProjectOwner, UserContext
+from api.commons import verifyUser, requireCredits, requireProjectOwner, requireTrialOrAbove, UserContext
 
 router = APIRouter()
 """
@@ -53,13 +53,13 @@ async def generateChart(chartDetails: GenerateChartInput, user: UserContext = De
         raiseHttpException(e)
     
 @router.post("/generatePanelChart")
-async def generatePanelChart(panelChartDetails: PanelChartDetails, user: UserContext = Depends(verifyUser)):
+async def generatePanelChart(panelChartDetails: PanelChartDetails, user: UserContext = Depends(requireTrialOrAbove)):
     """
     Generate a panel chart (multiple charts in a single view) based on the provided panel chart details.
 
     Args:
         panelChartDetails (PanelChartDetails): The details required to generate the panel chart, including data sources, layout, and configuration for each sub-chart.
-        user: UserContext injected after session verification.
+        user: UserContext injected after the subscription check.
 
     Returns:
         ORJSONResponse: A response containing the generated panel chart data in JSON format, or an error message if generation fails.
