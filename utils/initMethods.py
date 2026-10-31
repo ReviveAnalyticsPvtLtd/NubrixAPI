@@ -29,6 +29,7 @@ import redis
 import threading
 from collections import OrderedDict
 from utils.logger import logger
+from utils.projectStorage import readTableBytes
 from typing import Iterable
 
 try:
@@ -206,12 +207,7 @@ def _fetch_data_from_supabase(projectId: str, tableName: str) -> "pa.Table":
     """Cold-path reader that pulls the full unfiltered table for caching."""
     if pq is None:
         raise RuntimeError("pyarrow is required.")
-    import io
-    import httpx
-    url = os.environ["FILE_URL"].format(projectId=projectId, fileName=tableName)
-    resp = httpx.get(url, timeout=60, follow_redirects=True)
-    resp.raise_for_status()
-    return pq.read_table(io.BytesIO(resp.content))
+    return pq.read_table(io.BytesIO(readTableBytes(projectId, tableName)))
 
 
 def _apply_filters_in_arrow_if_possible(table: "pa.Table", tableName: str, filters: list) -> "pa.Table":

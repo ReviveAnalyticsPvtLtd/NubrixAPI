@@ -21,7 +21,7 @@ This file documents changes made to the NubrixAI Analytics Hub API codebase.
 - **`scan_data(projectId, "table")`**: Returns `pl.LazyFrame` for predicate/projection pushdown.
 - **`fetch_data()`**: Still returns `pd.DataFrame` (backward compat).
 - **Redis cache**: Arrow IPC bytes (smaller than parquet, faster deserialize).
-- **Cold path**: `httpx.get(url)` + `pq.read_table(BytesIO)` — PyArrow can't read HTTPS directly.
+- **Cold path**: `readTableBytes` (authenticated `httpx.get`) + `pq.read_table(BytesIO)` — PyArrow can't read HTTPS directly.
 - **Filter translation**: `_translate_to_pyarrow_filter()` maps filter dicts to PyArrow compute expressions.
 - **Size classification**: `classify_table_size(projectId, table)` buckets tables as `small|medium|large|massive` using cached Arrow `num_rows` (O(1)).
   - Buckets: `<10k=small`, `10k-100k=medium`, `100k-1M=large`, `>1M=massive`.
@@ -75,7 +75,7 @@ This file documents changes made to the NubrixAI Analytics Hub API codebase.
 ### 8. Table Viewer Endpoint (`api/routers/manager.py`)
 
 - `GET /viewTable/{projectId}/{tableName}?page=1&pageSize=100`
-- Uses `pl.scan_parquet(url)` — only materializes the requested row range. A 10M-row table returns page 1 as fast as a 1k-row table.
+- Uses `readTablePage` — Range GETs for the parquet footer and the row groups holding the page. `pl.scan_parquet` can't authenticate on HTTP URLs.
 - Auth via `verifyToken`. Max page size 500.
 - Response includes `rows` + `pagination` (page, pageSize, totalRows, totalPages).
 
@@ -194,4 +194,4 @@ These were added during the refactor and then reverted because they broke produc
 
 ## TL;DR
 
-Polars is the default data engine for LLM-generated code. Sandboxes run in subprocesses with `close_fds=True` (no fork deadlock, no RLIMIT caps). Transformation executor uses subprocess + temp-file IPC + Polars head-only preview. Workflow post-processor auto-routes 1M+ row tables to lazy `scan_data`. `json.dumps` calls normalized to single `default=serializer`. `viewTable` endpoint paginates any table via `pl.scan_parquet`. Active/inactive tables: every metadata entry has `isActive`, all LLM consumers filter to active only, `PATCH /toggleTableActive` toggles state, `validateTableNameAvailable` prevents name collisions at all entry points. Everything else — auth, CORS, Celery, supervisord, Docker, sizing — is original, untouched.
+Polars is the default data engine for LLM-generated code. Sandboxes run in subprocesses with `close_fds=True` (no fork deadlock, no RLIMIT caps). Transformation executor uses subprocess + temp-file IPC + Polars head-only preview. Workflow post-processor auto-routes 1M+ row tables to lazy `scan_data`. `json.dumps` calls normalized to single `default=serializer`. `viewTable` endpoint paginates any table via `readTablePage`. Active/inactive tables: every metadata entry has `isActive`, all LLM consumers filter to active only, `PATCH /toggleTableActive` toggles state, `validateTableNameAvailable` prevents name collisions at all entry points. Everything else — auth, CORS, Celery, supervisord, Docker, sizing — is original, untouched.

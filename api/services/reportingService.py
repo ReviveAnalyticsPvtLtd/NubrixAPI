@@ -18,6 +18,7 @@ from api.commons import updateProjectModifiedAt
 from utils.exceptionHandler import CustomException
 from concurrent.futures import ThreadPoolExecutor
 from utils.initMethods import fetch_data, scan_data
+from utils.projectStorage import authHeaders, objectUrl
 from nubrix.utils import readYaml
 from utils.logger import logger
 from api.commons import client
@@ -92,18 +93,13 @@ class ReportingService:
 
     async def _fetchJson(self, url: str) -> dict | list:
         """Async fetch with a short in-memory cache to avoid re-fetching metadata within a session."""
-        response = await self._httpClient.get(url)
+        response = await self._httpClient.get(url, headers=authHeaders())
         response.raise_for_status()
         return response.json()
 
     def _projectMetadataUrl(self, projectId: str, fileName: str = "metadata.json") -> str:
-        """Build a cache-busting public URL for a project file."""
-        return (
-            os.environ["FILE_URL"]
-            .format(projectId=projectId, fileName=fileName)
-            .replace(".parquet", "")
-            + f"?cb={int(time.time())}"
-        )
+        """Build the authenticated URL for a project file."""
+        return objectUrl(projectId, fileName)
 
     @staticmethod
     def _augment_with_size_hints(metadata: dict, projectId: str) -> dict:

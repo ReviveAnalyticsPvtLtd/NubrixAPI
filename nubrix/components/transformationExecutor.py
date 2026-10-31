@@ -111,7 +111,7 @@ def _run_subprocess(launcher_name: str, payload: dict, timeoutSeconds: int) -> t
         "PATH", "PYTHONPATH", "HOME", "LANG", "LC_ALL", "TZ",
         "REDIS_HOST", "REDIS_PORT", "REDIS_PASSWORD", "REDIS_DB",
         "SUPABASE_URL", "SUPABASE_KEY", "DATABASE_URL",
-        "FILE_URL", "STORAGE_URL",
+        "STORAGE_URL",
         "GOOGLE_API_KEY", "GEMINI_API_KEY",
         "POLARS_MAX_THREADS", "OPENBLAS_NUM_THREADS",
         "DF_CACHE_MAX_BYTES", "DF_CACHE_MAX_ENTRIES",

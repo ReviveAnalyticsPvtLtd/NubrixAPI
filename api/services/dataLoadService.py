@@ -17,7 +17,7 @@ from pymongo.mongo_client import MongoClient
 from pymongo.server_api import ServerApi
 from fastapi import Form, UploadFile
 from sqlalchemy import URL, create_engine
-from urllib.request import urlopen
+from utils.projectStorage import readJson
 from utils.logger import logger
 from api.commons import client
 from typing import Annotated
@@ -30,7 +30,6 @@ import pandas as pd
 import tempfile
 import json
 import fitz
-import time
 import io
 import os
 import gc
@@ -537,8 +536,7 @@ class DataLoadService:
         """
         try:
             _ = self.client.storage.from_("AnalyticsHub").remove(f"{tableDetails.projectId}/{tableDetails.tableName}" + ".parquet")
-            fileUrl = os.environ["FILE_URL"].format(projectId = tableDetails.projectId, fileName = "metadata.json").replace(".parquet", "") + f"?cb={int(time.time())}"
-            jsonData = json.loads(urlopen(fileUrl).read())
+            jsonData = readJson(tableDetails.projectId, "metadata.json")
             jsonData.pop(tableDetails.tableName)
             with io.BytesIO() as buffer:
                 buffer.write(json.dumps(jsonData, indent=4).encode("utf-8"))

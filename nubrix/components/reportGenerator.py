@@ -11,11 +11,10 @@ __all__ = ["ReportGenerator"]
 
 
 from ydata_profiling import ProfileReport
-from urllib.request import urlopen
+from utils.projectStorage import readJson, readTableBytes
 from bs4 import BeautifulSoup
 import pandas as pd
-import json
-import os
+import io
 
 class ReportGenerator:
     """
@@ -37,8 +36,7 @@ class ReportGenerator:
         Returns:
             list: A list of table names available in the project.
         """
-        metadataUrl = os.environ["FILE_URL"].format(projectId = projectId, fileName = "metadata.json").replace(".parquet", "")
-        metadata = json.loads(urlopen(metadataUrl).read().decode("utf-8"))
+        metadata = readJson(projectId, "metadata.json")
         tables = [k for k, v in metadata.items() if not k.startswith("_") and v.get("isActive", True) is not False]
         return tables
 
@@ -53,7 +51,7 @@ class ReportGenerator:
         Returns:
             str: The cleaned HTML profiling report as a string.
         """
-        df = pd.read_parquet(os.environ["FILE_URL"].format(projectId = projectId, fileName = tableName))
+        df = pd.read_parquet(io.BytesIO(readTableBytes(projectId, tableName)))
         htmlText = ProfileReport(df, title = f"Report for: {tableName}").to_html()
         soup = BeautifulSoup(htmlText, 'html.parser')
         soup.find("button", id = "tab-overview-reproduction").decompose()

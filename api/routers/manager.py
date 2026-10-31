@@ -10,8 +10,8 @@ __all__ = ["router"]
 
 
 from utils.exceptionHandler import CustomException, raiseHttpException
+from utils.projectStorage import readTablePage
 import asyncio
-import os
 from fastapi import APIRouter, Depends, Form, Request, Query
 from api.services.managementService import managementService
 from fastapi.responses import ORJSONResponse, HTMLResponse
@@ -556,22 +556,13 @@ async def viewTable(
     """
     Read a parquet table from Supabase storage and return paginated rows.
 
-    Uses Polars lazy scan so only the requested row range is materialised —
-    a 10M-row table returns page 1 as fast as a 1k-row table.
+    Only the footer and the row groups holding the page are fetched, so a
+    10M-row table costs one row group, not the whole file.
     """
     try:
-        import polars as pl
-
-        fileUrlTemplate = os.environ.get("FILE_URL")
-        if not fileUrlTemplate:
-            raise CustomException(ValueError("FILE_URL not configured"), statusCode=500, uiMessage="Server misconfiguration.")
-        url = fileUrlTemplate.format(projectId=projectId, fileName=tableName)
-
         def _read_page() -> dict:
-            lf = pl.scan_parquet(url)
-            totalRows = lf.select(pl.len()).collect().item()
-            offset = (page - 1) * pageSize
-            rows = lf.slice(offset, pageSize).collect().to_dicts()
+            frame, totalRows = readTablePage(projectId, tableName, offset=(page - 1) * pageSize, limit=pageSize)
+            rows = frame.to_dicts()
             from utils.initMethods import serializer
             import json as _json
             rows = _json.loads(_json.dumps(rows, default=serializer))
