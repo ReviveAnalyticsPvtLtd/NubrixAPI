@@ -107,12 +107,11 @@ def _run_subprocess(launcher_name: str, payload: dict, timeoutSeconds: int) -> t
     """Run a launcher script in a subprocess with close_fds=True (no inherited sockets)."""
     repo_root = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
     launcher_path = os.path.join(repo_root, "utils", launcher_name)
+    # Generated code can read its whole environment: pass only what a table read uses.
     inherit_envs = (
         "PATH", "PYTHONPATH", "HOME", "LANG", "LC_ALL", "TZ",
         "REDIS_HOST", "REDIS_PORT", "REDIS_PASSWORD", "REDIS_DB",
-        "SUPABASE_URL", "SUPABASE_KEY", "DATABASE_URL",
-        "STORAGE_URL",
-        "GOOGLE_API_KEY", "GEMINI_API_KEY",
+        "SUPABASE_URL", "SUPABASE_KEY",
         "POLARS_MAX_THREADS", "OPENBLAS_NUM_THREADS",
         "DF_CACHE_MAX_BYTES", "DF_CACHE_MAX_ENTRIES",
     )
