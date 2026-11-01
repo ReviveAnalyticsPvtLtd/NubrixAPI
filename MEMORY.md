@@ -75,7 +75,7 @@ This file documents changes made to the NubrixAI Analytics Hub API codebase.
 ### 8. Table Viewer Endpoint (`api/routers/manager.py`)
 
 - `GET /viewTable/{projectId}/{tableName}?page=1&pageSize=100`
-- Uses `readTablePage` — Range GETs for the parquet footer and the row groups holding the page. `pl.scan_parquet` can't authenticate on HTTP URLs.
+- Uses `readTablePage` — Range GETs for the parquet footer and the row groups holding the page, decoded batch by batch up to the end of the page. `pl.scan_parquet` can't authenticate on HTTP URLs.
 - Auth via `verifyToken`. Max page size 500.
 - Response includes `rows` + `pagination` (page, pageSize, totalRows, totalPages).
 
