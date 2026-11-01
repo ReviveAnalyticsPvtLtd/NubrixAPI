@@ -33,10 +33,12 @@ from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.middleware.gzip import GZipMiddleware
 from utils.logger import logger
+from utils.sandboxRunner import sweepOrphanedRuns
 from fastapi.responses import ORJSONResponse
 from fastapi import FastAPI, Request
 from starlette.exceptions import HTTPException as StarletteHTTPException
 import psutil
+import threading
 import os
 
 app = FastAPI(
@@ -141,6 +143,11 @@ async def stats():
     logger.debug(f"RAM Usage Percentage: {memory.percent}%")
     logger.debug(f"Total CPU Utilization: {totalUsage}%")
     logger.debug(f"Total CPU Usage Per Core: {cpu_usage}")
+
+@app.on_event("startup")
+async def sweepSandboxRuns():
+    """Clear what a killed worker's sandbox runs left. On a thread, because a uid that won't clear takes a while."""
+    threading.Thread(target=sweepOrphanedRuns, daemon=True).start()
 
 app.include_router(authentication.router, prefix = "/auth", tags = ["Authentication"])
 app.include_router(manager.router, prefix = "/projects", tags = ["Project Management"])

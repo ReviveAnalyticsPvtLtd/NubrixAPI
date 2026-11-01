@@ -7,7 +7,9 @@ transformed tables.
 Production design: every code execution runs in a subprocess started by
 utils/sandboxRunner.py. The child writes its result to a temp file and the
 parent reads it back, avoiding the multiprocessing Queue pickle overhead for
-large DataFrames.
+large DataFrames. The child also writes the preview: the parent only moves a
+result's bytes, because a run can write a file that decodes to far more than
+the parent can hold, whatever its footer says.
 No hard timeout/SIGKILL is enforced by default; set TRANSFORMATION_TIMEOUT_SECONDS
 env var to re-enable one.
 """
@@ -20,7 +22,6 @@ __all__ = ["TransformationExecutor"]
 from utils.exceptionHandler import CustomException
 from utils.initMethods import fetch_data, fetch_data_pl, scan_data, serializer
 from utils.sandboxRunner import runSandbox
-from utils.sizing import detect_resources
 from api.commons import client
 from utils.logger import logger
 import multiprocessing as mp
@@ -30,13 +31,13 @@ import datetime
 import redis
 import json
 import math
-import io
 import os
 import re
-import polars as pl
-import pyarrow.parquet as pq
+import struct
 
-_PREVIEW_ROWS = 100
+_PARQUET_MAGIC = b"PAR1"
+# A footer this long is thousands of columns over thousands of row groups, and parsing one has no limit of its own.
+_MAX_FOOTER_BYTES = 16 * 1024 * 1024
 
 # Module-level Redis connection pool for reuse
 _redis_pool: redis.ConnectionPool | None = None
@@ -131,55 +132,57 @@ class TransformationExecutor:
 
     def _execute_code(self, projectId: str, pythonCode: str) -> pd.DataFrame:
         """Execute generated code and return the first rows of `final_df` (validation run, result discarded)."""
-        return self._preview(self._run_transformation(projectId, pythonCode)).to_pandas()
+        return pd.DataFrame(self._run_transformation(projectId, pythonCode)[0])
 
-    def _run_transformation(self, projectId: str, pythonCode: str) -> bytes:
-        """Run transformation code and return the parquet bytes of `final_df`."""
-        _, stderr, rc, parquetBytes = runSandbox("transform_launcher.py", projectId, pythonCode, self.timeoutSeconds, withResult=True)
+    def _run_transformation(self, projectId: str, pythonCode: str) -> tuple[list[dict], bytes]:
+        """Run transformation code and return the preview rows and the parquet bytes of `final_df`."""
+        _, stderr, rc, parquetBytes, previewBytes = runSandbox("transform_launcher.py", projectId, pythonCode, self.timeoutSeconds, withResult=True)
         if rc != 0:
             raise ValueError(stderr.strip() or "Transformation execution failed.")
         if not parquetBytes:
             raise ValueError("Transformation produced no final_df.")
-        self._refuse_oversized_result(parquetBytes)
-        return parquetBytes
+        self._check_parquet_shape(parquetBytes)
+        return self._preview(previewBytes), parquetBytes
 
-    def _refuse_oversized_result(self, parquetBytes: bytes) -> None:
-        """Check the footer: a small file can decode to far more than it holds, and saving a table decodes all of it."""
-        footer = pq.read_metadata(io.BytesIO(parquetBytes))
-        declaredBytes = sum(footer.row_group(i).total_byte_size for i in range(footer.num_row_groups))
-        decodedBytes = max(declaredBytes, footer.num_rows * footer.num_columns * 8)
-        if decodedBytes > detect_resources()["total_memory_bytes"] // 2:
-            raise ValueError(f"Transformation result is too large: {footer.num_rows} rows and {footer.num_columns} columns.")
+    def _check_parquet_shape(self, parquetBytes: bytes) -> None:
+        """Check the file's frame without parsing it. Whatever reads this table later will parse its footer."""
+        if len(parquetBytes) < 12 or parquetBytes[:4] != _PARQUET_MAGIC or parquetBytes[-4:] != _PARQUET_MAGIC:
+            raise ValueError("Transformation result is not a parquet file.")
+        footerBytes = struct.unpack("<I", parquetBytes[-8:-4])[0]
+        if footerBytes > _MAX_FOOTER_BYTES:
+            raise ValueError(f"Transformation result's footer is too large: {footerBytes} bytes.")
+        if footerBytes > len(parquetBytes) - 12:
+            raise ValueError("Transformation result is not a parquet file.")
 
-    def _preview(self, parquetBytes: bytes) -> pl.DataFrame:
-        """Decode only the rows a preview shows, so heavy datasets stay out of this process."""
-        return pl.read_parquet(io.BytesIO(parquetBytes), n_rows=_PREVIEW_ROWS)
+    def _preview(self, previewBytes: bytes | None) -> list[dict]:
+        """Read the rows the child wrote. They're the run's own data, so all this checks is their shape."""
+        try:
+            rows = json.loads(previewBytes)
+        except (TypeError, ValueError, RecursionError) as e:
+            raise ValueError("Transformation produced no readable preview.") from e
+        if not isinstance(rows, list) or not all(isinstance(row, dict) for row in rows):
+            raise ValueError("Transformation produced no readable preview.")
+        return rows
 
     def executeInspection(self, projectId: str, pythonCode: str) -> str:
         """Execute inspection code in the sandbox and return stdout + stderr."""
-        stdout, stderr, rc, _ = runSandbox("inspect_launcher.py", projectId, pythonCode, self.timeoutSeconds)
+        stdout, stderr, rc, *_ = runSandbox("inspect_launcher.py", projectId, pythonCode, self.timeoutSeconds)
         if rc != 0 and stderr:
             return f"Stdout:\n{stdout}\nStderr/Errors:\n{stderr}"
         return stdout if stdout else "Inspection executed successfully with no output."
 
     def executeAndPreview(self, projectId: str, pythonCode: str, tableName: str) -> tuple[list[dict], bytes]:
-        """Execute code and return preview rows plus parquet bytes.
-        Reads only the first rows for the preview, so heavy datasets don't need
-        to be fully loaded here.
-        """
+        """Execute code and return preview rows plus parquet bytes, none of it decoded here."""
         try:
             self._validate_table_name(tableName)
-            parquetBytes = self._run_transformation(projectId, pythonCode)
-            previewRecords = self._preview(parquetBytes).to_dicts()
-            previewRows = json.loads(json.dumps(previewRecords, default=serializer))
-            return previewRows, parquetBytes
+            return self._run_transformation(projectId, pythonCode)
         except Exception as e:
             exception = CustomException(e, statusCode=400, uiMessage=str(e))
             logger.error(exception)
             raise exception
 
     def apply(self, projectId: str, parquetBytes: bytes, tableName: str) -> None:
-        """Upload parquet bytes to Supabase storage and refresh the fetch_data cache."""
+        """Upload parquet bytes to Supabase storage and drop the table from the fetch_data caches."""
         try:
             self._validate_table_name(tableName)
             storagePath = f"{projectId}/{tableName}.parquet"
@@ -188,8 +191,7 @@ class TransformationExecutor:
                 file=parquetBytes,
                 file_options={"upsert": "true"},
             )
-            redisClient = self._redis_client()
-            redisClient.set(name=f"{projectId}::{tableName}", value=parquetBytes, ex=300)
+            self._redis_client().delete(f"{projectId}::{tableName}")
             try:
                 from utils.initMethods import invalidate_data_cache
                 invalidate_data_cache(projectId=projectId, tableName=tableName)

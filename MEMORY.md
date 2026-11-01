@@ -42,7 +42,7 @@ This file documents changes made to the NubrixAI Analytics Hub API codebase.
 
 - **Subprocess-based**: Transformation code runs in a fresh subprocess (same `close_fds=True` pattern). Replaced multiprocessing fork which deadlocked on inherited Redis sockets.
 - **Temp-file IPC**: Child writes `final_df` as parquet to a file in its run folder; parent reads it. No multiprocessing Queue pickle overhead.
-- **Polars preview**: `executeAndPreview` uses `pl.read_parquet(..., n_rows=100).to_dicts()` — only decodes 100 rows, not the full table.
+- **Polars preview**: `transform_launcher.py` writes the first 100 rows as JSON, and `executeAndPreview` only reads that — the parent never decodes a result.
 - **Accepts**: `pl.LazyFrame` (auto-collects), `pl.DataFrame` (via `.to_arrow()`), `pd.DataFrame` (via `pa.Table.from_pandas`).
 - **Timeout**: Configurable via `TRANSFORMATION_TIMEOUT_SECONDS` env (default `0` = no timeout).
 - **Restricted imports**: Same whitelist as sandbox.

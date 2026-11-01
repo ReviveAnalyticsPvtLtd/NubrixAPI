@@ -13,14 +13,17 @@ Each run has its own uid, so a child can't read the parent's secrets from
 `/proc`, write to the application, or reach another run's tables. A shared
 sandbox user would let concurrent runs for different projects read each other.
 A uid is free again only once sandbox_reaper.py has ended everything running as
-it, because generated code can fork and outlive the launcher.
+it and removed everything it owns, because generated code can fork and outlive
+the launcher. A run folder is the claim on its uid. Its worker holds a lock on
+it, which the kernel drops if the worker dies, so a sweep can tell an orphaned
+run from a live one.
 
     runFolder/        root's, children may only pass through
         tables/       the parent writes here, this run may read
         work/         this run's own: cwd, HOME, TMPDIR and the result file
 """
 
-__all__ = ["runSandbox", "serveTables", "readResult", "enterSandbox", "SandboxResult"]
+__all__ = ["runSandbox", "sweepOrphanedRuns", "serveTables", "readResult", "enterSandbox", "SandboxResult"]
 
 
 import base64
@@ -43,19 +46,24 @@ from typing import IO, NamedTuple
 from utils.initMethods import spool_table, use_table_source
 from utils.logger import logger
 
-# Below 65536, the range a user namespace normally maps.
+# Below 65536, the range a user namespace normally maps. The same number of uids above
+# the range are spare: a reaper's real uid is its run's uid plus _RUN_UID_COUNT. No run
+# has one, and no two reapers share one, because a shared real uid could signal each other.
 _FIRST_RUN_UID = 20000
-_RUN_UID_COUNT = 40000
+_RUN_UID_COUNT = 20000
+_MAX_CLAIM_ATTEMPTS = 64
 _MAX_REQUEST_BYTES = 4096
 _MAX_OUTPUT_BYTES = 64 * 1024 * 1024
 # Redis refuses a bigger value, and a transformation preview is cached there before it can be applied.
 _MAX_RESULT_BYTES = 512 * 1024 * 1024
+_MAX_PREVIEW_BYTES = 4 * 1024 * 1024
 _MAX_SPOOL_BYTES = 8 * 1024 * 1024 * 1024
 # Limits every process of a run shares. Threads count, so leave room for Polars, Arrow, BLAS and OpenMP.
 _MAX_RUN_PROCESSES = 1024
 _MAX_RUN_OPEN_FILES = 4096
 _MAX_CHILD_FILE_BYTES = 4 * 1024 * 1024 * 1024
 _CLEAR_UID_TIMEOUT_SECONDS = 30
+_MAX_REAPER_ERROR_BYTES = 1024
 _PR_SET_PDEATHSIG = 1
 _PR_SET_NO_NEW_PRIVS = 38
 _ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -72,15 +80,34 @@ class SandboxResult(NamedTuple):
     stderr: str
     returncode: int
     resultBytes: bytes | None
+    previewBytes: bytes | None = None
 
 
-def _claimRun() -> tuple[int | None, str]:
-    """Return this run's uid and folder. The folder is the claim: only one run can create it.
+def _lockRun(runFolder: str) -> int | None:
+    """Lock a run folder and return the descriptor holding it, or None if a live process holds it or it has gone."""
+    import fcntl
+
+    try:
+        lock = os.open(runFolder, os.O_RDONLY)
+    except FileNotFoundError:
+        return None
+    try:
+        fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        if os.path.samestat(os.fstat(lock), os.stat(runFolder)):
+            return lock
+    except OSError:
+        pass
+    os.close(lock)
+    return None
+
+
+def _claimRun() -> tuple[int | None, str, int | None]:
+    """Return this run's uid, its folder and the lock on that folder. The folder is the claim: only one run can create it.
 
     An image sets SANDBOX_RUN_ROOT to require a separate uid, and a parent that
-    can't change uid then fails on the chown instead of running without one.
-    Running children as this process's own uid is for local development only, so
-    it has to be asked for.
+    can't change uid then refuses instead of running without one. Running
+    children as this process's own uid is for local development only, so it has
+    to be asked for.
     """
     runRoot = os.environ.get("SANDBOX_RUN_ROOT")
     if not runRoot:
@@ -88,15 +115,20 @@ def _claimRun() -> tuple[int | None, str]:
             raise RuntimeError("SANDBOX_RUN_ROOT must be set: a root parent can't run sandboxes without a separate uid.")
         if os.environ.get("SANDBOX_ALLOW_SAME_UID") != "1":
             raise RuntimeError("Set SANDBOX_RUN_ROOT, or SANDBOX_ALLOW_SAME_UID=1 for local development.")
-        return None, tempfile.mkdtemp(prefix="sandbox-")
-    while True:
+        return None, tempfile.mkdtemp(prefix="sandbox-"), None
+    if os.geteuid() != 0:
+        raise PermissionError("Sandboxes need a root parent when SANDBOX_RUN_ROOT is set.")
+    for _ in range(_MAX_CLAIM_ATTEMPTS):
         runUid = _FIRST_RUN_UID + secrets.randbelow(_RUN_UID_COUNT)
         runFolder = os.path.join(runRoot, f"sandbox-{runUid}")
         try:
             os.mkdir(runFolder, 0o700)
-            return runUid, runFolder
         except FileExistsError:
             continue
+        lock = _lockRun(runFolder)
+        if lock is not None:  # Otherwise a sweep took it for an orphan, and it is removing it.
+            return runUid, runFolder, lock
+    raise RuntimeError("No sandbox uid is free.")
 
 
 def _prepareFolders(runUid: int | None, runFolder: str) -> tuple[str, str]:
@@ -113,27 +145,31 @@ def _prepareFolders(runUid: int | None, runFolder: str) -> tuple[str, str]:
     return tablesFolder, workFolder
 
 
-def _clearUid(runUid: int | None) -> bool:
-    """End every process running as this uid and remove its shared temp files. Returns False if that failed."""
+def _clearUid(runUid: int | None, runFolder: str) -> bool:
+    """End every process of this uid and remove everything it owns. Returns False unless all of it has gone.
+
+    The reaper starts as root and drops itself, so that what a run left can't reach it.
+    """
     if runUid is None:
         return True
     try:
         subprocess.run(
-            [sys.executable, "-I", "-S", os.path.join(_ROOT, "utils", "sandbox_reaper.py"), str(runUid)],
-            user=runUid,
-            group=runUid,
-            extra_groups=[],
+            [
+                sys.executable, "-I", "-S", os.path.join(_ROOT, "utils", "sandbox_reaper.py"),
+                str(runUid), str(runUid + _RUN_UID_COUNT), os.path.join(runFolder, "work"),
+            ],
             env={},
             cwd="/",
             stdin=subprocess.DEVNULL,
             stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
+            stderr=subprocess.PIPE,
             timeout=_CLEAR_UID_TIMEOUT_SECONDS,
             check=True,
         )
         return True
     except (OSError, subprocess.SubprocessError) as e:
-        logger.error(f"Could not clear sandbox uid {runUid}: {e}")
+        reason = (getattr(e, "stderr", None) or b"")[-_MAX_REAPER_ERROR_BYTES:].decode("utf-8", "replace")
+        logger.error(f"Could not clear sandbox uid {runUid}: {e} {reason}")
         return False
 
 
@@ -144,6 +180,35 @@ def _removeRun(runFolder: str, uidIsClear: bool) -> None:
         return
     for name in os.listdir(runFolder):
         shutil.rmtree(os.path.join(runFolder, name), ignore_errors=True)
+
+
+def _sweepRun(runRoot: str, name: str) -> None:
+    """Clear one folder of the run root, unless a live worker holds it."""
+    runUid = name.removeprefix("sandbox-")
+    if not runUid.isdigit() or not _FIRST_RUN_UID <= int(runUid) < _FIRST_RUN_UID + _RUN_UID_COUNT:
+        logger.warning(f"Sandbox sweep left {name!r}, which is not a run folder.")
+        return
+    runFolder = os.path.join(runRoot, name)
+    lock = _lockRun(runFolder)
+    if lock is None:
+        return
+    try:
+        logger.warning(f"Sandbox sweep is clearing the orphaned run {name}.")
+        _removeRun(runFolder, _clearUid(int(runUid), runFolder))
+    finally:
+        os.close(lock)
+
+
+def sweepOrphanedRuns() -> None:
+    """Clear runs whose worker died: their processes, and the copies of customer tables in their folders."""
+    runRoot = os.environ.get("SANDBOX_RUN_ROOT")
+    if not runRoot:
+        return
+    try:
+        for name in os.listdir(runRoot):
+            _sweepRun(runRoot, name)
+    except Exception as e:
+        logger.error(f"Sandbox sweep failed: {e}")
 
 
 def serveTables(projectId: str, requests, replies, tablesFolder: str, runEnded: threading.Event) -> None:
@@ -185,7 +250,7 @@ def serveTables(projectId: str, requests, replies, tablesFolder: str, runEnded: 
 def _startChild(launcherName: str, runUid: int | None, workFolder: str, childEnd: socket.socket, stdout: IO[bytes], stderr: IO[bytes]) -> subprocess.Popen:
     """Start the launcher. Its output goes to files, so nothing a process holds open can block the parent."""
     env = {k: os.environ[k] for k in _INHERITED_ENV if k in os.environ}
-    env["PYTHONPATH"] = _ROOT + os.pathsep + env.get("PYTHONPATH", "")
+    env["PYTHONPATH"] = os.pathsep.join(filter(None, (_ROOT, env.get("PYTHONPATH"))))
     env.update(HOME=workFolder, TMPDIR=workFolder, USER="sandbox", LOGNAME="sandbox")
     options: dict = {}
     if runUid is not None:
@@ -212,8 +277,9 @@ def _channelFor(proc: subprocess.Popen, childEnd: socket.socket) -> dict:
     return {"fd": childEnd.fileno()}
 
 
-def readResult(path: str, runUid: int | None) -> bytes | None:
-    """Read the child's result file. The child owns that folder, so a link there could point anywhere the parent can read, and a sparse file could fill its memory."""
+def readResult(path: str, runUid: int | None, maxBytes: int | None = None) -> bytes | None:
+    """Read a file the child wrote. The child owns that folder, so a link there could point anywhere the parent can read, and a sparse file could fill its memory."""
+    maxBytes = maxBytes or _MAX_RESULT_BYTES
     flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_NONBLOCK", 0) | getattr(os, "O_BINARY", 0)
     try:
         fd = os.open(path, flags)
@@ -225,9 +291,9 @@ def readResult(path: str, runUid: int | None) -> bytes | None:
         info = os.fstat(result.fileno())
         if not stat.S_ISREG(info.st_mode) or (runUid is not None and info.st_uid != runUid):
             raise ValueError("Sandbox result is not a regular file.")
-        if info.st_size > _MAX_RESULT_BYTES:
+        if info.st_size > maxBytes:
             raise ValueError(f"Sandbox result is too large: {info.st_size} bytes.")
-        return result.read(_MAX_RESULT_BYTES)
+        return result.read(maxBytes)
 
 
 def _waitForChild(proc: subprocess.Popen, payload: str, timeoutSeconds: int | None) -> str:
@@ -256,6 +322,7 @@ def _readOutput(output: IO[bytes]) -> str:
 def _runChild(launcherName: str, projectId: str, code: str, timeoutSeconds: int | None, withResult: bool, runUid: int | None, runFolder: str, tablesFolder: str, workFolder: str) -> SandboxResult:
     """Start the launcher, serve its table reads and collect what it produced."""
     resultPath = os.path.join(workFolder, "result.parquet")
+    previewPath = os.path.join(workFolder, "preview.json")
     parentEnd, childEnd = socket.socketpair()
     runEnded = threading.Event()
     with (
@@ -271,6 +338,7 @@ def _runChild(launcherName: str, projectId: str, code: str, timeoutSeconds: int 
                 "projectId": projectId,
                 "code": code,
                 "result_path": resultPath,
+                "preview_path": previewPath,
                 "channel": {**_channelFor(proc, childEnd), "tablesFolder": tablesFolder, "parentPid": os.getpid()},
             })
         server = threading.Thread(target=serveTables, args=(projectId, requests, replies, tablesFolder, runEnded), daemon=True)
@@ -283,8 +351,11 @@ def _runChild(launcherName: str, projectId: str, code: str, timeoutSeconds: int 
             with contextlib.suppress(OSError):
                 parentEnd.shutdown(socket.SHUT_RDWR)
             server.join()
-        resultBytes = readResult(resultPath, runUid) if withResult and proc.returncode == 0 else None
-        return SandboxResult(_readOutput(stdout), _readOutput(stderr) + timeoutNote, proc.returncode, resultBytes)
+        resultBytes = previewBytes = None
+        if withResult and proc.returncode == 0:
+            resultBytes = readResult(resultPath, runUid)
+            previewBytes = readResult(previewPath, runUid, _MAX_PREVIEW_BYTES)
+        return SandboxResult(_readOutput(stdout), _readOutput(stderr) + timeoutNote, proc.returncode, resultBytes, previewBytes)
 
 
 def runSandbox(launcherName: str, projectId: str, code: str, timeoutSeconds: int | None, withResult: bool = False) -> SandboxResult:
@@ -292,20 +363,28 @@ def runSandbox(launcherName: str, projectId: str, code: str, timeoutSeconds: int
 
     Only a launcher that writes a result sets `withResult`: the file is the child's, so it isn't read otherwise.
     """
-    runUid, runFolder = _claimRun()
-    uidIsClear = True
+    runUid, runFolder, lock = _claimRun()
+    uidIsClear = False
     try:
-        tablesFolder, workFolder = _prepareFolders(runUid, runFolder)
-        # A worker that died mid-run can leave a process holding this uid.
-        uidIsClear = _clearUid(runUid)
+        # A worker that died mid-run can leave a process holding this uid, so nothing is handed over until it's gone.
+        uidIsClear = _clearUid(runUid, runFolder)
         if not uidIsClear:
             raise RuntimeError("Could not clear the sandbox run's uid.")
+        tablesFolder, workFolder = _prepareFolders(runUid, runFolder)
+        uidIsClear = False
         try:
             return _runChild(launcherName, projectId, code, timeoutSeconds, withResult, runUid, runFolder, tablesFolder, workFolder)
         finally:
-            uidIsClear = _clearUid(runUid)
+            uidIsClear = _clearUid(runUid, runFolder)
     finally:
         _removeRun(runFolder, uidIsClear)
+        if lock is not None:
+            os.close(lock)
+
+
+def _withinHardLimit(wanted: int, hard: int) -> int:
+    """Ask for no more than the hard limit, which only a privileged process can raise. RLIM_INFINITY is negative here."""
+    return wanted if hard < 0 else min(wanted, hard)
 
 
 def _lockDownChild(channel: dict) -> None:
@@ -329,6 +408,7 @@ def _lockDownChild(channel: dict) -> None:
         (resource.RLIMIT_CORE, 0),
         (resource.RLIMIT_NOFILE, _MAX_RUN_OPEN_FILES),
     ):
+        value = _withinHardLimit(value, resource.getrlimit(limit)[1])
         resource.setrlimit(limit, (value, value))
 
 
@@ -354,7 +434,7 @@ def _connectTableChannel(channel: dict) -> None:
             raise RuntimeError(reply["error"])
         path = os.path.join(channel["tablesFolder"], reply["file"])
         if path.endswith(".arrow"):
-            return pa.ipc.open_file(pa.memory_map(path)).read_all()
+            return pa.ipc.open_stream(pa.memory_map(path)).read_all()
         return pq.read_table(path)
 
     use_table_source(readTable)

@@ -74,7 +74,7 @@ class REPLManager:
         stdout = ""
         stderr = ""
         try:
-            stdout, stderr, _, _ = runSandbox("sandbox_launcher.py", projectId, codeString, self.timeoutSeconds)
+            stdout, stderr, *_ = runSandbox("sandbox_launcher.py", projectId, codeString, self.timeoutSeconds)
         except Exception as e:
             stderr = f"Error during subprocess execution: {e}\n"
         finally:
