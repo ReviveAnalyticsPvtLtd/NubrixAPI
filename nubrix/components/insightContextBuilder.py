@@ -49,16 +49,18 @@ class InsightContextBuilder:
         """
         Loads a JSON file from Supabase storage with cache-busting.
 
-        Returns None if the file does not exist in the project folder.
+        Returns None if the file does not exist in the project folder. A failed
+        read raises, so insights are never generated from a context it emptied.
         """
         try:
-            files = self.client.storage.from_(self.config.storageBucket).list(path=projectId)
+            files = self.client.storage.from_(self.config.storageBucket).list(path=projectId, options={"search": fileName})
             if fileName not in [x.get("name") for x in files]:
                 return None
             fileUrl = os.environ["FILE_URL"].format(projectId=projectId, fileName=fileName).replace(".parquet", "") + f"?cb={int(time.time())}"
             return json.loads(urlopen(fileUrl).read())
-        except Exception:
-            return None
+        except Exception as e:
+            logger.error(f"Failed to read {fileName} for project {projectId}: {e}")
+            raise
 
     def _loadDomainContext(self, projectId: str) -> dict:
         """
