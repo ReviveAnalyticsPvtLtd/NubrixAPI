@@ -1,5 +1,6 @@
 import asyncio
 import threading
+import types
 
 import pytest
 from celery import Celery, states
@@ -35,6 +36,43 @@ class FakeWebSocket:
 
     async def close(self, code=status.WS_1000_NORMAL_CLOSURE):
         self.closeCodes.append(code)
+
+
+class LeavingWebSocket(FakeWebSocket):
+    """Refuses to send once the disconnect has been received, as uvicorn does."""
+
+    def __init__(self):
+        super().__init__()
+        self.left = threading.Event()
+        self.sendsAfterLeaving = 0
+
+    async def accept(self):
+        await super().accept()
+        self.loop = asyncio.get_running_loop()
+
+    def leave(self):
+        self.loop.call_soon_threadsafe(
+            self.incoming.put_nowait,
+            {"type": "websocket.disconnect", "code": 1001},
+        )
+        self.left.wait(timeout=2)
+
+    async def receive(self):
+        message = await super().receive()
+        self.left.set()
+        return message
+
+    async def send_json(self, payload):
+        if self.left.is_set():
+            self.sendsAfterLeaving += 1
+            raise RuntimeError("Unexpected ASGI message 'websocket.send'")
+        await super().send_json(payload)
+
+    async def close(self, code=status.WS_1000_NORMAL_CLOSURE):
+        if self.left.is_set():
+            self.sendsAfterLeaving += 1
+            raise RuntimeError("Unexpected ASGI message 'websocket.close'")
+        await super().close(code)
 
 
 class SessionChecks:
@@ -312,5 +350,115 @@ def test_task_status_keeps_polling_error_detail_out_of_the_browser(monkeypatch):
     assert websocket.sent == [
         {"status": "RUNNING"},
         {"status": "ERROR", "errorDetail": "Task status is unavailable."},
+    ]
+    assert websocket.closeCodes == [status.WS_1000_NORMAL_CLOSURE]
+
+
+def record_logged_errors(monkeypatch):
+    errors = []
+    monkeypatch.setattr(
+        utilsRouter,
+        "logger",
+        types.SimpleNamespace(warning=lambda *_args: None, error=lambda *args: errors.append(args)),
+    )
+    return errors
+
+
+@pytest.mark.parametrize(
+    "outcome",
+    ["valid", HTTPException(status_code=401, detail="Invalid or expired token")],
+)
+def test_task_status_ends_quietly_when_client_leaves_during_session_check(monkeypatch, outcome):
+    errors = record_logged_errors(monkeypatch)
+    websocket = LeavingWebSocket()
+    sessionChecks = SessionChecks("valid", outcome)
+
+    def leave_during_poll_check(credentials, checkExpiry):
+        if sessionChecks.calls == 1:
+            websocket.leave()
+        return sessionChecks(credentials, checkExpiry)
+
+    monkeypatch.setattr(commons, "_verifyTokenInternal", leave_during_poll_check)
+    monkeypatch.setattr(utilsRouter.celeryApp, "AsyncResult", lambda _taskId: ReadyTask(1))
+
+    watch_task(websocket)
+
+    assert websocket.sent == [{"status": "RUNNING"}]
+    assert websocket.closeCodes == []
+    assert websocket.sendsAfterLeaving == 0
+    assert errors == []
+
+
+def test_task_status_ends_quietly_when_client_leaves_during_final_result_read(monkeypatch):
+    errors = record_logged_errors(monkeypatch)
+    websocket = LeavingWebSocket()
+
+    class TaskReadAsClientLeaves(ReadyTask):
+        def get(self):
+            websocket.leave()
+            return super().get()
+
+    monkeypatch.setattr(commons, "_verifyTokenInternal", SessionChecks("valid"))
+    monkeypatch.setattr(utilsRouter.celeryApp, "AsyncResult", lambda _taskId: TaskReadAsClientLeaves())
+
+    watch_task(websocket)
+
+    assert websocket.sent == [{"status": "RUNNING"}]
+    assert websocket.closeCodes == []
+    assert websocket.sendsAfterLeaving == 0
+    assert errors == []
+
+
+def test_task_status_ends_quietly_when_polling_fails_as_client_leaves(monkeypatch):
+    errors = record_logged_errors(monkeypatch)
+    websocket = LeavingWebSocket()
+
+    class TaskFailingAsClientLeaves(ReadyTask):
+        def ready(self):
+            websocket.leave()
+            raise ConnectionError("private connection detail")
+
+    monkeypatch.setattr(commons, "_verifyTokenInternal", SessionChecks("valid"))
+    monkeypatch.setattr(utilsRouter.celeryApp, "AsyncResult", lambda _taskId: TaskFailingAsClientLeaves())
+
+    watch_task(websocket)
+
+    assert websocket.sent == [{"status": "RUNNING"}]
+    assert websocket.closeCodes == []
+    assert websocket.sendsAfterLeaving == 0
+    assert errors == []
+
+
+def test_task_status_gives_no_verdict_when_limit_passes_during_session_check_outage(monkeypatch):
+    websocket = FakeWebSocket()
+    monkeypatch.setattr(utilsRouter, "TASK_STATUS_MAX_WATCH_SECONDS", 0.05, raising=False)
+    monkeypatch.setattr(
+        commons,
+        "_verifyTokenInternal",
+        SessionChecks("valid", ConnectionError("outage")),
+    )
+    monkeypatch.setattr(utilsRouter.celeryApp, "AsyncResult", lambda _taskId: ReadyTask(1))
+
+    watch_task(websocket)
+
+    assert websocket.sent == [
+        {"status": "RUNNING"},
+        {"taskId": "task-1", "status": "UNKNOWN", "taskResponseCode": None},
+    ]
+    assert "private" not in str(websocket.sent)
+    assert websocket.closeCodes == [status.WS_1000_NORMAL_CLOSURE]
+
+
+def test_task_status_ignores_client_text_frames(monkeypatch):
+    websocket = FakeWebSocket()
+    websocket.incoming.put_nowait({"type": "websocket.receive", "text": "ignored"})
+    monkeypatch.setattr(commons, "_verifyTokenInternal", SessionChecks("valid"))
+    monkeypatch.setattr(utilsRouter.celeryApp, "AsyncResult", lambda _taskId: ReadyTask(1))
+
+    watch_task(websocket)
+
+    assert websocket.sent == [
+        {"status": "RUNNING"},
+        {"taskId": "task-1", "status": "SUCCESS", "taskResponseCode": {"private": "result"}},
     ]
     assert websocket.closeCodes == [status.WS_1000_NORMAL_CLOSURE]
