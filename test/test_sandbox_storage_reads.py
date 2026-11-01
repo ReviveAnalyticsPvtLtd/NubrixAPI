@@ -455,6 +455,14 @@ def test_parentSpoolsParquetFromRedisAsParquet(storage, tmp_path, monkeypatch):
     assert not storage.requests
 
 
+def test_apiReadsAParquetFileFromRedis(monkeypatch):
+    buffer = io.BytesIO()
+    pl.DataFrame({"amount": [7, 8]}).write_parquet(buffer)
+    monkeypatch.setattr(initMethods, "_read_redis_bytes", lambda _key: buffer.getvalue())
+
+    assert initMethods._fetch_data_from_redis("key").num_rows == 2
+
+
 def test_applyLeavesTheTableOutOfRedis(monkeypatch):
     fakeRedis = MagicMock()
     executor = TransformationExecutor(timeoutSeconds=1)
@@ -1413,7 +1421,7 @@ def test_reaperRemovesAFolderWithNoPermissions():
 @separateUids
 def test_reaperRemovesATreeTooDeepForAPath():
     uid = FORCED_RUN_UID + 6
-    folder = f"/tmp/deep-{uid}"
+    folder = f"/dev/shm/deep-{uid}"  # Some container filesystems refuse a tree this deep, and tmpfs doesn't.
     code = (
         'import os\n'
         f'os.mkdir("{folder}")\n'
