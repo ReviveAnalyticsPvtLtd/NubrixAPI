@@ -19,6 +19,8 @@ __all__ = [
     "requireProjectOwner",
     "UserContext",
     "updateProjectModifiedAt",
+    "issueTaskId",
+    "sessionOwnsTask",
 ]
 
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
@@ -33,7 +35,10 @@ from utils.exceptionHandler import (
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from fastapi import Depends
+import hashlib
+import hmac
 import os
+import uuid
 
 security = HTTPBearer()
 client = create_client(
@@ -417,3 +422,29 @@ def updateProjectModifiedAt(projectId: str) -> None:
         }).eq("projectId", projectId).execute()
     except Exception as e:
         logger.error(f"Failed to update modifiedAt for project {projectId}: {e}")
+
+
+def _taskSignature(nonce: str, userId: str) -> str:
+    message = f"taskOwner:{nonce}:{userId}".encode()
+    return hmac.new(os.environ["SECRET_KEY"].encode(), message, hashlib.sha256).hexdigest()
+
+
+def issueTaskId(userId: str) -> str:
+    """
+    Build a Celery task ID that is tied to the user who started the task.
+
+    Celery keeps no owner for a task, so the ID carries a signature of it.
+    Nothing is stored, and the ID does not contain the user ID.
+    """
+    nonce = uuid.uuid4().hex
+    return f"{nonce}-{_taskSignature(nonce, userId)}"
+
+
+def sessionOwnsTask(token: str, taskId: str | None) -> bool:
+    """
+    True only for a task issued to this session's user. Scheduled jobs have
+    plain Celery IDs, so no session owns them. Call after verifying the token.
+    """
+    userId = jwt.decode(token, os.environ["SECRET_KEY"], algorithms=["HS256"])["userId"]
+    nonce, _, signature = (taskId or "").partition("-")
+    return hmac.compare_digest(signature.encode(), _taskSignature(nonce, userId).encode())

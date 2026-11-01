@@ -1579,6 +1579,8 @@ Trigger a forecasts Celery task.
 
 WebSocket for polling Celery task status. Emits JSON status updates every 5 seconds until the task is ready.
 
+Only the user who started the task can read it. Any other `taskId`, including a scheduled job's, closes with 1008 before a message is sent. Treat the ID as opaque: it comes from `sendForecasts` and is not a plain UUID.
+
 **Connection:**
 ```
 ws://api.example.com/api/latest/utils/ws/getTaskStatus?token=eyJ...&taskId=celery-uuid

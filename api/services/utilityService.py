@@ -359,9 +359,12 @@ class UtilityService:
             logger.error(exception)
             raise exception
         
-    def sendForecasts(self) -> AsyncResult:
+    def sendForecasts(self, taskId: str) -> AsyncResult:
         """
         Sends a task to generate forecasts asynchronously using Celery.
+
+        Args:
+            taskId (str): The task ID, from issueTaskId for the user starting the task.
 
         Returns:
             AsyncResult: The result object for the Celery task.
@@ -369,7 +372,7 @@ class UtilityService:
             CustomException: If the task submission fails.
         """
         try:
-            return celeryApp.send_task("NubrixAI.generateForecasts")
+            return celeryApp.send_task("NubrixAI.generateForecasts", task_id=taskId)
         except Exception as e:
             exception  = CustomException(e)
             logger.error(exception)

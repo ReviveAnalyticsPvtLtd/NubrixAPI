@@ -33,6 +33,18 @@ class ReadyTask:
         return {"private": "result"}
 
 
+sessionOwnsTask = utilsRouter.sessionOwnsTask
+
+
+def setup_function():
+    # Task ownership has its own tests in test_task_ownership.py.
+    utilsRouter.sessionOwnsTask = lambda token, taskId: True
+
+
+def teardown_function():
+    utilsRouter.sessionOwnsTask = sessionOwnsTask
+
+
 def test_task_status_revalidates_access_before_sending_final_result(monkeypatch):
     calls = 0
 
