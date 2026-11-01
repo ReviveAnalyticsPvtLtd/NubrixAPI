@@ -15,6 +15,7 @@ __all__ = [
     "requireTrialOrAbove",
     "requirePaidPlan",
     "requireCredits",
+    "requireWorkspaceOwner",
     "requireProjectOwner",
     "UserContext",
     "updateProjectModifiedAt",
@@ -331,6 +332,38 @@ def requireCredits(operationType: str):
         return user
 
     return _dependency
+
+
+def requireWorkspaceOwner(workspaceId: str, user: UserContext) -> None:
+    """
+    Allow only the workspace's owner, with the same responses as
+    requireProjectOwner: someone else's workspace reads as missing, and a
+    failed lookup never falls through.
+    """
+    try:
+        rows = (
+            client.table("Workspaces")
+            .select("ownerId")
+            .eq("id", workspaceId)
+            .limit(1)
+            .execute().data
+        )
+    except Exception as exc:
+        logger.error("Workspace owner lookup failed for workspaceId={}: {}", workspaceId, type(exc).__name__)
+        raiseFeatureGateHttpException(
+            statusCode=status.HTTP_503_SERVICE_UNAVAILABLE,
+            uiMessage="Workspace access could not be verified. Please try again.",
+            backendLogMessage=f"Workspace owner lookup unavailable for workspaceId={workspaceId}",
+            errorCode="WORKSPACE_ACCESS_UNAVAILABLE",
+        )
+    if not rows or rows[0].get("ownerId") != user.userId:
+        logger.warning("Workspace access denied: workspaceId={}, userId={}", workspaceId, user.userId)
+        raiseFeatureGateHttpException(
+            statusCode=status.HTTP_404_NOT_FOUND,
+            uiMessage="Workspace not found.",
+            backendLogMessage=f"Workspace access denied: workspaceId={workspaceId}, userId={user.userId}",
+            errorCode="WORKSPACE_NOT_FOUND",
+        )
 
 
 def requireProjectOwner(projectId: str, user: UserContext) -> None:

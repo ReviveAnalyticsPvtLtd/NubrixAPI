@@ -237,6 +237,8 @@ All routes under `/api/latest/projects/`. Auth via `verifyToken` unless otherwis
 
 ### 2.1 `POST /api/latest/projects/createProject`
 
+**Auth:** Required, and `workspaceId` must be a workspace the session's user owns (`404 WORKSPACE_NOT_FOUND` otherwise; `503 WORKSPACE_ACCESS_UNAVAILABLE` when the owner lookup fails).
+
 **Request Body:**
 ```json
 {

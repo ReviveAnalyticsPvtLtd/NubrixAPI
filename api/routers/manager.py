@@ -16,6 +16,7 @@ from fastapi import APIRouter, Depends, Form, Request, Query
 from api.services.managementService import managementService
 from fastapi.responses import ORJSONResponse, HTMLResponse
 from starlette.datastructures import UploadFile as StarletteUploadFile
+from api.commons import requireWorkspaceOwner
 from api.models import (
     UpdateProjectState,
     CreateProject,
@@ -30,19 +31,22 @@ Router for project and management-related endpoints.
 """
 
 @router.post("/createProject")
-async def createProject(projectDetails: CreateProject, token = Depends(verifyToken)):
+async def createProject(projectDetails: CreateProject, user: UserContext = Depends(verifyUser)):
     """
     Create a new project.
 
     Status Codes:
         200 - Success
         401 - Please login to create a project.
+        404 - Workspace not found.
         409 - A project with this name already exists in the workspace.
         422 - Invalid project details.
         500 - Failed to create project. Try again later.
+        503 - Workspace access could not be verified.
     """
+    await asyncio.to_thread(requireWorkspaceOwner, projectDetails.workspaceId, user)
     try:
-        projectId = managementService.createProject(projectDetails=projectDetails, token=token)
+        projectId = managementService.createProject(projectDetails=projectDetails, token=user.token)
         return ORJSONResponse(
             status_code=200,
             content={
