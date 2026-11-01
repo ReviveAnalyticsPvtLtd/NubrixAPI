@@ -8,7 +8,7 @@ hold no credentials, so it reads SUPABASE_URL and SUPABASE_KEY at call time and
 must not import api.commons.
 """
 
-__all__ = ["objectUrl", "authHeaders", "readBytes", "readJson", "readTableBytes", "downloadTable", "readTablePage"]
+__all__ = ["StorageReadError", "objectUrl", "authHeaders", "readBytes", "readJson", "readTableBytes", "downloadTable", "readTablePage"]
 
 
 import httpx
@@ -23,8 +23,13 @@ from urllib.parse import quote
 _BUCKET = "AnalyticsHub"
 _READ_TIMEOUT_SECONDS = 60
 _DOWNLOAD_CHUNK_BYTES = 1024 * 1024
+_PAGE_BATCH_ROWS = 8192
 _UNSAFE_PATH_SEGMENT = re.compile(r"[/\\%\x00-\x1f]")
 _SSL_CONTEXT: ssl.SSLContext | None = None
+
+
+class StorageReadError(Exception):
+    """A storage read failed. Message only, so it survives the trip back from a process pool."""
 
 
 def _sslContext() -> ssl.SSLContext:
@@ -54,6 +59,11 @@ def authHeaders() -> dict:
     return {"apikey": key, "Authorization": f"Bearer {key}"}
 
 
+def _requireSuccess(response: httpx.Response) -> None:
+    if not response.is_success:
+        raise StorageReadError(f"Storage answered {response.status_code} for {response.url.path}.")
+
+
 def readBytes(projectId: str, fileName: str) -> bytes:
     """Read a project file. Redirects stay off so the service key never reaches another host."""
     response = httpx.get(
@@ -62,7 +72,7 @@ def readBytes(projectId: str, fileName: str) -> bytes:
         timeout=_READ_TIMEOUT_SECONDS,
         verify=_sslContext(),
     )
-    response.raise_for_status()
+    _requireSuccess(response)
     return response.content
 
 
@@ -108,9 +118,26 @@ class _TableFile(io.RawIOBase):
         self._client = client
         self._url = url
         self._thread = threading.local()
-        response = client.head(url)
-        response.raise_for_status()
-        self._size = int(response.headers["Content-Length"])
+        self._size = self._readSize()
+
+    def _readRange(self, start: int, end: int) -> httpx.Response:
+        response = self._client.get(self._url, headers={"Range": f"bytes={start}-{end - 1}"})
+        _requireSuccess(response)
+        if response.status_code != httpx.codes.PARTIAL_CONTENT or len(response.content) != end - start:
+            raise StorageReadError(f"Storage did not answer bytes {start}-{end - 1} of {response.url.path}.")
+        return response
+
+    def _readSize(self) -> int:
+        """Read the size from HEAD. A GET costs far more on a large object, so a range is only the fallback."""
+        response = self._client.head(self._url)
+        _requireSuccess(response)
+        length = response.headers.get("Content-Length")
+        if length is not None:
+            return int(length)
+        total = self._readRange(0, 1).headers.get("Content-Range", "").rpartition("/")[2]
+        if not total.isdigit():
+            raise StorageReadError(f"Storage did not report the size of {self._url.rpartition('/')[2]}.")
+        return int(total)
 
     def readable(self) -> bool:
         return True
@@ -131,12 +158,23 @@ class _TableFile(io.RawIOBase):
         end = self._size if size is None or size < 0 else min(start + size, self._size)
         if end <= start:
             return b""
-        response = self._client.get(self._url, headers={"Range": f"bytes={start}-{end - 1}"})
-        response.raise_for_status()
-        if response.status_code != httpx.codes.PARTIAL_CONTENT:
-            raise httpx.HTTPError(f"Storage ignored the Range header with status {response.status_code}.")
+        content = self._readRange(start, end).content
         self._thread.position = end
-        return response.content
+        return content
+
+
+def _pageBatches(parquet, rowGroups: list, firstRow: int, offset: int, limit: int) -> list:
+    """Decode only up to the end of the page. pandas writes a million rows as one row group."""
+    batches, batchStart = [], firstRow
+    for batch in parquet.iter_batches(batch_size=_PAGE_BATCH_ROWS, row_groups=rowGroups):
+        batchEnd = batchStart + batch.num_rows
+        if batchEnd > offset:
+            start = max(offset, batchStart)
+            batches.append(batch.slice(start - batchStart, offset + limit - start))
+        batchStart = batchEnd
+        if batchStart >= offset + limit:
+            break
+    return batches
 
 
 def readTablePage(projectId: str, tableName: str, offset: int, limit: int) -> tuple:
@@ -147,9 +185,11 @@ def readTablePage(projectId: str, tableName: str, offset: int, limit: int) -> tu
     signed URL makes storage read the whole object on Polars' HEAD request.
     """
     import polars as pl
+    import pyarrow as pa
     import pyarrow.parquet as pq
 
-    with httpx.Client(headers=authHeaders(), timeout=_READ_TIMEOUT_SECONDS, verify=_sslContext()) as client:
+    headers = {**authHeaders(), "Accept-Encoding": "identity"}
+    with httpx.Client(headers=headers, timeout=_READ_TIMEOUT_SECONDS, verify=_sslContext()) as client:
         tableFile = _TableFile(client, objectUrl(projectId, f"{tableName}.parquet"))
         with pq.ParquetFile(tableFile, pre_buffer=True) as parquet:
             metadata = parquet.metadata
@@ -161,5 +201,5 @@ def readTablePage(projectId: str, tableName: str, offset: int, limit: int) -> tu
                         firstRow = nextRow
                     rowGroups.append(index)
                 nextRow += groupRows
-            table = parquet.read_row_groups(rowGroups) if rowGroups else parquet.schema_arrow.empty_table()
-            return pl.from_arrow(table).slice(offset - firstRow, limit), metadata.num_rows
+            batches = _pageBatches(parquet, rowGroups, firstRow, offset, limit)
+            return pl.from_arrow(pa.Table.from_batches(batches, schema=parquet.schema_arrow)), metadata.num_rows

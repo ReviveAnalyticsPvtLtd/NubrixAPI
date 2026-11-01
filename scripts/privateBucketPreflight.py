@@ -1,7 +1,9 @@
 """Read-only rollout check for the private AnalyticsHub bucket.
 
 Reads one project's metadata.json and one of its tables, then prints JSON with
-counts only, never stored content. Run with --expect-private after the flip.
+counts and cache headers only, never stored content. Run it before the deploy on
+a small table and on a large pandas-written one. Run with --expect-private after
+the flip, with SUPABASE_ANON_KEY in the environment.
 
     python scripts/privateBucketPreflight.py --project-id <id> --table <name> [--expect-private]
 """
@@ -22,7 +24,9 @@ if str(REPOSITORY_ROOT) not in sys.path:
 from dotenv import load_dotenv
 import httpx
 
-from utils.projectStorage import readJson, readTablePage
+from utils.projectStorage import authHeaders, objectUrl, readJson, readTablePage
+
+_REFUSED_STATUSES = {400, 401, 403, 404}
 
 
 def _checkAuthenticatedRead(projectId: str) -> dict:
@@ -41,17 +45,42 @@ def _checkPagedRead(projectId: str, tableName: str) -> dict:
         return {"pagedReadRows": None, "pagedReadError": type(e).__name__}
 
 
-def _checkPublicRoute(projectId: str) -> str:
-    url = f"{os.environ['SUPABASE_URL'].rstrip('/')}/storage/v1/object/public/AnalyticsHub/{projectId}/metadata.json"
-    return "reachable" if httpx.get(url, timeout=20).status_code == 200 else "refused"
+def _probe(url: str, headers: dict | None = None) -> str:
+    """Ask for one byte, so a table that is still public isn't downloaded."""
+    status = httpx.get(url, headers={**(headers or {}), "Range": "bytes=0-0"}, timeout=20).status_code
+    if status in (200, 206):
+        return "reachable"
+    return "refused" if status in _REFUSED_STATUSES else "unknown"
+
+
+def _combine(probes: list) -> str:
+    return next((level for level in ("reachable", "unknown") if level in probes), "refused")
+
+
+def _checkPublicRoute(urls: list) -> str:
+    return _combine([_probe(url.replace("/storage/v1/object/", "/storage/v1/object/public/", 1)) for url in urls])
+
+
+def _checkAnonKey(urls: list) -> str:
+    key = os.environ.get("SUPABASE_ANON_KEY")
+    if not key:
+        return "notChecked"
+    return _combine([_probe(url, {"apikey": key, "Authorization": f"Bearer {key}"}) for url in urls])
+
+
+def _checkCacheHeaders(url: str) -> dict:
+    headers = httpx.head(url, headers=authHeaders(), timeout=20).headers
+    return {"cacheControl": headers.get("cache-control"), "cfCacheStatus": headers.get("cf-cache-status")}
 
 
 def runPreflight(projectId: str, tableName: str, expectPrivate: bool = False) -> dict:
-    """Check authenticated reads, the paged table read and the public route."""
-    result = {**_checkAuthenticatedRead(projectId), **_checkPagedRead(projectId, tableName)}
-    result["publicRoute"] = _checkPublicRoute(projectId)
-    publicRouteOk = result["publicRoute"] == "refused" or not expectPrivate
-    result["ok"] = result["authenticatedRead"] == "ok" and result["pagedReadRows"] is not None and publicRouteOk
+    """Check authenticated reads, the paged table read and that nothing else can read."""
+    urls = [objectUrl(projectId, "metadata.json"), objectUrl(projectId, f"{tableName}.parquet")]
+    result = {**_checkAuthenticatedRead(projectId), **_checkPagedRead(projectId, tableName), **_checkCacheHeaders(urls[0])}
+    result["publicRoute"] = _checkPublicRoute(urls)
+    result["anonKeyRead"] = _checkAnonKey(urls)
+    closed = result["publicRoute"] == "refused" and result["anonKeyRead"] == "refused"
+    result["ok"] = result["authenticatedRead"] == "ok" and result["pagedReadRows"] is not None and (closed or not expectPrivate)
     return result
 
 
