@@ -1421,16 +1421,24 @@ def test_reaperRemovesAFolderWithNoPermissions():
 @separateUids
 def test_reaperRemovesATreeTooDeepForAPath():
     uid = FORCED_RUN_UID + 6
-    folder = f"/dev/shm/deep-{uid}"  # Some container filesystems refuse a tree this deep, and tmpfs doesn't.
+    folder = f"/tmp/deep-{uid}"
     code = (
-        'import os\n'
+        'import errno, os\n'
         f'os.mkdir("{folder}")\n'
         f'os.chdir("{folder}")\n'
-        'for _ in range(3000):\n'
-        '    os.mkdir("d" * 200)\n'
-        '    os.chdir("d" * 200)\n'
+        'depth = 0\n'
+        'try:\n'
+        '    while depth < 3000:\n'
+        '        os.mkdir("d" * 200)\n'
+        '        os.chdir("d" * 200)\n'
+        '        depth += 1\n'
+        'except OSError as error:\n'
+        '    if error.errno != errno.ENAMETOOLONG:\n'
+        '        raise\n'
+        'print(depth)\n'
     )
-    _ranAsRunUid(uid, code)
+    # Some hosts refuse a full path well before 3000 levels. Past PATH_MAX is all this needs.
+    assert int(_ranAsRunUid(uid, code)) * 201 > 4096
 
     assert _reap(uid).returncode == 0
     assert not os.path.exists(folder)
