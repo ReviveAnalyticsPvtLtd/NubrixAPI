@@ -204,14 +204,21 @@ async def getTaskStatus(websocket: WebSocket):
                 return
             taskReady = await asyncio.to_thread(r.ready)
             sessionValid = await asyncio.to_thread(_websocketTokenIsValid, credentials)
+            if clientLeft.done():
+                return
             if sessionValid is False:
                 await websocket.close(code=status.WS_1008_POLICY_VIOLATION)
                 return
-        await websocket.send_json(await asyncio.to_thread(_finalTaskStatus, r))
+        finalStatus = await asyncio.to_thread(_finalTaskStatus, r)
+        if clientLeft.done():
+            return
+        await websocket.send_json(finalStatus)
         await websocket.close()
     except WebSocketDisconnect:
         pass
     except Exception as e:
+        if clientLeft.done():
+            return
         logger.error("Task status watch failed: {}", e)
         await websocket.send_json({"status": "ERROR", "errorDetail": "Task status is unavailable."})
         await websocket.close()
