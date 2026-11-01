@@ -55,7 +55,7 @@ NubrixAI Analytics Hub API — FastAPI + Celery + LangChain monolith.
 - `classify_table_size(projectId, table)` → `{rows_estimate, columns, size_class, hint}`. Drives workflow auto-routing.
 - `serializer` — converts Polars types for `json.dumps`.
 - `invalidate_data_cache(projectId, table)` — call after transformations.
-- Every AnalyticsHub read goes through `utils/projectStorage.py` with the service key, in the API, Celery and the sandboxes. Failures raise `StorageReadError`, because `httpx.HTTPStatusError` can't be unpickled and breaks a `ProcessPoolExecutor`. Never add a read through a public URL: `test_storage_read_paths.py` fails on `FILE_URL` and on stray `urlopen` calls. `DOMAIN_FILE_URL` is a separate public bucket.
+- Every AnalyticsHub read goes through `utils/projectStorage.py` with the service key, in the API, Celery and the sandboxes. Its sync reads raise `StorageReadError` for a bad status or a bad Range answer, because `httpx.HTTPStatusError` can't be unpickled and breaks a `ProcessPoolExecutor`. Transport errors such as `httpx.ConnectError` stay httpx types, which do pickle. The async reads in `reportingService.py` and `transformationService.py` keep `raise_for_status`. Never add a read through a public URL: `test_storage_read_paths.py` fails on `FILE_URL` and on stray `urlopen` calls. `DOMAIN_FILE_URL` is a separate public bucket.
 
 ## Table Viewer Endpoint
 - `GET /api/latest/projects/viewTable/{projectId}/{tableName}?page=1&pageSize=100`
