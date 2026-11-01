@@ -53,7 +53,7 @@ class BlendService:
                 "blendOn": blendDetails.blendOn,
                 "joinTypes": blendDetails.joinTypes
             }
-            if "blendConfig.json" in [x.get("name") for x in self.client.storage.from_("AnalyticsHub").list(path = blendDetails.projectId)]:
+            if "blendConfig.json" in [x.get("name") for x in self.client.storage.from_("AnalyticsHub").list(path = blendDetails.projectId, options = {"search": "blendConfig.json"})]:
                 fileUrl = os.environ["FILE_URL"].format(projectId = blendDetails.projectId, fileName = "blendConfig.json").replace(".parquet", "") + f"?cb={int(time.time())}"
                 blendConfig = json.loads(urlopen(fileUrl).read())
                 blendConfig[blendDetails.blendName] = joinConfig
@@ -84,7 +84,7 @@ class BlendService:
             CustomException: For any errors during retrieval.
         """
         try:
-            if "blendConfig.json" in [x.get("name") for x in self.client.storage.from_("AnalyticsHub").list(path = projectId)]:
+            if "blendConfig.json" in [x.get("name") for x in self.client.storage.from_("AnalyticsHub").list(path = projectId, options = {"search": "blendConfig.json"})]:
                 blendConfigUrl = os.environ["FILE_URL"].format(projectId = projectId, fileName = "blendConfig.json").replace(".parquet", "") + f"?cb={int(time.time())}"
                 blendConfig = json.loads(urlopen(blendConfigUrl).read())
                 blendedTables = list(blendConfig.keys())
@@ -121,7 +121,6 @@ class BlendService:
             CustomException: For any errors during extraction.
         """
         try:
-            allFiles = [x.get("name") for x in self.client.storage.from_("AnalyticsHub").list(path = details.projectId)]
             metadataUrl = os.environ["FILE_URL"].format(projectId = details.projectId, fileName = "metadata.json").replace(".parquet", "") + f"?cb={int(time.time())}"
             metadata = json.loads(urlopen(metadataUrl).read())
             if details.tableName in metadata.keys():
@@ -132,7 +131,7 @@ class BlendService:
                         uiMessage=f"Table '{details.tableName}' is inactive. Activate it first to use it."
                     )
                 allFields = metadata[details.tableName]["columns"]
-            elif "blendConfig.json" in allFiles:
+            elif "blendConfig.json" in [x.get("name") for x in self.client.storage.from_("AnalyticsHub").list(path = details.projectId, options = {"search": "blendConfig.json"})]:
                 blendConfigUrl = os.environ["FILE_URL"].format(projectId = details.projectId, fileName = "blendConfig.json").replace(".parquet", "") + f"?cb={int(time.time())}"
                 blendConfig = json.loads(urlopen(blendConfigUrl).read())
                 allFields = list()

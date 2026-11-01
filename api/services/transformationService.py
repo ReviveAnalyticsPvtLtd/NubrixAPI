@@ -192,7 +192,7 @@ class TransformationService:
 
         # 3. Check metadata.json to block overwriting base dataset tables
         try:
-            files = self.supabase.storage.from_("AnalyticsHub").list(projectId)
+            files = self.supabase.storage.from_("AnalyticsHub").list(projectId, {"search": "metadata.json"})
             filenames = [x.get("name") for x in files]
             if "metadata.json" in filenames:
                 fileUrl = os.environ["FILE_URL"].format(projectId=projectId, fileName="metadata.json").replace(".parquet", "") + f"?cb={int(time.time())}"

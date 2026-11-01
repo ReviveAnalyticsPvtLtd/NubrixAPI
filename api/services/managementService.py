@@ -17,6 +17,7 @@ from api.services.credits.creditTrackingCallback import CreditTrackingCallback
 from utils.llmOutputParser import parseModelJsonOutput
 from api.commons import updateProjectModifiedAt
 from utils.exceptionHandler import CustomException
+from utils.storageListing import listProjectFiles
 from api.services.authenticationService import DEFAULT_PROFILE_IMAGE
 from api.services.subscriptions.subscriptionFieldUtils import (
     CANONICAL_SUBSCRIPTION_SELECT,
@@ -502,7 +503,7 @@ class ManagementService:
         Raises CustomException(409) if the name is already taken.
         """
         try:
-            files = self.client.storage.from_("AnalyticsHub").list(projectId)
+            files = self.client.storage.from_("AnalyticsHub").list(projectId, {"search": "metadata.json"})
             filenames = [x.get("name") for x in files]
             if "metadata.json" not in filenames:
                 return
@@ -540,7 +541,7 @@ class ManagementService:
             if tableNames is not None:
                 dataFiles = [f"{name}.parquet" for name in tableNames]
             else:
-                dataFiles = [x.get("name") for x in self.client.storage.from_("AnalyticsHub").list(path = projectId) if x.get("name").endswith(".parquet")]
+                dataFiles = [x.get("name") for x in listProjectFiles(self.client, projectId) if x.get("name").endswith(".parquet")]
             results = ""
             tableShapes: dict = {}
             for fileName in dataFiles:
@@ -607,7 +608,7 @@ class ManagementService:
                 projectId=projectId, userId=userId, tableNames=tableNames
             )
             # Load existing metadata.json (if it exists)
-            files = self.client.storage.from_("AnalyticsHub").list(projectId)
+            files = self.client.storage.from_("AnalyticsHub").list(projectId, {"search": "metadata.json"})
             filenames = [x.get("name") for x in files]
             existingMetadata = {}
             if "metadata.json" in filenames:
@@ -794,7 +795,7 @@ class ManagementService:
             CustomException: For any errors during metadata generation or upload.
         """
         try:
-            files = self.client.storage.from_("AnalyticsHub").list(projectId)
+            files = listProjectFiles(self.client, projectId)
             filenames = [x.get("name") for x in files]
             if "metadata.json" in filenames:
                 fileUrl = os.environ["FILE_URL"].format(projectId = projectId, fileName = "metadata.json").replace(".parquet", "") + f"?cb={int(time.time())}"
@@ -849,7 +850,7 @@ class ManagementService:
             CustomException: For any errors during retrieval.
         """
         try:
-            files = self.client.storage.from_("AnalyticsHub").list(projectId)
+            files = self.client.storage.from_("AnalyticsHub").list(projectId, {"search": "metadata.json"})
             filenames = [x.get("name") for x in files]
             if "metadata.json" not in filenames:
                 return dict()
@@ -960,10 +961,11 @@ class ManagementService:
         """
         try:
             _ = self.client.table("Projects").delete().eq("projectId", projectId).execute()
-            allFiles = self.client.storage.from_("AnalyticsHub").list(projectId)
+            allFiles = listProjectFiles(self.client, projectId)
             fileNames = [os.path.join(projectId, x.get("name")) for x in allFiles]
-            if fileNames:
-                _ = self.client.storage.from_("AnalyticsHub").remove(fileNames)
+            # Storage refuses more than 1000 paths in one remove.
+            for start in range(0, len(fileNames), 1000):
+                _ = self.client.storage.from_("AnalyticsHub").remove(fileNames[start : start + 1000])
             return
         except Exception as e:
             exception = CustomException(e)

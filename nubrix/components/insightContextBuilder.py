@@ -52,7 +52,7 @@ class InsightContextBuilder:
         Returns None if the file does not exist in the project folder.
         """
         try:
-            files = self.client.storage.from_(self.config.storageBucket).list(path=projectId)
+            files = self.client.storage.from_(self.config.storageBucket).list(path=projectId, options={"search": fileName})
             if fileName not in [x.get("name") for x in files]:
                 return None
             fileUrl = os.environ["FILE_URL"].format(projectId=projectId, fileName=fileName).replace(".parquet", "") + f"?cb={int(time.time())}"

@@ -284,7 +284,7 @@ class UtilityService:
             list: Existing insight records, or empty list if file does not exist.
         """
         try:
-            files = self.client.storage.from_("AnalyticsHub").list(path=projectId)
+            files = self.client.storage.from_("AnalyticsHub").list(path=projectId, options={"search": "dashboardInsights.json"})
             if "dashboardInsights.json" not in [x.get("name") for x in files]:
                 return []
             fileUrl = os.environ["FILE_URL"].format(projectId=projectId, fileName="dashboardInsights.json").replace(".parquet", "") + f"?cb={int(time.time())}"
