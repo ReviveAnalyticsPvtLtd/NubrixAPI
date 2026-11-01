@@ -76,8 +76,11 @@ def readTableBytes(projectId: str, tableName: str) -> bytes:
     return readBytes(projectId, f"{tableName}.parquet")
 
 
-def downloadTable(projectId: str, tableName: str, path: str) -> None:
-    """Stream a table's parquet file to a new file, so a big table is never held in memory."""
+def downloadTable(projectId: str, tableName: str, path: str, cancelled: threading.Event | None = None) -> None:
+    """Stream a table's parquet file to a new file, so a big table is never held in memory.
+
+    Setting `cancelled` stops it at the next chunk.
+    """
     with httpx.stream(
         "GET",
         objectUrl(projectId, f"{tableName}.parquet"),
@@ -88,6 +91,8 @@ def downloadTable(projectId: str, tableName: str, path: str) -> None:
         response.raise_for_status()
         with open(path, "xb") as table:
             for chunk in response.iter_bytes(_DOWNLOAD_CHUNK_BYTES):
+                if cancelled is not None and cancelled.is_set():
+                    raise InterruptedError("Table download cancelled.")
                 table.write(chunk)
 
 

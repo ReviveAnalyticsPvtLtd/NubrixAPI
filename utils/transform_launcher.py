@@ -33,14 +33,14 @@ def main():
         sys.exit(1)
 
     from utils.initMethods import fetch_data, fetch_data_pl, scan_data, serializer
-    from utils.sandboxRunner import connectTableChannel
+    from utils.sandboxRunner import enterSandbox
     import pandas as pd
     import numpy as np
     import datetime
     import math
     import re
 
-    connectTableChannel(input_data["channel"])
+    enterSandbox(input_data["channel"])
 
     _ALLOWED_MODULES = frozenset({
         "pandas", "numpy", "datetime", "math", "re", "time",

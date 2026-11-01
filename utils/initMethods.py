@@ -95,6 +95,8 @@ _DF_CACHE_BYTES = 0
 _DF_CACHE_LOCK = threading.Lock()
 
 _REDIS_MAX_ROWS = 100000
+# What the parent will decode to fill Redis for a sandbox: row counts say nothing about wide text columns.
+_REDIS_MAX_DECODED_BYTES = 512 * 1024 * 1024
 
 # Set in sandbox children, where the parent process supplies tables.
 _TABLE_SOURCE: "Callable[[str], pa.Table] | None" = None
@@ -352,7 +354,7 @@ def _load_table(projectId: str, tableName: str) -> "pa.Table":
     return table
 
 
-def spool_table(projectId: str, tableName: str, pathStem: str) -> str:
+def spool_table(projectId: str, tableName: str, pathStem: str, cancelled: threading.Event | None = None) -> str:
     """Write a table to disk for a sandbox child and return its path.
 
     Reads Redis then Supabase like `fetch_data`, but keeps a cold read as parquet
@@ -368,8 +370,10 @@ def spool_table(projectId: str, tableName: str, pathStem: str) -> str:
             writer.write_table(table)
         return path
     path = f"{pathStem}.parquet"
-    downloadTable(projectId, tableName, path)
-    if pq.read_metadata(path).num_rows <= _REDIS_MAX_ROWS:
+    downloadTable(projectId, tableName, path, cancelled)
+    footer = pq.read_metadata(path)
+    decodedBytes = sum(footer.row_group(i).total_byte_size for i in range(footer.num_row_groups))
+    if footer.num_rows <= _REDIS_MAX_ROWS and decodedBytes <= _REDIS_MAX_DECODED_BYTES:
         _store_to_redis(redis_key, pq.read_table(path))
     return path
 

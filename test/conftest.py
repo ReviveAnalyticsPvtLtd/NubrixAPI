@@ -18,6 +18,9 @@ os.environ.setdefault("REDIS_PASSWORD", "")
 os.environ.setdefault("GEMINI_API_KEY", "test-key")
 os.environ.setdefault("GROQ_API_KEY", "test-key")
 
+# Sandbox tests run as the developer's own uid outside the image, which sets SANDBOX_RUN_ROOT.
+os.environ.setdefault("SANDBOX_ALLOW_SAME_UID", "1")
+
 # Automatic-capture rules cutover; unset blocks new Orders by design.
 os.environ.setdefault("PAYMENT_RULES_EFFECTIVE_AT", "2026-01-01T00:00:00+00:00")
 

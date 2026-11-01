@@ -15,9 +15,9 @@ def main():
 
     # 2. Setup data fetchers and sanitize imports
     from utils.initMethods import fetch_data, fetch_data_pl, scan_data, serializer
-    from utils.sandboxRunner import connectTableChannel
+    from utils.sandboxRunner import enterSandbox
 
-    connectTableChannel(input_data["channel"])
+    enterSandbox(input_data["channel"])
 
     def safe_fetch_data(targetProjectId, tableName, *args, **kwargs):
         if targetProjectId != projectId:

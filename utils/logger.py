@@ -25,7 +25,8 @@ from loguru import logger
 import sys
 import os
 
-os.makedirs("logs", exist_ok=True)
+# Other users' details land here, and sandbox runs have their own uids.
+os.makedirs("logs", mode=0o700, exist_ok=True)
 
 logger.remove()
 
@@ -48,4 +49,5 @@ logger.add(
     "logs/runLogs.log",
     level="DEBUG",
     rotation="1 MB",
+    diagnose=False,
 )

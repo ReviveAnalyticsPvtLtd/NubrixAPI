@@ -14,9 +14,13 @@ import glob
 import io
 import json
 import os
+import shutil
+import signal
 import subprocess
+import sys
 import tempfile
 import threading
+import time
 import uuid
 from unittest.mock import MagicMock
 
@@ -25,9 +29,10 @@ import pyarrow as pa
 import pyarrow.parquet as pq
 import pytest
 
+from nubrix.components import transformationExecutor
 from nubrix.components.transformationExecutor import TransformationExecutor
 from test.privateStorageFixtures import SERVICE_KEY, FakePrivateStorage
-from utils import codeExecutor, initMethods
+from utils import codeExecutor, initMethods, projectStorage, sandbox_reaper, sandboxRunner
 
 PROJECT = "11111111-2222-4333-8444-555555555555"
 OTHER_PROJECT = "99999999-8888-4777-8666-555555555555"
@@ -49,19 +54,6 @@ READ_AND_LIST_SECRETS = READ_EVERY_WAY + (
     "env = pd.io.common.os.environ\n"
     f'seen = ",".join(sorted(k for k, v in env.items() if v == "{SECRET_VALUE}"))\n'
 )
-
-
-@pytest.fixture(autouse=True)
-def _windowsSocketsNeedSystemRoot(monkeypatch):
-    """Winsock can't load without SYSTEMROOT, which the Linux-only allowlists leave out."""
-    if os.name != "nt":
-        return
-    realPopen = subprocess.Popen
-
-    def popen(*args, env=None, **kwargs):
-        return realPopen(*args, env={**env, "SYSTEMROOT": os.environ["SYSTEMROOT"]}, **kwargs)
-
-    monkeypatch.setattr(subprocess, "Popen", popen)
 
 
 @pytest.fixture
@@ -351,7 +343,7 @@ def test_parentIgnoresAProjectInTheRequest(storage, tmp_path):
     request = json.dumps({"projectId": OTHER_PROJECT, "tableName": "sales"}).encode()
     replies = io.BytesIO()
 
-    serveTables(PROJECT, io.BytesIO(request + b'\n"sales"\n'), replies, str(tmp_path))
+    serveTables(PROJECT, io.BytesIO(request + b'\n"sales"\n'), replies, str(tmp_path), threading.Event())
 
     first, second = [json.loads(line) for line in replies.getvalue().splitlines()]
     assert "error" in first
@@ -364,7 +356,7 @@ def test_parentSpoolsATableOnceInARun(storage, tmp_path):
 
     replies = io.BytesIO()
 
-    serveTables(PROJECT, io.BytesIO(b'"sales"\n"sales"\n'), replies, str(tmp_path))
+    serveTables(PROJECT, io.BytesIO(b'"sales"\n"sales"\n'), replies, str(tmp_path), threading.Event())
 
     first, second = [json.loads(line) for line in replies.getvalue().splitlines()]
     assert first == second
@@ -376,17 +368,17 @@ def test_failedDownloadDoesNotBreakTheNextRead(storage, tmp_path, monkeypatch):
 
     realDownload = initMethods.downloadTable
 
-    def failAfterAPartialWrite(projectId, tableName, path):
+    def failAfterAPartialWrite(projectId, tableName, path, runEnded=None):
         if tableName == "broken":
             with open(path, "xb") as partial:
                 partial.write(b"PAR1")
             raise OSError("connection dropped")
-        realDownload(projectId, tableName, path)
+        realDownload(projectId, tableName, path, runEnded)
 
     monkeypatch.setattr(initMethods, "downloadTable", failAfterAPartialWrite)
     replies = io.BytesIO()
 
-    serveTables(PROJECT, io.BytesIO(b'"broken"\n"sales"\n'), replies, str(tmp_path))
+    serveTables(PROJECT, io.BytesIO(b'"broken"\n"sales"\n'), replies, str(tmp_path), threading.Event())
 
     first, second = [json.loads(line) for line in replies.getvalue().splitlines()]
     assert first == {"error": "Could not read table 'broken'."}
@@ -400,6 +392,17 @@ def test_parentCachesASmallTableInRedisAfterAColdRead(storage, tmp_path, monkeyp
     initMethods.spool_table(PROJECT, "sales", str(tmp_path / "0"))
 
     assert stored == {f"{PROJECT}::sales": 3}
+
+
+def test_parentKeepsAWideTableAsParquetWithoutDecodingIt(storage, tmp_path, monkeypatch):
+    monkeypatch.setattr(initMethods, "_REDIS_MAX_DECODED_BYTES", 1)
+
+    def refuse(*_args, **_kwargs):
+        raise AssertionError("the parent decoded a table too wide to cache")
+
+    monkeypatch.setattr(pq, "read_table", refuse)
+
+    initMethods.spool_table(PROJECT, "sales", str(tmp_path / "0"))
 
 
 def test_parentKeepsABigTableAsParquetWithoutDecodingIt(storage, tmp_path, monkeypatch):
@@ -418,24 +421,131 @@ def test_parentKeepsABigTableAsParquetWithoutDecodingIt(storage, tmp_path, monke
         assert spooled.read() == buffer.getvalue()
 
 
+GRAB_THE_CHANNEL = (
+    'source = pd.io.common.os.sys.modules["utils.initMethods"]._TABLE_SOURCE\n'
+    'pipes = [c.cell_contents for c in source.__closure__ if hasattr(c.cell_contents, "writable")]\n'
+    'requests = [pipe for pipe in pipes if pipe.writable()][0]\n'
+)
+
+
+def _finishesWithin(seconds, call):
+    """Run `call` on a thread and return its result, failing if it is still blocked at the deadline."""
+    outputs = []
+    run = threading.Thread(target=lambda: outputs.append(call()), daemon=True)
+
+    run.start()
+    run.join(timeout=seconds)
+
+    assert not run.is_alive()
+    return outputs[0]
+
+
 def test_childThatFloodsTheChannelCantHangTheParent(storage):
-    code = (
-        'source = pd.io.common.os.sys.modules["utils.initMethods"]._TABLE_SOURCE\n'
-        'pipes = [c.cell_contents for c in source.__closure__ if hasattr(c.cell_contents, "writable")]\n'
-        'requests = [pipe for pipe in pipes if pipe.writable()][0]\n'
+    code = GRAB_THE_CHANNEL + (
         'for _ in range(100000):\n'
         '    requests.write(b\'"sales"\\n\')\n'
         '    requests.flush()\n'
     )
     executor = TransformationExecutor(timeoutSeconds=15)
-    outputs = []
-    run = threading.Thread(target=lambda: outputs.append(executor.executeInspection(PROJECT, code)), daemon=True)
 
-    run.start()
-    run.join(timeout=60)
+    output = _finishesWithin(60, lambda: executor.executeInspection(PROJECT, code))
 
-    assert not run.is_alive()
-    assert "timed out" in outputs[0]
+    assert "timed out" in output
+
+
+def test_childCantHangTheParentWithABlankLine(storage):
+    code = GRAB_THE_CHANNEL + (
+        'import time\n'
+        'requests.write(b"\\n")\n'
+        'requests.flush()\n'
+        'time.sleep(1)\n'
+        'requests.write(b"x" * 65536)\n'
+        'requests.flush()\n'
+        'print("exiting")\n'
+    )
+    executor = TransformationExecutor(timeoutSeconds=10)
+
+    output = _finishesWithin(30, lambda: executor.executeInspection(PROJECT, code))
+
+    assert output.strip() == "exiting"
+
+
+@pytest.mark.skipif(os.name != "posix", reason="needs fork")
+def test_processHoldingTheOutputCantHangTheParent(storage):
+    code = (
+        'import time\n'
+        'os = pd.io.common.os\n'
+        'if os.fork() == 0:\n'
+        '    os.setsid()\n'
+        '    time.sleep(60)\n'
+        '    os._exit(0)\n'
+        'time.sleep(60)\n'
+    )
+    executor = TransformationExecutor(timeoutSeconds=5)
+
+    output = _finishesWithin(30, lambda: executor.executeInspection(PROJECT, code))
+
+    assert "timed out" in output
+
+
+def test_outputIsCappedInTheParent(storage, monkeypatch):
+    monkeypatch.setattr(sandboxRunner, "_MAX_OUTPUT_BYTES", 1024)
+    executor = TransformationExecutor(timeoutSeconds=120)
+
+    output = executor.executeInspection(PROJECT, 'print("x" * 100000)')
+
+    assert len(output) < 2048
+    assert "truncated" in output
+
+
+def test_runStopsSpoolingAtTheCap(storage, tmp_path, monkeypatch):
+    from utils.sandboxRunner import serveTables
+
+    buffer = io.BytesIO()
+    pl.DataFrame({"amount": [1]}).write_parquet(buffer)
+    storage.put(PROJECT, "other.parquet", buffer.getvalue())
+    monkeypatch.setattr(sandboxRunner, "_MAX_SPOOL_BYTES", 1)
+    replies = io.BytesIO()
+
+    serveTables(PROJECT, io.BytesIO(b'"sales"\n"other"\n"sales"\n'), replies, str(tmp_path), threading.Event())
+
+    first, second, third = [json.loads(line) for line in replies.getvalue().splitlines()]
+    assert "file" in first
+    assert "error" in second
+    assert third == first
+
+
+def test_blankLineDoesNotEndServing(storage, tmp_path):
+    from utils.sandboxRunner import serveTables
+
+    replies = io.BytesIO()
+
+    serveTables(PROJECT, io.BytesIO(b'\n"sales"\n'), replies, str(tmp_path), threading.Event())
+
+    first, second = [json.loads(line) for line in replies.getvalue().splitlines()]
+    assert "error" in first
+    assert "file" in second
+
+
+def test_serveTablesStopsWhenTheRunEnds(storage, tmp_path):
+    from utils.sandboxRunner import serveTables
+
+    runEnded = threading.Event()
+    runEnded.set()
+    replies = io.BytesIO()
+
+    serveTables(PROJECT, io.BytesIO(b'"sales"\n'), replies, str(tmp_path), runEnded)
+
+    assert not replies.getvalue()
+    assert not storage.requests
+
+
+def test_downloadStopsWhenTheRunEnds(storage, tmp_path):
+    runEnded = threading.Event()
+    runEnded.set()
+
+    with pytest.raises(InterruptedError):
+        projectStorage.downloadTable(PROJECT, "sales", str(tmp_path / "0"), runEnded)
 
 
 def _runFolders():
@@ -448,7 +558,8 @@ def _runFolders():
     'raise RuntimeError("failed on purpose")',
     'import time\ntime.sleep(120)',
 ))
-def test_runLeavesNoFolderBehind(storage, code):
+def test_runLeavesNoFolderBehind(storage, code, tmp_path, monkeypatch):
+    monkeypatch.setattr(tempfile, "tempdir", str(tmp_path))
     executor = TransformationExecutor(timeoutSeconds=20)
     before = _runFolders()
 
@@ -464,6 +575,53 @@ def test_transformationResultStillComesBack(storage):
 
     assert rows == [{"amount": 1}, {"amount": 2}, {"amount": 3}]
     assert pl.read_parquet(io.BytesIO(parquetBytes)).height == 3
+
+
+def test_previewDecodesOnlyTheRowsItShows(storage):
+    executor = TransformationExecutor(timeoutSeconds=120)
+    code = 'final_df = pd.DataFrame({"a": range(1000)})'
+
+    rows, parquetBytes = executor.executeAndPreview(PROJECT, code, "copy")
+
+    assert len(rows) == 100
+    assert len(executor._execute_code(PROJECT, code)) == 100
+    assert pl.read_parquet(io.BytesIO(parquetBytes)).height == 1000
+
+
+@pytest.mark.parametrize("launcher", ("sandbox_launcher.py", "inspect_launcher.py"))
+def test_launcherWithNoResultNeverHasItsResultFileRead(storage, launcher):
+    code = (
+        'os = pd.io.common.os\n'
+        'fd = os.open("result.parquet", os.O_CREAT | os.O_WRONLY, 0o600)\n'
+        'os.write(fd, b"x" * 1024)\n'
+        'os.close(fd)\n'
+    )
+
+    result = sandboxRunner.runSandbox(launcher, PROJECT, code, 120)
+
+    assert result.returncode == 0
+    assert result.resultBytes is None
+
+
+def test_parentRefusesAResultFileOverTheCap(storage, monkeypatch):
+    monkeypatch.setattr(sandboxRunner, "_MAX_RESULT_BYTES", 16)
+    executor = TransformationExecutor(timeoutSeconds=120)
+
+    with pytest.raises(ValueError, match="too large"):
+        executor._execute_code(PROJECT, 'final_df = fetch_data_pl(projectId, "sales")')
+
+
+def test_parentChecksTheResultFooterBeforeDecoding(storage, monkeypatch):
+    monkeypatch.setattr(transformationExecutor, "detect_resources", lambda: {"total_memory_bytes": 2})
+
+    def refuse(*_args, **_kwargs):
+        raise AssertionError("the parent decoded a result it should have refused")
+
+    monkeypatch.setattr(pl, "read_parquet", refuse)
+    executor = TransformationExecutor(timeoutSeconds=120)
+
+    with pytest.raises(ValueError, match="too large"):
+        executor._run_transformation(PROJECT, 'final_df = fetch_data_pl(projectId, "sales")')
 
 
 @pytest.mark.skipif(os.name != "posix", reason="links and pipes behave differently on Windows")
@@ -482,6 +640,296 @@ separateUids = pytest.mark.skipif(
     os.name != "posix" or os.geteuid() != 0,
     reason="only a root parent on Linux can run a child as another uid",
 )
+inTheImage = pytest.mark.skipif(not os.environ.get("SANDBOX_RUN_ROOT"), reason="checks the built image")
+FORCED_RUN_UID = sandboxRunner._FIRST_RUN_UID + 7
+LEAVE_A_PROCESS_BEHIND = (
+    'import time\n'
+    'os = pd.io.common.os\n'
+    'if os.fork() == 0:\n'
+    '    os.setsid()\n'
+    '    for fd in (0, 1, 2):\n'
+    '        os.close(fd)\n'
+    '    time.sleep(120)\n'
+    '    os._exit(0)\n'
+)
+
+
+def _forceRunUid(monkeypatch):
+    """Stands for the random pick landing on a uid a run has used before."""
+    monkeypatch.setattr(sandboxRunner.secrets, "randbelow", lambda _count: 7)
+
+
+def _liveRunUidProcesses():
+    processes = []
+    for pid in filter(str.isdigit, os.listdir("/proc")):
+        try:
+            uid = os.stat(f"/proc/{pid}").st_uid
+            with open(f"/proc/{pid}/stat") as source:
+                state = source.read().rsplit(") ", 1)[1][0]
+        except OSError:
+            continue
+        if sandboxRunner._FIRST_RUN_UID <= uid < sandboxRunner._FIRST_RUN_UID + sandboxRunner._RUN_UID_COUNT and state != "Z":
+            processes.append(pid)
+    return processes
+
+
+def _worldWritableFolder():
+    folder = os.path.join(tempfile.gettempdir(), f"handoff-{uuid.uuid4().hex}")
+    os.mkdir(folder)
+    os.chmod(folder, 0o777)
+    return folder
+
+
+@separateUids
+def test_runLeavesNoProcessBehind(storage):
+    executor = TransformationExecutor(timeoutSeconds=60)
+
+    output = executor.executeInspection(PROJECT, LEAVE_A_PROCESS_BEHIND + 'print("done")')
+
+    assert output.strip() == "done"
+    deadline = time.time() + 5
+    while _liveRunUidProcesses() and time.time() < deadline:
+        time.sleep(0.05)
+    assert not _liveRunUidProcesses()
+
+
+@separateUids
+def test_leftoverProcessCantReadALaterRunThatGetsItsUid(storage, monkeypatch):
+    _forceRunUid(monkeypatch)
+    handoff = _worldWritableFolder()
+    attacker = (
+        'import time\n'
+        'os = pd.io.common.os\n'
+        'tables = os.path.join(os.path.dirname(os.getcwd()), "tables")\n'
+        'if os.fork() == 0:\n'
+        '    os.setsid()\n'
+        '    for fd in (0, 1, 2):\n'
+        '        os.close(fd)\n'
+        '    deadline = time.time() + 30\n'
+        '    while time.time() < deadline:\n'
+        '        try:\n'
+        '            if os.listdir(tables):\n'
+        f'                os.close(os.open("{handoff}/stolen", os.O_CREAT | os.O_WRONLY))\n'
+        '                os._exit(0)\n'
+        '        except OSError:\n'
+        '            pass\n'
+        '        time.sleep(0.02)\n'
+        '    os._exit(0)\n'
+    )
+    executor = TransformationExecutor(timeoutSeconds=60)
+
+    executor.executeInspection(PROJECT, attacker)
+    executor.executeInspection(OTHER_PROJECT, 'fetch_data_pl(projectId, "sales")\nimport time\ntime.sleep(2)')
+
+    assert not os.path.exists(os.path.join(handoff, "stolen"))
+
+
+@separateUids
+def test_runEndsAnyProcessAlreadyHoldingItsUid(storage, monkeypatch):
+    _forceRunUid(monkeypatch)
+    leftover = subprocess.Popen(["sleep", "120"], user=FORCED_RUN_UID, group=FORCED_RUN_UID, extra_groups=[])
+    try:
+        TransformationExecutor(timeoutSeconds=60).executeInspection(PROJECT, 'print("ran")')
+
+        assert leftover.wait(timeout=5) == -signal.SIGKILL
+    finally:
+        leftover.kill()
+
+
+@separateUids
+def test_uidStaysClaimedIfItsProcessesCantBeEnded(storage, monkeypatch):
+    outcomes = iter((True, False))
+    monkeypatch.setattr(sandboxRunner, "_clearUid", lambda _runUid: next(outcomes))
+    before = _runFolders()
+
+    output = TransformationExecutor(timeoutSeconds=60).executeInspection(PROJECT, 'fetch_data_pl(projectId, "sales")\nprint("ran")')
+
+    left = _runFolders() - before
+    assert output.strip() == "ran"
+    assert len(left) == 1
+    folder = left.pop()
+    try:
+        assert os.listdir(folder) == []
+    finally:
+        os.rmdir(folder)
+
+
+@separateUids
+def test_runRefusesToStartIfItsUidCantBeCleared(storage, monkeypatch):
+    monkeypatch.setattr(sandboxRunner, "_clearUid", lambda _runUid: False)
+    started = MagicMock()
+    monkeypatch.setattr(subprocess, "Popen", started)
+    before = _runFolders()
+
+    with pytest.raises(RuntimeError, match="clear"):
+        TransformationExecutor(timeoutSeconds=60).executeInspection(PROJECT, 'print("ran")')
+
+    started.assert_not_called()
+    for folder in _runFolders() - before:
+        os.rmdir(folder)
+
+
+@separateUids
+def test_runRemovesItsFilesFromSharedTempFolders(storage):
+    code = (
+        'os = pd.io.common.os\n'
+        'for folder in ("/tmp", "/var/tmp", "/dev/shm"):\n'
+        '    name = f"{folder}/left-{os.getuid()}"\n'
+        '    os.close(os.open(name, os.O_CREAT | os.O_WRONLY))\n'
+        '    os.mkdir(name + "-folder")\n'
+        '    os.close(os.open(name + "-folder/inside", os.O_CREAT | os.O_WRONLY))\n'
+        'print(os.getuid())\n'
+    )
+
+    uid = TransformationExecutor(timeoutSeconds=60).executeInspection(PROJECT, code).strip()
+
+    assert not glob.glob(f"/tmp/left-{uid}*") + glob.glob(f"/var/tmp/left-{uid}*") + glob.glob(f"/dev/shm/left-{uid}*")
+
+
+@pytest.mark.parametrize(("realUid", "named"), ((0, "0"), (0, "20007"), (20008, "20007")))
+def test_reaperNeverSignalsAsAnyOtherUid(monkeypatch, realUid, named):
+    kill = MagicMock()
+    monkeypatch.setattr(sandbox_reaper.os, "getuid", lambda: realUid, raising=False)
+    monkeypatch.setattr(sandbox_reaper.os, "kill", kill)
+    monkeypatch.setattr(sandbox_reaper.sys, "argv", ["sandbox_reaper.py", named])
+
+    with pytest.raises(SystemExit) as refused:
+        sandbox_reaper.main()
+
+    assert refused.value.code
+    kill.assert_not_called()
+
+
+def test_logFileNeverRecordsLocalVariables(tmp_path):
+    root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    script = (
+        'from utils.logger import logger\n'
+        'def fail():\n'
+        '    localSecret = "local-" + "variable-value"\n'
+        '    raise ValueError(len(localSecret))\n'
+        'try:\n'
+        '    fail()\n'
+        'except ValueError:\n'
+        '    logger.exception("logged")\n'
+    )
+
+    (tmp_path / "failing.py").write_text(script)
+
+    subprocess.run([sys.executable, "failing.py"], cwd=tmp_path, env={**os.environ, "PYTHONPATH": root}, check=True, capture_output=True)
+
+    written = (tmp_path / "logs" / "runLogs.log").read_text()
+    assert "logged" in written
+    assert "local-variable-value" not in written
+
+
+@separateUids
+def test_sandboxCannotReadTheApplicationLogs(runInSandbox):
+    root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+
+    output = runInSandbox(f'outcome = pd.io.common.os.listdir("{root}/logs")')
+
+    assert "PermissionError" in output
+
+
+@separateUids
+def test_sandboxHasHardLimits(runInSandbox):
+    code = (
+        'resource = pd.io.common.os.sys.modules["resource"]
+'
+        'limits = {name: resource.getrlimit(getattr(resource, name)) for name in ("RLIMIT_NPROC", "RLIMIT_FSIZE", "RLIMIT_CORE", "RLIMIT_NOFILE")}
+'
+        'outcome = pd.io.common.os.sys.modules["json"].dumps(limits)'
+    )
+
+    limits = json.loads(runInSandbox(code).strip())
+
+    assert limits["RLIMIT_NPROC"] == [sandboxRunner._MAX_RUN_PROCESSES] * 2
+    assert limits["RLIMIT_FSIZE"] == [sandboxRunner._MAX_CHILD_FILE_BYTES] * 2
+    assert limits["RLIMIT_CORE"] == [0, 0]
+    assert limits["RLIMIT_NOFILE"] == [sandboxRunner._MAX_RUN_OPEN_FILES] * 2
+
+
+@separateUids
+def test_sandboxCantRaiseItsLimits(runInSandbox):
+    code = (
+        'resource = pd.io.common.os.sys.modules["resource"]
+'
+        f'resource.setrlimit(resource.RLIMIT_NPROC, ({sandboxRunner._MAX_RUN_PROCESSES + 1},) * 2)
+'
+        'outcome = "raised"'
+    )
+
+    assert "ValueError" in runInSandbox(code)
+
+
+@separateUids
+def test_sandboxCantWriteAFilePastTheLimit(runInSandbox):
+    code = (
+        'os = pd.io.common.os\n'
+        'fd = os.open("big", os.O_CREAT | os.O_WRONLY)\n'
+        f'os.lseek(fd, {sandboxRunner._MAX_CHILD_FILE_BYTES}, os.SEEK_SET)\n'
+        'outcome = os.write(fd, b"x")'
+    )
+
+    assert "File too large" in runInSandbox(code)
+
+
+@separateUids
+def test_sandboxCantGainPrivileges(runInSandbox):
+    code = (
+        'os = pd.io.common.os\n'
+        'fd = os.open("/proc/self/status", os.O_RDONLY)\n'
+        'status = os.read(fd, 65536).decode()\n'
+        'outcome = [line.split()[1] for line in status.splitlines() if line.startswith("NoNewPrivs")][0]'
+    )
+
+    assert runInSandbox(code).strip() == "1"
+
+
+@separateUids
+@inTheImage
+def test_imageHasNoSetuidOrSetgidFiles():
+    found = subprocess.run(["find", "/", "-xdev", "-perm", "/6000", "-type", "f"], capture_output=True, text=True)
+
+    assert found.stdout.split() == []
+
+
+@separateUids
+def test_launcherDiesWithTheWorkerThatStartedIt(storage):
+    root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    handoff = _worldWritableFolder()
+    before = _runFolders()
+    code = (
+        'import time\n'
+        'os = pd.io.common.os\n'
+        f'fd = os.open("{handoff}/pid.tmp", os.O_CREAT | os.O_WRONLY)\n'
+        'os.write(fd, str(os.getpid()).encode())\n'
+        'os.close(fd)\n'
+        f'os.rename("{handoff}/pid.tmp", "{handoff}/pid")\n'
+        'time.sleep(120)\n'
+    )
+    worker = subprocess.Popen(
+        [sys.executable, "-c", f"from utils.sandboxRunner import runSandbox\nrunSandbox('inspect_launcher.py', {PROJECT!r}, {code!r}, 90)"],
+        cwd=root,
+    )
+    try:
+        deadline = time.time() + 30
+        while not os.path.exists(f"{handoff}/pid") and time.time() < deadline:
+            time.sleep(0.05)
+        with open(f"{handoff}/pid") as source:
+            launcher = source.read()
+
+        worker.kill()
+        worker.wait()
+
+        deadline = time.time() + 5
+        while launcher in _liveRunUidProcesses() and time.time() < deadline:
+            time.sleep(0.05)
+        assert launcher not in _liveRunUidProcesses()
+    finally:
+        worker.kill()
+        for folder in _runFolders() - before:
+            shutil.rmtree(folder, ignore_errors=True)
 
 
 @separateUids
@@ -565,9 +1013,23 @@ def test_concurrentRunsCannotReachEachOther(storage):
     assert outputs["second"].strip() == "['denied', 'denied', 'denied']"
 
 
+@pytest.mark.skipif(os.name == "posix" and os.geteuid() == 0, reason="a root parent refuses either way")
+def test_sameUidRunsNeedAnExplicitOptIn(storage, monkeypatch):
+    monkeypatch.delenv("SANDBOX_RUN_ROOT", raising=False)
+    monkeypatch.delenv("SANDBOX_ALLOW_SAME_UID", raising=False)
+    started = MagicMock()
+    monkeypatch.setattr(subprocess, "Popen", started)
+
+    with pytest.raises(RuntimeError, match="SANDBOX_ALLOW_SAME_UID"):
+        TransformationExecutor(timeoutSeconds=20).executeInspection(PROJECT, 'print("ran")')
+
+    started.assert_not_called()
+
+
 @separateUids
 def test_rootParentRefusesToRunWithoutARunRoot(storage, monkeypatch):
     monkeypatch.delenv("SANDBOX_RUN_ROOT", raising=False)
+    monkeypatch.setenv("SANDBOX_ALLOW_SAME_UID", "1")
     started = MagicMock()
     monkeypatch.setattr(subprocess, "Popen", started)
 

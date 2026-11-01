@@ -6,32 +6,39 @@ Runs a launcher as a subprocess that holds no credentials.
 Generated code can reach anything its process can: its environment, its memory
 and, through pandas and NumPy, `os`, file reads and HTTP reads. So the child
 gets no Supabase or Redis settings. The parent reads tables for it over a
-private pipe pair. The child sends a table name only: the project isn't in the
+private socket. The child sends a table name only: the project isn't in the
 protocol, because the parent already knows it.
 
 Each run has its own uid, so a child can't read the parent's secrets from
 `/proc`, write to the application, or reach another run's tables. A shared
 sandbox user would let concurrent runs for different projects read each other.
+A uid is free again only once sandbox_reaper.py has ended everything running as
+it, because generated code can fork and outlive the launcher.
 
     runFolder/        root's, children may only pass through
         tables/       the parent writes here, this run may read
         work/         this run's own: cwd, HOME, TMPDIR and the result file
 """
 
-__all__ = ["runSandbox", "serveTables", "readResult", "connectTableChannel", "SandboxResult"]
+__all__ = ["runSandbox", "serveTables", "readResult", "enterSandbox", "SandboxResult"]
 
 
+import base64
+import contextlib
+import ctypes
 import itertools
 import json
 import os
 import secrets
 import shutil
+import signal
+import socket
 import stat
 import subprocess
 import sys
 import tempfile
 import threading
-from typing import NamedTuple
+from typing import IO, NamedTuple
 
 from utils.initMethods import spool_table, use_table_source
 from utils.logger import logger
@@ -40,12 +47,21 @@ from utils.logger import logger
 _FIRST_RUN_UID = 20000
 _RUN_UID_COUNT = 40000
 _MAX_REQUEST_BYTES = 4096
-# The first newline ends any partial request the child left, the second is a blank line.
-_STOP_SERVING = b"\n\n"
+_MAX_OUTPUT_BYTES = 64 * 1024 * 1024
+# Redis refuses a bigger value, and a transformation preview is cached there before it can be applied.
+_MAX_RESULT_BYTES = 512 * 1024 * 1024
+_MAX_SPOOL_BYTES = 8 * 1024 * 1024 * 1024
+# Limits every process of a run shares. Threads count, so leave room for Polars, Arrow, BLAS and OpenMP.
+_MAX_RUN_PROCESSES = 1024
+_MAX_RUN_OPEN_FILES = 4096
+_MAX_CHILD_FILE_BYTES = 4 * 1024 * 1024 * 1024
+_CLEAR_UID_TIMEOUT_SECONDS = 30
+_PR_SET_PDEATHSIG = 1
+_PR_SET_NO_NEW_PRIVS = 38
 _ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 # Generated code can read its whole environment, so never add a secret here.
 _INHERITED_ENV = (
-    "PATH", "PYTHONPATH", "LANG", "LC_ALL", "TZ",
+    "PATH", "PYTHONPATH", "LANG", "LC_ALL", "TZ", "SYSTEMROOT",
     "POLARS_MAX_THREADS", "OPENBLAS_NUM_THREADS",
     "DF_CACHE_MAX_BYTES", "DF_CACHE_MAX_ENTRIES",
 )
@@ -63,11 +79,15 @@ def _claimRun() -> tuple[int | None, str]:
 
     An image sets SANDBOX_RUN_ROOT to require a separate uid, and a parent that
     can't change uid then fails on the chown instead of running without one.
+    Running children as this process's own uid is for local development only, so
+    it has to be asked for.
     """
     runRoot = os.environ.get("SANDBOX_RUN_ROOT")
     if not runRoot:
         if os.name == "posix" and os.geteuid() == 0:
             raise RuntimeError("SANDBOX_RUN_ROOT must be set: a root parent can't run sandboxes without a separate uid.")
+        if os.environ.get("SANDBOX_ALLOW_SAME_UID") != "1":
+            raise RuntimeError("Set SANDBOX_RUN_ROOT, or SANDBOX_ALLOW_SAME_UID=1 for local development.")
         return None, tempfile.mkdtemp(prefix="sandbox-")
     while True:
         runUid = _FIRST_RUN_UID + secrets.randbelow(_RUN_UID_COUNT)
@@ -93,26 +113,63 @@ def _prepareFolders(runUid: int | None, runFolder: str) -> tuple[str, str]:
     return tablesFolder, workFolder
 
 
-def serveTables(projectId: str, requests, replies, tablesFolder: str) -> None:
+def _clearUid(runUid: int | None) -> bool:
+    """End every process running as this uid and remove its shared temp files. Returns False if that failed."""
+    if runUid is None:
+        return True
+    try:
+        subprocess.run(
+            [sys.executable, "-I", "-S", os.path.join(_ROOT, "utils", "sandbox_reaper.py"), str(runUid)],
+            user=runUid,
+            group=runUid,
+            extra_groups=[],
+            env={},
+            cwd="/",
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            timeout=_CLEAR_UID_TIMEOUT_SECONDS,
+            check=True,
+        )
+        return True
+    except (OSError, subprocess.SubprocessError) as e:
+        logger.error(f"Could not clear sandbox uid {runUid}: {e}")
+        return False
+
+
+def _removeRun(runFolder: str, uidIsClear: bool) -> None:
+    """Delete the run's files. The run folder frees the uid, so it stays while a process may be left."""
+    if uidIsClear:
+        shutil.rmtree(runFolder, ignore_errors=True)
+        return
+    for name in os.listdir(runFolder):
+        shutil.rmtree(os.path.join(runFolder, name), ignore_errors=True)
+
+
+def serveTables(projectId: str, requests, replies, tablesFolder: str, runEnded: threading.Event) -> None:
     """Answer table requests until the run ends. Nothing the child sends can name a project."""
     spooled: dict[str, str] = {}
+    spooledBytes = 0
     fileNumbers = itertools.count()
-    childIsGone = False
-    while True:
-        line = requests.readline(_MAX_REQUEST_BYTES)
-        if not line.strip():
+    while not runEnded.is_set():
+        try:
+            line = requests.readline(_MAX_REQUEST_BYTES)
+        except OSError:
             return
-        if childIsGone:
-            continue
+        if not line:
+            return
         tableName = None
         try:
             tableName = json.loads(line)
             if not isinstance(tableName, str):
                 raise ValueError("A table request must be a table name.")
             if tableName not in spooled:
-                path = spool_table(projectId, tableName, os.path.join(tablesFolder, str(next(fileNumbers))))
+                if spooledBytes >= _MAX_SPOOL_BYTES:
+                    raise ValueError("This run has already read as much table data as it can.")
+                path = spool_table(projectId, tableName, os.path.join(tablesFolder, str(next(fileNumbers))), runEnded)
                 os.chmod(path, 0o644)
                 spooled[tableName] = os.path.basename(path)
+                spooledBytes += os.path.getsize(path)
             reply = {"file": spooled[tableName]}
         except ValueError as e:
             reply = {"error": str(e)}
@@ -122,43 +179,41 @@ def serveTables(projectId: str, requests, replies, tablesFolder: str) -> None:
         try:
             replies.write(json.dumps(reply).encode("utf-8") + b"\n")
         except OSError:
-            # Keep draining, so the parent's stop line can't block on a full pipe.
-            childIsGone = True
+            return
 
 
-def _startChild(launcherName: str, runUid: int | None, workFolder: str, childFds: tuple[int, int]) -> tuple[subprocess.Popen, dict]:
-    """Start the launcher. Returns the process and how the child finds its end of the channel."""
+def _startChild(launcherName: str, runUid: int | None, workFolder: str, childEnd: socket.socket, stdout: IO[bytes], stderr: IO[bytes]) -> subprocess.Popen:
+    """Start the launcher. Its output goes to files, so nothing a process holds open can block the parent."""
     env = {k: os.environ[k] for k in _INHERITED_ENV if k in os.environ}
     env["PYTHONPATH"] = _ROOT + os.pathsep + env.get("PYTHONPATH", "")
     env.update(HOME=workFolder, TMPDIR=workFolder, USER="sandbox", LOGNAME="sandbox")
     options: dict = {}
     if runUid is not None:
         options.update(user=runUid, group=runUid, extra_groups=[])
-    if os.name == "nt":
-        import msvcrt
-        channelEnds = [msvcrt.get_osfhandle(fd) for fd in childFds]
-        for handle in channelEnds:
-            os.set_handle_inheritable(handle, True)
-        options["startupinfo"] = subprocess.STARTUPINFO(lpAttributeList={"handle_list": channelEnds})
-    else:
-        channelEnds = list(childFds)
-        options["pass_fds"] = childFds
-    proc = subprocess.Popen(
+    if os.name == "posix":
+        options["pass_fds"] = (childEnd.fileno(),)
+    return subprocess.Popen(
         [sys.executable, "-s", os.path.join(_ROOT, "utils", launcherName)],
         stdin=subprocess.PIPE,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
+        stdout=stdout,
+        stderr=stderr,
         text=True,
         env=env,
         cwd=workFolder,
         close_fds=True,
         **options,
     )
-    return proc, {"requests": channelEnds[0], "replies": channelEnds[1]}
+
+
+def _channelFor(proc: subprocess.Popen, childEnd: socket.socket) -> dict:
+    """Say how the child finds its end of the socket. Windows can only hand one to a known process."""
+    if os.name == "nt":
+        return {"share": base64.b64encode(childEnd.share(proc.pid)).decode("ascii")}
+    return {"fd": childEnd.fileno()}
 
 
 def readResult(path: str, runUid: int | None) -> bytes | None:
-    """Read the child's result file. The child owns that folder, so a link there could point anywhere the parent can read."""
+    """Read the child's result file. The child owns that folder, so a link there could point anywhere the parent can read, and a sparse file could fill its memory."""
     flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_NONBLOCK", 0) | getattr(os, "O_BINARY", 0)
     try:
         fd = os.open(path, flags)
@@ -170,70 +225,124 @@ def readResult(path: str, runUid: int | None) -> bytes | None:
         info = os.fstat(result.fileno())
         if not stat.S_ISREG(info.st_mode) or (runUid is not None and info.st_uid != runUid):
             raise ValueError("Sandbox result is not a regular file.")
-        return result.read()
+        if info.st_size > _MAX_RESULT_BYTES:
+            raise ValueError(f"Sandbox result is too large: {info.st_size} bytes.")
+        return result.read(_MAX_RESULT_BYTES)
 
 
-def _communicate(proc: subprocess.Popen, payload: str, timeoutSeconds: int | None) -> tuple[str, str]:
-    """Send the payload and wait for the child, killing it at the timeout."""
+def _waitForChild(proc: subprocess.Popen, payload: str, timeoutSeconds: int | None) -> str:
+    """Send the payload and wait for the launcher, killing it at the timeout. Returns a note for stderr."""
+    with contextlib.suppress(OSError):  # A launcher that died reports that through its exit code.
+        with proc.stdin:
+            proc.stdin.write(payload)
     try:
-        if timeoutSeconds and timeoutSeconds > 0:
-            return proc.communicate(input=payload, timeout=timeoutSeconds)
-        return proc.communicate(input=payload)
+        proc.wait(timeoutSeconds if timeoutSeconds and timeoutSeconds > 0 else None)
+        return ""
     except subprocess.TimeoutExpired:
         proc.kill()
-        stdout, stderr = proc.communicate()
-        return stdout, stderr + f"\nExecution timed out after {timeoutSeconds} seconds.\n"
+        proc.wait()
+        return f"\nExecution timed out after {timeoutSeconds} seconds.\n"
 
 
-def runSandbox(launcherName: str, projectId: str, code: str, timeoutSeconds: int | None) -> SandboxResult:
-    """Run generated code in a launcher subprocess, serving its table reads from this process."""
+def _readOutput(output: IO[bytes]) -> str:
+    """Read what the child printed, up to the cap."""
+    output.seek(0)
+    printed = output.read(_MAX_OUTPUT_BYTES + 1)
+    if len(printed) > _MAX_OUTPUT_BYTES:
+        return printed[:_MAX_OUTPUT_BYTES].decode("utf-8", "replace") + "\nOutput truncated.\n"
+    return printed.decode("utf-8", "replace")
+
+
+def _runChild(launcherName: str, projectId: str, code: str, timeoutSeconds: int | None, withResult: bool, runUid: int | None, runFolder: str, tablesFolder: str, workFolder: str) -> SandboxResult:
+    """Start the launcher, serve its table reads and collect what it produced."""
+    resultPath = os.path.join(workFolder, "result.parquet")
+    parentEnd, childEnd = socket.socketpair()
+    runEnded = threading.Event()
+    with (
+        parentEnd,
+        parentEnd.makefile("rb") as requests,
+        parentEnd.makefile("wb", buffering=0) as replies,
+        tempfile.TemporaryFile(dir=runFolder) as stdout,
+        tempfile.TemporaryFile(dir=runFolder) as stderr,
+    ):
+        with childEnd:
+            proc = _startChild(launcherName, runUid, workFolder, childEnd, stdout, stderr)
+            payload = json.dumps({
+                "projectId": projectId,
+                "code": code,
+                "result_path": resultPath,
+                "channel": {**_channelFor(proc, childEnd), "tablesFolder": tablesFolder, "parentPid": os.getpid()},
+            })
+        server = threading.Thread(target=serveTables, args=(projectId, requests, replies, tablesFolder, runEnded), daemon=True)
+        server.start()
+        try:
+            timeoutNote = _waitForChild(proc, payload, timeoutSeconds)
+        finally:
+            # Out of the child's reach: nothing it wrote to the socket can stop this or block it.
+            runEnded.set()
+            with contextlib.suppress(OSError):
+                parentEnd.shutdown(socket.SHUT_RDWR)
+            server.join()
+        resultBytes = readResult(resultPath, runUid) if withResult and proc.returncode == 0 else None
+        return SandboxResult(_readOutput(stdout), _readOutput(stderr) + timeoutNote, proc.returncode, resultBytes)
+
+
+def runSandbox(launcherName: str, projectId: str, code: str, timeoutSeconds: int | None, withResult: bool = False) -> SandboxResult:
+    """Run generated code in a launcher subprocess, serving its table reads from this process.
+
+    Only a launcher that writes a result sets `withResult`: the file is the child's, so it isn't read otherwise.
+    """
     runUid, runFolder = _claimRun()
+    uidIsClear = True
     try:
         tablesFolder, workFolder = _prepareFolders(runUid, runFolder)
-        resultPath = os.path.join(workFolder, "result.parquet")
-        requestRead, requestWrite = os.pipe()
-        replyRead, replyWrite = os.pipe()
-        with os.fdopen(requestRead, "rb") as requests, os.fdopen(replyWrite, "wb", buffering=0) as replies:
-            try:
-                try:
-                    proc, channel = _startChild(launcherName, runUid, workFolder, (requestWrite, replyRead))
-                finally:
-                    # Only the child holds this end now, so a reply to a dead child fails instead of blocking.
-                    os.close(replyRead)
-                server = threading.Thread(target=serveTables, args=(projectId, requests, replies, tablesFolder), daemon=True)
-                server.start()
-                try:
-                    payload = json.dumps({
-                        "projectId": projectId,
-                        "code": code,
-                        "result_path": resultPath,
-                        "channel": {**channel, "tablesFolder": tablesFolder},
-                    })
-                    stdout, stderr = _communicate(proc, payload, timeoutSeconds)
-                finally:
-                    os.write(requestWrite, _STOP_SERVING)
-                    server.join()
-            finally:
-                os.close(requestWrite)
-        resultBytes = readResult(resultPath, runUid) if proc.returncode == 0 else None
-        return SandboxResult(stdout, stderr, proc.returncode, resultBytes)
+        # A worker that died mid-run can leave a process holding this uid.
+        uidIsClear = _clearUid(runUid)
+        if not uidIsClear:
+            raise RuntimeError("Could not clear the sandbox run's uid.")
+        try:
+            return _runChild(launcherName, projectId, code, timeoutSeconds, withResult, runUid, runFolder, tablesFolder, workFolder)
+        finally:
+            uidIsClear = _clearUid(runUid)
     finally:
-        shutil.rmtree(runFolder, ignore_errors=True)
+        _removeRun(runFolder, uidIsClear)
 
 
-def connectTableChannel(channel: dict) -> None:
+def _lockDownChild(channel: dict) -> None:
+    """Child side: limits a run's uid can't raise, set before any generated code runs.
+
+    A run under this process's own uid is local development, where these would hit the developer's other processes.
+    """
+    if sys.platform != "linux" or not _FIRST_RUN_UID <= os.getuid() < _FIRST_RUN_UID + _RUN_UID_COUNT:
+        return
+    import resource
+
+    libc = ctypes.CDLL(None, use_errno=True)
+    for option, value in ((_PR_SET_NO_NEW_PRIVS, 1), (_PR_SET_PDEATHSIG, signal.SIGKILL)):
+        if libc.prctl(option, ctypes.c_ulong(value), ctypes.c_ulong(0), ctypes.c_ulong(0), ctypes.c_ulong(0)) != 0:
+            raise OSError(ctypes.get_errno(), "prctl failed")
+    if os.getppid() != channel["parentPid"]:  # The worker died before the signal was set.
+        sys.exit(1)
+    for limit, value in (
+        (resource.RLIMIT_NPROC, _MAX_RUN_PROCESSES),
+        (resource.RLIMIT_FSIZE, _MAX_CHILD_FILE_BYTES),
+        (resource.RLIMIT_CORE, 0),
+        (resource.RLIMIT_NOFILE, _MAX_RUN_OPEN_FILES),
+    ):
+        resource.setrlimit(limit, (value, value))
+
+
+def _connectTableChannel(channel: dict) -> None:
     """Child side: send every table read to the parent, which holds the credentials and the project."""
     import pyarrow as pa
     import pyarrow.parquet as pq
 
     if os.name == "nt":
-        import msvcrt
-        requestFd = msvcrt.open_osfhandle(channel["requests"], os.O_WRONLY)
-        replyFd = msvcrt.open_osfhandle(channel["replies"], os.O_RDONLY)
+        parent = socket.fromshare(base64.b64decode(channel["share"]))
     else:
-        requestFd, replyFd = channel["requests"], channel["replies"]
-    requests = os.fdopen(requestFd, "wb")
-    replies = os.fdopen(replyFd, "rb")
+        parent = socket.socket(fileno=channel["fd"])
+    requests = parent.makefile("wb")
+    replies = parent.makefile("rb")
     lock = threading.Lock()
 
     def readTable(tableName: str) -> "pa.Table":
@@ -249,3 +358,9 @@ def connectTableChannel(channel: dict) -> None:
         return pq.read_table(path)
 
     use_table_source(readTable)
+
+
+def enterSandbox(channel: dict) -> None:
+    """Child side: every launcher calls this once, before it runs generated code."""
+    _lockDownChild(channel)
+    _connectTableChannel(channel)
