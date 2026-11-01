@@ -187,12 +187,10 @@ class TransformationService:
             latest = t.get("latest_approved_artifact")
             if isinstance(latest, dict) and latest.get("table_name"):
                 allTransformationTables.add(self._sanitizeTableName(latest.get("table_name")))
-        if currentTransformationId is None:
-            allTransformationTables.add(sanitizedTarget)
 
         # 3. Check metadata.json to block overwriting base dataset tables
         try:
-            files = self.supabase.storage.from_("AnalyticsHub").list(projectId)
+            files = self.supabase.storage.from_("AnalyticsHub").list(projectId, {"search": "metadata.json"})
             filenames = [x.get("name") for x in files]
             if "metadata.json" in filenames:
                 fileUrl = os.environ["FILE_URL"].format(projectId=projectId, fileName="metadata.json").replace(".parquet", "") + f"?cb={int(time.time())}"
@@ -207,7 +205,10 @@ class TransformationService:
         except CustomException:
             raise
         except Exception as e:
-            logger.warning(f"_validate_transformation_table_name metadata check warning for {projectId}/{sanitizedTarget}: {e}")
+            # Refuse rather than skip: a base table this check misses is overwritten on apply.
+            exception = CustomException(e, statusCode=503, uiMessage="We could not check this table name right now. Please try again.")
+            logger.error(exception)
+            raise exception
 
     def _get_messages_from_db(self, projectId: str, transformationId: str) -> list[dict]:
         """Load messages list directly from transformations table."""
