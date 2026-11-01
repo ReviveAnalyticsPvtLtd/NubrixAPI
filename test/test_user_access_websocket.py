@@ -462,3 +462,38 @@ def test_task_status_ignores_client_text_frames(monkeypatch):
         {"taskId": "task-1", "status": "SUCCESS", "taskResponseCode": {"private": "result"}},
     ]
     assert websocket.closeCodes == [status.WS_1000_NORMAL_CLOSURE]
+
+
+class ReceiveFailsWebSocket(FakeWebSocket):
+    async def receive(self):
+        raise RuntimeError("receive failed")
+
+
+def test_task_status_sends_final_result_when_the_disconnect_watcher_fails(monkeypatch):
+    websocket = ReceiveFailsWebSocket()
+    monkeypatch.setattr(commons, "_verifyTokenInternal", SessionChecks("valid"))
+    monkeypatch.setattr(utilsRouter.celeryApp, "AsyncResult", lambda _taskId: ReadyTask())
+
+    watch_task(websocket)
+
+    assert websocket.sent == [
+        {"status": "RUNNING"},
+        {"taskId": "task-1", "status": "SUCCESS", "taskResponseCode": {"private": "result"}},
+    ]
+    assert websocket.closeCodes == [status.WS_1000_NORMAL_CLOSURE]
+
+
+def test_task_status_stops_polling_when_the_disconnect_watcher_fails(monkeypatch):
+    sessionChecks = SessionChecks("valid")
+    websocket = ReceiveFailsWebSocket()
+    monkeypatch.setattr(commons, "_verifyTokenInternal", sessionChecks)
+    monkeypatch.setattr(
+        utilsRouter.celeryApp,
+        "AsyncResult",
+        lambda _taskId: ReadyTask(10**6),
+    )
+
+    watch_task(websocket)
+
+    assert websocket.sent == [{"status": "RUNNING"}]
+    assert sessionChecks.calls == 1
