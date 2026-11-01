@@ -1,6 +1,7 @@
 """Authenticated reads of the private AnalyticsHub bucket."""
 
 import asyncio
+import concurrent.futures
 import io
 import json
 import os
@@ -9,6 +10,7 @@ import threading
 import httpx
 import pandas as pd
 import polars as pl
+import pyarrow.parquet as pq
 import pytest
 
 from test.privateStorageFixtures import SERVICE_KEY, FakePrivateStorage
@@ -30,6 +32,30 @@ def _parquet(rows: int = 1000) -> bytes:
     buffer = io.BytesIO()
     pl.DataFrame({"a": list(range(rows))}).write_parquet(buffer, row_group_size=100)
     return buffer.getvalue()
+
+
+def _oneRowGroupParquet(rows: int = 50_000) -> bytes:
+    """Written the way every loader writes: pandas keeps a table this size in one row group."""
+    source = pd.DataFrame({
+        "a": range(rows),
+        "region": pd.Categorical(["north", "south", "east"] * (rows // 3) + ["west"] * (rows % 3)),
+    })
+    buffer = io.BytesIO()
+    source.to_parquet(buffer, compression="snappy")
+    return buffer.getvalue()
+
+
+def _countDecodedBatches(monkeypatch) -> list:
+    decoded = []
+    realBatches = pq.ParquetFile.iter_batches
+
+    def countingBatches(self, *args, **kwargs):
+        for batch in realBatches(self, *args, **kwargs):
+            decoded.append(batch.num_rows)
+            yield batch
+
+    monkeypatch.setattr(pq.ParquetFile, "iter_batches", countingBatches)
+    return decoded
 
 
 def _wideParquet() -> bytes:
@@ -68,7 +94,7 @@ def test_trailingSlashOnTheBaseUrlIsIgnored(storage, monkeypatch):
 
 
 def test_missingObjectRaisesInsteadOfReturningTheErrorBody(storage):
-    with pytest.raises(httpx.HTTPStatusError):
+    with pytest.raises(projectStorage.StorageReadError):
         projectStorage.readBytes(PROJECT, "missing.json")
 
 
@@ -76,7 +102,7 @@ def test_wrongKeyRaises(storage, monkeypatch):
     storage.put(PROJECT, "metadata.json", b"{}")
     monkeypatch.setenv("SUPABASE_KEY", "anon-key")
 
-    with pytest.raises(httpx.HTTPStatusError):
+    with pytest.raises(projectStorage.StorageReadError):
         projectStorage.readBytes(PROJECT, "metadata.json")
 
 
@@ -84,7 +110,7 @@ def test_redirectIsRefusedSoTheKeyNeverReachesAnotherHost(storage):
     other = FakePrivateStorage()
     storage.redirectTo = f"{other.url}/stolen"
     try:
-        with pytest.raises(httpx.HTTPStatusError):
+        with pytest.raises(projectStorage.StorageReadError):
             projectStorage.readBytes(PROJECT, "metadata.json")
         assert other.requests == []
     finally:
@@ -215,7 +241,7 @@ def test_readTablePageWorksForNamesThatSigningCannotHandle(storage):
 
 
 def test_readTablePageForAMissingTableRaises(storage):
-    with pytest.raises(httpx.HTTPStatusError):
+    with pytest.raises(projectStorage.StorageReadError):
         projectStorage.readTablePage(PROJECT, "missing", offset=0, limit=1)
 
 
@@ -231,7 +257,7 @@ def test_readTablePageRefusesARedirect(storage):
     other = FakePrivateStorage()
     storage.redirectTo = f"{other.url}/stolen"
     try:
-        with pytest.raises(httpx.HTTPStatusError):
+        with pytest.raises(projectStorage.StorageReadError):
             projectStorage.readTablePage(PROJECT, "sales", offset=0, limit=1)
         assert other.requests == []
     finally:
@@ -242,8 +268,104 @@ def test_aServerThatIgnoresRangeIsAnErrorNotWrongRows(storage):
     storage.put(PROJECT, "sales.parquet", _parquet(10))
     storage.ignoreRange = True
 
-    with pytest.raises(httpx.HTTPError):
+    with pytest.raises(projectStorage.StorageReadError):
         projectStorage.readTablePage(PROJECT, "sales", offset=0, limit=1)
+
+
+def test_aFailedReadComesBackFromAProcessPoolWithoutBreakingIt(storage):
+    with concurrent.futures.ProcessPoolExecutor(max_workers=1) as pool:
+        failed = pool.submit(projectStorage.readBytes, PROJECT, "missing.json")
+        with pytest.raises(projectStorage.StorageReadError):
+            failed.result(timeout=60)
+
+        storage.put(PROJECT, "metadata.json", b"{}")
+        assert pool.submit(projectStorage.readBytes, PROJECT, "metadata.json").result(timeout=60) == b"{}"
+
+
+def test_aFailedReadNamesTheFileButNeverTheKey(storage):
+    with pytest.raises(projectStorage.StorageReadError) as failure:
+        projectStorage.readBytes(PROJECT, "missing.json")
+
+    assert "missing.json" in str(failure.value)
+    assert SERVICE_KEY not in str(failure.value)
+
+
+def test_readTablePageTakesTheSizeFromHeadWhenItCan(storage):
+    storage.put(PROJECT, "sales.parquet", _parquet(10))
+
+    projectStorage.readTablePage(PROJECT, "sales", offset=2, limit=2)
+
+    assert storage.requests[0]["method"] == "HEAD"
+    assert "bytes=0-0" not in [r["range"] for r in storage.requests]
+
+
+def test_readTablePageFallsBackToARangeWithoutContentLength(storage):
+    storage.put(PROJECT, "sales.parquet", _parquet(10))
+    storage.omitContentLength = True
+
+    frame, totalRows = projectStorage.readTablePage(PROJECT, "sales", offset=2, limit=2)
+
+    assert frame["a"].to_list() == [2, 3]
+    assert totalRows == 10
+    assert "bytes=0-0" in [r["range"] for r in storage.requests]
+
+
+def test_readTablePageAsksForUncompressedBytes(storage):
+    storage.put(PROJECT, "sales.parquet", _parquet(10))
+    storage.compressUnlessIdentity = True
+
+    frame, _ = projectStorage.readTablePage(PROJECT, "sales", offset=2, limit=2)
+
+    assert frame["a"].to_list() == [2, 3]
+    assert {r["acceptEncoding"] for r in storage.requests} == {"identity"}
+
+
+def test_aShortRangeBodyIsAnErrorNotWrongRows(storage):
+    storage.put(PROJECT, "sales.parquet", _parquet(10))
+    storage.truncateRanges = True
+
+    with pytest.raises(projectStorage.StorageReadError):
+        projectStorage.readTablePage(PROJECT, "sales", offset=0, limit=1)
+
+
+def test_aRangeAnswerWithoutTheTotalSizeIsAnError(storage):
+    storage.put(PROJECT, "sales.parquet", _parquet(10))
+    storage.omitContentLength = True
+    storage.hideRangeTotal = True
+
+    with pytest.raises(projectStorage.StorageReadError):
+        projectStorage.readTablePage(PROJECT, "sales", offset=0, limit=1)
+
+
+def test_readTablePageStopsDecodingOnceThePageIsCovered(storage, monkeypatch):
+    storage.put(PROJECT, "loaded.parquet", _oneRowGroupParquet())
+    decoded = _countDecodedBatches(monkeypatch)
+
+    frame, totalRows = projectStorage.readTablePage(PROJECT, "loaded", offset=10, limit=5)
+
+    assert frame["a"].to_list() == [10, 11, 12, 13, 14]
+    assert totalRows == 50_000
+    assert len(decoded) == 1 and sum(decoded) < 50_000
+
+
+def test_readTablePageAcrossABatchBoundaryOfOneRowGroup(storage):
+    body = _oneRowGroupParquet()
+    storage.put(PROJECT, "loaded.parquet", body)
+
+    frame, _ = projectStorage.readTablePage(PROJECT, "loaded", offset=8190, limit=5)
+
+    expected = pl.read_parquet(io.BytesIO(body)).slice(8190, 5)
+    assert frame["a"].to_list() == [8190, 8191, 8192, 8193, 8194]
+    assert frame.to_dicts() == expected.to_dicts()
+    assert frame.schema == expected.schema
+
+
+def test_readTablePageAtTheEndOfOneRowGroup(storage):
+    storage.put(PROJECT, "loaded.parquet", _oneRowGroupParquet())
+
+    frame, _ = projectStorage.readTablePage(PROJECT, "loaded", offset=49_998, limit=10)
+
+    assert frame["a"].to_list() == [49_998, 49_999]
 
 
 def test_aSeekOnOneThreadDoesNotMoveAnotherThreadsRead(storage):
