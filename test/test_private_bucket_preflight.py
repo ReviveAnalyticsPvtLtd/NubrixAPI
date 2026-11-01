@@ -147,6 +147,42 @@ def test_failsWhenATableCannotBePaged(storage):
     assert result["pagedReadRows"] is None
 
 
+def test_aRefusedReadReportsTheStatusAndTheFile(storage, monkeypatch):
+    storage.publicBucket = True
+    monkeypatch.setenv("SUPABASE_KEY", "wrong-key")
+
+    result = _run()
+
+    assert "400" in result["authenticatedReadError"] and "metadata.json" in result["authenticatedReadError"]
+    assert "400" in result["pagedReadError"] and "sales.parquet" in result["pagedReadError"]
+    assert "wrong-key" not in json.dumps(result)
+
+
+def test_aMissingTableIsToldApartFromAnIgnoredRange(storage):
+    missing = preflight.runPreflight(PROJECT, "absent")
+    storage.ignoreRange = True
+    ignored = _run()
+
+    assert "400" in missing["pagedReadError"] and "absent.parquet" in missing["pagedReadError"]
+    assert "bytes" in ignored["pagedReadError"]
+    assert missing["pagedReadError"] != ignored["pagedReadError"]
+
+
+def test_aShortRangeBodyNamesTheBytesItAskedFor(storage):
+    storage.truncateRanges = True
+
+    assert "bytes" in _run()["pagedReadError"]
+
+
+def test_otherErrorsStillReportOnlyTheirType(storage, monkeypatch):
+    def fail(*_args):
+        raise RuntimeError(SERVICE_KEY)
+
+    monkeypatch.setattr(preflight, "readJson", fail)
+
+    assert _run()["authenticatedReadError"] == "RuntimeError"
+
+
 def test_resultCarriesNoStoredContentOrCredential(storage, monkeypatch):
     text = json.dumps(_run())
 

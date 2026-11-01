@@ -1,9 +1,10 @@
 """Read-only rollout check for the private AnalyticsHub bucket.
 
 Reads one project's metadata.json and one of its tables, then prints JSON with
-counts and cache headers only, never stored content. Run it before the deploy on
-a small table and on a large pandas-written one. Run with --expect-private after
-the flip, with SUPABASE_ANON_KEY in the environment.
+counts, cache headers and storage error messages only, never stored content or
+a key. Run it before the deploy on a small table and on a large pandas-written
+one. Run with --expect-private after the flip, with SUPABASE_ANON_KEY in the
+environment.
 
     python scripts/privateBucketPreflight.py --project-id <id> --table <name> [--expect-private]
 """
@@ -24,9 +25,14 @@ if str(REPOSITORY_ROOT) not in sys.path:
 from dotenv import load_dotenv
 import httpx
 
-from utils.projectStorage import authHeaders, objectUrl, readJson, readTablePage
+from utils.projectStorage import StorageReadError, authHeaders, objectUrl, readJson, readTablePage
 
 _REFUSED_STATUSES = {400, 401, 403, 404}
+
+
+def _errorText(error: Exception) -> str:
+    """A StorageReadError holds only a status or byte range and a path. Anything else could hold more."""
+    return str(error) if isinstance(error, StorageReadError) else type(error).__name__
 
 
 def _checkAuthenticatedRead(projectId: str) -> dict:
@@ -34,7 +40,7 @@ def _checkAuthenticatedRead(projectId: str) -> dict:
         readJson(projectId, "metadata.json")
         return {"authenticatedRead": "ok"}
     except Exception as e:
-        return {"authenticatedRead": "failed", "authenticatedReadError": type(e).__name__}
+        return {"authenticatedRead": "failed", "authenticatedReadError": _errorText(e)}
 
 
 def _checkPagedRead(projectId: str, tableName: str) -> dict:
@@ -42,7 +48,7 @@ def _checkPagedRead(projectId: str, tableName: str) -> dict:
         _, totalRows = readTablePage(projectId, tableName, offset=0, limit=1)
         return {"pagedReadRows": totalRows}
     except Exception as e:
-        return {"pagedReadRows": None, "pagedReadError": type(e).__name__}
+        return {"pagedReadRows": None, "pagedReadError": _errorText(e)}
 
 
 def _probe(url: str, headers: dict | None = None) -> str:
