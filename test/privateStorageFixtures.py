@@ -4,6 +4,7 @@ The status codes and bodies match storage-api v1.82.1 behind Kong: a private
 object answers 400 with a JSON 404 body and the public route is dead.
 """
 
+import gzip
 import http.server
 import json
 import threading
@@ -24,6 +25,14 @@ class FakePrivateStorage:
         self.redirectTo: str | None = None
         self.ignoreRange = False
         self.publicBucket = False
+        self.publicRouteStatus: int | None = None
+        self.publicKeys: set[str] = set()
+        self.anonKey: str | None = None
+        self.omitContentLength = False
+        self.truncateRanges = False
+        self.hideRangeTotal = False
+        self.compressUnlessIdentity = False
+        self.responseHeaders: dict[str, str] = {}
         fake = self
 
         class Handler(http.server.BaseHTTPRequestHandler):
@@ -65,6 +74,7 @@ class FakePrivateStorage:
             "authorization": handler.headers.get("Authorization"),
             "apikey": handler.headers.get("apikey"),
             "range": handler.headers.get("Range"),
+            "acceptEncoding": handler.headers.get("Accept-Encoding"),
         })
         if self.redirectTo:
             handler.send_response(302)
@@ -74,18 +84,23 @@ class FakePrivateStorage:
             return
         route = unquote(parts.path)[len(_OBJECT_PREFIX):]
         if route.startswith("public/"):
-            if self.publicBucket:
-                self._sendObject(handler, route[len("public/"):], sendBody)
+            key = route[len("public/"):]
+            if self.publicRouteStatus:
+                self._sendJson(handler, _NOT_FOUND, sendBody, status=self.publicRouteStatus)
+            elif self.publicBucket or key in self.publicKeys:
+                self._sendObject(handler, key, sendBody)
             else:
                 self._sendJson(handler, _NO_BUCKET, sendBody)
+        elif self.anonKey and handler.headers.get("Authorization") == f"Bearer {self.anonKey}":
+            self._sendObject(handler, route, sendBody)
         elif not self._authorized(handler):
             self._sendJson(handler, _NO_BUCKET, sendBody)
         else:
             self._sendObject(handler, route, sendBody)
 
-    def _sendJson(self, handler, body: dict, sendBody: bool) -> None:
+    def _sendJson(self, handler, body: dict, sendBody: bool, status: int = 400) -> None:
         payload = json.dumps(body).encode("utf-8")
-        handler.send_response(400)
+        handler.send_response(status)
         handler.send_header("Content-Type", "application/json")
         handler.send_header("Content-Length", str(len(payload)))
         handler.end_headers()
@@ -97,19 +112,35 @@ class FakePrivateStorage:
             self._sendJson(handler, _NOT_FOUND, sendBody)
             return
         body = self.objects[key]
+        if self.compressUnlessIdentity and handler.headers.get("Accept-Encoding") != "identity":
+            self._sendCompressed(handler, body, sendBody)
+            return
         status = 200
         requestedRange = handler.headers.get("Range")
         if requestedRange and handler.command == "GET" and not self.ignoreRange:
             start, end = requestedRange.split("=")[1].split("-")
             start, end = int(start), min(int(end) if end else len(body) - 1, len(body) - 1)
-            contentRange = f"bytes {start}-{end}/{len(body)}"
+            contentRange = f"bytes {start}-{end}/{'*' if self.hideRangeTotal else len(body)}"
             body = body[start:end + 1]
             status = 206
+            if self.truncateRanges and len(body) > 1:
+                body = body[:-1]
         handler.send_response(status)
         if status == 206:
             handler.send_header("Content-Range", contentRange)
         handler.send_header("Accept-Ranges", "bytes")
-        handler.send_header("Content-Length", str(len(body)))
+        for name, value in self.responseHeaders.items():
+            handler.send_header(name, value)
+        if not self.omitContentLength:
+            handler.send_header("Content-Length", str(len(body)))
         handler.end_headers()
         if sendBody:
             handler.wfile.write(body)
+
+    def _sendCompressed(self, handler, body: bytes, sendBody: bool) -> None:
+        """Answer like an edge that compresses text/plain: gzip, no length and no Range."""
+        handler.send_response(200)
+        handler.send_header("Content-Encoding", "gzip")
+        handler.end_headers()
+        if sendBody:
+            handler.wfile.write(gzip.compress(body))
