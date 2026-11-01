@@ -59,6 +59,13 @@ async def _waitForClientToLeave(websocket: WebSocket) -> None:
         pass
 
 
+def _clientHasLeft(clientLeft: asyncio.Task) -> bool:
+    """
+    A watcher that failed says nothing about the client, so a result is still sent.
+    """
+    return clientLeft.done() and clientLeft.exception() is None
+
+
 def _finalTaskStatus(task) -> dict:
     if task.status != "SUCCESS":
         return {"taskId": task.task_id, "status": "FAILURE", "taskResponseCode": None}
@@ -204,20 +211,20 @@ async def getTaskStatus(websocket: WebSocket):
                 return
             taskReady = await asyncio.to_thread(r.ready)
             sessionValid = await asyncio.to_thread(_websocketTokenIsValid, credentials)
-            if clientLeft.done():
+            if _clientHasLeft(clientLeft):
                 return
             if sessionValid is False:
                 await websocket.close(code=status.WS_1008_POLICY_VIOLATION)
                 return
         finalStatus = await asyncio.to_thread(_finalTaskStatus, r)
-        if clientLeft.done():
+        if _clientHasLeft(clientLeft):
             return
         await websocket.send_json(finalStatus)
         await websocket.close()
     except WebSocketDisconnect:
         pass
     except Exception as e:
-        if clientLeft.done():
+        if _clientHasLeft(clientLeft):
             return
         logger.error("Task status watch failed: {}", e)
         await websocket.send_json({"status": "ERROR", "errorDetail": "Task status is unavailable."})
