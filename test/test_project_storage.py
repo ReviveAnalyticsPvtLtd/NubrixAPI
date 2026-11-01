@@ -6,6 +6,7 @@ import io
 import json
 import os
 import threading
+import weakref
 
 import httpx
 import pandas as pd
@@ -346,6 +347,26 @@ def test_readTablePageStopsDecodingOnceThePageIsCovered(storage, monkeypatch):
     assert frame["a"].to_list() == [10, 11, 12, 13, 14]
     assert totalRows == 50_000
     assert len(decoded) == 1 and sum(decoded) < 50_000
+
+
+def test_readTablePageReleasesEachBatchBeforeThePage(storage, monkeypatch):
+    storage.put(PROJECT, "loaded.parquet", _oneRowGroupParquet())
+    realBatches = pq.ParquetFile.iter_batches
+    decoded, aliveAtEachYield = [], []
+
+    def trackingBatches(self, *args, **kwargs):
+        for batch in realBatches(self, *args, **kwargs):
+            decoded.append(weakref.ref(batch))
+            aliveAtEachYield.append(sum(ref() is not None for ref in decoded))
+            yield batch
+
+    monkeypatch.setattr(pq.ParquetFile, "iter_batches", trackingBatches)
+
+    frame, _ = projectStorage.readTablePage(PROJECT, "loaded", offset=40_000, limit=5)
+
+    assert frame["a"].to_list() == [40_000, 40_001, 40_002, 40_003, 40_004]
+    assert len(aliveAtEachYield) >= 5
+    assert max(aliveAtEachYield) <= 2
 
 
 def test_readTablePageAcrossABatchBoundaryOfOneRowGroup(storage):
