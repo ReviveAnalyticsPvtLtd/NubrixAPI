@@ -834,10 +834,8 @@ def test_sandboxCannotReadTheApplicationLogs(runInSandbox):
 @separateUids
 def test_sandboxHasHardLimits(runInSandbox):
     code = (
-        'resource = pd.io.common.os.sys.modules["resource"]
-'
-        'limits = {name: resource.getrlimit(getattr(resource, name)) for name in ("RLIMIT_NPROC", "RLIMIT_FSIZE", "RLIMIT_CORE", "RLIMIT_NOFILE")}
-'
+        'resource = pd.io.common.os.sys.modules["resource"]\n'
+        'limits = {name: resource.getrlimit(getattr(resource, name)) for name in ("RLIMIT_NPROC", "RLIMIT_FSIZE", "RLIMIT_CORE", "RLIMIT_NOFILE")}\n'
         'outcome = pd.io.common.os.sys.modules["json"].dumps(limits)'
     )
 
@@ -852,10 +850,8 @@ def test_sandboxHasHardLimits(runInSandbox):
 @separateUids
 def test_sandboxCantRaiseItsLimits(runInSandbox):
     code = (
-        'resource = pd.io.common.os.sys.modules["resource"]
-'
-        f'resource.setrlimit(resource.RLIMIT_NPROC, ({sandboxRunner._MAX_RUN_PROCESSES + 1},) * 2)
-'
+        'resource = pd.io.common.os.sys.modules["resource"]\n'
+        f'resource.setrlimit(resource.RLIMIT_NPROC, ({sandboxRunner._MAX_RUN_PROCESSES + 1},) * 2)\n'
         'outcome = "raised"'
     )
 
