@@ -1575,7 +1575,7 @@ Trigger a forecasts Celery task.
 
 ### 10.6 `WS /api/latest/utils/ws/getTaskStatus?token={jwt}&taskId={taskId}`
 
-WebSocket for polling Celery task status. Emits JSON status updates every 5 seconds until the task is ready.
+WebSocket for watching a Celery task. Sends `RUNNING` once, checks the task every 5 seconds, then sends one last message and closes. A watch ends after 30 minutes, or as soon as the client leaves. The session is re-checked on each poll: a refused session closes with 1008, while a failed check keeps watching and holds any result until a check succeeds.
 
 **Connection:**
 ```
@@ -1586,7 +1586,15 @@ ws://api.example.com/api/latest/utils/ws/getTaskStatus?token=eyJ...&taskId=celer
 ```json
 { "status": "RUNNING" }
 { "taskId": "uuid", "status": "SUCCESS", "taskResponseCode": { ... } }
+{ "taskId": "uuid", "status": "FAILURE", "taskResponseCode": 500 }
+{ "taskId": "uuid", "status": "FAILURE", "taskResponseCode": null }
+{ "taskId": "uuid", "status": "UNKNOWN", "taskResponseCode": null }
+{ "status": "ERROR", "errorDetail": "Task status is unavailable." }
 ```
+
+- `FAILURE`: the task failed or was revoked (`taskResponseCode` is null), or it finished with a code of 400 or above.
+- `UNKNOWN`: the watch limit was reached. The task may still be running, so open a new socket to keep watching.
+- `ERROR`: polling itself failed. The task's outcome is unknown.
 
 ---
 

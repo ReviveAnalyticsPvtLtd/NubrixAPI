@@ -16,6 +16,7 @@ from fastapi import (
     status,
     APIRouter,
     Depends,
+    HTTPException,
     WebSocket,
     WebSocketDisconnect,
 )
@@ -26,6 +27,8 @@ from nubrix.triggers.celery import celeryApp
 from fastapi.responses import ORJSONResponse
 from api.commons import verifyToken, requireCredits, UserContext
 import asyncio
+import time
+from utils.logger import logger
 
 router = APIRouter()
 """
@@ -33,11 +36,27 @@ Router for utility-related endpoints.
 """
 
 
-def _websocketTokenIsValid(credentials: HTTPAuthorizationCredentials) -> bool:
+def _websocketTokenIsValid(credentials: HTTPAuthorizationCredentials) -> bool | None:
+    """
+    Check a socket's session. Returns None when the check itself failed, which
+    is neither a valid session nor a refused one.
+    """
     try:
         return bool(verifyToken(credentials))
-    except Exception:
+    except HTTPException:
         return False
+    except Exception as e:
+        logger.warning("Task status session check failed: {}", e)
+        return None
+
+
+TASK_STATUS_POLL_SECONDS = 5
+TASK_STATUS_MAX_WATCH_SECONDS = 30 * 60
+
+
+async def _waitForClientToLeave(websocket: WebSocket) -> None:
+    while (await websocket.receive())["type"] != "websocket.disconnect":
+        pass
 
 
 def _finalTaskStatus(task) -> dict:
@@ -164,25 +183,37 @@ async def getTaskStatus(websocket: WebSocket):
         await websocket.close(code=status.WS_1008_POLICY_VIOLATION)
         return
     credentials = HTTPAuthorizationCredentials(scheme = "Bearer", credentials = token)
-    if not _websocketTokenIsValid(credentials):
+    if not await asyncio.to_thread(_websocketTokenIsValid, credentials):
         await websocket.close(code = status.WS_1008_POLICY_VIOLATION)
         return
     await websocket.send_json({"status": "RUNNING"})
+    clientLeft = asyncio.create_task(_waitForClientToLeave(websocket))
     try:
         taskId = websocket.query_params.get("taskId")
         r = celeryApp.AsyncResult(taskId)
-        while not r.ready():
-            await asyncio.sleep(5)
-            if not _websocketTokenIsValid(credentials):
+        watchEndsAt = time.monotonic() + TASK_STATUS_MAX_WATCH_SECONDS
+        sessionValid = True
+        taskReady = await asyncio.to_thread(r.ready)
+        while not (taskReady and sessionValid):
+            if time.monotonic() >= watchEndsAt:
+                await websocket.send_json({"taskId": r.task_id, "status": "UNKNOWN", "taskResponseCode": None})
+                await websocket.close()
+                return
+            await asyncio.wait({clientLeft}, timeout=TASK_STATUS_POLL_SECONDS)
+            if clientLeft.done():
+                return
+            taskReady = await asyncio.to_thread(r.ready)
+            sessionValid = await asyncio.to_thread(_websocketTokenIsValid, credentials)
+            if sessionValid is False:
                 await websocket.close(code=status.WS_1008_POLICY_VIOLATION)
                 return
-        if not _websocketTokenIsValid(credentials):
-            await websocket.close(code=status.WS_1008_POLICY_VIOLATION)
-            return
-        await websocket.send_json(_finalTaskStatus(r))
+        await websocket.send_json(await asyncio.to_thread(_finalTaskStatus, r))
         await websocket.close()
     except WebSocketDisconnect:
         pass
     except Exception as e:
-        await websocket.send_json({"status": "ERROR", "errorDetail": str(e)})
+        logger.error("Task status watch failed: {}", e)
+        await websocket.send_json({"status": "ERROR", "errorDetail": "Task status is unavailable."})
         await websocket.close()
+    finally:
+        clientLeft.cancel()
