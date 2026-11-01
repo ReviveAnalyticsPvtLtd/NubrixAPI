@@ -535,6 +535,8 @@ Multipart form upload.
 
 All routes under `/api/latest/dataLoader/`. Auth via `verifyToken` unless noted.
 
+CSV, Excel, MySQL, PostgreSQL and MongoDB loads check the table name first. A name already in the project returns `409`. If `metadata.json` cannot be read the load is refused with `503` and can be retried.
+
 ### 3.1 `POST /api/latest/dataLoader/loadCsvData`
 
 Multipart form upload.

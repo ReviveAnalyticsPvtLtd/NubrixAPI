@@ -500,7 +500,8 @@ class ManagementService:
 
     def validateTableNameAvailable(self, projectId: str, tableName: str) -> None:
         """Check that a table name does not already exist in metadata.json (active or inactive).
-        Raises CustomException(409) if the name is already taken.
+        Raises CustomException(409) if the name is already taken, and
+        CustomException(503) if metadata.json cannot be read.
         """
         try:
             files = self.client.storage.from_("AnalyticsHub").list(projectId, {"search": "metadata.json"})
@@ -518,7 +519,10 @@ class ManagementService:
         except CustomException:
             raise
         except Exception as e:
-            logger.warning(f"validateTableNameAvailable check failed for {projectId}/{tableName}: {e}")
+            # Refuse rather than skip: a table this check misses is overwritten on upload.
+            exception = CustomException(e, statusCode=503, uiMessage="We could not check this table name right now. Please try again.")
+            logger.error(exception)
+            raise exception
 
     def _generateMetadata(self, projectId: str, userId: str | None = None, tableNames: list[str] | None = None) -> dict:
         """
