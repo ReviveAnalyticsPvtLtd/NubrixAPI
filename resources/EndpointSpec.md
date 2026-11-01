@@ -1536,6 +1536,8 @@ page's data is unchanged) and `refresh: true` to force regeneration.
 }
 ```
 
+An empty list means the project has no stored insights. If the stored file cannot be read the route returns 500, never an empty list.
+
 ---
 
 ### 10.4 `PATCH /api/latest/utils/updateDashboardInsightStatus`

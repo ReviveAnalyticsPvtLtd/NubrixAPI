@@ -1,8 +1,12 @@
 import importlib
+import io
 import json
+import os
 import sys
 import types
 import unittest
+from unittest import mock
+from urllib.error import URLError
 
 
 def _install_import_stubs():
@@ -140,20 +144,32 @@ class _FakeImageToInsights:
 
 
 class _FakeStorageBucket:
-    def __init__(self):
+    PAGE_LIMIT = 100
+
+    def __init__(self, fileNames=(), listError=None):
         self.uploads = []
+        self.fileNames = sorted(fileNames)
+        self.listError = listError
 
     def from_(self, bucket):
         self.bucket = bucket
         return self
+
+    def list(self, path=None, options=None):
+        """Mirrors the storage client: one page of names, narrowed by `search`."""
+        if self.listError:
+            raise self.listError
+        search = (options or {}).get("search", "")
+        matches = [name for name in self.fileNames if name.startswith(search)]
+        return [{"name": name} for name in matches[:self.PAGE_LIMIT]]
 
     def upload(self, path, file, file_options=None):
         self.uploads.append({"path": path, "file": file, "file_options": file_options})
 
 
 class _FakeClient:
-    def __init__(self):
-        self.storage = _FakeStorageBucket()
+    def __init__(self, fileNames=(), listError=None):
+        self.storage = _FakeStorageBucket(fileNames, listError)
 
 
 class DashboardInsightsTests(unittest.TestCase):
@@ -328,6 +344,164 @@ class DashboardInsightsTests(unittest.TestCase):
         self.assertEqual("generated", result["source"])
         self.assertFalse(result["cacheHit"])
         self.assertEqual(1, len(service.imageToInsightsModule.calls))
+
+
+class DashboardInsightsReadFailureTests(unittest.TestCase):
+    """dashboardInsights.json is rewritten whole, so a failed read must never look like an empty file."""
+
+    STORED = [
+        {"id": "other-page", "pageId": "page_2", "status": "accepted", "insights": _insights()},
+        {"id": "this-page", "pageId": "page_1", "status": "rejected", "insights": _insights()},
+    ]
+
+    @classmethod
+    def setUpClass(cls):
+        cls._savedModules = {name: sys.modules.get(name) for name in _STUB_KEYS}
+        cls.module = _reload_utility_service()
+        cls.ImageToInsightsModel = importlib.import_module("api.models").ImageToInsightsModel
+
+    @classmethod
+    def tearDownClass(cls):
+        for name, module in cls._savedModules.items():
+            if module is None:
+                sys.modules.pop(name, None)
+            else:
+                sys.modules[name] = module
+
+    def setUp(self):
+        self.logger = mock.Mock()
+        self.urlopen = mock.Mock(side_effect=lambda _url: io.BytesIO(json.dumps(self.STORED).encode("utf-8")))
+        for patcher in (
+            mock.patch.object(self.module, "logger", self.logger),
+            mock.patch.object(self.module, "urlopen", self.urlopen),
+            mock.patch.dict(os.environ, {"FILE_URL": "https://files.example.test/{projectId}/{fileName}.parquet"}),
+        ):
+            patcher.start()
+            self.addCleanup(patcher.stop)
+
+    def _service(self, fileNames=("dashboardInsights.json",), listError=None):
+        service = object.__new__(self.module.UtilityService)
+        service.insightContextBuilder = _FakeContextBuilder()
+        service.signalEngine = _FakeSignalEngine()
+        service.payloadBuilder = _FakePayloadBuilder()
+        service.imageToInsightsModule = _FakeImageToInsights(_insights(fresh=True))
+        service.client = _FakeClient(fileNames, listError)
+        return service
+
+    def _payload(self, refresh=False):
+        return self.ImageToInsightsModel(projectId="project_1", pageId="page_1", refresh=refresh)
+
+    def _assertReadFailureLogged(self):
+        self.logger.error.assert_called()
+        self.assertTrue(any("project_1" in str(call) for call in self.logger.error.call_args_list))
+
+    def test_missing_file_is_an_empty_list(self):
+        service = self._service(fileNames=("metadata.json",))
+
+        self.assertEqual([], service._loadDashboardInsightsFile("project_1"))
+        self.urlopen.assert_not_called()
+        self.logger.error.assert_not_called()
+
+    def test_stored_records_are_returned(self):
+        self.assertEqual(self.STORED, self._service()._loadDashboardInsightsFile("project_1"))
+
+    def test_file_past_the_first_page_of_a_listing_is_still_found(self):
+        earlierFiles = [f"a_table_{index:03}.parquet" for index in range(150)]
+        service = self._service(fileNames=[*earlierFiles, "dashboardInsights.json"])
+
+        self.assertEqual(self.STORED, service._loadDashboardInsightsFile("project_1"))
+
+    def test_listing_failure_raises_and_is_logged(self):
+        service = self._service(listError=ConnectionError("storage unavailable"))
+
+        with self.assertRaises(ConnectionError):
+            service._loadDashboardInsightsFile("project_1")
+
+        self._assertReadFailureLogged()
+
+    def test_download_failure_raises_and_is_logged(self):
+        self.urlopen.side_effect = URLError("storage unavailable")
+
+        with self.assertRaises(URLError):
+            self._service()._loadDashboardInsightsFile("project_1")
+
+        self._assertReadFailureLogged()
+
+    def test_unreadable_contents_raise_and_are_logged(self):
+        self.urlopen.side_effect = lambda _url: io.BytesIO(b"{not json")
+
+        with self.assertRaises(ValueError):
+            self._service()._loadDashboardInsightsFile("project_1")
+
+        self._assertReadFailureLogged()
+
+    def test_contents_that_are_not_a_list_raise_and_are_logged(self):
+        self.urlopen.side_effect = lambda _url: io.BytesIO(b'{"id": "not-a-list"}')
+
+        with self.assertRaises(ValueError):
+            self._service()._loadDashboardInsightsFile("project_1")
+
+        self._assertReadFailureLogged()
+
+    def test_get_dashboard_insights_raises_on_a_failed_read(self):
+        self.urlopen.side_effect = URLError("storage unavailable")
+
+        with self.assertRaises(self.module.CustomException) as caught:
+            self._service().getDashboardInsights("project_1")
+
+        self.assertEqual(500, caught.exception.statusCode)
+
+    def test_status_update_reports_the_read_failure_and_writes_nothing(self):
+        self.urlopen.side_effect = URLError("storage unavailable")
+        service = self._service()
+
+        with self.assertRaises(self.module.CustomException) as caught:
+            service.updateDashboardInsightStatus("project_1", "this-page", "accepted")
+
+        self.assertIn("storage unavailable", str(caught.exception))
+        self.assertNotIn("not found", str(caught.exception))
+        self.assertEqual([], service.client.storage.uploads)
+
+    def test_failed_read_stops_a_generation_before_the_model_runs(self):
+        for refresh in (False, True):
+            with self.subTest(refresh=refresh):
+                self.urlopen.side_effect = URLError("storage unavailable")
+                service = self._service()
+
+                with self.assertRaises(self.module.CustomException):
+                    service.getInsightsFromImage(self._payload(refresh=refresh))
+
+                self.assertEqual([], service.imageToInsightsModule.calls)
+                self.assertEqual([], service.client.storage.uploads)
+
+    def test_upsert_never_writes_after_a_failed_read(self):
+        self.urlopen.side_effect = URLError("storage unavailable")
+        service = self._service()
+
+        with self.assertRaises(URLError):
+            service._persistDashboardInsight("project_1", "page_1", _insights(), "key")
+
+        self.assertEqual([], service.client.storage.uploads)
+
+    def test_read_failing_after_the_model_ran_still_writes_nothing(self):
+        stored = io.BytesIO(json.dumps(self.STORED).encode("utf-8"))
+        self.urlopen.side_effect = [stored, URLError("storage unavailable")]
+        service = self._service()
+
+        with self.assertRaises(self.module.CustomException):
+            service.getInsightsFromImage(self._payload(refresh=True))
+
+        self.assertEqual(1, len(service.imageToInsightsModule.calls))
+        self.assertEqual([], service.client.storage.uploads)
+
+    def test_upsert_keeps_other_pages_after_a_good_read(self):
+        service = self._service()
+
+        service._persistDashboardInsight("project_1", "page_1", _insights(), "key")
+
+        written = json.loads(service.client.storage.uploads[-1]["file"].decode("utf-8"))
+        self.assertEqual(2, len(written))
+        self.assertEqual(self.STORED[0], written[0])
 
 
 if __name__ == "__main__":
