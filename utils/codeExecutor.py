@@ -75,6 +75,7 @@ class REPLManager:
         # 2. Launch subprocess
         stdout = ""
         stderr = ""
+        returnCode = None
         launcher_path = os.path.join(os.path.dirname(__file__), "sandbox_launcher.py")
         try:
             app_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -112,6 +113,7 @@ class REPLManager:
                 proc.kill()
                 stdout, stderr = proc.communicate()
                 stderr += f"\nExecution timed out after {self.timeoutSeconds} seconds.\n"
+            returnCode = proc.returncode
         except Exception as e:
             stderr = f"Error during subprocess execution: {e}\n"
         finally:
@@ -121,9 +123,10 @@ class REPLManager:
                 except Exception as e:
                     logger.warning(f"Failed to release semaphore for project {projectId}: {e}")
 
-        if stdout:
-            return stdout
-        return stderr
+        # Callers accept any valid JSON as the result, so a failed run's partial stdout must not reach them.
+        if returnCode:
+            return stderr or f"Code execution exited with code {returnCode} and wrote no error output."
+        return stdout or stderr
 
 
 replManager = REPLManager(timeoutSeconds=None, maxConcurrentPerProject=50)

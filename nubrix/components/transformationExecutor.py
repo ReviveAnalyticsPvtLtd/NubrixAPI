@@ -190,8 +190,9 @@ class TransformationExecutor:
             {"projectId": projectId, "code": pythonCode},
             self.timeoutSeconds,
         )
-        if rc != 0 and stderr:
-            return f"Stdout:\n{stdout}\nStderr/Errors:\n{stderr}"
+        if rc != 0:
+            errors = stderr or f"Inspection exited with code {rc} and wrote no error output."
+            return f"Stdout:\n{stdout}\nStderr/Errors:\n{errors}"
         return stdout if stdout else "Inspection executed successfully with no output."
 
     def executeAndPreview(self, projectId: str, pythonCode: str, tableName: str) -> tuple[list[dict], bytes]:
