@@ -197,11 +197,15 @@ class TransformationService:
                 metadata = json.loads(urlopen(fileUrl).read())
                 # If target table exists in metadata.json AND is not owned by ANY transformation workspace, it's a base dataset table!
                 if sanitizedTarget in metadata and sanitizedTarget not in allTransformationTables:
-                    raise CustomException(
-                        ValueError(f"Table '{sanitizedTarget}' is a base dataset and cannot be overwritten."),
-                        statusCode=409,
-                        uiMessage=f"A base dataset named '{sanitizedTarget}' already exists in this project and cannot be overwritten by a transformation."
-                    )
+                    # A key alone proves nothing: earlier transformation deletes left theirs behind.
+                    tableFile = f"{sanitizedTarget}.parquet"
+                    tableFiles = self.supabase.storage.from_("AnalyticsHub").list(projectId, {"search": tableFile})
+                    if tableFile in [x.get("name") for x in tableFiles]:
+                        raise CustomException(
+                            ValueError(f"Table '{sanitizedTarget}' is a base dataset and cannot be overwritten."),
+                            statusCode=409,
+                            uiMessage=f"A base dataset named '{sanitizedTarget}' already exists in this project and cannot be overwritten by a transformation."
+                        )
         except CustomException:
             raise
         except Exception as e:
@@ -209,6 +213,23 @@ class TransformationService:
             exception = CustomException(e, statusCode=503, uiMessage="We could not check this table name right now. Please try again.")
             logger.error(exception)
             raise exception
+
+    def _remove_table_from_metadata(self, projectId: str, tableName: str) -> None:
+        """Drop a deleted table's key from metadata.json. generateMetadata only ever adds keys."""
+        bucket = self.supabase.storage.from_("AnalyticsHub")
+        files = bucket.list(projectId, {"search": "metadata.json"})
+        if "metadata.json" not in [x.get("name") for x in files]:
+            return
+        metadataPath = f"{projectId}/metadata.json"
+        metadata = json.loads(bucket.download(metadataPath))
+        if tableName not in metadata:
+            return
+        metadata.pop(tableName)
+        bucket.upload(
+            path=metadataPath,
+            file=json.dumps(metadata, indent=4).encode("utf-8"),
+            file_options={"upsert": "true"},
+        )
 
     def _get_messages_from_db(self, projectId: str, transformationId: str) -> list[dict]:
         """Load messages list directly from transformations table."""
@@ -780,23 +801,20 @@ class TransformationService:
                 transformationName = row.get("transformation_name")
                 tableName = self._sanitizeTableName(transformationName if transformationName else "table")
 
-            # 2. Delete the transformation row from database
-            self.supabase.table("transformations").delete().eq("project_id", projectId).eq("transformation_id", transformationId).execute()
-
-            # 3. Delete parquet file from storage if exists
+            # 2. Remove the table from metadata.json and storage. Each step is safe to
+            # repeat, and the row goes last: a failure here keeps it, so the delete can be retried.
             if tableName:
                 try:
+                    self._remove_table_from_metadata(projectId, tableName)
                     storagePath = f"{projectId}/{tableName}.parquet"
-                    self.supabase.storage.from_("AnalyticsHub").remove(storagePath)
+                    self.supabase.storage.from_("AnalyticsHub").remove([storagePath])
                 except Exception as e:
-                    logger.warning(f"Could not remove transformation table file during deletion: {e}")
+                    exception = CustomException(e, statusCode=503, uiMessage="We could not delete this transformation right now. Please try again.")
+                    logger.error(exception)
+                    raise exception
 
-            # 4. Regenerate project metadata so the deleted table is no longer registered in metadata.json
-            try:
-                from api.services.managementService import managementService
-                managementService.generateMetadata(projectId=projectId, userId=userId)
-            except Exception as e:
-                logger.warning(f"Failed to generate metadata after deleting transformation: {e}")
+            # 3. Delete the transformation row from database
+            self.supabase.table("transformations").delete().eq("project_id", projectId).eq("transformation_id", transformationId).execute()
 
             updateProjectModifiedAt(projectId)
             return {"status": "200", "message": "Transformation deleted successfully."}
