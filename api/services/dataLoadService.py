@@ -13,6 +13,7 @@ from nubrix.components.pdfTableExtractor import PdfTableExtractor
 from api.services.credits.creditTrackingCallback import CreditTrackingCallback
 from api.commons import updateProjectModifiedAt
 from utils.exceptionHandler import CustomException
+from utils.initMethods import forget_table
 from pymongo.mongo_client import MongoClient
 from pymongo.server_api import ServerApi
 from fastapi import Form, UploadFile
@@ -536,6 +537,8 @@ class DataLoadService:
             CustomException: If deletion or metadata update fails.
         """
         try:
+            # The transformation no longer owns this name: deleting it later must not take a new upload.
+            self.client.table("transformations").update({"latest_approved_artifact": None}).eq("project_id", tableDetails.projectId).eq("latest_approved_artifact->>table_name", tableDetails.tableName).execute()
             _ = self.client.storage.from_("AnalyticsHub").remove(f"{tableDetails.projectId}/{tableDetails.tableName}" + ".parquet")
             fileUrl = os.environ["FILE_URL"].format(projectId = tableDetails.projectId, fileName = "metadata.json").replace(".parquet", "") + f"?cb={int(time.time())}"
             jsonData = json.loads(urlopen(fileUrl).read())
@@ -544,6 +547,10 @@ class DataLoadService:
                 buffer.write(json.dumps(jsonData, indent=4).encode("utf-8"))
                 buffer.seek(0)
                 self.client.storage.from_("AnalyticsHub").upload(path = f"{tableDetails.projectId}/metadata.json", file = buffer.getvalue(), file_options = {"upsert": "true"})
+            try:
+                forget_table(tableDetails.projectId, tableDetails.tableName)
+            except Exception as e:
+                logger.warning(f"Could not clear caches for deleted table {tableDetails.tableName}: {e}")
             updateProjectModifiedAt(tableDetails.projectId)
             return
         except Exception as e:

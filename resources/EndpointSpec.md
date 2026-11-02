@@ -650,6 +650,8 @@ Multipart form upload.
 
 ### 3.7 `DELETE /api/latest/dataLoader/deleteTable`
 
+Also clears `latest_approved_artifact` on the transformation that produced the table. The transformation stays, and deleting it later leaves any new table of that name alone.
+
 **Request Body:**
 ```json
 {
@@ -1424,7 +1426,7 @@ Rollback workspace state and messages to a specific message ID.
 
 ### 9.9 `DELETE /api/latest/transformations/{transformationId}?projectId={projectId}`
 
-Delete a transformation workspace and its associated parquet file.
+Delete a transformation workspace and, if it was applied, its parquet file. A transformation that was never applied, was rolled back to the start, or lost its table through `deleteTable` owns no file, so a table of the same name stays. Answers 503 and keeps the transformation if a storage or cache step fails; the delete can be retried.
 
 **Response (200):**
 ```json

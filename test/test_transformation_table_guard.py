@@ -9,6 +9,7 @@ from urllib.error import URLError
 
 import pytest
 
+from api.services.dataLoadService import DataLoadService
 from api.services.transformationService import TransformationService
 from utils.exceptionHandler import CustomException
 
@@ -144,7 +145,11 @@ class _FakeRows:
         return self
 
     def eq(self, column, value):
-        self.filters.append(lambda row: row.get(column) == value)
+        column, _, jsonField = column.partition("->>")
+        if jsonField:
+            self.filters.append(lambda row: (row.get(column) or {}).get(jsonField) == value)
+        else:
+            self.filters.append(lambda row: row.get(column) == value)
         return self
 
     def neq(self, column, value):
@@ -178,6 +183,10 @@ class _FakeRows:
             self.project.fail("rowDelete")
             self.project.rows = [row for row in self.project.rows if row not in self._matches()]
             return mock.Mock(data=[])
+        if action == "update":
+            self.project.fail("rowUpdate")
+            for row in self._matches():
+                row.update(values)
         return mock.Mock(data=self._matches())
 
 
@@ -192,6 +201,7 @@ class _FakeProject:
         self.rows = [dict(row) for row in rows]
         self.failures = {}
         self.metadataWrites = 0
+        self.forgotten = []
         self.storage = mock.Mock()
         self.storage.from_.return_value = self
 
@@ -205,7 +215,8 @@ class _FakeProject:
     def list(self, path=None, options=None):
         search = (options or {}).get("search", "")
         self.fail(f"list:{search}")
-        matches = [name for name in sorted(self.fileNames) if name.startswith(search)]
+        # As on real storage: a case-insensitive prefix, so a hit is not yet the exact file.
+        matches = [name for name in sorted(self.fileNames) if name.lower().startswith(search.lower())]
         return [{"name": name} for name in matches[:self.PAGE_LIMIT]]
 
     def download(self, path):
@@ -214,13 +225,20 @@ class _FakeProject:
 
     def upload(self, path, file, file_options=None):
         self.fail("metadataWrite")
+        if (file_options or {}).get("upsert") != "true" and path.rpartition("/")[2] in self.fileNames:
+            raise ValueError("The resource already exists")
         self.metadata = json.loads(file)
         self.metadataWrites += 1
 
     def remove(self, paths):
         self.fail("tableRemove")
-        for path in paths:
+        # Real storage turns a lone string into a one-item list.
+        for path in [paths] if isinstance(paths, str) else paths:
             self.fileNames.discard(path.rpartition("/")[2])
+
+    def forget(self, projectId, tableName):
+        self.fail("cacheClear")
+        self.forgotten.append(tableName)
 
 
 def _projectService(project):
@@ -257,6 +275,10 @@ def projectStorage():
     with (
         mock.patch("urllib.request.urlopen", side_effect=currentMetadata),
         mock.patch("api.services.transformationService.updateProjectModifiedAt"),
+        mock.patch("api.services.dataLoadService.updateProjectModifiedAt"),
+        mock.patch("api.services.dataLoadService.urlopen", side_effect=currentMetadata),
+        mock.patch("api.services.transformationService.forget_table", side_effect=lambda *args: holder["project"].forget(*args)),
+        mock.patch("api.services.dataLoadService.forget_table", side_effect=lambda *args: holder["project"].forget(*args)),
     ):
         yield lambda project: holder.update(project=project) or project
 
@@ -349,8 +371,8 @@ def test_oldNameOfARenamedTransformationIsFreeOnceItsTableIsGone(projectStorage)
     assert _create(project, "before")["transformation_name"] == "before"
 
 
-@pytest.mark.parametrize("operation", ["metadataRead", "metadataWrite", "tableRemove", "list:metadata.json"])
-def test_failedStorageStepKeepsTheTransformationAndCanBeRetried(projectStorage, operation):
+@pytest.mark.parametrize("operation", ["metadataRead", "metadataWrite", "tableRemove", "list:metadata.json", "cacheClear"])
+def test_failedStepKeepsTheTransformationAndCanBeRetried(projectStorage, operation):
     project = _appliedProject(projectStorage)
     project.failures[operation] = ConnectionError("storage unavailable")
 
@@ -402,3 +424,254 @@ def test_deletingInAProjectWithNoMetadataFileStillWorks(projectStorage):
 
     assert project.metadataWrites == 0
     assert project.rows == []
+
+
+def _draftRow(name="sales", transformationId="t1"):
+    return {"transformation_id": transformationId, "project_id": "project_1", "transformation_name": name}
+
+
+def _deleteTable(project, tableName):
+    service = object.__new__(DataLoadService)
+    service.client = project
+    service.deleteTable(mock.Mock(projectId="project_1", tableName=tableName))
+
+
+def _upload(project, tableName):
+    project.fileNames.add(f"{tableName}.parquet")
+    project.metadata[tableName] = {"isActive": True}
+
+
+class _FakeExecutor:
+    """Stands in for the sandbox: running the code is not what these tests are about."""
+
+    def __init__(self, project):
+        self.project = project
+
+    def executeAndPreview(self, projectId, pythonCode, tableName):
+        return [{"row": 1}], b"parquet"
+
+    def apply(self, projectId, parquetBytes, tableName):
+        self.project.fileNames.add(f"{tableName}.parquet")
+
+
+def _workspaceService(project):
+    service = _projectService(project)
+    service._executor = _FakeExecutor(project)
+    service._agent = mock.Mock()
+    service._redis_client = lambda: mock.Mock(get=mock.Mock(return_value=None))
+    return service
+
+
+def _withMessages(row):
+    message = {"message_id": "m1", "role": "assistant", "python_code": "code", "artifact": {"code": "graph"}}
+    return {**row, "messages": [{"message_id": "m0", "role": "user", "content": "go"}, message]}
+
+
+def _approveAndApply(project, transformationId="t1"):
+    service = _workspaceService(project)
+
+    def registerTables(projectId, userId=None):
+        project.metadata.update({name.removesuffix(".parquet"): {} for name in project.fileNames if name.endswith(".parquet")})
+
+    async def run():
+        await service.approveMessage("project_1", transformationId, "m1")
+        await service.applyTransformation("project_1", transformationId, "m1")
+
+    with mock.patch("api.services.managementService.managementService.generateMetadata", side_effect=registerTables):
+        asyncio.run(run())
+
+
+def _rename(project, newName, transformationId="t1"):
+    asyncio.run(_projectService(project).renameTransformation("project_1", transformationId, newName))
+
+
+def test_deletingADraftLeavesAnUploadOfTheSameName(projectStorage):
+    project = projectStorage(_FakeProject(metadata={}, rows=[_draftRow()]))
+    _upload(project, "sales")
+
+    assert _delete(project)["status"] == "200"
+
+    assert "sales.parquet" in project.fileNames
+    assert "sales" in project.metadata
+    assert project.forgotten == []
+    assert project.rows == []
+
+
+def test_deletingARolledBackDraftClearsTheKeyItLeftBehind(projectStorage):
+    project = projectStorage(_FakeProject(metadata={"sales": {}, "summary": {}}, tables=("sales",), rows=[_draftRow("summary")]))
+
+    assert _delete(project)["status"] == "200"
+
+    assert list(project.metadata) == ["sales"]
+    assert project.forgotten == ["summary"]
+
+
+def test_aSimilarFileDoesNotCountAsTheDraftsTable(projectStorage):
+    project = projectStorage(_FakeProject(metadata={"sales": {}}, rows=[_draftRow()]))
+    project.fileNames |= {"sales.parquet.bak", "Sales.parquet"}
+
+    assert _delete(project)["status"] == "200"
+
+    assert project.metadata == {}
+    assert {"sales.parquet.bak", "Sales.parquet"} <= project.fileNames
+
+
+def test_aSimilarFileDoesNotMakeANameABaseTable(projectStorage):
+    project = projectStorage(_FakeProject(metadata={"sales": {}}))
+    project.fileNames |= {"sales.parquet.bak", "Sales.parquet"}
+
+    assert _create(project, "sales")["transformation_name"] == "sales"
+
+
+def test_failedFileCheckKeepsADraftAndItsKey(projectStorage):
+    project = projectStorage(_FakeProject(metadata={"sales": {}}, rows=[_draftRow()]))
+    project.failures["list:sales.parquet"] = ConnectionError("storage unavailable")
+
+    with pytest.raises(CustomException) as caught:
+        _delete(project)
+
+    assert caught.value.statusCode == 503
+    assert project.metadata == {"sales": {}}
+    assert len(project.rows) == 1
+
+
+def test_deleteRemovesTheTableTheArtifactNames(projectStorage):
+    project = projectStorage(_FakeProject(
+        metadata={"before": {}, "after": {}},
+        tables=("before", "after"),
+        rows=[_appliedRow(name="after", tableName="before")],
+    ))
+
+    assert _delete(project)["status"] == "200"
+
+    assert list(project.metadata) == ["after"]
+    assert "before.parquet" not in project.fileNames
+    assert "after.parquet" in project.fileNames
+    assert project.forgotten == ["before"]
+
+
+def test_failedTableRemoveChangesNothing(projectStorage):
+    project = _appliedProject(projectStorage)
+    project.failures["tableRemove"] = ConnectionError("storage unavailable")
+
+    with pytest.raises(CustomException):
+        _delete(project)
+
+    assert project.metadataWrites == 0
+    assert "summary" in project.metadata
+    assert "summary.parquet" in project.fileNames
+
+
+def test_cachesAreClearedOnceTheTableIsGone(projectStorage):
+    project = _appliedProject(projectStorage)
+    seenByCacheClear = {}
+    realForget = project.forget
+
+    def forget(projectId, tableName):
+        seenByCacheClear.update(file="summary.parquet" in project.fileNames, key="summary" in project.metadata)
+        realForget(projectId, tableName)
+
+    project.forget = forget
+
+    _delete(project)
+
+    assert project.forgotten == ["summary"]
+    assert seenByCacheClear == {"file": False, "key": False}
+
+
+def test_deletingATableReleasesItFromItsTransformation(projectStorage):
+    project = _appliedProject(projectStorage)
+
+    _deleteTable(project, "summary")
+
+    assert project.rows[0]["latest_approved_artifact"] is None
+    assert project.forgotten == ["summary"]
+
+
+def test_deletingATableLeavesOtherTransformationsAlone(projectStorage):
+    project = _appliedProject(projectStorage)
+
+    _deleteTable(project, "sales")
+
+    assert project.rows[0]["latest_approved_artifact"] == {"table_name": "summary"}
+
+
+def test_deletingATableStillWorksIfTheCacheClearFails(projectStorage):
+    project = _appliedProject(projectStorage)
+    project.failures["cacheClear"] = ConnectionError("redis unavailable")
+
+    _deleteTable(project, "summary")
+
+    assert "summary" not in project.metadata
+
+
+def test_failedReleaseLeavesTheTableInPlace(projectStorage):
+    project = _appliedProject(projectStorage)
+    project.failures["rowUpdate"] = ConnectionError("database unavailable")
+
+    with pytest.raises(CustomException):
+        _deleteTable(project, "summary")
+
+    assert "summary.parquet" in project.fileNames
+    assert "summary" in project.metadata
+
+
+def test_uploadUnderADeletedTablesNameSurvivesDeletingItsOldTransformation(projectStorage):
+    project = _appliedProject(projectStorage)
+    _deleteTable(project, "summary")
+    _upload(project, "summary")
+
+    assert _delete(project)["status"] == "200"
+
+    assert "summary.parquet" in project.fileNames
+    assert "summary" in project.metadata
+    assert project.rows == []
+
+
+def test_appliedTransformationCanBeDeletedAndItsNameAppliedAgain(projectStorage):
+    project = projectStorage(_FakeProject(metadata={"sales": {}}, tables=("sales",), rows=[_withMessages(_draftRow("summary"))]))
+    _approveAndApply(project)
+    assert project.rows[0]["latest_approved_artifact"]["table_name"] == "summary"
+
+    _delete(project)
+    assert list(project.metadata) == ["sales"]
+
+    recreated = _create(project, "summary")
+    project.rows[0].update(_withMessages({}))
+    _approveAndApply(project, recreated["transformation_id"])
+
+    assert "summary.parquet" in project.fileNames
+    assert "summary" in project.metadata
+
+
+def test_renamedTransformationKeepsItsOldNameUntilItsOldTableIsDeleted(projectStorage):
+    project = projectStorage(_FakeProject(metadata={}, rows=[_withMessages(_draftRow("before"))]))
+    _approveAndApply(project)
+    _rename(project, "after")
+    _approveAndApply(project)
+    assert project.rows[0]["latest_approved_artifact"]["table_name"] == "after"
+
+    with pytest.raises(CustomException) as caught:
+        _create(project, "before")
+    assert caught.value.statusCode == 409
+
+    _deleteTable(project, "before")
+
+    assert _create(project, "before")["transformation_name"] == "before"
+
+
+def test_rolledBackTransformationCanBeDeletedAndItsNameReused(projectStorage):
+    project = projectStorage(_FakeProject(metadata={}, rows=[_withMessages(_draftRow("summary"))]))
+    _approveAndApply(project)
+
+    service = _workspaceService(project)
+    service.getMessages = mock.AsyncMock(return_value=[])
+    with mock.patch("api.services.managementService.managementService.generateMetadata"):
+        asyncio.run(service.rollbackTransformation("project_1", "t1", "m0"))
+    assert project.rows[0]["latest_approved_artifact"] is None
+    assert "summary.parquet" not in project.fileNames
+
+    _delete(project)
+
+    assert project.metadata == {}
+    assert _create(project, "summary")["transformation_name"] == "summary"
