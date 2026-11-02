@@ -236,6 +236,12 @@ class TransformationService:
             file_options={"upsert": "true"},
         )
 
+    def _remove_owned_table(self, projectId: str, tableName: str) -> None:
+        """Remove a table this transformation produced: the file, then its key, then the caches. Each step is safe to repeat."""
+        self.supabase.storage.from_("AnalyticsHub").remove([f"{projectId}/{tableName}.parquet"])
+        self._remove_table_from_metadata(projectId, tableName)
+        forget_table(projectId, tableName)
+
     def _get_messages_from_db(self, projectId: str, transformationId: str) -> list[dict]:
         """Load messages list directly from transformations table."""
         row = self._ensure_transformation(projectId=projectId, transformationId=transformationId)
@@ -691,14 +697,19 @@ class TransformationService:
                 approvedArtifact["is_approved"] = True
                 lastApprovedMsg["artifact"] = approvedArtifact
             else:
-                # No approved transformation exists in truncated history — clean slate
-                logger.info(f"Rolling back to pre-transformation state. Deleting table '{newTransformedTableName}' if exists.")
-                try:
-                    storagePath = f"{projectId}/{newTransformedTableName}.parquet"
-                    self.supabase.storage.from_("AnalyticsHub").remove(storagePath)
-                except Exception as e:
-                    logger.warning(f"Could not remove rolled-back table file: {e}")
-                
+                # No approved transformation exists in truncated history — clean slate.
+                # Only the table the artifact names is this row's; a file under its name without one is an upload.
+                latestApproved = row.get("latest_approved_artifact")
+                appliedTable = latestApproved.get("table_name") if isinstance(latestApproved, dict) else None
+                if appliedTable:
+                    logger.info(f"Rolling back to pre-transformation state. Deleting table '{appliedTable}'.")
+                    try:
+                        self._remove_owned_table(projectId, appliedTable)
+                    except Exception as e:
+                        exception = CustomException(e, statusCode=503, uiMessage="We could not roll back this transformation right now. Please try again.")
+                        logger.error(exception)
+                        raise exception
+
                 self.supabase.table("transformations").update({
                     "latest_approved_artifact": None,
                 }).eq("transformation_id", transformationId).execute()
@@ -803,15 +814,15 @@ class TransformationService:
             if latest_approved and isinstance(latest_approved, dict):
                 appliedTable = latest_approved.get("table_name")
             transformationName = row.get("transformation_name")
-            tableName = appliedTable or self._sanitizeTableName(transformationName if transformationName else "table")
+            tableName = self._sanitizeTableName(transformationName if transformationName else "table")
 
             # 2. Remove the table from storage, metadata.json and the caches. Each step is safe to
             # repeat, and the row goes last: a failure here keeps it, so the delete can be retried.
             try:
                 if appliedTable:
-                    self.supabase.storage.from_("AnalyticsHub").remove([f"{projectId}/{tableName}.parquet"])
+                    self._remove_owned_table(projectId, appliedTable)
                 # With no artifact the row owns no file: one under its name is an upload, so leave its key.
-                if appliedTable or not self._table_file_exists(projectId, tableName):
+                elif not self._table_file_exists(projectId, tableName):
                     self._remove_table_from_metadata(projectId, tableName)
                     forget_table(projectId, tableName)
             except Exception as e:

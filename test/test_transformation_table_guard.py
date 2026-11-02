@@ -202,6 +202,7 @@ class _FakeProject:
         self.failures = {}
         self.metadataWrites = 0
         self.forgotten = []
+        self.removed = []
         self.storage = mock.Mock()
         self.storage.from_.return_value = self
 
@@ -234,6 +235,7 @@ class _FakeProject:
         self.fail("tableRemove")
         # Real storage turns a lone string into a one-item list.
         for path in [paths] if isinstance(paths, str) else paths:
+            self.removed.append(path)
             self.fileNames.discard(path.rpartition("/")[2])
 
     def forget(self, projectId, tableName):
@@ -675,3 +677,71 @@ def test_rolledBackTransformationCanBeDeletedAndItsNameReused(projectStorage):
 
     assert project.metadata == {}
     assert _create(project, "summary")["transformation_name"] == "summary"
+
+
+def _rollback(project, messageId="m0", transformationId="t1"):
+    service = _workspaceService(project)
+    service.getMessages = mock.AsyncMock(return_value=[])
+    with mock.patch("api.services.managementService.managementService.generateMetadata"):
+        return asyncio.run(service.rollbackTransformation("project_1", transformationId, messageId))
+
+
+def test_rollingBackADraftLeavesAnUploadOfTheSameName(projectStorage):
+    project = projectStorage(_FakeProject(metadata={}, rows=[_withMessages(_draftRow())]))
+    _upload(project, "sales")
+
+    _rollback(project)
+
+    assert "sales.parquet" in project.fileNames
+    assert "sales" in project.metadata
+    assert project.removed == []
+    assert project.forgotten == []
+
+
+def test_rollingBackANeverAppliedDraftTouchesNothing(projectStorage):
+    # A key with no file behind it is left for delete to clear.
+    project = projectStorage(_FakeProject(metadata={"sales": {}}, rows=[_withMessages(_draftRow())]))
+
+    _rollback(project)
+
+    assert project.removed == []
+    assert project.metadataWrites == 0
+    assert project.forgotten == []
+    assert project.rows[0]["messages"] == []
+
+
+def test_rollingBackRemovesTheTableTheArtifactNamesWithItsKeyAndCaches(projectStorage):
+    project = projectStorage(_FakeProject(
+        metadata={"before": {}, "after": {}},
+        tables=("before", "after"),
+        rows=[_withMessages(_appliedRow(name="after", tableName="before"))],
+    ))
+
+    _rollback(project)
+
+    assert "before.parquet" not in project.fileNames
+    assert list(project.metadata) == ["after"]
+    assert project.forgotten == ["before"]
+    assert "after.parquet" in project.fileNames
+    assert project.rows[0]["latest_approved_artifact"] is None
+
+
+@pytest.mark.parametrize("operation", ["tableRemove", "list:metadata.json", "metadataRead", "metadataWrite", "cacheClear"])
+def test_failedRollbackCleanupChangesNoRowAndCanBeRetried(projectStorage, operation):
+    project = _appliedProject(projectStorage)
+    project.rows[0].update(_withMessages({}))
+    project.failures[operation] = ConnectionError("storage unavailable")
+
+    with pytest.raises(CustomException) as caught:
+        _rollback(project)
+
+    assert caught.value.statusCode == 503
+    assert project.rows[0]["latest_approved_artifact"] == {"table_name": "summary"}
+    assert len(project.rows[0]["messages"]) == 2
+
+    project.failures.clear()
+    _rollback(project)
+    assert "summary.parquet" not in project.fileNames
+    assert list(project.metadata) == ["sales"]
+    assert project.rows[0]["latest_approved_artifact"] is None
+
