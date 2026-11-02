@@ -5,6 +5,10 @@ Reads JSON from stdin: {"projectId": ..., "code": ..., "result_path": ..., "prev
 Executes the code, writes final_df as parquet to result_path and its first rows
 as JSON to preview_path, so the parent never has to decode what a run wrote.
 Writes error traceback to stderr if anything fails.
+
+The limits here only hold for a run that gets to them. Generated code runs in
+this process, so it can write both files itself and exit first, and the parent
+relies on none of these limits.
 """
 
 import sys
@@ -46,7 +50,7 @@ def _preview_json(parquetBytes, maxBytes):
 
 
 def _refuse_oversized_result(arrowTable, memoryBytes):
-    """Refuse a result too big to read back. Saving a table leads the API to decode all of it."""
+    """Stop an honest result too big to read back, as saving a table leads the API to decode all of it. A run that exits first skips this."""
     if arrowTable.nbytes > memoryBytes // 2:
         raise ValueError(f"Transformation result is too large: {arrowTable.num_rows} rows and {arrowTable.num_columns} columns.")
 

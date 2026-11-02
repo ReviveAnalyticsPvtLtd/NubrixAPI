@@ -14,7 +14,9 @@ Each run has its own uid, so a child can't read the parent's secrets from
 sandbox user would let concurrent runs for different projects read each other.
 A uid is free again only once sandbox_reaper.py has ended everything running as
 it and removed everything it owns, because generated code can fork and outlive
-the launcher. A run folder is the claim on its uid. Its worker holds a lock on
+the launcher. A run can only write in its own folder, because every clear would
+otherwise have to look through whatever it left in the shared temp folders. A
+run folder is the claim on its uid. Its worker holds a lock on
 it, which the kernel drops if the worker dies, so a sweep can tell an orphaned
 run from a live one.
 
@@ -45,6 +47,7 @@ from typing import IO, NamedTuple
 
 from utils.initMethods import spool_table, use_table_source
 from utils.logger import logger
+from utils.sandbox_reaper import _SHARED_TEMP_FOLDERS
 
 # Below 65536, the range a user namespace normally maps. The same number of uids above
 # the range are spare: a reaper's real uid is its run's uid plus _RUN_UID_COUNT. No run
@@ -52,6 +55,8 @@ from utils.logger import logger
 _FIRST_RUN_UID = 20000
 _RUN_UID_COUNT = 20000
 _MAX_CLAIM_ATTEMPTS = 64
+# Everything that uses these folders here runs as root. A run can pass through, but can't write or list.
+_CLOSED_FOLDER_MODE = 0o711
 _MAX_REQUEST_BYTES = 4096
 _MAX_OUTPUT_BYTES = 64 * 1024 * 1024
 # Redis refuses a bigger value, and a transformation preview is cached there before it can be applied.
@@ -101,6 +106,23 @@ def _lockRun(runFolder: str) -> int | None:
     return None
 
 
+def _closeSharedFolders() -> None:
+    """Leave a run nowhere to write but its own folder.
+
+    A clear has to list every shared folder to find its uid's files, so a run that
+    fills one would make every other run's clear time out and lose its uid. A clear
+    can't list a closed folder, so it costs nothing. If one can't be closed the
+    clear goes on looking through it, and only that protection is lost.
+    """
+    for folder in _SHARED_TEMP_FOLDERS:
+        try:
+            os.chmod(folder, _CLOSED_FOLDER_MODE)
+        except FileNotFoundError:
+            pass
+        except OSError as e:
+            logger.warning(f"Could not close {folder} to sandbox runs: {e}")
+
+
 def _claimRun() -> tuple[int | None, str, int | None]:
     """Return this run's uid, its folder and the lock on that folder. The folder is the claim: only one run can create it.
 
@@ -118,6 +140,7 @@ def _claimRun() -> tuple[int | None, str, int | None]:
         return None, tempfile.mkdtemp(prefix="sandbox-"), None
     if os.geteuid() != 0:
         raise PermissionError("Sandboxes need a root parent when SANDBOX_RUN_ROOT is set.")
+    _closeSharedFolders()
     for _ in range(_MAX_CLAIM_ATTEMPTS):
         runUid = _FIRST_RUN_UID + secrets.randbelow(_RUN_UID_COUNT)
         runFolder = os.path.join(runRoot, f"sandbox-{runUid}")

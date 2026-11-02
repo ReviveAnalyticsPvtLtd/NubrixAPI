@@ -57,6 +57,14 @@ READ_AND_LIST_SECRETS = READ_EVERY_WAY + (
 )
 
 
+@pytest.fixture(autouse=True)
+def sharedFoldersOpen():
+    """A run closes these for the whole container. The reaper's tests need them as they are if closing fails."""
+    if os.name == "posix" and os.geteuid() == 0:
+        for folder in filter(os.path.isdir, sandbox_reaper._SHARED_TEMP_FOLDERS):
+            os.chmod(folder, 0o1777)
+
+
 @pytest.fixture
 def storage(monkeypatch):
     fake = FakePrivateStorage()
@@ -98,9 +106,9 @@ def test_codeExecutionSandboxReadsTheBucket(storage, monkeypatch):
 def test_transformationSandboxReadsTheBucket(storage):
     executor = TransformationExecutor(timeoutSeconds=120)
 
-    frame = executor._execute_code(PROJECT, READ_EVERY_WAY + "final_df = b")
+    rows, _ = executor._run_transformation(PROJECT, READ_EVERY_WAY + "final_df = b")
 
-    assert list(frame["amount"]) == [1, 2, 3]
+    assert [row["amount"] for row in rows] == [1, 2, 3]
     _assertReadWithTheServiceKey(storage)
 
 
@@ -127,10 +135,10 @@ def test_transformationSandboxReadsWithoutTheParentSecrets(storage, parentSecret
     executor = TransformationExecutor(timeoutSeconds=120)
     code = READ_AND_LIST_SECRETS + 'final_df = pd.DataFrame({"rows": [len(a), b.height, c.height], "seen": seen})'
 
-    frame = executor._execute_code(PROJECT, code)
+    rows, _ = executor._run_transformation(PROJECT, code)
 
-    assert list(frame["rows"]) == [3, 3, 3]
-    assert list(frame["seen"]) == ["", "", ""]
+    assert [row["rows"] for row in rows] == [3, 3, 3]
+    assert [row["seen"] for row in rows] == ["", "", ""]
     _assertReadWithTheServiceKey(storage)
 
 
@@ -231,9 +239,9 @@ def test_transformationSandboxKeepsEveryOwnProjectCallShape(storage):
         'final_df = pd.DataFrame({"sizes": [a.height, b.height, len(c), len(d)]})'
     )
 
-    frame = executor._execute_code(PROJECT, code)
+    rows, _ = executor._run_transformation(PROJECT, code)
 
-    assert list(frame["sizes"]) == [3, 3, 1, 1]
+    assert [row["sizes"] for row in rows] == [3, 3, 1, 1]
     _assertReadWithTheServiceKey(storage)
 
 
@@ -266,10 +274,10 @@ def runInSandbox(request, storage, monkeypatch):
         if request.param == "inspection":
             return executor.executeInspection(PROJECT, f"{code}\nprint(outcome)")
         try:
-            frame = executor._execute_code(PROJECT, f'{code}\nfinal_df = pd.DataFrame({{"outcome": [str(outcome)]}})')
+            rows, _ = executor._run_transformation(PROJECT, f'{code}\nfinal_df = pd.DataFrame({{"outcome": [str(outcome)]}})')
         except ValueError as error:
             return str(error)
-        return frame["outcome"][0]
+        return rows[0]["outcome"]
 
     return run
 
@@ -882,8 +890,35 @@ def test_previewHoldsOnlyTheRowsItShows(storage):
     rows, parquetBytes = executor.executeAndPreview(PROJECT, code, "copy")
 
     assert len(rows) == 100
-    assert len(executor._execute_code(PROJECT, code)) == 100
     assert pl.read_parquet(io.BytesIO(parquetBytes)).height == 1000
+
+
+def test_validationRunBuildsNothingFromWhatARunWrote(monkeypatch):
+    buffer = io.BytesIO()
+    pq.write_table(pa.table({"a": [1]}), buffer)
+    # With its own key on each row, a frame is as wide as it is long.
+    preview = json.dumps([{f"column{number}": 1} for number in range(2000)]).encode()
+    result = sandboxRunner.SandboxResult("", "", 0, buffer.getvalue(), preview)
+    monkeypatch.setattr(transformationExecutor, "runSandbox", lambda *_args, **_kwargs: result)
+    monkeypatch.setattr(transformationExecutor.pd, "DataFrame", MagicMock(side_effect=AssertionError("built a frame from a run's preview")))
+
+    assert TransformationExecutor(timeoutSeconds=60)._execute_code(PROJECT, "final_df = 1") is None
+
+
+def test_aRunCanWriteItsOwnResultAndPreview(storage):
+    """The launcher's limits only hold for a run that gets as far as them, so the parent can't lean on them."""
+    forged = json.dumps([{"written": "x" * 5000}])
+    code = (
+        'os = pd.io.common.os\n'
+        'pd.DataFrame({"a": [1]}).to_parquet("result.parquet")\n'
+        'with os.fdopen(os.open("preview.json", os.O_CREAT | os.O_WRONLY), "w") as preview:\n'
+        f'    preview.write({forged!r})\n'
+        'os._exit(0)\n'
+    )
+
+    rows, _ = TransformationExecutor(timeoutSeconds=60).executeAndPreview(PROJECT, code, "copy")
+
+    assert rows == json.loads(forged)
 
 
 def test_parentNeverDecodesAResult(storage, monkeypatch):
@@ -1155,8 +1190,66 @@ def test_runRefusesToStartIfItsUidCantBeCleared(storage, monkeypatch):
         os.rmdir(folder)
 
 
+def test_closingSharedFoldersNeverStopsARun(monkeypatch):
+    closed = []
+
+    def chmod(folder, mode):
+        if folder == "/tmp":
+            raise PermissionError("not here")
+        if folder == "/var/tmp":
+            raise FileNotFoundError(folder)
+        closed.append((folder, mode))
+
+    warning = MagicMock()
+    monkeypatch.setattr(sandboxRunner.os, "chmod", chmod)
+    monkeypatch.setattr(sandboxRunner.logger, "warning", warning)
+
+    sandboxRunner._closeSharedFolders()
+
+    assert closed == [(folder, 0o711) for folder in sandbox_reaper._SHARED_TEMP_FOLDERS[2:]]
+    warning.assert_called_once()
+
+
 @separateUids
-def test_runRemovesItsFilesFromSharedTempFolders(storage):
+def test_aRunCanOnlyWriteInItsOwnFolder(storage):
+    code = (
+        'os = pd.io.common.os\n'
+        'for folder in ("/tmp", "/var/tmp", "/dev/shm", "/dev/mqueue", "/run/lock"):\n'
+        '    try:\n'
+        '        os.close(os.open(f"{folder}/left", os.O_CREAT | os.O_WRONLY))\n'
+        '        print("wrote", folder)\n'
+        '    except OSError:\n'
+        '        pass\n'
+        '    try:\n'
+        '        print("listed", folder, os.listdir(folder))\n'
+        '    except OSError:\n'
+        '        pass\n'
+        'os.close(os.open("left", os.O_CREAT | os.O_WRONLY))\n'
+        'print("done")\n'
+    )
+
+    output = TransformationExecutor(timeoutSeconds=60).executeInspection(PROJECT, code)
+
+    assert output.strip() == "done"
+
+
+@separateUids
+def test_parallelModelCodeRunsWithNoSharedMemoryFolder(storage):
+    code = (
+        'from sklearn.ensemble import RandomForestClassifier\n'
+        'from sklearn.model_selection import cross_val_score\n'
+        'X, y = [[n] for n in range(12)], [n % 2 for n in range(12)]\n'
+        'print(len(cross_val_score(RandomForestClassifier(n_estimators=2), X, y, cv=2, n_jobs=2)))\n'
+    )
+
+    output = TransformationExecutor(timeoutSeconds=120).executeInspection(PROJECT, code)
+
+    assert output.strip() == "2"
+
+
+@separateUids
+def test_runRemovesItsFilesFromAFolderThatCouldntBeClosed(storage, monkeypatch):
+    monkeypatch.setattr(sandboxRunner, "_closeSharedFolders", lambda: None)
     code = (
         'os = pd.io.common.os\n'
         'for folder in ("/tmp", "/var/tmp", "/dev/shm"):\n'
@@ -1444,18 +1537,103 @@ def test_reaperRemovesATreeTooDeepForAPath():
     assert not os.path.exists(folder)
 
 
+def _openFolderOf(uid):
+    folder = f"/tmp/shared-{uid}"
+    _ranAsRunUid(uid, f'import os\nos.mkdir("{folder}")\nos.chmod("{folder}", 0o777)\n')
+    return folder
+
+
 @separateUids
-def test_reaperFindsItsFilesInsideAnotherRunsFolder():
+@pytest.mark.parametrize("mode", (0o777, 0o1777))
+def test_aFileLeftInAnotherRunsFolderGoesWithThatRun(mode):
     uid = FORCED_RUN_UID + 8
     other = uid + 1
-    folder = f"/tmp/shared-{other}"
-    _ranAsRunUid(other, f'import os\nos.mkdir("{folder}")\nos.chmod("{folder}", 0o777)\n')
+    folder = _openFolderOf(other)
+    _ranAsRunUid(other, f'import os\nos.chmod("{folder}", {mode})\n')
     _ranAsRunUid(uid, f'import os\nos.close(os.open("{folder}/left", os.O_CREAT | os.O_WRONLY))\n')
 
     assert _reap(uid).returncode == 0
-    assert os.listdir(folder) == []
+    assert os.listdir(folder) == ["left"]
     assert _reap(other).returncode == 0
     assert not os.path.exists(folder)
+
+
+@separateUids
+def test_anEmptyFolderLeftInAnotherRunsFolderGoesWithThatRun():
+    uid = FORCED_RUN_UID + 8
+    other = uid + 1
+    folder = _openFolderOf(other)
+    _ranAsRunUid(uid, f'import os\nos.mkdir("{folder}/left", 0o700)\n')
+
+    assert _reap(uid).returncode == 0
+    assert _reap(other).returncode == 0
+    assert not os.path.exists(folder)
+
+
+@separateUids
+def test_uidStaysClaimedIfItsFolderHoldsAFolderOfAnotherRun():
+    uid = FORCED_RUN_UID + 8
+    other = uid + 1
+    folder = _openFolderOf(other)
+    _ranAsRunUid(uid, f'import os\nos.mkdir("{folder}/left", 0o700)\nos.close(os.open("{folder}/left/file", os.O_CREAT | os.O_WRONLY))\n')
+    try:
+        assert _reap(uid).returncode == 0
+
+        result = _reap(other)
+
+        assert result.returncode != 0
+        assert b"remain" in result.stderr
+    finally:
+        shutil.rmtree(folder, ignore_errors=True)
+
+
+def test_reaperDoesntLookInsideAnotherUidsFolder(tmp_path, monkeypatch):
+    (tmp_path / "theirs" / "inner").mkdir(parents=True)
+    (tmp_path / "theirs" / "inner" / "file").touch()
+    monkeypatch.chdir(tmp_path)
+    looked = MagicMock(side_effect=sandbox_reaper._entries)
+    monkeypatch.setattr(sandbox_reaper, "_entries", looked)
+
+    assert sandbox_reaper._removeOwned(str(tmp_path), os.stat(tmp_path).st_uid + 1) == 0
+
+    assert looked.call_count == 1
+    assert (tmp_path / "theirs" / "inner" / "file").exists()
+
+
+@pytest.mark.parametrize("unreadableFolder", (False, True))
+def test_reaperReportsAWalkItCantFinish(tmp_path, monkeypatch, unreadableFolder):
+    (tmp_path / "mine" / "inner").mkdir(parents=True)
+    monkeypatch.chdir(tmp_path)
+    realChdir = os.chdir
+
+    def chdir(path):
+        if path == "..":
+            raise PermissionError("locked from above")
+        realChdir(path)
+
+    monkeypatch.setattr(sandbox_reaper.os, "chdir", chdir)
+    if unreadableFolder:
+        monkeypatch.setattr(sandbox_reaper, "_entries", MagicMock(side_effect=[list(os.scandir(tmp_path)), PermissionError("locked")]))
+
+    assert sandbox_reaper._removeOwned(str(tmp_path), os.stat(tmp_path).st_uid) == 1
+
+
+@separateUids
+def test_reaperCountsAProcessWithAnInvalidName():
+    uid = FORCED_RUN_UID + 13
+    code = (
+        'import ctypes, time\n'
+        'ctypes.CDLL(None).prctl(15, b"\\xff\\xfe", 0, 0, 0)\n'
+        'print("named", flush=True)\n'
+        'time.sleep(60)\n'
+    )
+    process = _asRunUid(uid, code)
+    try:
+        assert process.stdout.readline().strip() == "named"
+        assert sandbox_reaper._liveProcesses(uid) == 1
+    finally:
+        process.kill()
+        process.wait()
 
 
 @separateUids
@@ -1533,6 +1711,7 @@ def test_uidStaysClaimedIfSomethingOfItCantBeRemoved():
 @separateUids
 def test_uidStaysClaimedIfARunLeavesWhatTheReaperCantRemove(storage, monkeypatch):
     _forceRunUid(monkeypatch)
+    monkeypatch.setattr(sandboxRunner, "_closeSharedFolders", lambda: None)
     folder = f"/tmp/stuck-{FORCED_RUN_UID}"
     os.makedirs(f"{folder}/inner")
     os.chown(folder, FORCED_RUN_UID, FORCED_RUN_UID)

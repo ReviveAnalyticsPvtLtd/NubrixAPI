@@ -7,9 +7,11 @@ transformed tables.
 Production design: every code execution runs in a subprocess started by
 utils/sandboxRunner.py. The child writes its result to a temp file and the
 parent reads it back, avoiding the multiprocessing Queue pickle overhead for
-large DataFrames. The child also writes the preview: the parent only moves a
-result's bytes, because a run can write a file that decodes to far more than
-the parent can hold, whatever its footer says.
+large DataFrames. The child also writes the preview. Generated code runs in
+that child, so it can write both files itself and exit before the launcher
+does, and neither has to obey the launcher's limits. So the parent only moves a
+result's bytes, because a file can decode to far more than the parent can hold,
+whatever its footer says, and it keeps a preview as rows.
 No hard timeout/SIGKILL is enforced by default; set TRANSFORMATION_TIMEOUT_SECONDS
 env var to re-enable one.
 """
@@ -130,9 +132,9 @@ class TransformationExecutor:
             raise ValueError("Table name must start with a letter and contain only letters, numbers, hyphens, and underscores.")
         return tableName
 
-    def _execute_code(self, projectId: str, pythonCode: str) -> pd.DataFrame:
-        """Execute generated code and return the first rows of `final_df` (validation run, result discarded)."""
-        return pd.DataFrame(self._run_transformation(projectId, pythonCode)[0])
+    def _execute_code(self, projectId: str, pythonCode: str) -> None:
+        """Execute generated code and raise if it fails. A validation run, so nothing it wrote is kept."""
+        self._run_transformation(projectId, pythonCode)
 
     def _run_transformation(self, projectId: str, pythonCode: str) -> tuple[list[dict], bytes]:
         """Run transformation code and return the preview rows and the parquet bytes of `final_df`."""
@@ -155,7 +157,10 @@ class TransformationExecutor:
             raise ValueError("Transformation result is not a parquet file.")
 
     def _preview(self, previewBytes: bytes | None) -> list[dict]:
-        """Read the rows the child wrote. They're the run's own data, so all this checks is their shape."""
+        """Read the rows the run left. A run can write them itself, so only their size and the shape checked here hold.
+
+        Never make a frame of them: rows that each have their own keys make one as wide as it is long.
+        """
         try:
             rows = json.loads(previewBytes)
         except (TypeError, ValueError, RecursionError) as e:
@@ -172,7 +177,7 @@ class TransformationExecutor:
         return stdout if stdout else "Inspection executed successfully with no output."
 
     def executeAndPreview(self, projectId: str, pythonCode: str, tableName: str) -> tuple[list[dict], bytes]:
-        """Execute code and return preview rows plus parquet bytes, none of it decoded here."""
+        """Execute code and return preview rows plus parquet bytes. The parquet is never decoded here."""
         try:
             self._validate_table_name(tableName)
             return self._run_transformation(projectId, pythonCode)

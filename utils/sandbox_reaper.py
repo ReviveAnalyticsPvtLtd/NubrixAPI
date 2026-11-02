@@ -20,7 +20,8 @@ import signal
 import sys
 import time
 
-# Every folder a run's uid can write to outside its own run folder.
+# Every folder a run's uid could write to outside its own run folder. sandboxRunner.py
+# closes them, and a uid can't list a closed one, so only one it couldn't close costs anything.
 _SHARED_TEMP_FOLDERS = ("/tmp", "/var/tmp", "/dev/shm", "/dev/mqueue", "/run/lock")
 _PROCESS_EXIT_SECONDS = 10
 _IPC_RMID = 0
@@ -50,11 +51,11 @@ def _liveProcesses(uid: int) -> int:
         if not pid.isdigit() or int(pid) == os.getpid():
             continue
         try:
-            with open(f"/proc/{pid}/status") as status:
-                fields = dict(line.split(":", 1) for line in status if line.startswith(("State:", "Uid:")))
-        except (OSError, ValueError):
+            with open(f"/proc/{pid}/status", "rb") as status:  # Bytes, because a process names itself.
+                fields = dict(line.split(b":", 1) for line in status if line.startswith((b"State:", b"Uid:")))
+        except OSError:
             continue  # It has just gone.
-        if fields.get("State", "Z").split()[0] not in ("Z", "X") and str(uid) in fields.get("Uid", "").split():
+        if fields.get(b"State", b"Z").split()[0] not in (b"Z", b"X") and str(uid).encode() in fields.get(b"Uid", b"").split():
             live += 1
     return live
 
@@ -79,48 +80,65 @@ def _entries() -> list:
         return list(entries)
 
 
+def _leaveFolder() -> bool:
+    """Go up a level. If the folder above has been locked, this walk can't go on."""
+    try:
+        os.chdir("..")
+    except OSError:
+        return False
+    return True
+
+
 def _removeOwned(folder: str, uid: int) -> int:
     """Remove everything this uid owns below a folder and return how many entries it couldn't.
 
-    A run can lock its folders, nest them past the longest path, or leave files
-    inside another run's folder. So this looks in every folder it can enter, moving
-    with chdir, which costs no descriptors and no path length.
+    A run can lock its folders or nest them past the longest path, so this moves
+    with chdir, which costs no descriptors and no path length. It enters only this
+    uid's folders, or one run's files could use up every other run's clear. What
+    another uid left in them goes too: the owner of a folder can remove any file in
+    it, sticky bit or not. Another uid's folder only goes if it's empty, and the
+    count then keeps this uid claimed.
     """
     try:
         if os.lstat(folder).st_uid == uid:
             os.chmod(folder, 0o700)
         os.chdir(folder)
-        walk = [("", iter(_entries()), False)]
+        walk = [("", iter(_entries()))]
     except OSError:
         return 0
     left = 0
     while walk:
-        name, entries, removing = walk[-1]
+        name, entries = walk[-1]
+        removing = len(walk) > 1
         entry = next(entries, None)
         if entry is None:
             walk.pop()
             if walk:
-                os.chdir("..")
-                if removing:
-                    try:
-                        os.rmdir(name)
-                    except OSError:
-                        left += 1
+                if not _leaveFolder():
+                    return left + 1
+                try:
+                    os.rmdir(name)
+                except OSError:
+                    left += 1
             continue
         mustGo = removing
         try:
-            mustGo = removing or entry.stat(follow_symlinks=False).st_uid == uid
-            if entry.is_dir(follow_symlinks=False):
+            owned = entry.stat(follow_symlinks=False).st_uid == uid
+            mustGo = removing or owned
+            if not entry.is_dir(follow_symlinks=False):
                 if mustGo:
-                    os.chmod(entry.name, 0o700)
+                    os.unlink(entry.name)
+            elif owned:
+                os.chmod(entry.name, 0o700)
                 os.chdir(entry.name)
                 try:
-                    walk.append((entry.name, iter(_entries()), mustGo))
+                    walk.append((entry.name, iter(_entries())))
                 except OSError:
-                    os.chdir("..")
+                    if not _leaveFolder():
+                        return left + 1
                     raise
-            elif mustGo:
-                os.unlink(entry.name)
+            elif removing:
+                os.rmdir(entry.name)
         except OSError:
             left += mustGo
     return left
