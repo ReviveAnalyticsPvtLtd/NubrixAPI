@@ -178,13 +178,11 @@ class TransformationService:
                 uiMessage=f"A transformation named '{sanitizedTarget}' already exists in this project. Please use a different name."
             )
 
-        # 2. Find table names owned by ALL transformations in this project (including current)
+        # 2. Find tables written by ALL transformations in this project (including current). Only the
+        # artifact proves that: a draft's own name can belong to an upload. Other rows' names were refused above.
         allTransformations = self.supabase.table("transformations").select("*").eq("project_id", projectId).execute().data or []
         allTransformationTables = set()
         for t in allTransformations:
-            tname = t.get("transformation_name")
-            if tname:
-                allTransformationTables.add(self._sanitizeTableName(tname))
             latest = t.get("latest_approved_artifact")
             if isinstance(latest, dict) and latest.get("table_name"):
                 allTransformationTables.add(self._sanitizeTableName(latest.get("table_name")))
@@ -556,6 +554,13 @@ class TransformationService:
             transformationName = row.get("transformation_name")
             newTransformedTableName = self._sanitizeTableName(transformationName if transformationName else "table")
 
+            # Checked again here: an upload can take the name after approve.
+            self._validate_transformation_table_name(
+                projectId=projectId,
+                targetTableName=newTransformedTableName,
+                currentTransformationId=transformationId,
+            )
+
             messages = row.get("messages") or []
             target_msg = None
             for msg in messages:
@@ -668,6 +673,12 @@ class TransformationService:
                     break
             
             if lastApprovedMsg:
+                # The table may have been deleted and its name taken since that checkpoint was applied.
+                self._validate_transformation_table_name(
+                    projectId=projectId,
+                    targetTableName=newTransformedTableName,
+                    currentTransformationId=transformationId,
+                )
                 # Re-execute the last approved transformation to restore storage state
                 pythonCode = lastApprovedMsg.get("python_code")
                 logger.info(f"Rolling back storage to last approved checkpoint: message {lastApprovedMsg.get('message_id')}")

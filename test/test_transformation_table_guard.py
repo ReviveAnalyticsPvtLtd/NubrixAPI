@@ -203,6 +203,7 @@ class _FakeProject:
         self.metadataWrites = 0
         self.forgotten = []
         self.removed = []
+        self.applied = []
         self.storage = mock.Mock()
         self.storage.from_.return_value = self
 
@@ -453,6 +454,7 @@ class _FakeExecutor:
         return [{"row": 1}], b"parquet"
 
     def apply(self, projectId, parquetBytes, tableName):
+        self.project.applied.append(tableName)
         self.project.fileNames.add(f"{tableName}.parquet")
 
 
@@ -686,6 +688,20 @@ def _rollback(project, messageId="m0", transformationId="t1"):
         return asyncio.run(service.rollbackTransformation("project_1", transformationId, messageId))
 
 
+def _rollbackToAfterTheApply(project):
+    project.rows[0]["messages"].append({"message_id": "m2", "role": "user", "content": "more"})
+    return _rollback(project, "m2")
+
+
+def _approve(project, transformationId="t1"):
+    asyncio.run(_workspaceService(project).approveMessage("project_1", transformationId, "m1"))
+
+
+def _apply(project, transformationId="t1"):
+    with mock.patch("api.services.managementService.managementService.generateMetadata"):
+        asyncio.run(_workspaceService(project).applyTransformation("project_1", transformationId, "m1"))
+
+
 def test_rollingBackADraftLeavesAnUploadOfTheSameName(projectStorage):
     project = projectStorage(_FakeProject(metadata={}, rows=[_withMessages(_draftRow())]))
     _upload(project, "sales")
@@ -745,3 +761,96 @@ def test_failedRollbackCleanupChangesNoRowAndCanBeRetried(projectStorage, operat
     assert list(project.metadata) == ["sales"]
     assert project.rows[0]["latest_approved_artifact"] is None
 
+
+def test_draftNamedAfterAnUploadIsRefusedAtApprove(projectStorage):
+    project = projectStorage(_FakeProject(metadata={}, rows=[_withMessages(_draftRow())]))
+    _upload(project, "sales")
+
+    with pytest.raises(CustomException) as caught:
+        _approve(project)
+
+    assert caught.value.statusCode == 409
+
+
+def test_applyIsRefusedOnceAnUploadTakesTheName(projectStorage):
+    # Approve passed before the upload, so only apply's own check stands in the way.
+    project = projectStorage(_FakeProject(metadata={}, rows=[_withMessages(_draftRow())]))
+    _approve(project)
+    _upload(project, "sales")
+
+    with pytest.raises(CustomException) as caught:
+        _apply(project)
+
+    assert caught.value.statusCode == 409
+    assert project.applied == []
+    assert project.rows[0].get("latest_approved_artifact") is None
+    assert not project.rows[0]["messages"][1]["artifact"].get("is_approved")
+
+
+def test_applyIsRefusedWhenTheNameCannotBeChecked(projectStorage):
+    project = projectStorage(_FakeProject(metadata={}, rows=[_withMessages(_draftRow())]))
+    _approve(project)
+    project.failures["list:metadata.json"] = ConnectionError("storage unavailable")
+
+    with pytest.raises(CustomException) as caught:
+        _apply(project)
+
+    assert caught.value.statusCode == 503
+    assert project.applied == []
+
+
+def test_transformationCanReapplyItsOwnTable(projectStorage):
+    project = projectStorage(_FakeProject(metadata={}, rows=[_withMessages(_draftRow("summary"))]))
+    _approveAndApply(project)
+
+    _approveAndApply(project)
+
+    assert project.applied == ["summary", "summary"]
+
+
+def test_tableWithNoArtifactIsRefusedUntilItIsDeleted(projectStorage):
+    # Only a row whose update failed straight after its upload ends up like this.
+    project = projectStorage(_FakeProject(metadata={"summary": {}}, tables=("summary",), rows=[_withMessages(_draftRow("summary"))]))
+
+    with pytest.raises(CustomException) as caught:
+        _approve(project)
+    assert caught.value.statusCode == 409
+
+    _deleteTable(project, "summary")
+    _approveAndApply(project)
+    assert project.applied == ["summary"]
+
+
+def test_fileWithNoKeyIsNotRefused(projectStorage):
+    # Nobody can see or delete such a table, so refusing would lose the name for good.
+    project = projectStorage(_FakeProject(metadata={}, tables=("sales",), rows=[_withMessages(_draftRow())]))
+
+    _approveAndApply(project)
+
+    assert project.applied == ["sales"]
+
+
+def test_rollbackToACheckpointRewritesItsOwnTable(projectStorage):
+    project = projectStorage(_FakeProject(metadata={}, rows=[_withMessages(_draftRow("summary"))]))
+    _approveAndApply(project)
+
+    _rollbackToAfterTheApply(project)
+
+    assert project.applied == ["summary", "summary"]
+    assert project.rows[0]["latest_approved_artifact"]["table_name"] == "summary"
+
+
+def test_rollbackToACheckpointDoesNotOverwriteAnUploadOfItsName(projectStorage):
+    # Deleting the table from the table list clears the artifact, but its messages stay approved.
+    project = projectStorage(_FakeProject(metadata={}, rows=[_withMessages(_draftRow("summary"))]))
+    _approveAndApply(project)
+    _deleteTable(project, "summary")
+    _upload(project, "summary")
+
+    with pytest.raises(CustomException) as caught:
+        _rollbackToAfterTheApply(project)
+
+    assert caught.value.statusCode == 409
+    assert project.applied == ["summary"]
+    assert len(project.rows[0]["messages"]) == 3
+    assert project.rows[0]["latest_approved_artifact"] is None
