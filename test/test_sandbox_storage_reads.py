@@ -1095,11 +1095,13 @@ def _liveRunUidProcesses():
     return processes
 
 
-def _worldWritableFolder():
+@pytest.fixture
+def handoff():
     folder = os.path.join(tempfile.gettempdir(), f"handoff-{uuid.uuid4().hex}")
     os.mkdir(folder)
     os.chmod(folder, 0o777)
-    return folder
+    yield folder
+    shutil.rmtree(folder, ignore_errors=True)
 
 
 @separateUids
@@ -1116,9 +1118,8 @@ def test_runLeavesNoProcessBehind(storage):
 
 
 @separateUids
-def test_leftoverProcessCantReadALaterRunThatGetsItsUid(storage, monkeypatch):
+def test_leftoverProcessCantReadALaterRunThatGetsItsUid(storage, monkeypatch, handoff):
     _forceRunUid(monkeypatch)
-    handoff = _worldWritableFolder()
     attacker = (
         'import time\n'
         'os = pd.io.common.os\n'
@@ -1766,9 +1767,8 @@ def test_runWorksUnderALowerHardLimit(storage):
 
 
 @separateUids
-def test_sweepClearsWhatAKilledWorkerLeft(storage):
+def test_sweepClearsWhatAKilledWorkerLeft(storage, handoff):
     root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-    handoff = _worldWritableFolder()
     before = _runFolders()
     code = (
         'import time\n'
@@ -1814,8 +1814,7 @@ def test_sweepClearsWhatAKilledWorkerLeft(storage):
 
 
 @separateUids
-def test_sweepLeavesALiveRunAlone(storage):
-    handoff = _worldWritableFolder()
+def test_sweepLeavesALiveRunAlone(storage, handoff):
     code = (
         'import time\n'
         'os = pd.io.common.os\n'
@@ -1929,9 +1928,8 @@ def test_imageHasNoSetuidOrSetgidFiles():
 
 
 @separateUids
-def test_launcherDiesWithTheWorkerThatStartedIt(storage):
+def test_launcherDiesWithTheWorkerThatStartedIt(storage, handoff):
     root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-    handoff = _worldWritableFolder()
     before = _runFolders()
     code = (
         'import time\n'
@@ -2005,10 +2003,7 @@ def test_sandboxCannotWriteToTheApplication(runInSandbox):
 
 
 @separateUids
-def test_concurrentRunsCannotReachEachOther(storage):
-    handoff = os.path.join(tempfile.gettempdir(), f"handoff-{uuid.uuid4().hex}")
-    os.mkdir(handoff)
-    os.chmod(handoff, 0o777)
+def test_concurrentRunsCannotReachEachOther(storage, handoff):
     executor = TransformationExecutor(timeoutSeconds=60)
     first = (
         'import time\n'
