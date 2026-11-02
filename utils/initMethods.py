@@ -27,6 +27,7 @@ import math
 import os
 import redis
 import threading
+import time
 from collections import OrderedDict
 from utils.logger import logger
 from typing import Iterable
@@ -85,11 +86,11 @@ def _redis_pool() -> redis.ConnectionPool:
     return _REDIS_POOL
 
 
-# In-process Arrow table cache: (projectId, tableName) -> (pa.Table, byte_estimate).
+# In-process Arrow table cache: (projectId, tableName) -> (pa.Table, byte_estimate, stored_at).
 # Arrow tables are cheap to share (immutable, reference-counted buffers) so we
 # cache them here instead of pandas DataFrames. A ``pd.DataFrame`` view is
 # built only at the call site.
-_DF_CACHE: "OrderedDict[tuple[str, str], tuple[pa.Table, int]]" = OrderedDict()
+_DF_CACHE: "OrderedDict[tuple[str, str], tuple[pa.Table, int, float]]" = OrderedDict()
 _DF_CACHE_BYTES = 0
 _DF_CACHE_LOCK = threading.Lock()
 
@@ -119,7 +120,7 @@ def _cache_put(key: tuple[str, str], table: "pa.Table") -> None:
     with _DF_CACHE_LOCK:
         if key in _DF_CACHE:
             _DF_CACHE_BYTES -= _DF_CACHE.pop(key)[1]
-        _DF_CACHE[key] = (table, size)
+        _DF_CACHE[key] = (table, size, time.monotonic())
         _DF_CACHE_BYTES += size
         _DF_CACHE.move_to_end(key)
         while (len(_DF_CACHE) > entries_cap or _DF_CACHE_BYTES > bytes_cap) and _DF_CACHE:
@@ -128,9 +129,15 @@ def _cache_put(key: tuple[str, str], table: "pa.Table") -> None:
 
 
 def _cache_get(key: tuple[str, str]):
+    global _DF_CACHE_BYTES
+    # A worker can only clear its own entries, so they expire to limit what the others keep serving.
+    ttl = int(os.environ.get("DF_CACHE_TTL_SECONDS", "60"))
     with _DF_CACHE_LOCK:
         entry = _DF_CACHE.get(key)
         if entry is None:
+            return None
+        if time.monotonic() - entry[2] > ttl:
+            _DF_CACHE_BYTES -= _DF_CACHE.pop(key)[1]
             return None
         _DF_CACHE.move_to_end(key)
         return entry[0]
@@ -478,3 +485,14 @@ def invalidate_data_cache(projectId: str | None = None, tableName: str | None = 
                    and (tableName is None or key[1] == tableName)]
         for key in to_drop:
             _DF_CACHE_BYTES -= _DF_CACHE.pop(key)[1]
+
+
+def forget_table(projectId: str, tableName: str) -> None:
+    """Clear a deleted table, and the metadata that lists it, from Redis and this worker.
+
+    Other workers drop their copy when it expires. Raises if Redis fails, so a
+    caller that can retry the delete may stop.
+    """
+    r = redis.Redis(connection_pool=_redis_pool())
+    r.delete(f"{projectId}::{tableName}", f"{projectId}::metadata.json", f"{projectId}::metadata")
+    invalidate_data_cache(projectId, tableName)
