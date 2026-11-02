@@ -90,14 +90,15 @@ def _leaveFolder() -> bool:
 
 
 def _removeOwned(folder: str, uid: int) -> int:
-    """Remove everything this uid owns below a folder and return how many entries it couldn't.
+    """Remove what this uid owns below a folder, and return how many entries it couldn't.
 
     A run can lock its folders or nest them past the longest path, so this moves
     with chdir, which costs no descriptors and no path length. It enters only this
-    uid's folders, or one run's files could use up every other run's clear. What
-    another uid left in them goes too: the owner of a folder can remove any file in
-    it, sticky bit or not. Another uid's folder only goes if it's empty, and the
-    count then keeps this uid claimed.
+    uid's folders, or one run's files could use up every other run's clear, so a
+    file this uid left in another uid's folder stays until that uid is cleared.
+    What another uid left in this uid's folders goes too: the owner of a folder can
+    remove any file in it, sticky bit or not. Another uid's folder only goes if
+    it's empty, and the count then keeps this uid claimed.
     """
     try:
         if os.lstat(folder).st_uid == uid:

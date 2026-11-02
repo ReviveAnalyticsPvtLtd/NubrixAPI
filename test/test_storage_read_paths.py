@@ -286,6 +286,15 @@ def test_attributeInfoDecodesOneRowForItsSample(storage, client, monkeypatch):
     assert "SAMPLE ROW:\n" in info
 
 
+def test_attributeInfoSaysSoWhenATableHasNoRows(storage, client):
+    storage.put(PROJECT, "sales.parquet", _parquet({"amount": pl.Series([], dtype=pl.Int64)}))
+
+    info, shape = managementModule.managementService._attributeInfoFunc(PROJECT, "sales")
+
+    assert shape == [0, 1]
+    assert "SAMPLE ROW: (no rows)\n" in info
+
+
 def test_validateTableNameAvailableStillRejectsATakenName(storage, client):
     storage.putJson(PROJECT, "metadata.json", {"sales": {}})
 

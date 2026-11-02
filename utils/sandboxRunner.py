@@ -13,10 +13,11 @@ Each run has its own uid, so a child can't read the parent's secrets from
 `/proc`, write to the application, or reach another run's tables. A shared
 sandbox user would let concurrent runs for different projects read each other.
 A uid is free again only once sandbox_reaper.py has ended everything running as
-it and removed everything it owns, because generated code can fork and outlive
-the launcher. A run can only write in its own folder, because every clear would
-otherwise have to look through whatever it left in the shared temp folders. A
-run folder is the claim on its uid. Its worker holds a lock on
+it and removed its files from its own folders, because generated code can fork
+and outlive the launcher. A file it left in another uid's folder stays until
+that uid is cleared. The shared temp folders are closed to runs, because every
+clear would otherwise have to look through whatever was left in them. A run
+folder is the claim on its uid. Its worker holds a lock on
 it, which the kernel drops if the worker dies, so a sweep can tell an orphaned
 run from a live one.
 
@@ -31,6 +32,7 @@ __all__ = ["runSandbox", "sweepOrphanedRuns", "serveTables", "readResult", "ente
 import base64
 import contextlib
 import ctypes
+import glob
 import itertools
 import json
 import os
@@ -57,6 +59,7 @@ _RUN_UID_COUNT = 20000
 _MAX_CLAIM_ATTEMPTS = 64
 # Everything that uses these folders here runs as root. A run can pass through, but can't write or list.
 _CLOSED_FOLDER_MODE = 0o711
+_CLOSED_FILE_MODE = 0o600
 _MAX_REQUEST_BYTES = 4096
 _MAX_OUTPUT_BYTES = 64 * 1024 * 1024
 # Redis refuses a bigger value, and a transformation preview is cached there before it can be applied.
@@ -106,21 +109,30 @@ def _lockRun(runFolder: str) -> int | None:
     return None
 
 
+def _closeToRuns(path: str, mode: int) -> None:
+    try:
+        os.chmod(path, mode)
+    except FileNotFoundError:
+        pass
+    except OSError as e:
+        logger.warning(f"Could not close {path} to sandbox runs: {e}")
+
+
 def _closeSharedFolders() -> None:
-    """Leave a run nowhere to write but its own folder.
+    """Close the shared temp folders and uv's lock files to runs.
 
     A clear has to list every shared folder to find its uid's files, so a run that
     fills one would make every other run's clear time out and lose its uid. A clear
     can't list a closed folder, so it costs nothing. If one can't be closed the
-    clear goes on looking through it, and only that protection is lost.
+    clear goes on looking through it, and only that protection is lost. uv makes
+    its lock files writable by anyone, and root owns them, so what a run wrote to
+    one would outlive every clear. uv leaves them closed, and if it makes a new
+    one the next claim closes that.
     """
     for folder in _SHARED_TEMP_FOLDERS:
-        try:
-            os.chmod(folder, _CLOSED_FOLDER_MODE)
-        except FileNotFoundError:
-            pass
-        except OSError as e:
-            logger.warning(f"Could not close {folder} to sandbox runs: {e}")
+        _closeToRuns(folder, _CLOSED_FOLDER_MODE)
+    for lockFile in (os.path.join(_ROOT, ".venv", ".lock"), *glob.glob("/tmp/uv-*.lock")):
+        _closeToRuns(lockFile, _CLOSED_FILE_MODE)
 
 
 def _claimRun() -> tuple[int | None, str, int | None]:
@@ -169,7 +181,7 @@ def _prepareFolders(runUid: int | None, runFolder: str) -> tuple[str, str]:
 
 
 def _clearUid(runUid: int | None, runFolder: str) -> bool:
-    """End every process of this uid and remove everything it owns. Returns False unless all of it has gone.
+    """End every process of this uid and remove its files. Returns False unless the reaper cleared all it found.
 
     The reaper starts as root and drops itself, so that what a run left can't reach it.
     """

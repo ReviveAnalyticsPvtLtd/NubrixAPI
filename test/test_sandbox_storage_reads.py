@@ -16,6 +16,7 @@ import json
 import os
 import shutil
 import signal
+import stat
 import struct
 import subprocess
 import sys
@@ -1193,21 +1194,36 @@ def test_runRefusesToStartIfItsUidCantBeCleared(storage, monkeypatch):
 def test_closingSharedFoldersNeverStopsARun(monkeypatch):
     closed = []
 
-    def chmod(folder, mode):
-        if folder == "/tmp":
+    def chmod(path, mode):
+        if path in ("/tmp", "/tmp/uv-refused.lock"):
             raise PermissionError("not here")
-        if folder == "/var/tmp":
-            raise FileNotFoundError(folder)
-        closed.append((folder, mode))
+        if path == "/var/tmp":
+            raise FileNotFoundError(path)
+        closed.append((path, mode))
 
     warning = MagicMock()
     monkeypatch.setattr(sandboxRunner.os, "chmod", chmod)
+    monkeypatch.setattr(sandboxRunner.glob, "glob", lambda _pattern: ["/tmp/uv-1.lock", "/tmp/uv-refused.lock"])
     monkeypatch.setattr(sandboxRunner.logger, "warning", warning)
 
     sandboxRunner._closeSharedFolders()
 
-    assert closed == [(folder, 0o711) for folder in sandbox_reaper._SHARED_TEMP_FOLDERS[2:]]
-    warning.assert_called_once()
+    assert closed == [
+        *((folder, 0o711) for folder in sandbox_reaper._SHARED_TEMP_FOLDERS[2:]),
+        (os.path.join(sandboxRunner._ROOT, ".venv", ".lock"), 0o600),
+        ("/tmp/uv-1.lock", 0o600),
+    ]
+    assert warning.call_count == 2
+
+
+def _worldWritable():
+    """Every folder and file that any uid can reach and write to, found as root because a run can't list everything."""
+    found = []
+    for folder, folders, files in os.walk("/"):
+        modes = {name: os.lstat(os.path.join(folder, name)).st_mode for name in (*folders, *files)}
+        found += [os.path.join(folder, name) for name, mode in modes.items() if (stat.S_ISREG(mode) or stat.S_ISDIR(mode)) and mode & stat.S_IWOTH]
+        folders[:] = [name for name in folders if os.path.join(folder, name) not in ("/proc", "/sys") and modes[name] & stat.S_IXOTH]
+    return found
 
 
 @separateUids
@@ -1231,6 +1247,7 @@ def test_aRunCanOnlyWriteInItsOwnFolder(storage):
     output = TransformationExecutor(timeoutSeconds=60).executeInspection(PROJECT, code)
 
     assert output.strip() == "done"
+    assert _worldWritable() == []
 
 
 @separateUids
