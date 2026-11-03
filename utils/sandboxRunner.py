@@ -67,10 +67,8 @@ _MAX_OUTPUT_BYTES = 64 * 1024 * 1024
 _MAX_RESULT_BYTES = 512 * 1024 * 1024
 _MAX_PREVIEW_BYTES = 4 * 1024 * 1024
 _MAX_SPOOL_BYTES = 8 * 1024 * 1024 * 1024
-# Limits every process of a run shares. Threads count, so leave room for Polars, Arrow, BLAS and OpenMP.
-_MAX_RUN_PROCESSES = 1024
 _MAX_RUN_OPEN_FILES = 4096
-_MAX_CHILD_FILE_BYTES = 4 * 1024 * 1024 * 1024
+_CPU_HARD_LIMIT_GRACE_SECONDS = 10
 _CLEAR_UID_TIMEOUT_SECONDS = 30
 _MAX_REAPER_ERROR_BYTES = 1024
 _PR_SET_PDEATHSIG = 1
@@ -442,14 +440,32 @@ def _lockDownChild(channel: dict) -> None:
             raise OSError(ctypes.get_errno(), "prctl failed")
     if os.getppid() != channel["parentPid"]:  # The worker died before the signal was set.
         sys.exit(1)
-    for limit, value in (
-        (resource.RLIMIT_NPROC, _MAX_RUN_PROCESSES),
-        (resource.RLIMIT_FSIZE, _MAX_CHILD_FILE_BYTES),
-        (resource.RLIMIT_CORE, 0),
-        (resource.RLIMIT_NOFILE, _MAX_RUN_OPEN_FILES),
-    ):
-        value = _withinHardLimit(value, resource.getrlimit(limit)[1])
-        resource.setrlimit(limit, (value, value))
+    limits = RunLimits.fromChannel(channel["limits"])
+    if limits.oomScoreAdj:
+        # Make this run the OOM killer's first pick. A failed write must stop the run, as a failed prctl does.
+        fd = os.open("/proc/self/oom_score_adj", os.O_WRONLY)
+        try:
+            os.write(fd, str(limits.oomScoreAdj).encode("ascii"))
+        except OSError as error:
+            raise OSError(error.errno, "could not set the memory priority") from error
+        finally:
+            os.close(fd)
+    # Limits every process of a run shares. Threads count towards the process limit.
+    wanted = [
+        (resource.RLIMIT_NPROC, limits.maxProcesses, limits.maxProcesses),
+        (resource.RLIMIT_FSIZE, limits.maxFileBytes, limits.maxFileBytes),
+        (resource.RLIMIT_CORE, 0, 0),
+        (resource.RLIMIT_NOFILE, _MAX_RUN_OPEN_FILES, _MAX_RUN_OPEN_FILES),
+        (resource.RLIMIT_DATA, limits.maxProcessMemory, limits.maxProcessMemory),
+        (resource.RLIMIT_CPU, limits.maxCpuSeconds, limits.maxCpuSeconds + _CPU_HARD_LIMIT_GRACE_SECONDS),
+    ]
+    for limit, soft, hard in wanted:
+        # Zero turns a limit off, except for core files, which are always off.
+        if limit != resource.RLIMIT_CORE and soft == 0:
+            continue
+        ceiling = resource.getrlimit(limit)[1]
+        resource.setrlimit(limit, (_withinHardLimit(soft, ceiling), _withinHardLimit(hard, ceiling)))
+    # The seccomp filter is installed here, after the limits and before any generated code runs.
 
 
 def _connectTableChannel(channel: dict) -> None:
