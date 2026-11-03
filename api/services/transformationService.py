@@ -260,22 +260,23 @@ class TransformationService:
         record failed) has its table removed as before. No lock is held: a load that writes between the file
         check and the remove still loses its upload, and storage has no delete that is conditional on the file.
 
-        If a step after the release fails, the claim is given back while the file is unchanged or gone, so a
-        retry removes the rest. If that give-back fails too, a retry keeps the file as an ordinary table, which
-        deleteTable can still remove.
+        If a step after the release fails, the claim is given back while the file is still the recorded one, or
+        gone, so a retry removes the rest. With no record it goes back only once the file is gone: a file there
+        could be an upload that landed after the release. Otherwise a retry keeps the file as an ordinary table,
+        which deleteTable can still remove.
         """
         tableName = artifact["table_name"]
         recorded = artifact.get("table_file")
         released = self.supabase.table("transformations").update({"latest_approved_artifact": None}).eq("project_id", projectId).eq("transformation_id", transformationId).eq("latest_approved_artifact->>table_name", tableName).execute().data
         if not released:
             return
+        # With a record, the file on the remove path is that record or gone; with none, only gone counts.
         ownFiles = (recorded, None)
         try:
             current = tableFileState(self.supabase, projectId, tableName)
             if current is not None and recorded is not None and current != recorded:
                 forget_table(projectId, tableName)
                 return
-            ownFiles = (current, None)
             if current is not None:
                 self.supabase.storage.from_("AnalyticsHub").remove([f"{projectId}/{tableName}.parquet"])
             self._remove_table_from_metadata(projectId, tableName)

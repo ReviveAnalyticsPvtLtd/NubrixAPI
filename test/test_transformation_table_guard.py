@@ -442,7 +442,7 @@ def test_oldNameOfARenamedTransformationIsFreeOnceItsTableIsGone(projectStorage)
     assert _create(project, "before")["transformation_name"] == "before"
 
 
-@pytest.mark.parametrize("operation", ["metadataRead", "metadataWrite", "tableRemove", "list:metadata.json", "cacheClear"])
+@pytest.mark.parametrize("operation", ["metadataRead", "metadataWrite", "list:metadata.json", "cacheClear"])
 def test_failedStepKeepsTheTransformationAndCanBeRetried(projectStorage, operation):
     project = _appliedProject(projectStorage)
     project.failures[operation] = ConnectionError("storage unavailable")
@@ -853,7 +853,7 @@ def test_rollingBackRemovesTheTableTheArtifactNamesWithItsKeyAndCaches(projectSt
     assert project.rows[0]["latest_approved_artifact"] is None
 
 
-@pytest.mark.parametrize("operation", ["tableRemove", "list:metadata.json", "metadataRead", "metadataWrite", "cacheClear"])
+@pytest.mark.parametrize("operation", ["list:metadata.json", "metadataRead", "metadataWrite", "cacheClear"])
 def test_failedRollbackCleanupChangesNoRowAndCanBeRetried(projectStorage, operation):
     project = _appliedProject(projectStorage)
     project.rows[0].update(_withMessages({}))
@@ -1946,6 +1946,8 @@ def test_loadWhoseReleaseAfterItsWriteKeepsFailingStillClearsCachesAndIsRefused(
         _load(project, "sales")
 
     assert caught.value.statusCode == 503
+    # The release before the write, then the release after it and each retry.
+    assert len(project.failures["rowUpdate"]) == 11 - 1 - (1 + 2)
     assert project.forgotten == ["sales"]
     assert any("project_1" in str(call) and "sales" in str(call) for call in log.error.call_args_list)
 
@@ -2172,3 +2174,39 @@ def test_listedTransformationsDoNotShowTheirFileRecord(projectStorage):
 
     assert [row.get("latest_approved_artifact") for row in listed] == [{"table_name": "sales", "mermaid_code": "graph"}, None]
     assert project.rows[0]["latest_approved_artifact"]["table_file"] == _recordedFile("sales")
+
+
+@pytest.mark.parametrize("operation", ["delete", "rollback"])
+def test_failedCleanupOfAnUnrecordedClaimDoesNotGiveItBackOverAnUploadAfterTheRelease(projectStorage, operation):
+    # The upload lands after the cleanup takes the name, before it reads the file; then the remove fails.
+    project = projectStorage(_FakeProject(metadata={}, tables=("summary",), rows=[_withMessages(_appliedRow())]))
+    project.afterRowUpdate.append(lambda: _uploadLands(project, "summary"))
+    project.failures["tableRemove"] = ConnectionError("storage unavailable")
+
+    with pytest.raises(CustomException):
+        _cleanUp(project, operation)
+
+    assert project.rows[0]["latest_approved_artifact"] is None
+    project.failures.clear()
+    _cleanUp(project, operation)
+    assert project.writers["summary.parquet"] == "upload"
+
+
+@pytest.mark.parametrize("operation", ["delete", "rollback"])
+def test_failedRemoveOfAnUnrecordedTableKeepsItAsAnOrdinaryTable(projectStorage, operation):
+    # With no record, the file still there cannot be told from an upload, so the claim is not given back.
+    project = projectStorage(_FakeProject(metadata={"sales": {}, "summary": {}}, tables=("sales", "summary"), rows=[_withMessages(_appliedRow())]))
+    project.failures["tableRemove"] = ConnectionError("storage unavailable")
+
+    with pytest.raises(CustomException) as caught:
+        _cleanUp(project, operation)
+
+    assert caught.value.statusCode == 503
+    assert project.rows[0]["latest_approved_artifact"] is None
+    project.failures.clear()
+    _cleanUp(project, operation)
+    assert "summary.parquet" in project.fileNames
+    assert "summary" in project.metadata
+    _cleanedUpRow(project, operation)
+    _deleteTable(project, "summary")
+    assert "summary.parquet" not in project.fileNames
