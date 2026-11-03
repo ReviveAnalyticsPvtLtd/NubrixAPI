@@ -11,7 +11,7 @@ __all__ = ["dataLoadService"]
 
 from nubrix.components.pdfTableExtractor import PdfTableExtractor
 from api.services.credits.creditTrackingCallback import CreditTrackingCallback
-from api.commons import giveTableNameBack, updateProjectModifiedAt
+from api.commons import giveTableNameBack, tableFileState, updateProjectModifiedAt
 from utils.exceptionHandler import CustomException
 from utils.initMethods import forget_table
 from pymongo.mongo_client import MongoClient
@@ -100,16 +100,28 @@ class DataLoadService:
             prior = claim["latest_approved_artifact"]
             if not prior:
                 continue
-            giveTableNameBack(self.client, projectId, claim["transformation_id"], tableName, prior, (prior.get("table_file"),))
+            ownFile = prior.get("table_file") or claim.get("file_before_release")
+            giveTableNameBack(self.client, projectId, claim["transformation_id"], tableName, prior, (ownFile,))
 
     def _acceptTableName(self, projectId: str, tableName: str) -> list[dict]:
         """Refuse a name already in the project, then release it. Loads release it again once the file is written.
 
-        Returns the claims it took, for _writeTable to give back if the load writes nothing.
+        Returns the claims it took, for _writeTable to give back if the load writes nothing. Each carries the
+        file as it was read before the claims were, for a claim with no recorded `table_file` (applied before
+        files were recorded, or the record failed). A load that writes releases the name after its write, so a
+        claim still there when the claims are read means no load finished a write since that read: the file read
+        is the transformation's. Read after the claims, it could be another load's upload.
         """
         from api.services.managementService import managementService
         managementService.validateTableNameAvailable(projectId=projectId, tableName=tableName)
-        return self._releaseTableName(projectId, tableName)
+        try:
+            fileBeforeRelease = tableFileState(self.client, projectId, tableName)
+        except Exception as e:
+            # Then only a claim whose table has no file is given back, as before files were read here.
+            fileBeforeRelease = None
+            logger.warning(f"Could not read '{tableName}' before taking its name; a failed load gives it back only to a transformation that recorded its file or has none: {e}")
+        claims = self._releaseTableName(projectId, tableName)
+        return [{**claim, "file_before_release": fileBeforeRelease} for claim in claims]
 
     def _writeTable(self, projectId: str, tableName: str, claims: list[dict], writeParquet) -> None:
         """Write a load's table under a name it accepted, then release the name again.

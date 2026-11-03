@@ -2,6 +2,7 @@
 
 import asyncio
 import copy
+import hashlib
 import io
 import json
 import os
@@ -202,7 +203,10 @@ class _FakeRows:
             if self.project.afterRowUpdate:
                 self.project.afterRowUpdate.pop(0)()
             return mock.Mock(data=updated)
-        return mock.Mock(data=self._matches())
+        selected = self._matches()
+        if self.project.afterRowSelect:
+            self.project.afterRowSelect.pop(0)()
+        return mock.Mock(data=selected)
 
 
 class _FakeProject:
@@ -226,7 +230,11 @@ class _FakeProject:
         # Bumped on every table write, as storage moves updated_at on every write.
         self.versions = {}
         self.afterRowUpdate = []
+        self.afterRowSelect = []
+        # What a transformation wrote to each file, so storage can report its MD5 as the eTag.
+        self.contents = {}
         self.beforeTableWrite = None
+        self.afterTableWrite = None
         self.duringSandbox = None
         self.duringTableWrite = None
         self.storage = mock.Mock()
@@ -248,7 +256,7 @@ class _FakeProject:
         self.fail(f"list:{search}")
         # As on real storage: a case-insensitive prefix, so a hit is not yet the exact file.
         matches = [name for name in sorted(self.fileNames) if name.lower().startswith(search.lower())]
-        return [_storageEntry(name, self.versions.get(name, 0)) for name in matches[:self.PAGE_LIMIT]]
+        return [_storageEntry(name, self.versions.get(name, 0), self.contents.get(name)) for name in matches[:self.PAGE_LIMIT]]
 
     def download(self, path):
         self.fail("metadataRead")
@@ -263,6 +271,7 @@ class _FakeProject:
                 hook()
             self.fileNames.add(fileName)
             self.writers[fileName] = "upload"
+            self.contents.pop(fileName, None)
             self.versions[fileName] = self.versions.get(fileName, 0) + 1
             return
         self.fail("metadataWrite")
@@ -278,6 +287,7 @@ class _FakeProject:
             self.removed.append(path)
             self.fileNames.discard(path.rpartition("/")[2])
             self.writers.pop(path.rpartition("/")[2], None)
+            self.contents.pop(path.rpartition("/")[2], None)
 
     def forget(self, projectId, tableName):
         self.fail("cacheClear")
@@ -298,13 +308,14 @@ def _delete(project, transformationId="t1"):
     return asyncio.run(_projectService(project).deleteTransformation("project_1", transformationId))
 
 
-def _storageEntry(fileName, version=0):
-    # As on real storage, every write moves updated_at and the eTag.
-    return {"name": fileName, "id": f"id-{fileName}", "updated_at": str(version), "metadata": {"eTag": f"v{version}"}}
+def _storageEntry(fileName, version=0, content=None):
+    # As on real storage, every write moves updated_at, and the eTag is the MD5 of a single-part upload.
+    eTag = f'"{hashlib.md5(content).hexdigest()}"' if content is not None else f"v{version}"
+    return {"name": fileName, "id": f"id-{fileName}", "updated_at": str(version), "metadata": {"eTag": eTag}}
 
 
-def _recordedFile(tableName, version=0):
-    entry = _storageEntry(f"{tableName}.parquet", version)
+def _recordedFile(tableName, version=0, content=None):
+    entry = _storageEntry(f"{tableName}.parquet", version, content)
     return {"id": entry["id"], "updated_at": entry["updated_at"], "eTag": entry["metadata"]["eTag"]}
 
 
@@ -523,7 +534,11 @@ class _FakeExecutor:
         self.project.applied.append(tableName)
         self.project.fileNames.add(f"{tableName}.parquet")
         self.project.writers[f"{tableName}.parquet"] = "transformation"
+        self.project.contents[f"{tableName}.parquet"] = parquetBytes
         self.project.versions[f"{tableName}.parquet"] = self.project.versions.get(f"{tableName}.parquet", 0) + 1
+        hook, self.project.afterTableWrite = self.project.afterTableWrite, None
+        if hook:
+            hook()
 
 
 def _workspaceService(project):
@@ -1214,18 +1229,27 @@ def test_applyIsRefusedWhenAnUploadIsWrittenAfterItsFirstCheck(projectStorage):
     assert project.rows[0].get("latest_approved_artifact") is None
 
 
-def test_loadAcceptedWhileTheTableIsWrittenKeepsTheName(projectStorage):
+def test_loadAcceptedWhileTheTableIsWrittenTakesTheNameWhenItWrites(projectStorage):
+    # The apply takes its name back over its own file; the load's write then takes it away again.
+    from api.services.managementService import managementService
+
     project = projectStorage(_FakeProject(metadata={}, rows=[_withMessages(_draftRow())]))
     _approve(project)
     loader = object.__new__(DataLoadService)
     loader.client = project
-    project.duringTableWrite = lambda: loader._releaseTableName("project_1", "sales")
+    accepted = {}
+    project.duringTableWrite = lambda: accepted.update(claims=loader._acceptTableName("project_1", "sales"))
 
-    with pytest.raises(CustomException) as caught:
+    with mock.patch.object(managementService, "client", project):
         _apply(project)
+    assert project.rows[0]["latest_approved_artifact"]["table_name"] == "sales"
 
-    assert caught.value.statusCode == 409
-    assert project.rows[0].get("latest_approved_artifact") is None
+    project.forgotten.clear()
+    loader._writeTable("project_1", "sales", accepted["claims"], lambda path: None)
+
+    assert project.rows[0]["latest_approved_artifact"] is None
+    assert project.writers["sales.parquet"] == "upload"
+    assert project.forgotten == ["sales"]
 
 
 def test_retriedApplyIsRefusedOnceALoadAcceptsItsName(projectStorage):
@@ -1356,7 +1380,7 @@ def test_applyRacingAnotherApplyOfTheSameTransformationLeavesTheOthersTable(proj
     assert caught.value.statusCode == 409
     assert project.applied == ["sales"]
     assert project.rows[0]["latest_approved_artifact"] == {
-        "mermaid_code": "graph", "message_id": "m1", "table_name": "sales", "table_file": _recordedFile("sales", 1),
+        "mermaid_code": "graph", "message_id": "m1", "table_name": "sales", "table_file": _recordedFile("sales", 1, b"parquet"),
     }
 
 
@@ -1568,6 +1592,7 @@ def test_loadIsKeptWhenClearingCachesFails(projectStorage):
 def _uploadLands(project, name):
     project.fileNames.add(f"{name}.parquet")
     project.writers[f"{name}.parquet"] = "upload"
+    project.contents.pop(f"{name}.parquet", None)
     project.versions[f"{name}.parquet"] = project.versions.get(f"{name}.parquet", 0) + 1
 
 
@@ -1624,14 +1649,16 @@ def test_failedLoadGivesBackAClaimWhoseTableHadNoFile(projectStorage):
     assert project.rows[0]["latest_approved_artifact"] == {"table_name": "sales"}
 
 
-def test_failedLoadDoesNotGiveBackANameWhoseFileWasNotRecorded(projectStorage):
-    # Applied before files were recorded, or the record failed: the file cannot be told apart from an upload.
+def test_failedLoadGivesBackANameWhoseFileWasNotRecorded(projectStorage):
+    # Applied before files were recorded, or the record failed. The load read the file before it took the claim.
     project = projectStorage(_FakeProject(metadata={}, tables=("sales",), rows=[_appliedRow("sales")]))
+    project.writers["sales.parquet"] = "transformation"
 
     with pytest.raises(CustomException):
         _load(project, "sales", parquetError=ValueError("cannot convert"))
 
-    assert project.rows[0]["latest_approved_artifact"] is None
+    assert project.rows[0]["latest_approved_artifact"] == {"table_name": "sales"}
+    assert project.writers["sales.parquet"] == "transformation"
 
 
 def test_failedLoadDoesNotHandOverAnUploadThatLandedBeforeItReleasedTheName(projectStorage):
@@ -1670,7 +1697,7 @@ def test_applyRecordsTheFileItWrote(projectStorage):
 
     _apply(project)
 
-    assert project.rows[0]["latest_approved_artifact"]["table_file"] == _recordedFile("sales", project.versions["sales.parquet"])
+    assert project.rows[0]["latest_approved_artifact"]["table_file"] == _recordedFile("sales", project.versions["sales.parquet"], b"parquet")
 
 
 def test_applyStillSucceedsWhenItsFileCannotBeRecorded(projectStorage):
@@ -1918,3 +1945,217 @@ def test_loadWhoseReleaseAfterItsWriteKeepsFailingStillClearsCachesAndIsRefused(
     assert caught.value.statusCode == 503
     assert project.forgotten == ["sales"]
     assert any("project_1" in str(call) and "sales" in str(call) for call in log.error.call_args_list)
+
+
+def _loader(project):
+    loader = object.__new__(DataLoadService)
+    loader.client = project
+    return loader
+
+
+def _releasedByALoadThatDies(project, name="sales"):
+    """A load takes the name and stops before writing, without giving it back."""
+    return lambda: _loader(project)._releaseTableName("project_1", name)
+
+
+def _onFileRead(project, name, action):
+    """Run action once, straight after the next read of name's file."""
+    realList = project.list
+
+    def listThenAct(path=None, options=None):
+        entries = realList(path, options)
+        if (options or {}).get("search") == f"{name}.parquet":
+            project.list = realList
+            action()
+        return entries
+
+    project.list = listThenAct
+
+
+@pytest.mark.parametrize("operation", ["apply", "rollback"])
+def test_applyKeepsItsTableWhenALoadTakesTheNameAndFailsBeforeTheRecord(projectStorage, operation):
+    project = projectStorage(_FakeProject(metadata={}, rows=[_withMessages(_draftRow())]))
+    _approve(project)
+    if operation == "rollback":
+        _apply(project)
+        project.rows[0]["messages"].append({"message_id": "m2", "role": "user", "content": "more"})
+    project.afterTableWrite = _releasedByALoadThatDies(project)
+
+    _run(_workspaceService(project), operation)
+
+    artifact = project.rows[0]["latest_approved_artifact"]
+    assert artifact["table_name"] == "sales"
+    assert artifact["table_file"] == _recordedFile("sales", project.versions["sales.parquet"], b"parquet")
+    assert project.writers["sales.parquet"] == "transformation"
+
+
+def test_applyIsRefusedWhenALoadWritesAndReleasesBeforeTheRecord(projectStorage):
+    # The load overwrites the apply's file before the apply reads it back, so that read is the load's upload.
+    project = projectStorage(_FakeProject(metadata={}, rows=[_withMessages(_draftRow())]))
+    _approve(project)
+    project.afterTableWrite = lambda: _load(project, "sales")
+
+    with pytest.raises(CustomException) as caught:
+        _apply(project)
+
+    assert caught.value.statusCode == 409
+    assert project.writers["sales.parquet"] == "upload"
+    assert project.rows[0]["latest_approved_artifact"] is None
+
+
+def test_applyIsRefusedWhenALoadWritesAfterTheApplyReadsItsFile(projectStorage):
+    project = projectStorage(_FakeProject(metadata={}, rows=[_withMessages(_draftRow())]))
+    _approve(project)
+    seen = []
+
+    def releaseThenArm():
+        _releasedByALoadThatDies(project)()
+        _onFileRead(project, "sales", lambda: _uploadLands(project, "sales"))
+        project.afterRowUpdate.extend([lambda: seen.append(project.rows[0]["latest_approved_artifact"])] * 5)
+
+    project.afterTableWrite = releaseThenArm
+
+    with pytest.raises(CustomException) as caught:
+        _apply(project)
+
+    assert caught.value.statusCode == 409
+    assert project.writers["sales.parquet"] == "upload"
+    # Not even briefly given back onto the upload.
+    assert seen == [None]
+
+
+def test_applyReleasesTheNameAgainWhenTheFileChangesAsItTakesItBack(projectStorage):
+    project = projectStorage(_FakeProject(metadata={}, rows=[_withMessages(_draftRow())]))
+    _approve(project)
+
+    def releaseThenArm():
+        _releasedByALoadThatDies(project)()
+        # The next two row updates are the apply's record, which finds no claim, then its taking the name back.
+        project.afterRowUpdate.extend([lambda: None, lambda: _uploadLands(project, "sales")])
+
+    project.afterTableWrite = releaseThenArm
+
+    with pytest.raises(CustomException) as caught:
+        _apply(project)
+
+    assert caught.value.statusCode == 409
+    assert project.writers["sales.parquet"] == "upload"
+    assert project.rows[0]["latest_approved_artifact"] is None
+
+
+def test_applyDoesNotTakeBackAFileWhoseETagIsNotItsContent(projectStorage):
+    # Storage that reports another kind of eTag, such as for a multipart upload, cannot prove the file is the apply's.
+    project = projectStorage(_FakeProject(metadata={}, rows=[_withMessages(_draftRow())]))
+    _approve(project)
+
+    def releaseAndForgetTheContent():
+        _releasedByALoadThatDies(project)()
+        project.contents.pop("sales.parquet")
+
+    project.afterTableWrite = releaseAndForgetTheContent
+
+    with pytest.raises(CustomException) as caught:
+        _apply(project)
+
+    assert caught.value.statusCode == 409
+    assert project.rows[0]["latest_approved_artifact"] is None
+
+
+def test_failedLoadDoesNotGiveBackAnUnrecordedNameWhenAnotherLoadWritesBeforeItFails(projectStorage):
+    project = projectStorage(_FakeProject(metadata={}, tables=("sales",), rows=[_appliedRow("sales")]))
+    project.writers["sales.parquet"] = "transformation"
+
+    def otherLoadWritesThenFail(*_args, **_kwargs):
+        _uploadLands(project, "sales")
+        raise ValueError("cannot convert")
+
+    with pytest.raises(CustomException):
+        _load(project, "sales", parquetError=otherLoadWritesThenFail)
+
+    assert project.rows[0]["latest_approved_artifact"] is None
+    assert project.writers["sales.parquet"] == "upload"
+
+
+def test_failedLoadReadsTheFileBeforeTheClaims(projectStorage):
+    # Written straight after the load reads the claims, by a worker that does not release names: not the transformation's.
+    project = projectStorage(_FakeProject(metadata={}, tables=("sales",), rows=[_appliedRow("sales")]))
+    project.writers["sales.parquet"] = "transformation"
+    project.afterRowSelect.append(lambda: _uploadLands(project, "sales"))
+
+    with pytest.raises(CustomException):
+        _load(project, "sales", parquetError=ValueError("cannot convert"))
+
+    assert project.rows[0]["latest_approved_artifact"] is None
+    assert project.writers["sales.parquet"] == "upload"
+
+
+def test_applyCompletedBetweenALoadsFileReadAndItsClaimReadKeepsItsTable(projectStorage):
+    # The apply claims, writes and records its file after the load read the file, and before it read the claims.
+    project = projectStorage(_FakeProject(metadata={}, rows=[_withMessages(_draftRow())]))
+    _approve(project)
+    _onFileRead(project, "sales", lambda: _apply(project))
+
+    with pytest.raises(CustomException):
+        _load(project, "sales", parquetError=ValueError("cannot convert"))
+
+    assert project.rows[0]["latest_approved_artifact"]["table_file"] == _recordedFile("sales", project.versions["sales.parquet"], b"parquet")
+    assert project.writers["sales.parquet"] == "transformation"
+
+
+def test_twoFailedLoadsOverAnUnrecordedClaimGiveItBackOnce(projectStorage):
+    # The second load starts after the first gave the name back, and fails too.
+    project = projectStorage(_FakeProject(metadata={}, tables=("sales",), rows=[_appliedRow("sales")]))
+    project.writers["sales.parquet"] = "transformation"
+
+    for _ in range(2):
+        with pytest.raises(CustomException):
+            _load(project, "sales", parquetError=ValueError("cannot convert"))
+
+    assert project.rows[0]["latest_approved_artifact"] == {"table_name": "sales"}
+
+
+def test_secondLoadThatWritesAfterAFirstFailedLoadTakesTheName(projectStorage):
+    project = projectStorage(_FakeProject(metadata={}, tables=("sales",), rows=[_appliedRow("sales")]))
+    project.writers["sales.parquet"] = "transformation"
+    with pytest.raises(CustomException):
+        _load(project, "sales", parquetError=ValueError("cannot convert"))
+
+    _load(project, "sales")
+
+    assert project.rows[0]["latest_approved_artifact"] is None
+    assert project.writers["sales.parquet"] == "upload"
+
+
+def test_failedLoadGivesBackANameWhoseTableHasNoKey(projectStorage):
+    # Applied before files were recorded and never registered: without the name back, nothing lists the table.
+    project = projectStorage(_FakeProject(metadata={"sales": {}}, tables=("sales", "summary"), rows=[_appliedRow("summary")]))
+    project.writers["summary.parquet"] = "transformation"
+
+    with pytest.raises(CustomException):
+        _load(project, "summary", parquetError=ValueError("cannot convert"))
+
+    assert project.rows[0]["latest_approved_artifact"] == {"table_name": "summary"}
+
+
+def test_loadStillWritesWhenItCannotReadTheFileBeforeTheClaims(projectStorage):
+    project = projectStorage(_FakeProject(metadata={}, tables=("sales",), rows=[_appliedRow("sales")]))
+    # The first read of the file is the one before the claims.
+    project.failures["list:sales.parquet"] = [ConnectionError("storage unavailable")]
+
+    _load(project, "sales")
+
+    assert project.writers["sales.parquet"] == "upload"
+    assert project.rows[0]["latest_approved_artifact"] is None
+
+
+def test_failedLoadThatCouldNotReadTheFileGivesBackOnlyARecordedClaim(projectStorage):
+    project = projectStorage(_FakeProject(
+        metadata={}, tables=("sales",), rows=[_appliedRow("sales"), _appliedRow("sales", transformationId="t2", recorded=True)],
+    ))
+    project.failures["list:sales.parquet"] = [ConnectionError("storage unavailable")]
+
+    with pytest.raises(CustomException):
+        _load(project, "sales", parquetError=ValueError("cannot convert"))
+
+    assert project.rows[0]["latest_approved_artifact"] is None
+    assert project.rows[1]["latest_approved_artifact"] == {"table_name": "sales", "table_file": _recordedFile("sales")}

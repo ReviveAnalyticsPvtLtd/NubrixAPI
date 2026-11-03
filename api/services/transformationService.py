@@ -362,18 +362,24 @@ class TransformationService:
         except Exception as e:
             logger.error(f"Could not undo the claim on '{tableName}' for transformation {transformationId}: {e}")
 
-    def _record_applied_artifact(self, projectId: str, transformationId: str, latestArtifact: dict) -> None:
+    def _record_applied_artifact(self, projectId: str, transformationId: str, latestArtifact: dict, parquetBytes: bytes) -> None:
         """Point the row at the table it just wrote, unless a load has taken the name meanwhile.
 
         It also records the file storage now holds, so a failed load gives the name back only while that file is
         unchanged. A load that wrote first releases the name after its write, which clears this record with it.
+
+        A load that took the name and wrote nothing leaves this row with no claim. The row then takes the name back
+        onto its own file, as a failed load gives one back: only while storage reports this write's content (an
+        MD5 eTag of parquetBytes) and the file is unchanged since it was read, only onto a row with no artifact,
+        and released again if the file changes as it does. A load that wrote meanwhile changed the content, so its
+        upload is never taken. Storage that reports no such eTag, as for a multipart upload, gets the 409.
         """
         tableName = latestArtifact["table_name"]
         try:
             fileState = tableFileState(self.supabase, projectId, tableName)
         except Exception as e:
             fileState = None
-            logger.warning(f"Could not record the file for '{tableName}'; a failed load will not give the name back: {e}")
+            logger.warning(f"Could not record the file for '{tableName}'; a failed load gives the name back only while no load has written it since: {e}")
         if fileState:
             latestArtifact = {**latestArtifact, "table_file": fileState}
         try:
@@ -385,12 +391,20 @@ class TransformationService:
             exception = CustomException(e, statusCode=503, uiMessage="We could not finish saving this table. Please try again.")
             logger.error(exception)
             raise exception
+        if not updated and fileState and self._holds_written_content(fileState, parquetBytes):
+            updated = giveTableNameBack(self.supabase, projectId, transformationId, tableName, latestArtifact, (fileState,))
         if not updated:
             raise CustomException(
                 ValueError(f"Table '{tableName}' was taken by a load while it was written."),
                 statusCode=409,
                 uiMessage=f"A table named '{tableName}' was just added to this project. Please use a different name."
             )
+
+    @staticmethod
+    def _holds_written_content(fileState: dict, parquetBytes: bytes) -> bool:
+        """Whether storage reports parquetBytes as the file's content: a single-part upload's eTag is its MD5."""
+        import hashlib
+        return str(fileState.get("eTag") or "").strip('"') == hashlib.md5(parquetBytes).hexdigest()
 
     def _get_messages_from_db(self, projectId: str, transformationId: str) -> list[dict]:
         """Load messages list directly from transformations table."""
@@ -739,7 +753,7 @@ class TransformationService:
                 "mermaid_code": artifact.get("code"),
                 "message_id": messageId,
                 "table_name": newTransformedTableName,
-            })
+            }, parquetBytes)
 
             artifact["is_approved"] = True
             target_msg["artifact"] = artifact
@@ -828,7 +842,7 @@ class TransformationService:
                     "mermaid_code": (lastApprovedMsg.get("artifact") or {}).get("code"),
                     "message_id": lastApprovedMsg.get("message_id"),
                     "table_name": newTransformedTableName,
-                })
+                }, parquetBytes)
                 
                 # Keep the approved checkpoint's status intact
                 approvedArtifact = lastApprovedMsg.get("artifact") or {}
