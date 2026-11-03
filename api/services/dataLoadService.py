@@ -38,6 +38,10 @@ import gc
 import re
 import csv
 
+# Seconds to wait before each retry of the release after a load's write.
+RELEASE_RETRY_PAUSES = (0.2, 0.5)
+
+
 class DataLoadService:
     """
     Service class for loading data from different sources and managing project tables.
@@ -113,7 +117,8 @@ class DataLoadService:
         writeParquet(path) produces the file. If it fails, nothing was written, so the claims are given back
         and a transformation's table keeps its owner. A failed upload may still have landed, so after one the
         claims stay released. After the write the name is released again and the table's caches are cleared,
-        whether or not this load saw a claim: another load may have taken it first.
+        whether or not this load saw a claim: another load may have taken it first. That release is retried,
+        the caches are cleared even if it keeps failing, and the load then answers 503.
         """
         uploading = False
         try:
@@ -129,11 +134,24 @@ class DataLoadService:
             if not uploading:
                 self._restoreClaims(projectId, tableName, claims)
             raise
-        self._releaseTableName(projectId, tableName)
+        releaseError = None
+        for pause in (*RELEASE_RETRY_PAUSES, None):
+            try:
+                self._releaseTableName(projectId, tableName)
+                releaseError = None
+                break
+            except CustomException as e:
+                releaseError = e
+                if pause is not None:
+                    time.sleep(pause)
         try:
             forget_table(projectId, tableName)
         except Exception as e:
             logger.warning(f"Could not clear caches for {tableName} after a load replaced it: {e}")
+        if releaseError:
+            # A transformation may still claim this upload, so deleting it would remove the upload.
+            logger.error(f"Load wrote '{tableName}' in project {projectId} but could not release the name from its transformations.")
+            raise releaseError
 
     @staticmethod
     def _sanitizeDfForParquet(df: pd.DataFrame) -> pd.DataFrame:

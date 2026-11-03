@@ -233,8 +233,12 @@ class _FakeProject:
         self.storage.from_.return_value = self
 
     def fail(self, operation):
-        if operation in self.failures:
-            raise self.failures[operation]
+        failure = self.failures.get(operation)
+        if isinstance(failure, list):
+            # One failure, or None for a success, per call in turn.
+            failure = failure.pop(0) if failure else None
+        if failure:
+            raise failure
 
     def table(self, _name):
         return _FakeRows(self)
@@ -1884,3 +1888,33 @@ def test_failedReapplyThenAFailedLoadGivesTheNameBack(projectStorage):
 
     assert project.rows[0]["latest_approved_artifact"] == applied
     assert project.writers["summary.parquet"] == "transformation"
+
+
+@pytest.fixture
+def noRetryPause():
+    with mock.patch("api.services.dataLoadService.RELEASE_RETRY_PAUSES", (0, 0)):
+        yield
+
+
+def test_loadRetriesTheReleaseAfterItsWrite(projectStorage, noRetryPause):
+    project = projectStorage(_FakeProject(metadata={}, tables=("sales",), rows=[_appliedRow("sales", recorded=True)]))
+    # The release before the write works; the first one after it fails.
+    project.failures["rowUpdate"] = [None, ConnectionError("database unavailable")]
+
+    _load(project, "sales")
+
+    assert project.rows[0]["latest_approved_artifact"] is None
+    assert project.forgotten == ["sales"]
+    assert project.writers["sales.parquet"] == "upload"
+
+
+def test_loadWhoseReleaseAfterItsWriteKeepsFailingStillClearsCachesAndIsRefused(projectStorage, noRetryPause):
+    project = projectStorage(_FakeProject(metadata={}, tables=("sales",), rows=[_appliedRow("sales", recorded=True)]))
+    project.failures["rowUpdate"] = [None] + [ConnectionError("database unavailable")] * 10
+
+    with mock.patch("api.services.dataLoadService.logger") as log, pytest.raises(CustomException) as caught:
+        _load(project, "sales")
+
+    assert caught.value.statusCode == 503
+    assert project.forgotten == ["sales"]
+    assert any("project_1" in str(call) and "sales" in str(call) for call in log.error.call_args_list)
