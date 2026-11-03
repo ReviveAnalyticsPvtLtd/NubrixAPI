@@ -125,11 +125,12 @@ Every table entry in `metadata.json` now has an `isActive` boolean. Inactive tab
 No new table (from data load or transformation) can take a name that already exists in `metadata.json` — active or inactive. Raises `409` with message `"A table named '{tableName}' already exists in this project."`
 
 Called at every entry point where a new table is created:
-- Transformation preview (`transformationService.executeAndPreviewArtifact`) — validated once at preview, not re-validated at apply.
+- Transformations (`transformationService._validate_transformation_table_name`) — checked at approve, then again at apply and rollback straight before the write: `_claim_table_name` claims the name only over the artifact it read, checks again, and a first write never replaces an existing file.
 
-**Carve-out**: `transformationService.approveMessage` skips the check when the transformation's own `latest_approved_artifact.table_name` matches `newTransformedTableName` — i.e., a transformation may re-approve / overwrite its own output. Re-using a name that belongs to a *different* table still raises 409.
+**Carve-out**: a transformation may overwrite the table its own `latest_approved_artifact.table_name` names. Re-using a name that belongs to a *different* table still raises 409. Loads release that claim when they accept the name, give it back if they fail before writing, and clear the table's caches after writing over it.
 - CSV upload (`dataLoadService.loadCsvData`)
 - Excel upload (`dataLoadService.loadExcelData`)
+- PDF upload (`dataLoadService.loadPdfData`)
 - MySQL load (`dataLoadService.loadMySql`)
 - PostgreSQL load (`dataLoadService.loadPostgreSQL`)
 - MongoDB load (`dataLoadService.loadMongoDB`)

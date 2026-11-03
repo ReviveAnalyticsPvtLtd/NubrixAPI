@@ -254,23 +254,32 @@ class TransformationService:
         self._remove_table_from_metadata(projectId, tableName)
         forget_table(projectId, tableName)
 
-    def _claim_table_name(self, projectId: str, transformationId: str, tableName: str) -> None:
+    def _claim_table_name(self, projectId: str, transformationId: str, tableName: str) -> tuple[bool, dict | None]:
         """Check the name and claim it for this row, straight before its table is written.
 
         A load releases every claim on a name it accepts, so a claim gone by the second check means
         a load is writing that table. The second check also catches a file written since the first.
+        The claim is written only over the artifact read here, so a claim a load released since is not put back.
+
+        Returns whether the row already owned the name, and its artifact before the claim.
         """
         row = self._ensure_transformation(projectId=projectId, transformationId=transformationId)
         priorArtifact = row.get("latest_approved_artifact") if isinstance(row.get("latest_approved_artifact"), dict) else None
-        ownedBefore = bool(priorArtifact) and priorArtifact.get("table_name") == tableName
+        priorTable = (priorArtifact or {}).get("table_name")
+        ownedBefore = priorTable == tableName
         self._validate_transformation_table_name(projectId=projectId, targetTableName=tableName, currentTransformationId=transformationId)
 
-        stillClaimed = False
+        claimed = stillClaimed = False
         try:
-            self.supabase.table("transformations").update({
+            claim = self.supabase.table("transformations").update({
                 "latest_approved_artifact": {**(priorArtifact or {}), "table_name": tableName},
-            }).eq("transformation_id", transformationId).execute()
-            stillClaimed = bool(
+            }).eq("transformation_id", transformationId)
+            if priorTable:
+                claim = claim.eq("latest_approved_artifact->>table_name", priorTable)
+            else:
+                claim = claim.is_("latest_approved_artifact->>table_name", "null")
+            claimed = bool(claim.execute().data)
+            stillClaimed = claimed and bool(
                 self.supabase.table("transformations").select("transformation_id")
                 .eq("transformation_id", transformationId)
                 .eq("latest_approved_artifact->>table_name", tableName)
@@ -284,7 +293,7 @@ class TransformationService:
                     ignoreOwnClaim=not ownedBefore,
                 )
         except Exception as e:
-            if stillClaimed:
+            if claimed:
                 self._restore_artifact(transformationId, tableName, priorArtifact)
             if isinstance(e, CustomException):
                 raise
@@ -297,6 +306,19 @@ class TransformationService:
                 statusCode=409,
                 uiMessage=f"A table named '{tableName}' was just added to this project. Please use a different name."
             )
+        return ownedBefore, priorArtifact
+
+    def _write_claimed_table(self, projectId: str, transformationId: str, tableName: str, parquetBytes: bytes) -> None:
+        """Claim the name, then write the table. Only a row that already owned the name may replace a file,
+        so an upload that lands between the last check and a first write is kept, and this answers 409.
+        """
+        ownedBefore, priorArtifact = self._claim_table_name(projectId, transformationId, tableName)
+        try:
+            self.executor.apply(projectId=projectId, parquetBytes=parquetBytes, tableName=tableName, overwrite=ownedBefore)
+        except CustomException as e:
+            if e.statusCode == 409:
+                self._restore_artifact(transformationId, tableName, priorArtifact)
+            raise
 
     def _restore_artifact(self, transformationId: str, tableName: str, priorArtifact: dict | None) -> None:
         """Undo a claim this row made, unless something has replaced it since."""
@@ -666,12 +688,7 @@ class TransformationService:
                 )
 
             # Checked here, not at approve: an upload can take the name while the code runs.
-            self._claim_table_name(projectId, transformationId, newTransformedTableName)
-            self.executor.apply(
-                projectId=projectId,
-                parquetBytes=parquetBytes,
-                tableName=newTransformedTableName,
-            )
+            self._write_claimed_table(projectId, transformationId, newTransformedTableName, parquetBytes)
             self._record_applied_artifact(transformationId, {
                 "mermaid_code": artifact.get("code"),
                 "message_id": messageId,
@@ -758,12 +775,7 @@ class TransformationService:
                     tableName=newTransformedTableName,
                 )
                 # The table may have been deleted and its name taken since that checkpoint was applied.
-                self._claim_table_name(projectId, transformationId, newTransformedTableName)
-                self.executor.apply(
-                    projectId=projectId,
-                    parquetBytes=parquetBytes,
-                    tableName=newTransformedTableName,
-                )
+                self._write_claimed_table(projectId, transformationId, newTransformedTableName, parquetBytes)
                 
                 # Update latest approved artifact to point to this checkpoint
                 self._record_applied_artifact(transformationId, {

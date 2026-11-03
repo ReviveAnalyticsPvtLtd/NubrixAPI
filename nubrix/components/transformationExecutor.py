@@ -233,16 +233,24 @@ class TransformationExecutor:
             logger.error(exception)
             raise exception
 
-    def apply(self, projectId: str, parquetBytes: bytes, tableName: str) -> None:
-        """Upload parquet bytes to Supabase storage and refresh the fetch_data cache."""
+    def apply(self, projectId: str, parquetBytes: bytes, tableName: str, overwrite: bool = True) -> None:
+        """Upload parquet bytes to Supabase storage and refresh the fetch_data cache.
+
+        With overwrite=False storage keeps any file already there, and this answers 409.
+        """
         try:
             self._validate_table_name(tableName)
             storagePath = f"{projectId}/{tableName}.parquet"
-            self.client.storage.from_("AnalyticsHub").upload(
-                path=storagePath,
-                file=parquetBytes,
-                file_options={"upsert": "true"},
-            )
+            try:
+                self.client.storage.from_("AnalyticsHub").upload(
+                    path=storagePath,
+                    file=parquetBytes,
+                    file_options={"upsert": "true" if overwrite else "false"},
+                )
+            except Exception as e:
+                if not overwrite and (str(getattr(e, "status", "")) == "409" or getattr(e, "code", None) == "Duplicate"):
+                    raise CustomException(e, statusCode=409, uiMessage=f"A table named '{tableName}' was just added to this project. Please use a different name.")
+                raise
             redisClient = self._redis_client()
             redisClient.set(name=f"{projectId}::{tableName}", value=parquetBytes, ex=300)
             try:
@@ -250,6 +258,8 @@ class TransformationExecutor:
                 invalidate_data_cache(projectId=projectId, tableName=tableName)
             except Exception:
                 pass
+        except CustomException:
+            raise
         except Exception as e:
             exception = CustomException(e, statusCode=500, uiMessage="Failed to apply transformation.")
             logger.error(exception)

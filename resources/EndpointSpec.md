@@ -1368,7 +1368,7 @@ Approve a Mermaid artifact and return a 100-row preview of the transformed table
 
 ### 9.6 `POST /api/latest/transformations/{transformationId}/messages/{messageId}/apply?projectId={projectId}`
 
-Persist the approved transformation as a project table. Uploads parquet to Supabase storage and updates metadata. The name is checked straight before the table is written: `409` if a table this transformation did not write has it, or a load takes it during the apply; `503` if that cannot be checked. Nothing is written in either case.
+Persist the approved transformation as a project table. Uploads parquet to Supabase storage and updates metadata. The name is checked straight before the table is written: `409` if a table this transformation did not write has it, or a load takes it during the apply; `503` if that cannot be checked. A first apply of a name never replaces a stored file, so an upload that lands during the apply is kept and the apply answers `409`. The one exception is a re-apply over this transformation's own table while that table has no metadata key: a load that lands in the moment before the write can be overwritten, and the apply then answers `409`.
 
 **Auth:** Required + `requireActiveSubscription`
 
