@@ -290,6 +290,8 @@ class TransformationService:
         A load releases every claim on a name it accepts, so a claim gone by the second check means
         a load is writing that table. The second check also catches a file written since the first.
         The claim is written only over the artifact read here, so a claim a load released since is not put back.
+        A claim on the same name keeps the recorded `table_file`: until this write lands the file is still that
+        one, and once it lands the file differs from the record, which only ever stops a give-back or a remove.
 
         Returns whether the row already owned the name, and its artifact before the claim.
         """
@@ -303,7 +305,7 @@ class TransformationService:
         try:
             claim = self.supabase.table("transformations").update({
                 "latest_approved_artifact": {
-                    **{key: value for key, value in (priorArtifact or {}).items() if key != "table_file"},
+                    **{key: value for key, value in (priorArtifact or {}).items() if ownedBefore or key != "table_file"},
                     "table_name": tableName,
                 },
             }).eq("transformation_id", transformationId)

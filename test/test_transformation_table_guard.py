@@ -1854,3 +1854,33 @@ def test_failedCleanupDoesNotGiveTheNameBackOverAnUploadThatLandedMeanwhile(proj
     assert project.rows[0]["latest_approved_artifact"] is None
     assert project.writers["summary.parquet"] == "upload"
     assert "summary" in project.metadata
+
+
+def test_reapplyKeepsItsFileRecordWhileItClaimsTheSameName(projectStorage):
+    project = projectStorage(_FakeProject(metadata={}, rows=[_withMessages(_draftRow())]))
+    _approve(project)
+    _apply(project)
+    recorded = project.rows[0]["latest_approved_artifact"]["table_file"]
+    snapshots = []
+    project.afterRowUpdate.extend([lambda: snapshots.append(dict(project.rows[0]["latest_approved_artifact"] or {}))] * 5)
+
+    _apply(project)
+
+    assert snapshots[0]["table_file"] == recorded
+
+
+def test_failedReapplyThenAFailedLoadGivesTheNameBack(projectStorage):
+    # The re-apply's write fails without landing, so the file is still the one the first apply recorded.
+    project = projectStorage(_FakeProject(metadata={}, rows=[_withMessages(_draftRow("summary"))]))
+    _approve(project)
+    _apply(project)
+    applied = project.rows[0]["latest_approved_artifact"]
+    project.duringTableWrite = _writeFails
+    with pytest.raises(CustomException):
+        _apply(project)
+
+    with pytest.raises(CustomException):
+        _load(project, "summary", parquetError=ValueError("cannot convert"))
+
+    assert project.rows[0]["latest_approved_artifact"] == applied
+    assert project.writers["summary.parquet"] == "transformation"
