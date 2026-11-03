@@ -103,6 +103,12 @@ def _df_bytes(table: "pa.Table") -> int:
         return 0
 
 
+# Row and column counts outlive an expired table, so tables too large for Redis keep their
+# size class. invalidate_data_cache drops them with the table.
+_DF_SHAPES: "OrderedDict[tuple[str, str], tuple[int, int]]" = OrderedDict()
+_DF_SHAPES_MAX = 4096
+
+
 def _cache_caps():
     """Read cache caps once; env overrides take precedence over auto-sizing."""
     s = _sizing()
@@ -115,6 +121,11 @@ def _cache_put(key: tuple[str, str], table: "pa.Table") -> None:
     bytes_cap, entries_cap = _cache_caps()
     global _DF_CACHE_BYTES
     size = _df_bytes(table)
+    with _DF_CACHE_LOCK:
+        _DF_SHAPES[key] = (int(table.num_rows), int(table.num_columns))
+        _DF_SHAPES.move_to_end(key)
+        while len(_DF_SHAPES) > _DF_SHAPES_MAX:
+            _DF_SHAPES.popitem(last=False)
     if size > bytes_cap:
         return
     with _DF_CACHE_LOCK:
@@ -131,7 +142,7 @@ def _cache_put(key: tuple[str, str], table: "pa.Table") -> None:
 def _cache_get(key: tuple[str, str]):
     global _DF_CACHE_BYTES
     # A worker can only clear its own entries, so they expire to limit what the others keep serving.
-    ttl = int(os.environ.get("DF_CACHE_TTL_SECONDS", "60"))
+    ttl = int(os.environ.get("DF_CACHE_TTL_SECONDS") or "60")
     with _DF_CACHE_LOCK:
         entry = _DF_CACHE.get(key)
         if entry is None:
@@ -446,6 +457,12 @@ def classify_table_size(projectId: str, tableName: str) -> dict:
         sz = _classify_rows(rows)
         return {"rows_estimate": rows, "columns": cols, "size_class": sz,
                 "hint": _SIZE_HINTS[sz]}
+    shape = _DF_SHAPES.get(cache_key)
+    if shape is not None:
+        rows, cols = shape
+        sz = _classify_rows(rows)
+        return {"rows_estimate": rows, "columns": cols, "size_class": sz,
+                "hint": _SIZE_HINTS[sz]}
     # Cold fallback: metadata.json row counts in the Redis cache.
     redis_key = f"{projectId}::metadata"
     try:
@@ -478,6 +495,7 @@ def invalidate_data_cache(projectId: str | None = None, tableName: str | None = 
     with _DF_CACHE_LOCK:
         if projectId is None and tableName is None:
             _DF_CACHE.clear()
+            _DF_SHAPES.clear()
             _DF_CACHE_BYTES = 0
             return
         to_drop = [key for key in _DF_CACHE
@@ -485,14 +503,18 @@ def invalidate_data_cache(projectId: str | None = None, tableName: str | None = 
                    and (tableName is None or key[1] == tableName)]
         for key in to_drop:
             _DF_CACHE_BYTES -= _DF_CACHE.pop(key)[1]
+        for key in [key for key in _DF_SHAPES
+                    if (projectId is None or key[0] == projectId)
+                    and (tableName is None or key[1] == tableName)]:
+            del _DF_SHAPES[key]
 
 
 def forget_table(projectId: str, tableName: str) -> None:
     """Clear a deleted table, and the metadata that lists it, from Redis and this worker.
 
-    Other workers drop their copy when it expires. Raises if Redis fails, so a
-    caller that can retry the delete may stop.
+    Other workers drop their copy when it expires. This worker's copy goes first,
+    then Redis, which raises if it fails so a caller that can retry the delete may stop.
     """
+    invalidate_data_cache(projectId, tableName)
     r = redis.Redis(connection_pool=_redis_pool())
     r.delete(f"{projectId}::{tableName}", f"{projectId}::metadata.json", f"{projectId}::metadata")
-    invalidate_data_cache(projectId, tableName)
