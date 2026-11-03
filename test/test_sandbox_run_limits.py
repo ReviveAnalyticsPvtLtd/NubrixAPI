@@ -245,6 +245,7 @@ def test_cpuLimitEndsABusyLoop(storage, monkeypatch):
     result = sandboxRunner.runSandbox("inspect_launcher.py", PROJECT, "while True: pass", timeoutSeconds=60)
 
     assert result.returncode == -signal.SIGXCPU
+    assert result.stopped == "The run was stopped: it used more than 2 CPU-seconds."
     assert time.time() - started < 30
 
 
@@ -433,7 +434,9 @@ def test_fileFloodIsStopped(storage, monkeypatch):
 
 
 @separateUids
-def test_loweringTheOomPriorityStopsTheRun(storage):
+@pytest.mark.parametrize("blockNetwork", ["1", "0"])
+def test_loweringTheOomPriorityStopsTheRun(storage, monkeypatch, blockNetwork):
+    monkeypatch.setenv("SANDBOX_BLOCK_NETWORK", blockNetwork)
     code = (
         'os = pd.io.common.os\n'
         'try:\n'
@@ -452,9 +455,29 @@ def test_loweringTheOomPriorityStopsTheRun(storage):
 
 
 @separateUids
-def test_watchdogStopsWithTheRun(storage):
+def test_watchdogStopsWithTheRun(storage, monkeypatch):
+    started = []
+    realStart = RunWatchdog.start
+    monkeypatch.setattr(RunWatchdog, "start", lambda self: (started.append(self), realStart(self))[1])
+
     result = sandboxRunner.runSandbox("inspect_launcher.py", PROJECT, 'print("ok")', timeoutSeconds=60)
 
     assert result.returncode == 0
     assert result.stopped is None
-    assert not [thread for thread in threading.enumerate() if isinstance(thread, RunWatchdog)]
+    assert len(started) == 1
+    assert not started[0].is_alive()
+
+
+@pytest.mark.parametrize("returncode, watchdogReason, timeoutNote, expected", [
+    (-24, None, "", "The run was stopped: it used more than 7 CPU-seconds."),
+    (-9, None, "", "The run was stopped: the server ran out of memory."),
+    (-9, None, "\nExecution timed out after 5 seconds.\n", "Execution timed out after 5 seconds."),
+    (0, "The run was stopped: it created more than 5 files.", "", None),
+    (1, "The run was stopped: it created more than 5 files.", "", "The run was stopped: it created more than 5 files."),
+    (-9, "The run was stopped: it created more than 5 files.", "", "The run was stopped: it created more than 5 files."),
+    (1, None, "", None),
+])
+def test_stopReasonNamesTheLimitThatEndedTheRun(returncode, watchdogReason, timeoutNote, expected):
+    limits = currentRunLimits(maxCpuSeconds=7)
+
+    assert sandboxRunner._stopReason(returncode, watchdogReason, timeoutNote, limits) == expected

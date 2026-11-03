@@ -371,6 +371,19 @@ def _watchRun(proc: subprocess.Popen, runUid: int | None, workFolder: str, limit
     return watchdog
 
 
+def _giveRunPriority(proc: subprocess.Popen, runUid: int | None, limits: RunLimits) -> None:
+    """Set the run's OOM adjustment from the parent, before any generated code exists, so the watchdog can judge every process. A failed write ends the run."""
+    if runUid is None or not limits.oomScoreAdj:
+        return
+    try:
+        with open(f"/proc/{proc.pid}/oom_score_adj", "w") as target:
+            target.write(str(limits.oomScoreAdj))
+    except OSError:
+        proc.kill()
+        proc.wait()
+        raise
+
+
 def _stopReason(returncode: int, watchdogReason: str | None, timeoutNote: str, limits: RunLimits) -> str | None:
     """Why a limit ended the run, if one did. The watchdog's reason counts only if the run did not end well anyway."""
     if watchdogReason and returncode != 0:
@@ -399,7 +412,7 @@ def _runChild(launcherName: str, projectId: str, code: str, timeoutSeconds: int 
     ):
         with childEnd:
             proc = _startChild(launcherName, runUid, workFolder, childEnd, stdout, stderr, limits)
-            watchdog = _watchRun(proc, runUid, workFolder, limits)
+            _giveRunPriority(proc, runUid, limits)
             payload = json.dumps({
                 "projectId": projectId,
                 "code": code,
@@ -409,7 +422,9 @@ def _runChild(launcherName: str, projectId: str, code: str, timeoutSeconds: int 
             })
         server = threading.Thread(target=serveTables, args=(projectId, requests, replies, tablesFolder, runEnded), daemon=True)
         server.start()
+        watchdog = None
         try:
+            watchdog = _watchRun(proc, runUid, workFolder, limits)
             timeoutNote = _waitForChild(proc, payload, timeoutSeconds)
         finally:
             if watchdog is not None:

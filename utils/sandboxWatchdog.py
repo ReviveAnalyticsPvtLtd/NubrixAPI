@@ -9,8 +9,9 @@ and the work folder, and a process that exits mid-read counts as zero.
 import contextlib
 import os
 import threading
-from collections.abc import Callable
+from collections.abc import Callable, Iterator
 
+from utils.logger import logger
 from utils.sandboxLimits import RunLimits, _formatBytes
 
 _MEMORY_INTERVAL_SECONDS = 0.1
@@ -18,82 +19,99 @@ _DISK_INTERVAL_SECONDS = 1.0
 _KIB = 1024
 
 
-def _statusFields(status: bytes) -> dict[bytes, int]:
-    """The numeric fields of a /proc status file that this module reads, by name."""
-    fields = {}
-    for line in status.splitlines():
-        name, _, rest = line.partition(b":")
-        if name in (b"Uid", b"RssAnon", b"RssShmem", b"Seccomp_filters"):
-            with contextlib.suppress(ValueError, IndexError):
-                fields[name] = int(rest.split()[0])
-    return fields
+def _runFields(statusPath: str) -> tuple[int, int] | None:
+    """(real uid, anonymous plus shared anonymous bytes) from a status file, read only as far as needed."""
+    uid = anonymous = shared = None
+    with open(statusPath, "rb") as source:
+        for line in source:
+            name, _, rest = line.partition(b":")
+            if name == b"Uid":
+                uid = int(rest.split()[0])
+            elif name == b"RssAnon":
+                anonymous = int(rest.split()[0])
+            elif name == b"RssShmem":
+                shared = int(rest.split()[0])
+            if uid is not None and anonymous is not None and shared is not None:
+                break
+    if uid is None:
+        return None
+    return uid, ((anonymous or 0) + (shared or 0)) * _KIB
 
 
-def _runProcesses(runUid: int) -> list[tuple[str, dict[bytes, int]]]:
-    """Id and status fields of each process whose real uid is the run's. One that exits while being read is skipped."""
-    found = []
-    for name in os.listdir("/proc"):
-        if not name.isdigit():
-            continue
-        try:
-            with open(f"/proc/{name}/status", "rb") as source:
-                fields = _statusFields(source.read())
-        except OSError:
-            continue
-        if fields.get(b"Uid") == runUid:
-            found.append((name, fields))
-    return found
+def scanRun(runUid: int, wanted: int) -> tuple[int, bool]:
+    """One pass over /proc: the memory the run's processes hold, and whether any has an OOM adjustment below `wanted`.
+
+    Memory counts anonymous plus shared anonymous pages, which RSS alone would miss. A process owned by another
+    uid is skipped by its folder's owner, before anything in it is opened, because a run's processes can't change uid.
+    A process that exits while being read counts as zero.
+    """
+    total = 0
+    lowered = False
+    with os.scandir("/proc") as listing:
+        for entry in listing:
+            if not entry.name.isdigit():
+                continue
+            try:
+                if entry.stat().st_uid != runUid:
+                    continue
+                fields = _runFields(f"/proc/{entry.name}/status")
+                if fields is None or fields[0] != runUid:
+                    continue
+                total += fields[1]
+                if wanted > 0 and not lowered:
+                    with open(f"/proc/{entry.name}/oom_score_adj", "rb") as source:
+                        lowered = int(source.read().strip()) < wanted
+            except (OSError, ValueError, IndexError):
+                continue
+    return total, lowered
 
 
 def runMemoryBytes(runUid: int) -> int:
-    """Memory the run's processes hold: anonymous plus shared anonymous pages, which RSS-only counting would miss."""
-    return sum((fields.get(b"RssAnon", 0) + fields.get(b"RssShmem", 0)) * _KIB for _, fields in _runProcesses(runUid))
+    """Memory the run's processes hold."""
+    return scanRun(runUid, 0)[0]
 
 
 def oomPriorityLowered(runUid: int, wanted: int) -> bool:
-    """Whether any run process has an OOM score adjustment below the one the run was given.
+    """Whether any run process has an OOM score adjustment below the one the run was given."""
+    return scanRun(runUid, wanted)[1]
 
-    A process counts once it has more seccomp filters than this one, because its own filter is installed after its
-    adjustment was set. Before that it still has its parent's. Without that count (an older kernel) nothing is judged.
-    """
-    with open("/proc/self/status", "rb") as own:
-        inherited = _statusFields(own.read()).get(b"Seccomp_filters")
-    if wanted <= 0 or inherited is None:
-        return False
-    for name, fields in _runProcesses(runUid):
-        if fields.get(b"Seccomp_filters", 0) <= inherited:
-            continue
+
+def _entryStats(folder: str) -> Iterator[os.stat_result]:
+    """Link-level stats of everything under a folder. Each subfolder is opened from its parent's descriptor without following links, so a folder swapped for a link mid-walk is not entered."""
+    if hasattr(os, "fwalk"):
+        for _, folders, files, descriptor in os.fwalk(folder, follow_symlinks=False):
+            for name in folders + files:
+                try:
+                    yield os.stat(name, dir_fd=descriptor, follow_symlinks=False)
+                except OSError:
+                    continue
+        return
+    pending = [folder]  # Windows has no descriptor walk. There are no run uids there.
+    while pending:
         try:
-            with open(f"/proc/{name}/oom_score_adj", "rb") as source:
-                if int(source.read().strip()) < wanted:
-                    return True
-        except (OSError, ValueError):
+            with os.scandir(pending.pop()) as listing:
+                for entry in listing:
+                    try:
+                        info = entry.stat(follow_symlinks=False)
+                        if entry.is_dir(follow_symlinks=False):
+                            pending.append(entry.path)
+                    except OSError:
+                        continue
+                    yield info
+        except OSError:
             continue
-    return False
 
 
 def workUsage(folder: str, maxBytes: int, maxFiles: int) -> tuple[int, int, bool]:
     """Disk bytes and entries under a folder, without following links. Stops walking once a limit (0 = none) is passed."""
     used = entries = 0
-    pending = [folder]
-    while pending:
-        try:
-            with os.scandir(pending.pop()) as listing:
-                for entry in listing:
-                    entries += 1
-                    try:
-                        info = entry.stat(follow_symlinks=False)
-                        isFolder = entry.is_dir(follow_symlinks=False)
-                    except OSError:
-                        continue
-                    blocks = getattr(info, "st_blocks", None)
-                    used += blocks * 512 if blocks is not None else info.st_size
-                    if (maxBytes and used > maxBytes) or (maxFiles and entries > maxFiles):
-                        return used, entries, True
-                    if isFolder:
-                        pending.append(entry.path)
-        except OSError:
-            continue
+    with contextlib.closing(_entryStats(folder)) as stats:
+        for info in stats:
+            entries += 1
+            blocks = getattr(info, "st_blocks", None)
+            used += blocks * 512 if blocks is not None else info.st_size
+            if (maxBytes and used > maxBytes) or (maxFiles and entries > maxFiles):
+                return used, entries, True
     return used, entries, False
 
 
@@ -120,10 +138,11 @@ class RunWatchdog(threading.Thread):
 
     def _checkMemory(self) -> bool:
         limits = self.limits
-        if limits.maxRunMemory and runMemoryBytes(self.runUid) > limits.maxRunMemory:
+        used, lowered = scanRun(self.runUid, limits.oomScoreAdj)
+        if limits.maxRunMemory and used > limits.maxRunMemory:
             self._breach(f"The run was stopped: it used more than {_formatBytes(limits.maxRunMemory)} of memory.")
             return True
-        if oomPriorityLowered(self.runUid, limits.oomScoreAdj):
+        if lowered:
             self._breach("The run was stopped: it changed its own memory priority.")
             return True
         return False
@@ -142,6 +161,14 @@ class RunWatchdog(threading.Thread):
         return True
 
     def run(self) -> None:
+        try:
+            self._watch()
+        except Exception:
+            # An unwatched run could pass every limit, so a watchdog that fails ends the run.
+            logger.exception("Sandbox watchdog failed; stopping the run.")
+            self._breach("The run was stopped: the server ran out of memory.")
+
+    def _watch(self) -> None:
         elapsed = nextWork = 0.0
         while not self._stopped.wait(_MEMORY_INTERVAL_SECONDS):
             elapsed += _MEMORY_INTERVAL_SECONDS
