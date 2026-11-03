@@ -35,6 +35,7 @@ from nubrix.components import transformationExecutor
 from nubrix.components.transformationExecutor import TransformationExecutor
 from test.privateStorageFixtures import SERVICE_KEY, FakePrivateStorage
 from utils import codeExecutor, initMethods, projectStorage, sandbox_reaper, sandboxRunner, transform_launcher
+from utils.sandboxLimits import currentRunLimits
 
 PROJECT = "11111111-2222-4333-8444-555555555555"
 OTHER_PROJECT = "99999999-8888-4777-8666-555555555555"
@@ -744,7 +745,7 @@ def test_childPathHasNoEmptyEntry(tmp_path, monkeypatch):
     started = MagicMock()
     monkeypatch.setattr(subprocess, "Popen", started)
 
-    sandboxRunner._startChild("inspect_launcher.py", None, str(tmp_path), MagicMock(fileno=lambda: 3), None, None)
+    sandboxRunner._startChild("inspect_launcher.py", None, str(tmp_path), MagicMock(fileno=lambda: 3), None, None, currentRunLimits())
 
     assert "" not in started.call_args.kwargs["env"]["PYTHONPATH"].split(os.pathsep)
 

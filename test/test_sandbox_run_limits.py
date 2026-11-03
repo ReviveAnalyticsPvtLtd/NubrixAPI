@@ -4,6 +4,7 @@ import json
 
 import pytest
 
+from nubrix.components.transformationExecutor import TransformationExecutor
 from utils.sandboxLimits import (
     RunLimits,
     _formatBytes,
@@ -136,3 +137,29 @@ def test_formatBytes():
     assert _formatBytes(4294967296) == "4 GiB"
     assert _formatBytes(2 * GIB) == "2 GiB"
     assert _formatBytes(512 * 1024**2) == "512 MiB"
+
+
+
+
+PROJECT = "11111111-2222-4333-8444-555555555555"
+
+
+def test_runSeesTheThreadCaps(monkeypatch):
+    monkeypatch.setenv("POLARS_MAX_THREADS", "32")
+    monkeypatch.setenv("OPENBLAS_NUM_THREADS", "32")
+    code = (
+        "env = pd.io.common.os.environ\n"
+        'print(pl.thread_pool_size(), env.get("OMP_NUM_THREADS"), env.get("OPENBLAS_NUM_THREADS"),'
+        ' env.get("MKL_NUM_THREADS"), env.get("NUMEXPR_MAX_THREADS"))\n'
+    )
+    output = TransformationExecutor(timeoutSeconds=60).executeInspection(PROJECT, code)
+    assert output.split() == ["4", "4", "4", "4", "4"]
+
+
+def test_arrowPoolsAreCapped():
+    code = (
+        'pa = pd.io.common.os.sys.modules["pyarrow"]\n'
+        "print(pa.cpu_count(), pa.io_thread_count())\n"
+    )
+    output = TransformationExecutor(timeoutSeconds=60).executeInspection(PROJECT, code)
+    assert output.split() == ["4", "4"]

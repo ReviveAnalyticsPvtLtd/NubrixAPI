@@ -50,6 +50,7 @@ from typing import IO, NamedTuple
 from utils.initMethods import spool_table, use_table_source
 from utils.logger import logger
 from utils.sandbox_reaper import _SHARED_TEMP_FOLDERS
+from utils.sandboxLimits import RunLimits, currentRunLimits
 
 # Below 65536, the range a user namespace normally maps. The same number of uids above
 # the range are spare: a reaper's real uid is its run's uid plus _RUN_UID_COUNT. No run
@@ -74,11 +75,11 @@ _CLEAR_UID_TIMEOUT_SECONDS = 30
 _MAX_REAPER_ERROR_BYTES = 1024
 _PR_SET_PDEATHSIG = 1
 _PR_SET_NO_NEW_PRIVS = 38
+_THREAD_VARIABLES = ("POLARS_MAX_THREADS", "OMP_NUM_THREADS", "OPENBLAS_NUM_THREADS", "MKL_NUM_THREADS", "NUMEXPR_MAX_THREADS")
 _ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 # Generated code can read its whole environment, so never add a secret here.
 _INHERITED_ENV = (
     "PATH", "PYTHONPATH", "LANG", "LC_ALL", "TZ", "SYSTEMROOT",
-    "POLARS_MAX_THREADS", "OPENBLAS_NUM_THREADS",
     "DF_CACHE_MAX_BYTES", "DF_CACHE_MAX_ENTRIES",
 )
 
@@ -282,10 +283,13 @@ def serveTables(projectId: str, requests, replies, tablesFolder: str, runEnded: 
             return
 
 
-def _startChild(launcherName: str, runUid: int | None, workFolder: str, childEnd: socket.socket, stdout: IO[bytes], stderr: IO[bytes]) -> subprocess.Popen:
+def _startChild(launcherName: str, runUid: int | None, workFolder: str, childEnd: socket.socket, stdout: IO[bytes], stderr: IO[bytes], limits: RunLimits) -> subprocess.Popen:
     """Start the launcher. Its output goes to files, so nothing a process holds open can block the parent."""
     env = {k: os.environ[k] for k in _INHERITED_ENV if k in os.environ}
     env["PYTHONPATH"] = os.pathsep.join(filter(None, (_ROOT, env.get("PYTHONPATH"))))
+    if limits.threads > 0:
+        # Each library sizes its pool when it loads, so the cap has to be in the environment before the child starts.
+        env.update(dict.fromkeys(_THREAD_VARIABLES, str(limits.threads)))
     env.update(HOME=workFolder, TMPDIR=workFolder, USER="sandbox", LOGNAME="sandbox")
     options: dict = {}
     if runUid is not None:
@@ -354,7 +358,7 @@ def _readOutput(output: IO[bytes]) -> str:
     return printed.decode("utf-8", "replace")
 
 
-def _runChild(launcherName: str, projectId: str, code: str, timeoutSeconds: int | None, withResult: bool, runUid: int | None, runFolder: str, tablesFolder: str, workFolder: str) -> SandboxResult:
+def _runChild(launcherName: str, projectId: str, code: str, timeoutSeconds: int | None, withResult: bool, runUid: int | None, runFolder: str, tablesFolder: str, workFolder: str, limits: RunLimits) -> SandboxResult:
     """Start the launcher, serve its table reads and collect what it produced."""
     resultPath = os.path.join(workFolder, "result.parquet")
     previewPath = os.path.join(workFolder, "preview.json")
@@ -368,13 +372,13 @@ def _runChild(launcherName: str, projectId: str, code: str, timeoutSeconds: int 
         tempfile.TemporaryFile(dir=runFolder) as stderr,
     ):
         with childEnd:
-            proc = _startChild(launcherName, runUid, workFolder, childEnd, stdout, stderr)
+            proc = _startChild(launcherName, runUid, workFolder, childEnd, stdout, stderr, limits)
             payload = json.dumps({
                 "projectId": projectId,
                 "code": code,
                 "result_path": resultPath,
                 "preview_path": previewPath,
-                "channel": {**_channelFor(proc, childEnd), "tablesFolder": tablesFolder, "parentPid": os.getpid()},
+                "channel": {**_channelFor(proc, childEnd), "tablesFolder": tablesFolder, "parentPid": os.getpid(), "limits": limits.toChannel()},
             })
         server = threading.Thread(target=serveTables, args=(projectId, requests, replies, tablesFolder, runEnded), daemon=True)
         server.start()
@@ -398,6 +402,7 @@ def runSandbox(launcherName: str, projectId: str, code: str, timeoutSeconds: int
 
     Only a launcher that writes a result sets `withResult`: the file is the child's, so it isn't read otherwise.
     """
+    limits = currentRunLimits()
     runUid, runFolder, lock = _claimRun()
     uidIsClear = False
     try:
@@ -408,7 +413,7 @@ def runSandbox(launcherName: str, projectId: str, code: str, timeoutSeconds: int
         tablesFolder, workFolder = _prepareFolders(runUid, runFolder)
         uidIsClear = False
         try:
-            return _runChild(launcherName, projectId, code, timeoutSeconds, withResult, runUid, runFolder, tablesFolder, workFolder)
+            return _runChild(launcherName, projectId, code, timeoutSeconds, withResult, runUid, runFolder, tablesFolder, workFolder, limits)
         finally:
             uidIsClear = _clearUid(runUid, runFolder)
     finally:
@@ -475,7 +480,17 @@ def _connectTableChannel(channel: dict) -> None:
     use_table_source(readTable)
 
 
+def _capArrowThreads(limits: RunLimits) -> None:
+    """Child side: Arrow's pools are sized from the machine, not the environment, so cap them here."""
+    if limits.threads > 0:
+        import pyarrow as pa
+
+        pa.set_cpu_count(limits.threads)
+        pa.set_io_thread_count(limits.threads)
+
+
 def enterSandbox(channel: dict) -> None:
     """Child side: every launcher calls this once, before it runs generated code."""
     _lockDownChild(channel)
+    _capArrowThreads(RunLimits.fromChannel(channel["limits"]))
     _connectTableChannel(channel)
