@@ -51,6 +51,7 @@ from utils.initMethods import spool_table, use_table_source
 from utils.logger import logger
 from utils.sandbox_reaper import _SHARED_TEMP_FOLDERS
 from utils.sandboxLimits import RunLimits, currentRunLimits
+from utils.sandboxSeccomp import installFilter
 
 # Below 65536, the range a user namespace normally maps. The same number of uids above
 # the range are spare: a reaper's real uid is its run's uid plus _RUN_UID_COUNT. No run
@@ -465,7 +466,9 @@ def _lockDownChild(channel: dict) -> None:
             continue
         ceiling = resource.getrlimit(limit)[1]
         resource.setrlimit(limit, (_withinHardLimit(soft, ceiling), _withinHardLimit(hard, ceiling)))
-    # The seccomp filter is installed here, after the limits and before any generated code runs.
+    if limits.blockNetwork:
+        # Last step: refuses non-local sockets and uncounted shared memory. A failure stops the run.
+        installFilter()
 
 
 def _connectTableChannel(channel: dict) -> None:
