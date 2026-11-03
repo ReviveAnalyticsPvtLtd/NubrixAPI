@@ -65,6 +65,21 @@ class DataLoadService:
         sanitized = sanitized.strip("_")
         return sanitized
 
+    def _releaseTableName(self, projectId: str, tableName: str) -> None:
+        """Take the name from any transformation that still claims it, so none can remove or overwrite this table."""
+        try:
+            self.client.table("transformations").update({"latest_approved_artifact": None}).eq("project_id", projectId).eq("latest_approved_artifact->>table_name", tableName).execute()
+        except Exception as e:
+            exception = CustomException(e, statusCode=503, uiMessage="We could not check this table name right now. Please try again.")
+            logger.error(exception)
+            raise exception
+
+    def _acceptTableName(self, projectId: str, tableName: str) -> None:
+        """Refuse a name already in the project, then release it. Loads release it again once the file is written."""
+        from api.services.managementService import managementService
+        managementService.validateTableNameAvailable(projectId=projectId, tableName=tableName)
+        self._releaseTableName(projectId, tableName)
+
     @staticmethod
     def _sanitizeDfForParquet(df: pd.DataFrame) -> pd.DataFrame:
         for col in df.columns:
@@ -131,7 +146,7 @@ class DataLoadService:
                         uiMessage="Unsupported file type. Upload CSV files only."
                     )
                 sanitizedName = self._sanitizeFileName(file.filename)
-                managementService.validateTableNameAvailable(projectId=projectId, tableName=sanitizedName)
+                self._acceptTableName(projectId, sanitizedName)
                 with tempfile.NamedTemporaryFile(delete=True, suffix=".parquet") as temp:
                     df = self._readCsvUpload(await file.read())
                     self._sanitizeDfForParquet(df).to_parquet(temp.name, compression="snappy")
@@ -140,6 +155,7 @@ class DataLoadService:
                         path=f"{projectId}/{sanitizedName}.parquet",
                         file_options={"upsert": "true"}
                     )
+                self._releaseTableName(projectId, sanitizedName)
                 loadedTableNames.append(sanitizedName)
             updateProjectModifiedAt(projectId)
             # Generate metadata ONLY for the newly loaded tables
@@ -195,7 +211,7 @@ class DataLoadService:
                 for sheetName, sheetData in allSheetData.items():
                     sanitizedSheet = re.sub(r"[^\w-]", "_", str(sheetName)).strip("_")
                     tableName = f"{sanitizedBase}_{sanitizedSheet}"
-                    managementService.validateTableNameAvailable(projectId=projectId, tableName=tableName)
+                    self._acceptTableName(projectId, tableName)
                     with tempfile.NamedTemporaryFile(delete=True, suffix=".parquet") as temp:
                         self._sanitizeDfForParquet(sheetData).to_parquet(temp.name, compression="snappy")
                         fileName = f"{tableName}.parquet"
@@ -204,6 +220,7 @@ class DataLoadService:
                             path=f"{projectId}/{fileName}",
                             file_options={"upsert": "true"}
                         )
+                    self._releaseTableName(projectId, tableName)
                     loadedTableNames.append(tableName)
             updateProjectModifiedAt(projectId)
             newMetadata = {}
@@ -335,6 +352,8 @@ class DataLoadService:
                     f"into {len(pendingTables)} table(s)"
                 )
 
+                for idx in range(1, len(pendingTables) + 1):
+                    self._acceptTableName(projectId, f"{baseName}_table{idx}")
                 for idx, entry in enumerate(pendingTables, start=1):
                     with tempfile.NamedTemporaryFile(delete=True, suffix=".parquet") as temp:
                         self._sanitizeDfForParquet(entry["df"]).to_parquet(
@@ -347,6 +366,7 @@ class DataLoadService:
                             path=f"{projectId}/{fileName}",
                             file_options={"upsert": "true"}
                         )
+                    self._releaseTableName(projectId, tableName)
                     loadedTableNames.append(tableName)
 
             updateProjectModifiedAt(projectId)
@@ -395,7 +415,7 @@ class DataLoadService:
             engine = create_engine(connStr)
             sanitizedTable = self._sanitizeFileName(connection.table)
             from api.services.managementService import managementService
-            managementService.validateTableNameAvailable(projectId=connection.projectId, tableName=sanitizedTable)
+            self._acceptTableName(connection.projectId, sanitizedTable)
             with tempfile.NamedTemporaryFile(delete=True, suffix=".parquet") as temp:
                 pd.read_sql(f"SELECT * FROM {connection.table}", engine).to_parquet(
                     temp.name, compression="snappy"
@@ -405,6 +425,7 @@ class DataLoadService:
                     path=f"{connection.projectId}/{sanitizedTable}.parquet",
                     file_options={"upsert": "true"}
                 )
+            self._releaseTableName(connection.projectId, sanitizedTable)
             updateProjectModifiedAt(connection.projectId)
             newMetadata = {}
             try:
@@ -450,7 +471,7 @@ class DataLoadService:
             engine = create_engine(connStr)
             sanitizedTable = self._sanitizeFileName(connection.table)
             from api.services.managementService import managementService
-            managementService.validateTableNameAvailable(projectId=connection.projectId, tableName=sanitizedTable)
+            self._acceptTableName(connection.projectId, sanitizedTable)
             with tempfile.NamedTemporaryFile(delete=True, suffix=".parquet") as temp:
                 pd.read_sql(f"SELECT * FROM {connection.table}", engine).to_parquet(
                     temp.name, compression="snappy"
@@ -460,6 +481,7 @@ class DataLoadService:
                     path=f"{connection.projectId}/{sanitizedTable}.parquet",
                     file_options={"upsert": "true"}
                 )
+            self._releaseTableName(connection.projectId, sanitizedTable)
             updateProjectModifiedAt(connection.projectId)
             newMetadata = {}
             try:
@@ -493,7 +515,7 @@ class DataLoadService:
                 )
             sanitizedCollection = self._sanitizeFileName(connection.collection)
             from api.services.managementService import managementService
-            managementService.validateTableNameAvailable(projectId=connection.projectId, tableName=sanitizedCollection)
+            self._acceptTableName(connection.projectId, sanitizedCollection)
             with tempfile.NamedTemporaryFile(delete=True, suffix=".parquet") as temp:
                 mongoClient = MongoClient(connection.connectionString, server_api=ServerApi('1'))
                 records = list(mongoClient[connection.db][connection.collection].find())
@@ -505,6 +527,7 @@ class DataLoadService:
                     path=f"{connection.projectId}/{sanitizedCollection}.parquet",
                     file_options={"upsert": "true"}
                 )
+            self._releaseTableName(connection.projectId, sanitizedCollection)
             updateProjectModifiedAt(connection.projectId)
             newMetadata = {}
             try:
@@ -537,8 +560,6 @@ class DataLoadService:
             CustomException: If deletion or metadata update fails.
         """
         try:
-            # The transformation no longer owns this name: deleting it later must not take a new upload.
-            self.client.table("transformations").update({"latest_approved_artifact": None}).eq("project_id", tableDetails.projectId).eq("latest_approved_artifact->>table_name", tableDetails.tableName).execute()
             _ = self.client.storage.from_("AnalyticsHub").remove(f"{tableDetails.projectId}/{tableDetails.tableName}" + ".parquet")
             fileUrl = os.environ["FILE_URL"].format(projectId = tableDetails.projectId, fileName = "metadata.json").replace(".parquet", "") + f"?cb={int(time.time())}"
             jsonData = json.loads(urlopen(fileUrl).read())
@@ -547,6 +568,11 @@ class DataLoadService:
                 buffer.write(json.dumps(jsonData, indent=4).encode("utf-8"))
                 buffer.seek(0)
                 self.client.storage.from_("AnalyticsHub").upload(path = f"{tableDetails.projectId}/metadata.json", file = buffer.getvalue(), file_options = {"upsert": "true"})
+            # The transformation no longer owns this name. If this fails, the next load of the name releases it.
+            try:
+                self._releaseTableName(tableDetails.projectId, tableDetails.tableName)
+            except Exception as e:
+                logger.warning(f"Could not release deleted table {tableDetails.tableName} from its transformation: {e}")
             try:
                 forget_table(tableDetails.projectId, tableDetails.tableName)
             except Exception as e:

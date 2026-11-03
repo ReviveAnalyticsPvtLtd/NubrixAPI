@@ -76,8 +76,8 @@ NubrixAI Analytics Hub API — FastAPI + Celery + LangChain monolith.
 
 ## Table Name Collision Guard
 - `managementService.validateTableNameAvailable(projectId, tableName)` — raises `409` if name exists in metadata (active or inactive).
-- Called at every table creation entry point: CSV/Excel/MySQL/PostgreSQL/MongoDB load + transformation preview.
-- Transformation: validated at preview only, not re-validated at apply (name already confirmed).
+- Called at every table creation entry point: CSV/Excel/PDF/MySQL/PostgreSQL/MongoDB load, through `dataLoadService._acceptTableName`, which also clears any transformation artifact naming that table, and again once the file is written.
+- Transformation: `_validate_transformation_table_name` runs at create, rename and approve, and again straight before apply and rollback write the table (`_claim_table_name`: check, claim in `latest_approved_artifact`, check again). A table file the transformation did not write is refused, with or without a metadata key.
 
 ## Quick orientation for new tasks
 - New HTTP endpoint: add a function to the relevant `api/routers/*.py` (or a new router + `app.include_router` in `main.py:77-88`), put logic in `api/services/`, secure with `Depends(verifyUser)` or stronger dep from `api/commons.py`.

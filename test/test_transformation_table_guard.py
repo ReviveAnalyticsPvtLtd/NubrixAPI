@@ -7,6 +7,7 @@ import os
 from unittest import mock
 from urllib.error import URLError
 
+import pandas as pd
 import pytest
 
 from api.services.dataLoadService import DataLoadService
@@ -185,8 +186,12 @@ class _FakeRows:
             return mock.Mock(data=[])
         if action == "update":
             self.project.fail("rowUpdate")
-            for row in self._matches():
+            updated = self._matches()
+            for row in updated:
                 row.update(values)
+            if self.project.afterRowUpdate:
+                self.project.afterRowUpdate.pop(0)()
+            return mock.Mock(data=updated)
         return mock.Mock(data=self._matches())
 
 
@@ -204,6 +209,12 @@ class _FakeProject:
         self.forgotten = []
         self.removed = []
         self.applied = []
+        # Who wrote each table file last, to tell an upload from a transformation's output.
+        self.writers = {}
+        self.afterRowUpdate = []
+        self.beforeTableWrite = None
+        self.duringSandbox = None
+        self.duringTableWrite = None
         self.storage = mock.Mock()
         self.storage.from_.return_value = self
 
@@ -226,8 +237,17 @@ class _FakeProject:
         return json.dumps(self.metadata).encode("utf-8")
 
     def upload(self, path, file, file_options=None):
+        fileName = path.rpartition("/")[2]
+        if fileName.endswith(".parquet"):
+            self.fail("tableWrite")
+            hook, self.beforeTableWrite = self.beforeTableWrite, None
+            if hook:
+                hook()
+            self.fileNames.add(fileName)
+            self.writers[fileName] = "upload"
+            return
         self.fail("metadataWrite")
-        if (file_options or {}).get("upsert") != "true" and path.rpartition("/")[2] in self.fileNames:
+        if (file_options or {}).get("upsert") != "true" and fileName in self.fileNames:
             raise ValueError("The resource already exists")
         self.metadata = json.loads(file)
         self.metadataWrites += 1
@@ -238,6 +258,7 @@ class _FakeProject:
         for path in [paths] if isinstance(paths, str) else paths:
             self.removed.append(path)
             self.fileNames.discard(path.rpartition("/")[2])
+            self.writers.pop(path.rpartition("/")[2], None)
 
     def forget(self, projectId, tableName):
         self.fail("cacheClear")
@@ -280,6 +301,7 @@ def projectStorage():
         mock.patch("api.services.transformationService.updateProjectModifiedAt"),
         mock.patch("api.services.dataLoadService.updateProjectModifiedAt"),
         mock.patch("api.services.dataLoadService.urlopen", side_effect=currentMetadata),
+        mock.patch("api.services.managementService.urlopen", side_effect=currentMetadata),
         mock.patch("api.services.transformationService.forget_table", side_effect=lambda *args: holder["project"].forget(*args)),
         mock.patch("api.services.dataLoadService.forget_table", side_effect=lambda *args: holder["project"].forget(*args)),
     ):
@@ -396,9 +418,11 @@ def test_failedRowDeleteIsReportedAndCanBeRetried(projectStorage):
     project = _appliedProject(projectStorage)
     project.failures["rowDelete"] = ConnectionError("database unavailable")
 
-    with pytest.raises(CustomException):
+    with pytest.raises(CustomException) as caught:
         _delete(project)
 
+    assert caught.value.statusCode == 503
+    assert "database unavailable" not in caught.value.uiMessage
     assert len(project.rows) == 1
 
     project.failures.clear()
@@ -451,11 +475,18 @@ class _FakeExecutor:
         self.project = project
 
     def executeAndPreview(self, projectId, pythonCode, tableName):
+        hook, self.project.duringSandbox = self.project.duringSandbox, None
+        if hook:
+            hook()
         return [{"row": 1}], b"parquet"
 
     def apply(self, projectId, parquetBytes, tableName):
+        hook, self.project.duringTableWrite = self.project.duringTableWrite, None
+        if hook:
+            hook()
         self.project.applied.append(tableName)
         self.project.fileNames.add(f"{tableName}.parquet")
+        self.project.writers[f"{tableName}.parquet"] = "transformation"
 
 
 def _workspaceService(project):
@@ -609,15 +640,40 @@ def test_deletingATableStillWorksIfTheCacheClearFails(projectStorage):
     assert "summary" not in project.metadata
 
 
-def test_failedReleaseLeavesTheTableInPlace(projectStorage):
+def test_failedTableRemoveKeepsTheTableWithItsTransformation(projectStorage):
     project = _appliedProject(projectStorage)
-    project.failures["rowUpdate"] = ConnectionError("database unavailable")
+    project.failures["tableRemove"] = ConnectionError("storage unavailable")
 
     with pytest.raises(CustomException):
         _deleteTable(project, "summary")
 
-    assert "summary.parquet" in project.fileNames
     assert "summary" in project.metadata
+    assert project.rows[0]["latest_approved_artifact"] == {"table_name": "summary"}
+
+
+def test_failedReleaseStillDeletesTheTableAndLeavesItsNameSafeToLoad(projectStorage):
+    project = _appliedProject(projectStorage)
+    project.failures["rowUpdate"] = ConnectionError("database unavailable")
+
+    _deleteTable(project, "summary")
+
+    assert "summary.parquet" not in project.fileNames
+    assert "summary" not in project.metadata
+    project.failures.clear()
+    _load(project, "summary")
+    _delete(project)
+    assert project.writers["summary.parquet"] == "upload"
+    assert "summary" in project.metadata
+
+
+def test_deletingATableLeavesTheSameNameInOtherProjectsAlone(projectStorage):
+    project = _appliedProject(projectStorage)
+    project.rows.append({**_appliedRow(transformationId="t2"), "project_id": "project_2"})
+
+    _deleteTable(project, "summary")
+
+    assert project.rows[0]["latest_approved_artifact"] is None
+    assert project.rows[1]["latest_approved_artifact"] == {"table_name": "summary"}
 
 
 def test_uploadUnderADeletedTablesNameSurvivesDeletingItsOldTransformation(projectStorage):
@@ -809,7 +865,7 @@ def test_transformationCanReapplyItsOwnTable(projectStorage):
 
 
 def test_tableWithNoArtifactIsRefusedUntilItIsDeleted(projectStorage):
-    # Only a row whose update failed straight after its upload ends up like this.
+    # An upload of the draft's name looks like this, and so does a row from before artifacts proved ownership.
     project = projectStorage(_FakeProject(metadata={"summary": {}}, tables=("summary",), rows=[_withMessages(_draftRow("summary"))]))
 
     with pytest.raises(CustomException) as caught:
@@ -821,13 +877,15 @@ def test_tableWithNoArtifactIsRefusedUntilItIsDeleted(projectStorage):
     assert project.applied == ["summary"]
 
 
-def test_fileWithNoKeyIsNotRefused(projectStorage):
-    # Nobody can see or delete such a table, so refusing would lose the name for good.
+def test_fileWithNoKeyIsRefused(projectStorage):
+    # An upload has no key until its metadata is generated, and keeps none if that fails.
     project = projectStorage(_FakeProject(metadata={}, tables=("sales",), rows=[_withMessages(_draftRow())]))
 
-    _approveAndApply(project)
+    with pytest.raises(CustomException) as caught:
+        _approveAndApply(project)
 
-    assert project.applied == ["sales"]
+    assert caught.value.statusCode == 409
+    assert project.applied == []
 
 
 def test_rollbackToACheckpointRewritesItsOwnTable(projectStorage):
@@ -854,3 +912,316 @@ def test_rollbackToACheckpointDoesNotOverwriteAnUploadOfItsName(projectStorage):
     assert project.applied == ["summary"]
     assert len(project.rows[0]["messages"]) == 3
     assert project.rows[0]["latest_approved_artifact"] is None
+
+
+def _register(project):
+    def register(projectId, tableNames, userId=None):
+        project.metadata.update({name: {"isActive": True} for name in tableNames})
+        return {}
+    return register
+
+
+def _upload_file(name):
+    upload = mock.Mock(filename=name)
+    upload.read = mock.AsyncMock(return_value=b"amount\n1\n")
+    return upload
+
+
+def _connection(table):
+    return mock.Mock(host="db.test", port=5432, user="reader", password="unused", db="shop", table=table, projectId="project_1")
+
+
+def _loadVia(kind, service, tableName):
+    """Run one load route so that it stores tableName."""
+    amounts = pd.DataFrame({"amount": [1]})
+    if kind == "csv":
+        asyncio.run(service.loadCsvData("project_1", [_upload_file(f"{tableName}.csv")]))
+    elif kind == "excel":
+        base, _, sheet = tableName.rpartition("_")
+        with mock.patch("api.services.dataLoadService.pd.read_excel", return_value={sheet: amounts}):
+            asyncio.run(service.loadExcelData("project_1", [_upload_file(f"{base}.xlsx")]))
+    elif kind == "pdf":
+        extractor = mock.Mock(dpi=100)
+        extractor.extractPagesParallel = mock.AsyncMock(return_value=[{"table": mock.Mock(rows=[[1]])}])
+        extractor.planMerge.return_value = mock.Mock(groups=[mock.Mock(canonicalHeaders=["amount"], tableIndices=[0])])
+        document = mock.MagicMock()
+        document.__enter__.return_value = []
+        with (
+            mock.patch("api.services.dataLoadService.fitz.open", return_value=document),
+            mock.patch("api.services.dataLoadService.PdfTableExtractor", return_value=extractor),
+        ):
+            asyncio.run(service.loadPdfData("project_1", [_upload_file(f"{tableName.removesuffix('_table1')}.pdf")]))
+    elif kind in ("mysql", "postgresql"):
+        with (
+            mock.patch("api.services.dataLoadService.URL"),
+            mock.patch("api.services.dataLoadService.create_engine"),
+            mock.patch("api.services.dataLoadService.pd.read_sql", return_value=amounts),
+        ):
+            (service.loadMySql if kind == "mysql" else service.loadPostgreSQL)(_connection(tableName))
+    else:
+        with mock.patch("api.services.dataLoadService.MongoClient") as mongo:
+            mongo.return_value.__getitem__.return_value.__getitem__.return_value.find.return_value = [{"amount": 1}]
+            service.loadMongoDB(mock.Mock(connectionString="mongodb://db.test", db="shop", collection=tableName, projectId="project_1"))
+
+
+def _load(project, tableName, beforeWrite=None, kind="mongo"):
+    """Load a table through the real loader. beforeWrite runs after the name is accepted, before the file is written."""
+    from api.services.managementService import managementService
+
+    service = object.__new__(DataLoadService)
+    service.client = project
+    project.beforeTableWrite = beforeWrite
+    with (
+        mock.patch.object(managementService, "client", project),
+        mock.patch.object(managementService, "generateMetadataForTables", side_effect=_register(project)),
+        mock.patch("pandas.DataFrame.to_parquet"),
+    ):
+        _loadVia(kind, service, tableName)
+
+
+def _loadPdf(project, baseName="report"):
+    _load(project, f"{baseName}_table1", kind="pdf")
+
+
+def _applyWithoutRegistering(project):
+    with mock.patch("api.services.managementService.managementService.generateMetadata", side_effect=RuntimeError("model unavailable")):
+        asyncio.run(_workspaceService(project).applyTransformation("project_1", "t1", "m1"))
+
+
+@pytest.mark.parametrize("cleanUp", [_delete, _rollback], ids=["delete", "rollback"])
+def test_uploadBetweenAFailedCleanupAndItsRetrySurvives(projectStorage, cleanUp):
+    # The table and its key are gone, but the transformation still names the table.
+    project = _appliedProject(projectStorage)
+    project.rows[0].update(_withMessages({}))
+    project.failures["cacheClear"] = ConnectionError("redis unavailable")
+    with pytest.raises(CustomException):
+        cleanUp(project)
+    project.failures.clear()
+
+    _load(project, "summary")
+    cleanUp(project)
+
+    assert project.writers["summary.parquet"] == "upload"
+    assert "summary" in project.metadata
+
+
+def test_uploadBetweenAFailedRollbackAndAnApplyIsNotOverwritten(projectStorage):
+    project = _appliedProject(projectStorage)
+    project.rows[0].update(_withMessages({}))
+    project.failures["cacheClear"] = ConnectionError("redis unavailable")
+    with pytest.raises(CustomException):
+        _rollback(project)
+    project.failures.clear()
+
+    _load(project, "summary")
+    with pytest.raises(CustomException) as caught:
+        _approveAndApply(project)
+
+    assert caught.value.statusCode == 409
+    assert project.writers["summary.parquet"] == "upload"
+
+
+def test_uploadAfterAnUnregisteredApplySurvivesDeletingTheTransformation(projectStorage):
+    project = projectStorage(_FakeProject(metadata={}, rows=[_withMessages(_draftRow("summary"))]))
+    _approve(project)
+    _applyWithoutRegistering(project)
+    assert "summary" not in project.metadata
+
+    _load(project, "summary")
+    _delete(project)
+
+    assert project.writers["summary.parquet"] == "upload"
+    assert "summary" in project.metadata
+
+
+def test_unregisteredApplyCanBeAppliedAgain(projectStorage):
+    project = projectStorage(_FakeProject(metadata={}, rows=[_withMessages(_draftRow("summary"))]))
+    _approve(project)
+    _applyWithoutRegistering(project)
+
+    _approveAndApply(project)
+
+    assert project.applied == ["summary", "summary"]
+    assert "summary" in project.metadata
+
+
+def test_applyIsRefusedWhenAnUploadTakesTheNameWhileItsCodeRuns(projectStorage):
+    project = projectStorage(_FakeProject(metadata={}, rows=[_withMessages(_draftRow())]))
+    _approve(project)
+    project.duringSandbox = lambda: _load(project, "sales")
+
+    with pytest.raises(CustomException) as caught:
+        _apply(project)
+
+    assert caught.value.statusCode == 409
+    assert project.applied == []
+    assert project.writers["sales.parquet"] == "upload"
+
+
+def test_rollbackIsRefusedWhenAnUploadTakesTheNameWhileItsCodeRuns(projectStorage):
+    project = projectStorage(_FakeProject(metadata={}, rows=[_withMessages(_draftRow("summary"))]))
+    _approveAndApply(project)
+    _deleteTable(project, "summary")
+    project.duringSandbox = lambda: _load(project, "summary")
+
+    with pytest.raises(CustomException) as caught:
+        _rollbackToAfterTheApply(project)
+
+    assert caught.value.statusCode == 409
+    assert project.applied == ["summary"]
+    assert project.writers["summary.parquet"] == "upload"
+
+
+def test_applyIsRefusedWhenALoadAcceptsTheNameBeforeItWrites(projectStorage):
+    # The load has accepted the name but is still preparing its file.
+    project = projectStorage(_FakeProject(metadata={}, rows=[_withMessages(_draftRow())]))
+    _approve(project)
+    loader = object.__new__(DataLoadService)
+    loader.client = project
+    project.afterRowUpdate.append(lambda: loader._releaseTableName("project_1", "sales"))
+
+    with pytest.raises(CustomException) as caught:
+        _apply(project)
+
+    assert caught.value.statusCode == 409
+    assert project.applied == []
+    assert project.rows[0].get("latest_approved_artifact") is None
+
+
+def test_loadWrittenAfterAnApplyTakesTheNameFromTheTransformation(projectStorage):
+    project = projectStorage(_FakeProject(metadata={}, rows=[_withMessages(_draftRow())]))
+    _approve(project)
+
+    _load(project, "sales", beforeWrite=lambda: _apply(project))
+
+    assert project.applied == ["sales"]
+    assert project.rows[0]["latest_approved_artifact"] is None
+    _delete(project)
+    assert project.writers["sales.parquet"] == "upload"
+    assert "sales" in project.metadata
+
+
+def test_loadIsRefusedWhenItCannotTakeTheName(projectStorage):
+    project = projectStorage(_FakeProject(metadata={}, rows=[_appliedRow()]))
+    project.failures["rowUpdate"] = ConnectionError("database unavailable")
+
+    with pytest.raises(CustomException) as caught:
+        _load(project, "summary")
+
+    assert caught.value.statusCode == 503
+    assert "summary.parquet" not in project.fileNames
+
+
+def test_pdfLoadIsRefusedForANameAlreadyInTheProject(projectStorage):
+    project = projectStorage(_FakeProject(metadata={"report_table1": {}}, tables=("report_table1",)))
+
+    with pytest.raises(CustomException) as caught:
+        _loadPdf(project)
+
+    assert caught.value.statusCode == 409
+    assert project.writers == {}
+
+
+def test_pdfLoadTakesItsNamesFromTransformations(projectStorage):
+    project = projectStorage(_FakeProject(metadata={}, rows=[_appliedRow("report_table1")]))
+
+    _loadPdf(project)
+
+    assert project.writers == {"report_table1.parquet": "upload"}
+    assert project.rows[0]["latest_approved_artifact"] is None
+
+
+def test_applyIsRefusedWhenTheNameCannotBeClaimed(projectStorage):
+    project = projectStorage(_FakeProject(metadata={}, rows=[_withMessages(_draftRow())]))
+    _approve(project)
+    project.failures["rowUpdate"] = ConnectionError("database unavailable")
+
+    with pytest.raises(CustomException) as caught:
+        _apply(project)
+
+    assert caught.value.statusCode == 503
+    assert project.applied == []
+
+
+def test_applyIsRefusedWhenAnUploadIsWrittenAfterItsFirstCheck(projectStorage):
+    # The load accepted the name before the claim, so the claim survives; the second check finds its file.
+    project = projectStorage(_FakeProject(metadata={}, rows=[_withMessages(_draftRow())]))
+    _approve(project)
+
+    def uploadArrives():
+        project.fileNames.add("sales.parquet")
+        project.writers["sales.parquet"] = "upload"
+
+    project.afterRowUpdate.append(uploadArrives)
+
+    with pytest.raises(CustomException) as caught:
+        _apply(project)
+
+    assert caught.value.statusCode == 409
+    assert project.applied == []
+    assert project.writers["sales.parquet"] == "upload"
+    assert project.rows[0].get("latest_approved_artifact") is None
+
+
+def test_loadAcceptedWhileTheTableIsWrittenKeepsTheName(projectStorage):
+    project = projectStorage(_FakeProject(metadata={}, rows=[_withMessages(_draftRow())]))
+    _approve(project)
+    loader = object.__new__(DataLoadService)
+    loader.client = project
+    project.duringTableWrite = lambda: loader._releaseTableName("project_1", "sales")
+
+    with pytest.raises(CustomException) as caught:
+        _apply(project)
+
+    assert caught.value.statusCode == 409
+    assert project.rows[0].get("latest_approved_artifact") is None
+
+
+def test_retriedApplyIsRefusedOnceALoadAcceptsItsName(projectStorage):
+    project = projectStorage(_FakeProject(metadata={}, rows=[_withMessages(_draftRow("summary"))]))
+    _approve(project)
+    _applyWithoutRegistering(project)
+    refused = []
+
+    def retry():
+        with pytest.raises(CustomException) as caught:
+            _apply(project)
+        refused.append(caught.value.statusCode)
+
+    _load(project, "summary", beforeWrite=retry)
+
+    assert refused == [409]
+    assert project.writers["summary.parquet"] == "upload"
+
+
+LOADS = {"csv": "sales", "excel": "sales_q1", "pdf": "sales_table1", "mysql": "sales", "postgresql": "sales", "mongo": "sales"}
+
+
+@pytest.mark.parametrize("kind", LOADS)
+def test_everyLoadRefusesANameAlreadyInTheProject(projectStorage, kind):
+    name = LOADS[kind]
+    project = projectStorage(_FakeProject(metadata={name: {}}, tables=(name,)))
+
+    with pytest.raises(CustomException) as caught:
+        _load(project, name, kind=kind)
+
+    assert caught.value.statusCode == 409
+    assert project.writers == {}
+
+
+@pytest.mark.parametrize("kind", LOADS)
+def test_everyLoadTakesItsNameBeforeAndAfterWriting(projectStorage, kind):
+    name = LOADS[kind]
+    project = projectStorage(_FakeProject(metadata={}, rows=[_appliedRow(name)]))
+    seenAtWrite = []
+
+    def claimAgain():
+        # A transformation claims the name between the load's check and its write.
+        seenAtWrite.append(project.rows[0]["latest_approved_artifact"])
+        project.rows[0]["latest_approved_artifact"] = {"table_name": name}
+
+    _load(project, name, beforeWrite=claimAgain, kind=kind)
+
+    assert seenAtWrite == [None]
+    assert project.rows[0]["latest_approved_artifact"] is None
+    assert project.writers == {f"{name}.parquet": "upload"}
