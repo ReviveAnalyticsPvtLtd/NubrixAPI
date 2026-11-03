@@ -4,6 +4,7 @@ The evaluator tests run anywhere. The `separateUids` tests need a root parent on
 """
 
 import errno
+import json
 
 import pytest
 
@@ -103,6 +104,9 @@ def test_runCantConnectToTheNetworkButStillReadsTables(runInSandbox, storage, mo
         f'outcome = pd.io.common.urlopen("{storage.url}/").status'
     )
 
+    # With the filter on, the table read itself works.
+    assert runInSandbox(f'outcome = fetch_data_pl("{PROJECT}", "sales").height').strip() == "3"
+    storage.requests.clear()
     output = runInSandbox(code)
     assert "Operation not permitted" in output
     assert _tableReads(storage)
@@ -127,3 +131,25 @@ def test_runCantCreateMemfdOrSysvMemory(runInSandbox):  # noqa: F811
     )
 
     assert runInSandbox(code).strip() == str(errno.EPERM)
+
+
+@separateUids
+def test_everyThreadOfARunHasTheFilter(runInSandbox):  # noqa: F811
+    code = (
+        'os = pd.io.common.os\n'
+        'counts = {}\n'
+        'for tid in os.listdir("/proc/self/task"):\n'
+        '    fd = os.open("/proc/self/task/" + tid + "/status", os.O_RDONLY)\n'
+        '    text = os.read(fd, 65536).decode()\n'
+        '    os.close(fd)\n'
+        '    counts[tid] = [int(line.split()[1]) for line in text.splitlines() if line.startswith("Seccomp_filters")][0]\n'
+        'outcome = os.sys.modules["json"].dumps(counts)'
+    )
+    with open("/proc/self/status") as status:
+        parentFilters = [int(line.split()[1]) for line in status if line.startswith("Seccomp_filters")][0]
+
+    counts = json.loads(runInSandbox(code).strip())
+
+    assert len(counts) > 1  # Native libraries have started worker threads by now.
+    assert set(counts.values()) == {max(counts.values())}
+    assert max(counts.values()) > parentFilters

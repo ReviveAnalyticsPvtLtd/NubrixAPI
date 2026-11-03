@@ -10,8 +10,8 @@ import platform
 
 AF_UNIX = 1
 _PR_SET_NO_NEW_PRIVS = 38
-_PR_SET_SECCOMP = 22
-_SECCOMP_MODE_FILTER = 2
+_SECCOMP_SET_MODE_FILTER = 1
+_SECCOMP_FILTER_FLAG_TSYNC = 1  # Apply to every thread of the process, not just the caller.
 
 _SECCOMP_RET_KILL_PROCESS = 0x80000000
 _SECCOMP_RET_ERRNO = 0x00050000
@@ -30,6 +30,7 @@ _OFFSET_ARG0 = 16  # Low 32 bits on little-endian machines, which both supported
 _X32_FLAG = 0x40000000
 
 # machine: (AUDIT_ARCH, {syscall: number})
+_SECCOMP_SYSCALL = {"x86_64": 317, "aarch64": 277}
 _ARCHES = {
     "x86_64": (0xC000003E, {"socket": 41, "socketpair": 53, "io_uring_setup": 425, "io_uring_enter": 426,
                             "io_uring_register": 427, "memfd_create": 319, "shmget": 29}),
@@ -105,14 +106,18 @@ def buildFilter(machine: str) -> list[tuple[int, int, int, int]]:
 
 
 def installFilter(machine: str | None = None) -> None:
-    """Install the filter on this process and its future children. Raises OSError on any failure."""
-    rows = buildFilter(machine or platform.machine())
+    """Install the filter on every thread of this process and its future children. Raises OSError on any failure."""
+    machine = machine or platform.machine()
+    rows = buildFilter(machine)
     instructions = (_Filter * len(rows))(*[_Filter(*row) for row in rows])
     program = _Program(len(rows), instructions)  # `instructions` stays referenced until prctl returns.
     libc = ctypes.CDLL(None, use_errno=True)
     zero = ctypes.c_ulong(0)
     if libc.prctl(_PR_SET_NO_NEW_PRIVS, ctypes.c_ulong(1), zero, zero, zero) != 0:
         raise OSError(ctypes.get_errno(), "prctl failed")
-    if libc.prctl(_PR_SET_SECCOMP, ctypes.c_ulong(_SECCOMP_MODE_FILTER), ctypes.byref(program), zero, zero) != 0:
-        raise OSError(ctypes.get_errno(), "could not install the seccomp filter")
+    # prctl(PR_SET_SECCOMP) would filter only this thread. TSYNC covers the threads native libraries already started.
+    # It returns the id of a thread it couldn't sync, so any non-zero result is a failure.
+    result = libc.syscall(_SECCOMP_SYSCALL[machine], _SECCOMP_SET_MODE_FILTER, _SECCOMP_FILTER_FLAG_TSYNC, ctypes.byref(program))
+    if result != 0:
+        raise OSError(ctypes.get_errno() if result == -1 else errno.EBUSY, "could not install the seccomp filter")
     del instructions
