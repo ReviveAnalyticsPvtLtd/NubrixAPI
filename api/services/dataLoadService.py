@@ -11,7 +11,7 @@ __all__ = ["dataLoadService"]
 
 from nubrix.components.pdfTableExtractor import PdfTableExtractor
 from api.services.credits.creditTrackingCallback import CreditTrackingCallback
-from api.commons import updateProjectModifiedAt
+from api.commons import tableFileState, updateProjectModifiedAt
 from utils.exceptionHandler import CustomException
 from utils.initMethods import forget_table
 from pymongo.mongo_client import MongoClient
@@ -84,18 +84,37 @@ class DataLoadService:
             for row in released
         ]
 
-    def _restoreClaims(self, projectId: str, claims: list[dict]) -> None:
-        """Give names back to the transformations a load took them from, when the load wrote nothing over their tables.
+    def _restoreClaims(self, projectId: str, tableName: str, claims: list[dict]) -> None:
+        """Give a name back to the transformations a load took it from, when the load wrote nothing over their table.
 
-        A row that has claimed anything since keeps it.
+        Only while the file is still the one the transformation recorded when it wrote it, so another load's
+        upload is never handed to it. The file is checked again after the name is given back, and the name is
+        released again if the file changed or could not be checked. A load writing later releases it after its
+        own write. A row that has claimed anything since keeps it.
         """
         for claim in claims:
-            if not claim["latest_approved_artifact"]:
+            prior = claim["latest_approved_artifact"]
+            if not prior:
                 continue
+            transformationId = claim["transformation_id"]
+            recorded = prior.get("table_file")
+            attempted = False
             try:
-                self.client.table("transformations").update({"latest_approved_artifact": claim["latest_approved_artifact"]}).eq("project_id", projectId).eq("transformation_id", claim["transformation_id"]).is_("latest_approved_artifact", "null").execute()
+                if tableFileState(self.client, projectId, tableName) != recorded:
+                    continue
+                attempted = True
+                if not self.client.table("transformations").update({"latest_approved_artifact": prior}).eq("project_id", projectId).eq("transformation_id", transformationId).is_("latest_approved_artifact", "null").execute().data:
+                    continue
+                if tableFileState(self.client, projectId, tableName) == recorded:
+                    continue
             except Exception as e:
-                logger.error(f"Could not give the name back to transformation {claim['transformation_id']}: {e}")
+                logger.error(f"Could not give '{tableName}' back to transformation {transformationId}: {e}")
+                if not attempted:
+                    continue
+            try:
+                self.client.table("transformations").update({"latest_approved_artifact": None}).eq("project_id", projectId).eq("transformation_id", transformationId).eq("latest_approved_artifact->>table_name", tableName).execute()
+            except Exception as e:
+                logger.error(f"Could not release '{tableName}' again for transformation {transformationId}: {e}")
 
     def _acceptTableName(self, projectId: str, tableName: str) -> list[dict]:
         """Refuse a name already in the project, then release it. Loads release it again once the file is written.
@@ -111,7 +130,8 @@ class DataLoadService:
 
         writeParquet(path) produces the file. If it fails, nothing was written, so the claims are given back
         and a transformation's table keeps its owner. A failed upload may still have landed, so after one the
-        claims stay released. Once the load replaces a table a transformation claimed, caches of it are cleared.
+        claims stay released. After the write the name is released again and the table's caches are cleared,
+        whether or not this load saw a claim: another load may have taken it first.
         """
         uploading = False
         try:
@@ -125,13 +145,13 @@ class DataLoadService:
                 )
         except Exception:
             if not uploading:
-                self._restoreClaims(projectId, claims)
+                self._restoreClaims(projectId, tableName, claims)
             raise
-        if self._releaseTableName(projectId, tableName) or claims:
-            try:
-                forget_table(projectId, tableName)
-            except Exception as e:
-                logger.warning(f"Could not clear caches for {tableName} after a load replaced it: {e}")
+        self._releaseTableName(projectId, tableName)
+        try:
+            forget_table(projectId, tableName)
+        except Exception as e:
+            logger.warning(f"Could not clear caches for {tableName} after a load replaced it: {e}")
 
     @staticmethod
     def _sanitizeDfForParquet(df: pd.DataFrame) -> pd.DataFrame:
@@ -410,8 +430,8 @@ class DataLoadService:
                         )
                         loadedTableNames.append(tableName)
                 except Exception:
-                    for claims in acceptedClaims.values():
-                        self._restoreClaims(projectId, claims)
+                    for unwrittenName, claims in acceptedClaims.items():
+                        self._restoreClaims(projectId, unwrittenName, claims)
                     raise
 
             updateProjectModifiedAt(projectId)

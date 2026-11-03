@@ -13,7 +13,7 @@ from api.services.credits.creditTrackingCallback import CreditTrackingCallback
 from utils.exceptionHandler import CustomException
 from utils.initMethods import forget_table
 from api.models import TransformationAgentResponse
-from api.commons import client, updateProjectModifiedAt
+from api.commons import client, tableFileState, updateProjectModifiedAt
 from utils.logger import logger
 from typing import TYPE_CHECKING
 import redis
@@ -272,7 +272,10 @@ class TransformationService:
         claimed = stillClaimed = False
         try:
             claim = self.supabase.table("transformations").update({
-                "latest_approved_artifact": {**(priorArtifact or {}), "table_name": tableName},
+                "latest_approved_artifact": {
+                    **{key: value for key, value in (priorArtifact or {}).items() if key != "table_file"},
+                    "table_name": tableName,
+                },
             }).eq("transformation_id", transformationId)
             if priorTable:
                 claim = claim.eq("latest_approved_artifact->>table_name", priorTable)
@@ -327,9 +330,20 @@ class TransformationService:
         except Exception as e:
             logger.error(f"Could not undo the claim on '{tableName}' for transformation {transformationId}: {e}")
 
-    def _record_applied_artifact(self, transformationId: str, latestArtifact: dict) -> None:
-        """Point the row at the table it just wrote, unless a load has taken the name meanwhile."""
+    def _record_applied_artifact(self, projectId: str, transformationId: str, latestArtifact: dict) -> None:
+        """Point the row at the table it just wrote, unless a load has taken the name meanwhile.
+
+        It also records the file storage now holds, so a failed load gives the name back only while that file is
+        unchanged. A load that wrote first releases the name after its write, which clears this record with it.
+        """
         tableName = latestArtifact["table_name"]
+        try:
+            fileState = tableFileState(self.supabase, projectId, tableName)
+        except Exception as e:
+            fileState = None
+            logger.warning(f"Could not record the file for '{tableName}'; a failed load will not give the name back: {e}")
+        if fileState:
+            latestArtifact = {**latestArtifact, "table_file": fileState}
         try:
             updated = self.supabase.table("transformations").update({
                 "latest_approved_artifact": latestArtifact,
@@ -689,7 +703,7 @@ class TransformationService:
 
             # Checked here, not at approve: an upload can take the name while the code runs.
             self._write_claimed_table(projectId, transformationId, newTransformedTableName, parquetBytes)
-            self._record_applied_artifact(transformationId, {
+            self._record_applied_artifact(projectId, transformationId, {
                 "mermaid_code": artifact.get("code"),
                 "message_id": messageId,
                 "table_name": newTransformedTableName,
@@ -778,7 +792,7 @@ class TransformationService:
                 self._write_claimed_table(projectId, transformationId, newTransformedTableName, parquetBytes)
                 
                 # Update latest approved artifact to point to this checkpoint
-                self._record_applied_artifact(transformationId, {
+                self._record_applied_artifact(projectId, transformationId, {
                     "mermaid_code": (lastApprovedMsg.get("artifact") or {}).get("code"),
                     "message_id": lastApprovedMsg.get("message_id"),
                     "table_name": newTransformedTableName,

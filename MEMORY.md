@@ -127,7 +127,7 @@ No new table (from data load or transformation) can take a name that already exi
 Called at every entry point where a new table is created:
 - Transformations (`transformationService._validate_transformation_table_name`) — checked at approve, then again at apply and rollback straight before the write: `_claim_table_name` claims the name only over the artifact it read, checks again, and a first write never replaces an existing file.
 
-**Carve-out**: a transformation may overwrite the table its own `latest_approved_artifact.table_name` names. Re-using a name that belongs to a *different* table still raises 409. Loads release that claim when they accept the name, give it back if they fail before writing, and clear the table's caches after writing over it.
+**Carve-out**: a transformation may overwrite the table its own `latest_approved_artifact.table_name` names. Re-using a name that belongs to a *different* table still raises 409. Loads release that claim when they accept the name. A load that fails before writing gives it back only while the file is still the one apply or rollback recorded in the artifact's `table_file` after writing, and releases it again if a re-check finds the file changed. After every write a load releases the name again and clears the table's caches.
 - CSV upload (`dataLoadService.loadCsvData`)
 - Excel upload (`dataLoadService.loadExcelData`)
 - PDF upload (`dataLoadService.loadPdfData`)

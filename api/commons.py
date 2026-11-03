@@ -332,6 +332,19 @@ def requireCredits(operationType: str):
     return _dependency
 
 
+def tableFileState(supabaseClient, projectId: str, tableName: str) -> dict | None:
+    """What storage reports for a table's file, or None when there is none. Any write to the file changes it."""
+    fileName = f"{tableName}.parquet"
+    for entry in supabaseClient.storage.from_("AnalyticsHub").list(projectId, {"search": fileName}):
+        if entry.get("name") == fileName:
+            return {
+                "id": entry.get("id"),
+                "updated_at": entry.get("updated_at"),
+                "eTag": (entry.get("metadata") or {}).get("eTag"),
+            }
+    return None
+
+
 def updateProjectModifiedAt(projectId: str) -> None:
     """
     Update the modifiedAt field of a project to the current UTC timestamp.
