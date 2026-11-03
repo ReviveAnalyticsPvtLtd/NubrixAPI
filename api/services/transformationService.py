@@ -21,6 +21,7 @@ import httpx
 import orjson
 import json
 import os
+from api.commons import giveTableNameBack
 
 if TYPE_CHECKING:
     from nubrix.components.transformationAgent import TransformationAgent
@@ -248,11 +249,40 @@ class TransformationService:
             file_options={"upsert": "true"},
         )
 
-    def _remove_owned_table(self, projectId: str, tableName: str) -> None:
-        """Remove a table this transformation produced: the file, then its key, then the caches. Each step is safe to repeat."""
-        self.supabase.storage.from_("AnalyticsHub").remove([f"{projectId}/{tableName}.parquet"])
-        self._remove_table_from_metadata(projectId, tableName)
-        forget_table(projectId, tableName)
+    def _remove_table_if_unchanged(self, projectId: str, transformationId: str, artifact: dict) -> None:
+        """Remove the table this transformation's artifact names, unless it is no longer this transformation's.
+
+        The claim is released first, filtered on the name read. If no row comes back, a load released it first,
+        so the file under that name is the load's and nothing is removed. Otherwise the file, then its key, then
+        the caches go, each safe to repeat. A file that differs from the recorded `table_file` was written since,
+        so it is kept with its key and only the caches are cleared. With no file left, the key and caches still
+        go, so a retry finishes. An artifact with no `table_file` (applied before files were recorded, or the
+        record failed) has its table removed as before. No lock is held: a load that writes between the file
+        check and the remove still loses its upload, and storage has no delete that is conditional on the file.
+
+        If a step after the release fails, the claim is given back while the file is unchanged or gone, so a
+        retry removes the rest. If that give-back fails too, a retry keeps the file as an ordinary table, which
+        deleteTable can still remove.
+        """
+        tableName = artifact["table_name"]
+        recorded = artifact.get("table_file")
+        released = self.supabase.table("transformations").update({"latest_approved_artifact": None}).eq("project_id", projectId).eq("transformation_id", transformationId).eq("latest_approved_artifact->>table_name", tableName).execute().data
+        if not released:
+            return
+        ownFiles = (recorded, None)
+        try:
+            current = tableFileState(self.supabase, projectId, tableName)
+            if current is not None and recorded is not None and current != recorded:
+                forget_table(projectId, tableName)
+                return
+            ownFiles = (current, None)
+            if current is not None:
+                self.supabase.storage.from_("AnalyticsHub").remove([f"{projectId}/{tableName}.parquet"])
+            self._remove_table_from_metadata(projectId, tableName)
+            forget_table(projectId, tableName)
+        except Exception:
+            giveTableNameBack(self.supabase, projectId, transformationId, tableName, artifact, ownFiles)
+            raise
 
     def _claim_table_name(self, projectId: str, transformationId: str, tableName: str) -> tuple[bool, dict | None]:
         """Check the name and claim it for this row, straight before its table is written.
@@ -810,7 +840,7 @@ class TransformationService:
                 if appliedTable:
                     logger.info(f"Rolling back to pre-transformation state. Deleting table '{appliedTable}'.")
                     try:
-                        self._remove_owned_table(projectId, appliedTable)
+                        self._remove_table_if_unchanged(projectId, transformationId, latestApproved)
                     except Exception as e:
                         exception = CustomException(e, statusCode=503, uiMessage="We could not roll back this transformation right now. Please try again.")
                         logger.error(exception)
@@ -926,7 +956,7 @@ class TransformationService:
             # repeat, and the row goes last: a failure here keeps it, so the delete can be retried.
             try:
                 if appliedTable:
-                    self._remove_owned_table(projectId, appliedTable)
+                    self._remove_table_if_unchanged(projectId, transformationId, latest_approved)
                 # With no artifact the row owns no file: one under its name is an upload, so leave its key.
                 elif not self._table_file_exists(projectId, tableName):
                     self._remove_table_from_metadata(projectId, tableName)

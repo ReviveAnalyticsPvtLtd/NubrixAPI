@@ -11,7 +11,7 @@ __all__ = ["dataLoadService"]
 
 from nubrix.components.pdfTableExtractor import PdfTableExtractor
 from api.services.credits.creditTrackingCallback import CreditTrackingCallback
-from api.commons import tableFileState, updateProjectModifiedAt
+from api.commons import giveTableNameBack, updateProjectModifiedAt
 from utils.exceptionHandler import CustomException
 from utils.initMethods import forget_table
 from pymongo.mongo_client import MongoClient
@@ -96,25 +96,7 @@ class DataLoadService:
             prior = claim["latest_approved_artifact"]
             if not prior:
                 continue
-            transformationId = claim["transformation_id"]
-            recorded = prior.get("table_file")
-            attempted = False
-            try:
-                if tableFileState(self.client, projectId, tableName) != recorded:
-                    continue
-                attempted = True
-                if not self.client.table("transformations").update({"latest_approved_artifact": prior}).eq("project_id", projectId).eq("transformation_id", transformationId).is_("latest_approved_artifact", "null").execute().data:
-                    continue
-                if tableFileState(self.client, projectId, tableName) == recorded:
-                    continue
-            except Exception as e:
-                logger.error(f"Could not give '{tableName}' back to transformation {transformationId}: {e}")
-                if not attempted:
-                    continue
-            try:
-                self.client.table("transformations").update({"latest_approved_artifact": None}).eq("project_id", projectId).eq("transformation_id", transformationId).eq("latest_approved_artifact->>table_name", tableName).execute()
-            except Exception as e:
-                logger.error(f"Could not release '{tableName}' again for transformation {transformationId}: {e}")
+            giveTableNameBack(self.client, projectId, claim["transformation_id"], tableName, prior, (prior.get("table_file"),))
 
     def _acceptTableName(self, projectId: str, tableName: str) -> list[dict]:
         """Refuse a name already in the project, then release it. Loads release it again once the file is written.

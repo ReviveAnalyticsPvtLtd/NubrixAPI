@@ -1,6 +1,7 @@
 """Tests for the base-table guard on transformation output names."""
 
 import asyncio
+import copy
 import io
 import json
 import os
@@ -1718,3 +1719,138 @@ def test_releasingAgainLeavesANameTheTransformationClaimedMeanwhile(projectStora
         _load(project, "sales", parquetError=failAfterArmingAClaimAndAWrite)
 
     assert project.rows[0]["latest_approved_artifact"] == {"table_name": "renamed"}
+
+
+def _cleanUp(project, operation, afterRowRead=None):
+    """Delete the transformation, or roll it back to the start. afterRowRead runs once its row has been read."""
+    service = _workspaceService(project)
+    if afterRowRead:
+        realRead = service._ensure_transformation
+
+        def readThenRun(*args, **kwargs):
+            # A copy, as a real read returns: later changes to the row do not reach it.
+            row = copy.deepcopy(realRead(*args, **kwargs))
+            hook = afterRowRead
+            service._ensure_transformation = realRead
+            hook()
+            return row
+
+        service._ensure_transformation = readThenRun
+    service.getMessages = mock.AsyncMock(return_value=[])
+    with mock.patch("api.services.managementService.managementService.generateMetadata"):
+        if operation == "delete":
+            return asyncio.run(service.deleteTransformation("project_1", "t1"))
+        return asyncio.run(service.rollbackTransformation("project_1", "t1", "m0"))
+
+
+def _cleanedUpRow(project, operation):
+    if operation == "delete":
+        assert project.rows == []
+    else:
+        assert project.rows[0]["latest_approved_artifact"] is None
+        assert project.rows[0]["messages"] == []
+
+
+@pytest.mark.parametrize("recorded", [True, False], ids=["recorded", "notRecorded"])
+@pytest.mark.parametrize("operation", ["delete", "rollback"])
+def test_uploadBetweenTheRowReadAndTheRemoveSurvives(projectStorage, operation, recorded):
+    # The transformation's table has no key yet, so a load may take its name.
+    project = projectStorage(_FakeProject(metadata={}, tables=("summary",), rows=[_withMessages(_appliedRow(recorded=recorded))]))
+
+    _cleanUp(project, operation, afterRowRead=lambda: _load(project, "summary"))
+
+    assert project.writers["summary.parquet"] == "upload"
+    assert "summary" in project.metadata
+    assert project.removed == []
+    _cleanedUpRow(project, operation)
+
+
+@pytest.mark.parametrize("operation", ["delete", "rollback"])
+def test_uploadAfterTheClaimIsReleasedSurvivesWhenTheFileWasRecorded(projectStorage, operation):
+    # The upload lands after the cleanup takes the name back, but before it looks at the file.
+    project = projectStorage(_FakeProject(metadata={"summary": {}}, tables=("summary",), rows=[_withMessages(_appliedRow(recorded=True))]))
+    project.afterRowUpdate.append(lambda: _uploadLands(project, "summary"))
+
+    _cleanUp(project, operation)
+
+    assert project.writers["summary.parquet"] == "upload"
+    assert "summary" in project.metadata
+    assert project.removed == []
+    assert project.forgotten == ["summary"]
+    _cleanedUpRow(project, operation)
+
+
+@pytest.mark.parametrize("operation", ["delete", "rollback"])
+def test_fileChangedSinceItWasRecordedIsKeptWithItsKey(projectStorage, operation):
+    # Written without the name being released, as by a worker still running code that does not release names.
+    project = projectStorage(_FakeProject(metadata={"summary": {}}, tables=("summary",), rows=[_withMessages(_appliedRow(recorded=True))]))
+    _uploadLands(project, "summary")
+
+    _cleanUp(project, operation)
+
+    assert project.writers["summary.parquet"] == "upload"
+    assert "summary" in project.metadata
+    assert project.removed == []
+    assert project.forgotten == ["summary"]
+    _cleanedUpRow(project, operation)
+
+
+@pytest.mark.parametrize("operation", ["delete", "rollback"])
+def test_unchangedRecordedFileIsRemovedWithItsKeyAndCaches(projectStorage, operation):
+    project = projectStorage(_FakeProject(metadata={"sales": {}, "summary": {}}, tables=("sales", "summary"), rows=[_withMessages(_appliedRow(recorded=True))]))
+
+    _cleanUp(project, operation)
+
+    assert "summary.parquet" not in project.fileNames
+    assert list(project.metadata) == ["sales"]
+    assert project.forgotten == ["summary"]
+    _cleanedUpRow(project, operation)
+
+
+@pytest.mark.parametrize("operation", ["delete", "rollback"])
+def test_claimWhoseFileIsGoneStillClearsItsKeyAndCaches(projectStorage, operation):
+    project = projectStorage(_FakeProject(metadata={"sales": {}, "summary": {}}, tables=("sales",), rows=[_withMessages(_appliedRow(recorded=True))]))
+
+    _cleanUp(project, operation)
+
+    assert project.removed == []
+    assert list(project.metadata) == ["sales"]
+    assert project.forgotten == ["summary"]
+    _cleanedUpRow(project, operation)
+
+
+@pytest.mark.parametrize("operation", ["delete", "rollback"])
+@pytest.mark.parametrize("failure", ["tableRemove", "metadataWrite", "cacheClear"])
+def test_failedCleanupOfARecordedFileKeepsTheClaimAndCanBeRetried(projectStorage, operation, failure):
+    project = projectStorage(_FakeProject(metadata={"sales": {}, "summary": {}}, tables=("sales", "summary"), rows=[_withMessages(_appliedRow(recorded=True))]))
+    project.failures[failure] = ConnectionError("storage unavailable")
+
+    with pytest.raises(CustomException) as caught:
+        _cleanUp(project, operation)
+
+    assert caught.value.statusCode == 503
+    assert project.rows[0]["latest_approved_artifact"] == {"table_name": "summary", "table_file": _recordedFile("summary")}
+    project.failures.clear()
+    _cleanUp(project, operation)
+    assert "summary.parquet" not in project.fileNames
+    assert list(project.metadata) == ["sales"]
+    _cleanedUpRow(project, operation)
+
+
+@pytest.mark.parametrize("operation", ["delete", "rollback"])
+def test_failedCleanupDoesNotGiveTheNameBackOverAnUploadThatLandedMeanwhile(projectStorage, operation):
+    project = projectStorage(_FakeProject(metadata={"summary": {}}, tables=("summary",), rows=[_withMessages(_appliedRow(recorded=True))]))
+    project.forgotten = []
+
+    def uploadLandsThenRemoveFails(paths):
+        _uploadLands(project, "summary")
+        raise ConnectionError("storage unavailable")
+
+    project.remove = uploadLandsThenRemoveFails
+
+    with pytest.raises(CustomException):
+        _cleanUp(project, operation)
+
+    assert project.rows[0]["latest_approved_artifact"] is None
+    assert project.writers["summary.parquet"] == "upload"
+    assert "summary" in project.metadata
