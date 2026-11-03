@@ -92,9 +92,11 @@ class DataLoadService:
         """Give a name back to the transformations a load took it from, when the load wrote nothing over their table.
 
         Only while the file is still the one the transformation recorded when it wrote it, so another load's
-        upload is never handed to it. The file is checked again after the name is given back, and the name is
-        released again if the file changed or could not be checked. A load writing later releases it after its
-        own write. A row that has claimed anything since keeps it.
+        upload is never handed to it. A claim with no recorded `table_file` is compared with the file as this load
+        read it before it read the claims. No file then and none now also counts as unchanged, as for an apply
+        whose write failed. The file is checked again after the name is given back, and the name is released
+        again if the file changed or could not be checked. A load writing later releases it after its own write.
+        A row that has claimed anything since keeps it.
         """
         for claim in claims:
             prior = claim["latest_approved_artifact"]
@@ -127,7 +129,8 @@ class DataLoadService:
         """Write a load's table under a name it accepted, then release the name again.
 
         writeParquet(path) produces the file. If it fails, nothing was written, so the claims are given back
-        and a transformation's table keeps its owner. A failed upload may still have landed, so after one the
+        while the file is unchanged (see _restoreClaims, which also covers no file and no record) and a
+        transformation's table keeps its owner. A failed upload may still have landed, so after one the
         claims stay released. After the write the name is released again and the table's caches are cleared,
         whether or not this load saw a claim: another load may have taken it first. That release is retried,
         the caches are cleared even if it keeps failing, and the load then answers 503.
@@ -161,7 +164,7 @@ class DataLoadService:
         except Exception as e:
             logger.warning(f"Could not clear caches for {tableName} after a load replaced it: {e}")
         if releaseError:
-            # A transformation may still claim this upload, so deleting it would remove the upload.
+            # A transformation may still claim this upload. Deleting it then keeps the upload only if it recorded its file.
             logger.error(f"Load wrote '{tableName}' in project {projectId} but could not release the name from its transformations.")
             raise releaseError
 

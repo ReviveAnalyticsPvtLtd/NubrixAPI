@@ -520,7 +520,14 @@ class TransformationService:
                 .order("created_at", desc=True)
                 .execute()
             )
-            return response.data or []
+            # table_file is the server's record of storage's file, for name ownership; the browser has no use for it.
+            listed = []
+            for row in response.data or []:
+                artifact = row.get("latest_approved_artifact")
+                if isinstance(artifact, dict) and "table_file" in artifact:
+                    row = {**row, "latest_approved_artifact": {key: value for key, value in artifact.items() if key != "table_file"}}
+                listed.append(row)
+            return listed
         except Exception as e:
             exception = CustomException(e, statusCode=400, uiMessage="Failed to list transformations.")
             logger.error(exception)

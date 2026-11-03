@@ -171,6 +171,9 @@ class _FakeRows:
     def limit(self, _count):
         return self
 
+    def order(self, *_args, **_kwargs):
+        return self
+
     def insert(self, row):
         self.change = ("insert", row)
         return self
@@ -2159,3 +2162,13 @@ def test_failedLoadThatCouldNotReadTheFileGivesBackOnlyARecordedClaim(projectSto
 
     assert project.rows[0]["latest_approved_artifact"] is None
     assert project.rows[1]["latest_approved_artifact"] == {"table_name": "sales", "table_file": _recordedFile("sales")}
+
+
+def test_listedTransformationsDoNotShowTheirFileRecord(projectStorage):
+    project = projectStorage(_FakeProject(metadata={}, tables=("sales",), rows=[_appliedRow("sales", recorded=True), _draftRow("draft", transformationId="t2")]))
+    project.rows[0]["latest_approved_artifact"]["mermaid_code"] = "graph"
+
+    listed = asyncio.run(_projectService(project).listTransformations("project_1"))
+
+    assert [row.get("latest_approved_artifact") for row in listed] == [{"table_name": "sales", "mermaid_code": "graph"}, None]
+    assert project.rows[0]["latest_approved_artifact"]["table_file"] == _recordedFile("sales")
