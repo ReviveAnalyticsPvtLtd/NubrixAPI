@@ -166,7 +166,9 @@ def test_arrowPoolsAreCapped():
 
 
 # Kernel limits in a real run. They apply to a run uid on Linux, so these need a root parent.
+import os
 import signal
+import threading
 import time
 
 from nubrix.components.transformationExecutor import TransformationExecutor
@@ -296,3 +298,163 @@ def test_honestWorkloadFinishesUnderDefaultLimits(storage):
     assert "rows" in output and "Threads" in output, output
     threads = int(output.split("Threads")[1].split()[0])
     assert threads <= 32
+
+
+# The watchdog: measuring a run and stopping it when it passes a limit.
+from utils.sandboxWatchdog import RunWatchdog, workUsage
+
+
+@pytest.mark.skipif(os.name != "posix", reason="sparse files and block counts are posix")
+def test_workUsageCountsAllocatedBlocksNotSparseSize(tmp_path):
+    with open(tmp_path / "sparse", "wb") as sparse:
+        sparse.truncate(GIB)
+
+    used, entries, over = workUsage(str(tmp_path), 1 << 40, 1000)
+
+    assert used < 1024**2
+    assert entries == 1
+    assert not over
+
+
+def test_workUsageStopsWalkingOnceOverTheLimit(tmp_path):
+    for number in range(50):
+        (tmp_path / f"f{number}").write_bytes(b"")
+
+    _, entries, over = workUsage(str(tmp_path), 1 << 40, 10)
+
+    assert over
+    assert entries <= 11
+
+
+@pytest.mark.skipif(os.name != "posix", reason="creating links needs no privilege on posix")
+def test_workUsageDoesNotFollowLinks(tmp_path):
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    (outside / "big").write_bytes(b"x" * (1 << 20))
+    work = tmp_path / "work"
+    work.mkdir()
+    os.symlink(outside, work / "folderLink")
+    os.symlink(outside / "big", work / "fileLink")
+
+    used, entries, over = workUsage(str(work), 1 << 40, 1000)
+
+    assert entries == 2
+    assert used < 1 << 16
+    assert not over
+
+
+def _forkingCode(sizeMiB: int) -> str:
+    return (
+        'os = pd.io.common.os\n'
+        'for _ in range(3):\n'
+        '    if os.fork() == 0:\n'
+        f'        block = np.ones(({sizeMiB} << 20) // 8)\n'
+        '        pd.io.common.os.sys.modules["time"].sleep(30)\n'
+        '        os._exit(0)\n'
+        'pd.io.common.os.sys.modules["time"].sleep(30)\n'
+    )
+
+
+def _assertStopped(result, sentence: str, started: float, seconds: float = 10) -> None:
+    assert sentence in (result.stopped or ""), result
+    assert sentence in result.stderr, result
+    assert result.stderr.count(sentence) == 1
+    assert time.time() - started < seconds
+    assert result.returncode != 0
+
+
+@separateUids
+def test_forksThatAddUpPastTheRunLimitAreStopped(storage, monkeypatch):
+    from test.test_sandbox_storage_reads import _liveRunUidProcesses
+
+    monkeypatch.setenv("SANDBOX_MAX_RUN_MEMORY_BYTES", "536870912")
+    started = time.time()
+
+    result = sandboxRunner.runSandbox("inspect_launcher.py", PROJECT, _forkingCode(300), timeoutSeconds=60)
+
+    _assertStopped(result, "used more than 512 MiB of memory", started)
+    print("memory stop latency", time.time() - started)
+    assert _liveRunUidProcesses() == []
+
+
+@separateUids
+def test_sharedAnonymousMemoryCounts(storage, monkeypatch):
+    monkeypatch.setenv("SANDBOX_MAX_RUN_MEMORY_BYTES", "536870912")
+    code = (
+        'block = pd.io.common.mmap.mmap(-1, 600 << 20)\n'
+        'chunk = b"x" * (1 << 20)\n'
+        'for _ in range(600):\n'
+        '    block.write(chunk)\n'
+        'pd.io.common.os.sys.modules["time"].sleep(30)\n'
+    )
+    started = time.time()
+
+    result = sandboxRunner.runSandbox("inspect_launcher.py", PROJECT, code, timeoutSeconds=60)
+
+    _assertStopped(result, "used more than 512 MiB of memory", started)
+    print("shared memory stop latency", time.time() - started)
+
+
+@separateUids
+def test_diskFillIsStopped(storage, monkeypatch):
+    monkeypatch.setenv("SANDBOX_MAX_DISK_BYTES", "67108864")
+    code = (
+        'os = pd.io.common.os\n'
+        'chunk = b"x" * (1 << 20)\n'
+        'fd = os.open("f", os.O_CREAT | os.O_WRONLY)\n'
+        'for _ in range(1024):\n'
+        '    os.write(fd, chunk)\n'
+        '    os.fsync(fd)\n'
+        '    os.sys.modules["time"].sleep(0.02)\n'
+    )
+    started = time.time()
+
+    result = sandboxRunner.runSandbox("inspect_launcher.py", PROJECT, code, timeoutSeconds=60)
+
+    _assertStopped(result, "wrote more than 64 MiB to disk", started, 30)
+
+
+@separateUids
+def test_fileFloodIsStopped(storage, monkeypatch):
+    monkeypatch.setenv("SANDBOX_MAX_FILES", "500")
+    code = (
+        'os = pd.io.common.os\n'
+        'for number in range(5000):\n'
+        '    os.close(os.open(f"f{number}", os.O_CREAT | os.O_WRONLY))\n'
+        '    if number % 100 == 0:\n'
+        '        os.sys.modules["time"].sleep(0.1)\n'
+        'os.sys.modules["time"].sleep(30)\n'
+    )
+    started = time.time()
+
+    result = sandboxRunner.runSandbox("inspect_launcher.py", PROJECT, code, timeoutSeconds=60)
+
+    _assertStopped(result, "created more than 500 files", started, 30)
+
+
+@separateUids
+def test_loweringTheOomPriorityStopsTheRun(storage):
+    code = (
+        'os = pd.io.common.os\n'
+        'try:\n'
+        '    fd = os.open("/proc/self/oom_score_adj", os.O_WRONLY)\n'
+        '    os.write(fd, b"0")\n'
+        '    os.close(fd)\n'
+        'except OSError:\n'
+        '    pass\n'
+        'os.sys.modules["time"].sleep(30)\n'
+    )
+    started = time.time()
+
+    result = sandboxRunner.runSandbox("inspect_launcher.py", PROJECT, code, timeoutSeconds=60)
+
+    _assertStopped(result, "changed its own memory priority", started)
+
+
+@separateUids
+def test_watchdogStopsWithTheRun(storage):
+    result = sandboxRunner.runSandbox("inspect_launcher.py", PROJECT, 'print("ok")', timeoutSeconds=60)
+
+    assert result.returncode == 0
+    assert result.stopped is None
+    assert not [thread for thread in threading.enumerate() if isinstance(thread, RunWatchdog)]

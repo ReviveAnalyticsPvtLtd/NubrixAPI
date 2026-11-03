@@ -52,6 +52,7 @@ from utils.logger import logger
 from utils.sandbox_reaper import _SHARED_TEMP_FOLDERS
 from utils.sandboxLimits import RunLimits, currentRunLimits
 from utils.sandboxSeccomp import installFilter
+from utils.sandboxWatchdog import RunWatchdog
 
 # Below 65536, the range a user namespace normally maps. The same number of uids above
 # the range are spare: a reaper's real uid is its run's uid plus _RUN_UID_COUNT. No run
@@ -73,6 +74,9 @@ _CPU_HARD_LIMIT_GRACE_SECONDS = 10
 _CLEAR_UID_TIMEOUT_SECONDS = 30
 _MAX_REAPER_ERROR_BYTES = 1024
 _PR_SET_PDEATHSIG = 1
+# Linux numbers, because Windows has neither name.
+_SIGXCPU = 24
+_SIGKILL = 9
 _PR_SET_NO_NEW_PRIVS = 38
 _THREAD_VARIABLES = ("POLARS_MAX_THREADS", "OMP_NUM_THREADS", "OPENBLAS_NUM_THREADS", "MKL_NUM_THREADS", "NUMEXPR_MAX_THREADS")
 _ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -89,6 +93,7 @@ class SandboxResult(NamedTuple):
     returncode: int
     resultBytes: bytes | None
     previewBytes: bytes | None = None
+    stopped: str | None = None
 
 
 def _lockRun(runFolder: str) -> int | None:
@@ -357,6 +362,28 @@ def _readOutput(output: IO[bytes]) -> str:
     return printed.decode("utf-8", "replace")
 
 
+def _watchRun(proc: subprocess.Popen, runUid: int | None, workFolder: str, limits: RunLimits) -> RunWatchdog | None:
+    """Start the watchdog for a run uid. A development run under the parent's own uid has none."""
+    if runUid is None:
+        return None
+    watchdog = RunWatchdog(runUid, workFolder, limits, lambda reason: proc.kill())
+    watchdog.start()
+    return watchdog
+
+
+def _stopReason(returncode: int, watchdogReason: str | None, timeoutNote: str, limits: RunLimits) -> str | None:
+    """Why a limit ended the run, if one did. The watchdog's reason counts only if the run did not end well anyway."""
+    if watchdogReason and returncode != 0:
+        return watchdogReason
+    if timeoutNote:
+        return timeoutNote.strip()
+    if returncode == -_SIGXCPU:
+        return f"The run was stopped: it used more than {limits.maxCpuSeconds} CPU-seconds."
+    if returncode == -_SIGKILL:
+        return "The run was stopped: the server ran out of memory."
+    return None
+
+
 def _runChild(launcherName: str, projectId: str, code: str, timeoutSeconds: int | None, withResult: bool, runUid: int | None, runFolder: str, tablesFolder: str, workFolder: str, limits: RunLimits) -> SandboxResult:
     """Start the launcher, serve its table reads and collect what it produced."""
     resultPath = os.path.join(workFolder, "result.parquet")
@@ -372,6 +399,7 @@ def _runChild(launcherName: str, projectId: str, code: str, timeoutSeconds: int 
     ):
         with childEnd:
             proc = _startChild(launcherName, runUid, workFolder, childEnd, stdout, stderr, limits)
+            watchdog = _watchRun(proc, runUid, workFolder, limits)
             payload = json.dumps({
                 "projectId": projectId,
                 "code": code,
@@ -384,6 +412,8 @@ def _runChild(launcherName: str, projectId: str, code: str, timeoutSeconds: int 
         try:
             timeoutNote = _waitForChild(proc, payload, timeoutSeconds)
         finally:
+            if watchdog is not None:
+                watchdog.stop()
             # Out of the child's reach: nothing it wrote to the socket can stop this or block it.
             runEnded.set()
             with contextlib.suppress(OSError):
@@ -393,7 +423,9 @@ def _runChild(launcherName: str, projectId: str, code: str, timeoutSeconds: int 
         if withResult and proc.returncode == 0:
             resultBytes = readResult(resultPath, runUid)
             previewBytes = readResult(previewPath, runUid, _MAX_PREVIEW_BYTES)
-        return SandboxResult(_readOutput(stdout), _readOutput(stderr) + timeoutNote, proc.returncode, resultBytes, previewBytes)
+        stopped = _stopReason(proc.returncode, watchdog.reason if watchdog else None, timeoutNote, limits)
+        stopNote = f"\n{stopped}\n" if stopped and stopped not in timeoutNote else ""
+        return SandboxResult(_readOutput(stdout), _readOutput(stderr) + timeoutNote + stopNote, proc.returncode, resultBytes, previewBytes, stopped)
 
 
 def runSandbox(launcherName: str, projectId: str, code: str, timeoutSeconds: int | None, withResult: bool = False) -> SandboxResult:

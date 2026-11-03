@@ -138,7 +138,7 @@ class TransformationExecutor:
 
     def _run_transformation(self, projectId: str, pythonCode: str) -> tuple[list[dict], bytes]:
         """Run transformation code and return the preview rows and the parquet bytes of `final_df`."""
-        _, stderr, rc, parquetBytes, previewBytes = runSandbox("transform_launcher.py", projectId, pythonCode, self.timeoutSeconds, withResult=True)
+        _, stderr, rc, parquetBytes, previewBytes, _ = runSandbox("transform_launcher.py", projectId, pythonCode, self.timeoutSeconds, withResult=True)
         if rc != 0:
             raise ValueError(stderr.strip() or "Transformation execution failed.")
         if not parquetBytes:
