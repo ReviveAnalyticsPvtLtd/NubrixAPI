@@ -136,3 +136,23 @@ def test_forgettingATableDropsItsSizeClass():
     initMethods.invalidate_data_cache("project_1", "sales")
 
     assert _sizeClass() == "unknown"
+
+
+def test_redisMetadataWinsOverThisWorkersOldSizeClass():
+    # Another worker replaced the large table with a small one, and Redis holds the new metadata.
+    import json
+
+    with mock.patch("utils.initMethods.time.monotonic", return_value=1000.0):
+        initMethods._cache_put(KEY, pa.table({"amount": pa.array(range(150_000))}))
+    redisClient = mock.Mock()
+    redisClient.get.return_value = json.dumps({"sales": {"shape": [10, 1]}}).encode("utf-8")
+
+    with (
+        mock.patch("utils.initMethods.time.monotonic", return_value=1061.0),
+        mock.patch("utils.initMethods._redis_pool"),
+        mock.patch("utils.initMethods.redis.Redis", return_value=redisClient),
+    ):
+        result = initMethods.classify_table_size(*KEY)
+
+    assert result["rows_estimate"] == 10
+    assert result["size_class"] == initMethods._classify_rows(10)

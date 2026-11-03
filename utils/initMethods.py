@@ -447,7 +447,8 @@ def classify_table_size(projectId: str, tableName: str) -> dict:
     """Return ``{rows_estimate, columns, size_class, hint}`` for the table.
 
     Falls back to the Redis-cached ``metadata.json`` row count when the Arrow
-    table isn't in the in-process LRU, then to ``None`` if no signal exists.
+    table isn't in the in-process LRU, then to this worker's last seen shape,
+    then to ``None`` if no signal exists.
     """
     cache_key = (projectId, tableName)
     table = _cache_get(cache_key)
@@ -457,13 +458,7 @@ def classify_table_size(projectId: str, tableName: str) -> dict:
         sz = _classify_rows(rows)
         return {"rows_estimate": rows, "columns": cols, "size_class": sz,
                 "hint": _SIZE_HINTS[sz]}
-    shape = _DF_SHAPES.get(cache_key)
-    if shape is not None:
-        rows, cols = shape
-        sz = _classify_rows(rows)
-        return {"rows_estimate": rows, "columns": cols, "size_class": sz,
-                "hint": _SIZE_HINTS[sz]}
-    # Cold fallback: metadata.json row counts in the Redis cache.
+    # metadata.json row counts in the Redis cache come next: clearing a table drops them on every worker.
     redis_key = f"{projectId}::metadata"
     try:
         r = redis.Redis(connection_pool=_redis_pool())
@@ -485,6 +480,13 @@ def classify_table_size(projectId: str, tableName: str) -> dict:
                             "size_class": sz, "hint": _SIZE_HINTS[sz]}
         except Exception:
             pass
+    # Then this worker's own record, which outlives the table but not a replacement made elsewhere.
+    shape = _DF_SHAPES.get(cache_key)
+    if shape is not None:
+        rows, cols = shape
+        sz = _classify_rows(rows)
+        return {"rows_estimate": rows, "columns": cols, "size_class": sz,
+                "hint": _SIZE_HINTS[sz]}
     return {"rows_estimate": None, "columns": None, "size_class": "unknown",
             "hint": "size unknown; default to fetch_data_pl"}
 
