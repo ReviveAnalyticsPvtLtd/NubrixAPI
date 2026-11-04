@@ -11,8 +11,9 @@ __all__ = ["dataLoadService"]
 
 from nubrix.components.pdfTableExtractor import PdfTableExtractor
 from api.services.credits.creditTrackingCallback import CreditTrackingCallback
-from api.commons import updateProjectModifiedAt
+from api.commons import tableFileState, updateProjectModifiedAt
 from utils.exceptionHandler import CustomException
+from utils.initMethods import forget_table
 from pymongo.mongo_client import MongoClient
 from pymongo.server_api import ServerApi
 from fastapi import Form, UploadFile
@@ -62,6 +63,94 @@ class DataLoadService:
         sanitized = re.sub(r"_+", "_", sanitized)
         sanitized = sanitized.strip("_")
         return sanitized
+
+    def _releaseTableName(self, projectId: str, tableName: str) -> list[dict]:
+        """Take the name from any transformation that still claims it, so none can remove or overwrite this table.
+
+        Returns the claims it took, each with the transformation's artifact before the release where it was read.
+        """
+        try:
+            # Read first to keep what each row had; a claim made between the two is released without it.
+            claims = self.client.table("transformations").select("transformation_id, latest_approved_artifact").eq("project_id", projectId).eq("latest_approved_artifact->>table_name", tableName).execute().data or []
+            priorArtifacts = {claim.get("transformation_id"): claim.get("latest_approved_artifact") for claim in claims}
+            released = self.client.table("transformations").update({"latest_approved_artifact": None}).eq("project_id", projectId).eq("latest_approved_artifact->>table_name", tableName).execute().data or []
+        except Exception as e:
+            exception = CustomException(e, statusCode=503, uiMessage="We could not check this table name right now. Please try again.")
+            logger.error(exception)
+            raise exception
+        return [
+            {"transformation_id": row.get("transformation_id"), "latest_approved_artifact": priorArtifacts.get(row.get("transformation_id"))}
+            for row in released
+        ]
+
+    def _restoreClaims(self, projectId: str, tableName: str, claims: list[dict]) -> None:
+        """Give a name back to the transformations a load took it from, when the load wrote nothing over their table.
+
+        Only while the file is still the one the transformation recorded when it wrote it, so another load's
+        upload is never handed to it. The file is checked again after the name is given back, and the name is
+        released again if the file changed or could not be checked. A load writing later releases it after its
+        own write. A row that has claimed anything since keeps it.
+        """
+        for claim in claims:
+            prior = claim["latest_approved_artifact"]
+            if not prior:
+                continue
+            transformationId = claim["transformation_id"]
+            recorded = prior.get("table_file")
+            attempted = False
+            try:
+                if tableFileState(self.client, projectId, tableName) != recorded:
+                    continue
+                attempted = True
+                if not self.client.table("transformations").update({"latest_approved_artifact": prior}).eq("project_id", projectId).eq("transformation_id", transformationId).is_("latest_approved_artifact", "null").execute().data:
+                    continue
+                if tableFileState(self.client, projectId, tableName) == recorded:
+                    continue
+            except Exception as e:
+                logger.error(f"Could not give '{tableName}' back to transformation {transformationId}: {e}")
+                if not attempted:
+                    continue
+            try:
+                self.client.table("transformations").update({"latest_approved_artifact": None}).eq("project_id", projectId).eq("transformation_id", transformationId).eq("latest_approved_artifact->>table_name", tableName).execute()
+            except Exception as e:
+                logger.error(f"Could not release '{tableName}' again for transformation {transformationId}: {e}")
+
+    def _acceptTableName(self, projectId: str, tableName: str) -> list[dict]:
+        """Refuse a name already in the project, then release it. Loads release it again once the file is written.
+
+        Returns the claims it took, for _writeTable to give back if the load writes nothing.
+        """
+        from api.services.managementService import managementService
+        managementService.validateTableNameAvailable(projectId=projectId, tableName=tableName)
+        return self._releaseTableName(projectId, tableName)
+
+    def _writeTable(self, projectId: str, tableName: str, claims: list[dict], writeParquet) -> None:
+        """Write a load's table under a name it accepted, then release the name again.
+
+        writeParquet(path) produces the file. If it fails, nothing was written, so the claims are given back
+        and a transformation's table keeps its owner. A failed upload may still have landed, so after one the
+        claims stay released. After the write the name is released again and the table's caches are cleared,
+        whether or not this load saw a claim: another load may have taken it first.
+        """
+        uploading = False
+        try:
+            with tempfile.NamedTemporaryFile(delete=True, suffix=".parquet") as temp:
+                writeParquet(temp.name)
+                uploading = True
+                self.client.storage.from_("AnalyticsHub").upload(
+                    file=temp.name,
+                    path=f"{projectId}/{tableName}.parquet",
+                    file_options={"upsert": "true"}
+                )
+        except Exception:
+            if not uploading:
+                self._restoreClaims(projectId, tableName, claims)
+            raise
+        self._releaseTableName(projectId, tableName)
+        try:
+            forget_table(projectId, tableName)
+        except Exception as e:
+            logger.warning(f"Could not clear caches for {tableName} after a load replaced it: {e}")
 
     @staticmethod
     def _sanitizeDfForParquet(df: pd.DataFrame) -> pd.DataFrame:
@@ -129,15 +218,12 @@ class DataLoadService:
                         uiMessage="Unsupported file type. Upload CSV files only."
                     )
                 sanitizedName = self._sanitizeFileName(file.filename)
-                managementService.validateTableNameAvailable(projectId=projectId, tableName=sanitizedName)
-                with tempfile.NamedTemporaryFile(delete=True, suffix=".parquet") as temp:
-                    df = self._readCsvUpload(await file.read())
-                    self._sanitizeDfForParquet(df).to_parquet(temp.name, compression="snappy")
-                    self.client.storage.from_("AnalyticsHub").upload(
-                        file=temp.name,
-                        path=f"{projectId}/{sanitizedName}.parquet",
-                        file_options={"upsert": "true"}
-                    )
+                fileBytes = await file.read()
+                claims = self._acceptTableName(projectId, sanitizedName)
+                self._writeTable(
+                    projectId, sanitizedName, claims,
+                    lambda path: self._sanitizeDfForParquet(self._readCsvUpload(fileBytes)).to_parquet(path, compression="snappy"),
+                )
                 loadedTableNames.append(sanitizedName)
             updateProjectModifiedAt(projectId)
             # Generate metadata ONLY for the newly loaded tables
@@ -193,15 +279,11 @@ class DataLoadService:
                 for sheetName, sheetData in allSheetData.items():
                     sanitizedSheet = re.sub(r"[^\w-]", "_", str(sheetName)).strip("_")
                     tableName = f"{sanitizedBase}_{sanitizedSheet}"
-                    managementService.validateTableNameAvailable(projectId=projectId, tableName=tableName)
-                    with tempfile.NamedTemporaryFile(delete=True, suffix=".parquet") as temp:
-                        self._sanitizeDfForParquet(sheetData).to_parquet(temp.name, compression="snappy")
-                        fileName = f"{tableName}.parquet"
-                        self.client.storage.from_("AnalyticsHub").upload(
-                            file=temp.name,
-                            path=f"{projectId}/{fileName}",
-                            file_options={"upsert": "true"}
-                        )
+                    claims = self._acceptTableName(projectId, tableName)
+                    self._writeTable(
+                        projectId, tableName, claims,
+                        lambda path: self._sanitizeDfForParquet(sheetData).to_parquet(path, compression="snappy"),
+                    )
                     loadedTableNames.append(tableName)
             updateProjectModifiedAt(projectId)
             newMetadata = {}
@@ -333,19 +415,23 @@ class DataLoadService:
                     f"into {len(pendingTables)} table(s)"
                 )
 
-                for idx, entry in enumerate(pendingTables, start=1):
-                    with tempfile.NamedTemporaryFile(delete=True, suffix=".parquet") as temp:
-                        self._sanitizeDfForParquet(entry["df"]).to_parquet(
-                            temp.name, compression="snappy"
-                        )
+                # Every name is accepted before any is written. A load that stops gives back the names it has not written.
+                acceptedClaims: dict[str, list[dict]] = {}
+                try:
+                    for idx in range(1, len(pendingTables) + 1):
                         tableName = f"{baseName}_table{idx}"
-                        fileName = f"{tableName}.parquet"
-                        self.client.storage.from_("AnalyticsHub").upload(
-                            file=temp.name,
-                            path=f"{projectId}/{fileName}",
-                            file_options={"upsert": "true"}
+                        acceptedClaims[tableName] = self._acceptTableName(projectId, tableName)
+                    for idx, entry in enumerate(pendingTables, start=1):
+                        tableName = f"{baseName}_table{idx}"
+                        self._writeTable(
+                            projectId, tableName, acceptedClaims.pop(tableName),
+                            lambda path: self._sanitizeDfForParquet(entry["df"]).to_parquet(path, compression="snappy"),
                         )
-                    loadedTableNames.append(tableName)
+                        loadedTableNames.append(tableName)
+                except Exception:
+                    for unwrittenName, claims in acceptedClaims.items():
+                        self._restoreClaims(projectId, unwrittenName, claims)
+                    raise
 
             updateProjectModifiedAt(projectId)
             # Generate metadata ONLY for the newly loaded PDF tables
@@ -393,16 +479,11 @@ class DataLoadService:
             engine = create_engine(connStr)
             sanitizedTable = self._sanitizeFileName(connection.table)
             from api.services.managementService import managementService
-            managementService.validateTableNameAvailable(projectId=connection.projectId, tableName=sanitizedTable)
-            with tempfile.NamedTemporaryFile(delete=True, suffix=".parquet") as temp:
-                pd.read_sql(f"SELECT * FROM {connection.table}", engine).to_parquet(
-                    temp.name, compression="snappy"
-                )
-                self.client.storage.from_("AnalyticsHub").upload(
-                    file=temp.name,
-                    path=f"{connection.projectId}/{sanitizedTable}.parquet",
-                    file_options={"upsert": "true"}
-                )
+            claims = self._acceptTableName(connection.projectId, sanitizedTable)
+            self._writeTable(
+                connection.projectId, sanitizedTable, claims,
+                lambda path: pd.read_sql(f"SELECT * FROM {connection.table}", engine).to_parquet(path, compression="snappy"),
+            )
             updateProjectModifiedAt(connection.projectId)
             newMetadata = {}
             try:
@@ -448,16 +529,11 @@ class DataLoadService:
             engine = create_engine(connStr)
             sanitizedTable = self._sanitizeFileName(connection.table)
             from api.services.managementService import managementService
-            managementService.validateTableNameAvailable(projectId=connection.projectId, tableName=sanitizedTable)
-            with tempfile.NamedTemporaryFile(delete=True, suffix=".parquet") as temp:
-                pd.read_sql(f"SELECT * FROM {connection.table}", engine).to_parquet(
-                    temp.name, compression="snappy"
-                )
-                self.client.storage.from_("AnalyticsHub").upload(
-                    file=temp.name,
-                    path=f"{connection.projectId}/{sanitizedTable}.parquet",
-                    file_options={"upsert": "true"}
-                )
+            claims = self._acceptTableName(connection.projectId, sanitizedTable)
+            self._writeTable(
+                connection.projectId, sanitizedTable, claims,
+                lambda path: pd.read_sql(f"SELECT * FROM {connection.table}", engine).to_parquet(path, compression="snappy"),
+            )
             updateProjectModifiedAt(connection.projectId)
             newMetadata = {}
             try:
@@ -491,18 +567,16 @@ class DataLoadService:
                 )
             sanitizedCollection = self._sanitizeFileName(connection.collection)
             from api.services.managementService import managementService
-            managementService.validateTableNameAvailable(projectId=connection.projectId, tableName=sanitizedCollection)
-            with tempfile.NamedTemporaryFile(delete=True, suffix=".parquet") as temp:
+
+            def writeCollection(path: str) -> None:
                 mongoClient = MongoClient(connection.connectionString, server_api=ServerApi('1'))
                 records = list(mongoClient[connection.db][connection.collection].find())
                 for record in records:
                     record.pop("_id", None)
-                pd.DataFrame(records).to_parquet(temp.name, compression="snappy")
-                self.client.storage.from_("AnalyticsHub").upload(
-                    file=temp.name,
-                    path=f"{connection.projectId}/{sanitizedCollection}.parquet",
-                    file_options={"upsert": "true"}
-                )
+                pd.DataFrame(records).to_parquet(path, compression="snappy")
+
+            claims = self._acceptTableName(connection.projectId, sanitizedCollection)
+            self._writeTable(connection.projectId, sanitizedCollection, claims, writeCollection)
             updateProjectModifiedAt(connection.projectId)
             newMetadata = {}
             try:
@@ -542,6 +616,15 @@ class DataLoadService:
                 buffer.write(json.dumps(jsonData, indent=4).encode("utf-8"))
                 buffer.seek(0)
                 self.client.storage.from_("AnalyticsHub").upload(path = f"{tableDetails.projectId}/metadata.json", file = buffer.getvalue(), file_options = {"upsert": "true"})
+            # The transformation no longer owns this name. If this fails, the next load of the name releases it.
+            try:
+                self._releaseTableName(tableDetails.projectId, tableDetails.tableName)
+            except Exception as e:
+                logger.warning(f"Could not release deleted table {tableDetails.tableName} from its transformation: {e}")
+            try:
+                forget_table(tableDetails.projectId, tableDetails.tableName)
+            except Exception as e:
+                logger.warning(f"Could not clear caches for deleted table {tableDetails.tableName}: {e}")
             updateProjectModifiedAt(tableDetails.projectId)
             return
         except Exception as e:

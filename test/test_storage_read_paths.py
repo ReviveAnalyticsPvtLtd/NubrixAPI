@@ -410,6 +410,7 @@ def test_transformationMetadataIsReadWithTheServiceKey(storage):
 
 def test_transformationCannotOverwriteABaseTable(storage):
     storage.putJson(PROJECT, "metadata.json", {"sales": {}})
+    storage.put(PROJECT, "sales.parquet", b"table")
 
     with pytest.raises(CustomException) as caught:
         _transformationService(storage)._validate_transformation_table_name(PROJECT, "sales", currentTransformationId="t1")

@@ -73,8 +73,9 @@ class REPLManager:
         # 2. Launch subprocess
         stdout = ""
         stderr = ""
+        returnCode = None
         try:
-            stdout, stderr, *_ = runSandbox("sandbox_launcher.py", projectId, codeString, self.timeoutSeconds)
+            stdout, stderr, returnCode, *_ = runSandbox("sandbox_launcher.py", projectId, codeString, self.timeoutSeconds)
         except Exception as e:
             stderr = f"Error during subprocess execution: {e}\n"
         finally:
@@ -84,9 +85,10 @@ class REPLManager:
                 except Exception as e:
                     logger.warning(f"Failed to release semaphore for project {projectId}: {e}")
 
-        if stdout:
-            return stdout
-        return stderr
+        # Callers accept any valid JSON as the result, so a failed run's partial stdout must not reach them.
+        if returnCode:
+            return stderr or f"Code execution exited with code {returnCode} and wrote no error output."
+        return stdout or stderr
 
 
 replManager = REPLManager(timeoutSeconds=None, maxConcurrentPerProject=50)

@@ -803,7 +803,7 @@ class ManagementService:
                 metadataLastModifiedTime = None
                 for file in files:
                     if file["name"] == "metadata.json":
-                        metadataLastModifiedTime = datetime.datetime.strptime(file["metadata"]["lastModified"], '%Y-%m-%dT%H:%M:%S.000Z')
+                        metadataLastModifiedTime = self._storageTime(file["metadata"]["lastModified"])
                     elif os.path.splitext(file["name"])[-1] == ".parquet":
                         dataFiles.append(file)
                     else:
@@ -811,7 +811,7 @@ class ManagementService:
                 # Find tables added/modified after metadata.json was last updated
                 if metadataLastModifiedTime is not None:
                     updatedFiles = [os.path.splitext(x.get("name"))[0] for x in dataFiles
-                                    if datetime.datetime.strptime(x["metadata"]["lastModified"], '%Y-%m-%dT%H:%M:%S.000Z') > metadataLastModifiedTime]
+                                    if self._storageTime(x["metadata"]["lastModified"]) > metadataLastModifiedTime]
                 else:
                     updatedFiles = [os.path.splitext(x.get("name"))[0] for x in dataFiles]
                 if updatedFiles:
@@ -834,6 +834,11 @@ class ManagementService:
             exception = CustomException(e)
             logger.error(exception)
             raise exception   
+
+    @staticmethod
+    def _storageTime(value: str) -> datetime.datetime:
+        """Parse a storage lastModified time, which may carry real milliseconds or none."""
+        return datetime.datetime.fromisoformat(value.replace("Z", "+00:00"))
         
     def getMetadata(self, projectId: str) -> dict:
         """

@@ -27,6 +27,7 @@ import math
 import os
 import redis
 import threading
+import time
 from collections import OrderedDict
 from utils.logger import logger
 from utils.projectStorage import downloadTable, objectUrl, readTableBytes
@@ -86,11 +87,11 @@ def _redis_pool() -> redis.ConnectionPool:
     return _REDIS_POOL
 
 
-# In-process Arrow table cache: (projectId, tableName) -> (pa.Table, byte_estimate).
+# In-process Arrow table cache: (projectId, tableName) -> (pa.Table, byte_estimate, stored_at).
 # Arrow tables are cheap to share (immutable, reference-counted buffers) so we
 # cache them here instead of pandas DataFrames. A ``pd.DataFrame`` view is
 # built only at the call site.
-_DF_CACHE: "OrderedDict[tuple[str, str], tuple[pa.Table, int]]" = OrderedDict()
+_DF_CACHE: "OrderedDict[tuple[str, str], tuple[pa.Table, int, float]]" = OrderedDict()
 _DF_CACHE_BYTES = 0
 _DF_CACHE_LOCK = threading.Lock()
 
@@ -117,6 +118,12 @@ def _df_bytes(table: "pa.Table") -> int:
         return 0
 
 
+# Row and column counts outlive an expired table, so tables too large for Redis keep their
+# size class. invalidate_data_cache drops them with the table.
+_DF_SHAPES: "OrderedDict[tuple[str, str], tuple[int, int]]" = OrderedDict()
+_DF_SHAPES_MAX = 4096
+
+
 def _cache_caps():
     """Read cache caps once; env overrides take precedence over auto-sizing."""
     s = _sizing()
@@ -129,12 +136,17 @@ def _cache_put(key: tuple[str, str], table: "pa.Table") -> None:
     bytes_cap, entries_cap = _cache_caps()
     global _DF_CACHE_BYTES
     size = _df_bytes(table)
+    with _DF_CACHE_LOCK:
+        _DF_SHAPES[key] = (int(table.num_rows), int(table.num_columns))
+        _DF_SHAPES.move_to_end(key)
+        while len(_DF_SHAPES) > _DF_SHAPES_MAX:
+            _DF_SHAPES.popitem(last=False)
     if size > bytes_cap:
         return
     with _DF_CACHE_LOCK:
         if key in _DF_CACHE:
             _DF_CACHE_BYTES -= _DF_CACHE.pop(key)[1]
-        _DF_CACHE[key] = (table, size)
+        _DF_CACHE[key] = (table, size, time.monotonic())
         _DF_CACHE_BYTES += size
         _DF_CACHE.move_to_end(key)
         while (len(_DF_CACHE) > entries_cap or _DF_CACHE_BYTES > bytes_cap) and _DF_CACHE:
@@ -143,9 +155,15 @@ def _cache_put(key: tuple[str, str], table: "pa.Table") -> None:
 
 
 def _cache_get(key: tuple[str, str]):
+    global _DF_CACHE_BYTES
+    # A worker can only clear its own entries, so they expire to limit what the others keep serving.
+    ttl = int(os.environ.get("DF_CACHE_TTL_SECONDS") or "60")
     with _DF_CACHE_LOCK:
         entry = _DF_CACHE.get(key)
         if entry is None:
+            return None
+        if time.monotonic() - entry[2] > ttl:
+            _DF_CACHE_BYTES -= _DF_CACHE.pop(key)[1]
             return None
         _DF_CACHE.move_to_end(key)
         return entry[0]
@@ -479,7 +497,8 @@ def classify_table_size(projectId: str, tableName: str) -> dict:
     """Return ``{rows_estimate, columns, size_class, hint}`` for the table.
 
     Falls back to the Redis-cached ``metadata.json`` row count when the Arrow
-    table isn't in the in-process LRU, then to ``None`` if no signal exists.
+    table isn't in the in-process LRU, then to this worker's last seen shape,
+    then to ``None`` if no signal exists.
     """
     cache_key = (projectId, tableName)
     table = _cache_get(cache_key)
@@ -489,7 +508,7 @@ def classify_table_size(projectId: str, tableName: str) -> dict:
         sz = _classify_rows(rows)
         return {"rows_estimate": rows, "columns": cols, "size_class": sz,
                 "hint": _SIZE_HINTS[sz]}
-    # Cold fallback: metadata.json row counts in the Redis cache.
+    # metadata.json row counts in the Redis cache come next: clearing a table drops them on every worker.
     redis_key = f"{projectId}::metadata"
     try:
         r = redis.Redis(connection_pool=_redis_pool())
@@ -511,6 +530,13 @@ def classify_table_size(projectId: str, tableName: str) -> dict:
                             "size_class": sz, "hint": _SIZE_HINTS[sz]}
         except Exception:
             pass
+    # Then this worker's own record, which outlives the table but not a replacement made elsewhere.
+    shape = _DF_SHAPES.get(cache_key)
+    if shape is not None:
+        rows, cols = shape
+        sz = _classify_rows(rows)
+        return {"rows_estimate": rows, "columns": cols, "size_class": sz,
+                "hint": _SIZE_HINTS[sz]}
     return {"rows_estimate": None, "columns": None, "size_class": "unknown",
             "hint": "size unknown; default to fetch_data_pl"}
 
@@ -521,6 +547,7 @@ def invalidate_data_cache(projectId: str | None = None, tableName: str | None = 
     with _DF_CACHE_LOCK:
         if projectId is None and tableName is None:
             _DF_CACHE.clear()
+            _DF_SHAPES.clear()
             _DF_CACHE_BYTES = 0
             return
         to_drop = [key for key in _DF_CACHE
@@ -528,3 +555,18 @@ def invalidate_data_cache(projectId: str | None = None, tableName: str | None = 
                    and (tableName is None or key[1] == tableName)]
         for key in to_drop:
             _DF_CACHE_BYTES -= _DF_CACHE.pop(key)[1]
+        for key in [key for key in _DF_SHAPES
+                    if (projectId is None or key[0] == projectId)
+                    and (tableName is None or key[1] == tableName)]:
+            del _DF_SHAPES[key]
+
+
+def forget_table(projectId: str, tableName: str) -> None:
+    """Clear a deleted table, and the metadata that lists it, from Redis and this worker.
+
+    Other workers drop their copy when it expires. This worker's copy goes first,
+    then Redis, which raises if it fails so a caller that can retry the delete may stop.
+    """
+    invalidate_data_cache(projectId, tableName)
+    r = redis.Redis(connection_pool=_redis_pool())
+    r.delete(f"{projectId}::{tableName}", f"{projectId}::metadata.json", f"{projectId}::metadata")

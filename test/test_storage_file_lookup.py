@@ -227,6 +227,7 @@ def test_get_queries_reads_a_file_stored_past_the_first_names():
 
 def test_base_table_guard_reads_metadata_stored_past_the_first_names():
     bucket = largeFolder({"metadata.json": {"orders": {}}})
+    bucket.fileNames = sorted([*bucket.fileNames, "orders.parquet"])
     service = object.__new__(TransformationService)
     service.supabase = fakeClient(bucket)
     service.supabase.table.return_value.select.return_value.eq.return_value.neq.return_value.execute.return_value.data = []

@@ -654,6 +654,8 @@ Multipart form upload.
 
 ### 3.7 `DELETE /api/latest/dataLoader/deleteTable`
 
+Also clears `latest_approved_artifact` on the transformation that produced the table, once the table is gone. The transformation stays, and deleting it later leaves any new table of that name alone. Every load clears it too for the name it takes.
+
 **Request Body:**
 ```json
 {
@@ -1361,7 +1363,7 @@ Send a user message and stream the assistant response via SSE.
 
 ### 9.5 `POST /api/latest/transformations/{transformationId}/messages/{messageId}?projectId={projectId}`
 
-Approve a Mermaid artifact and return a 100-row preview of the transformed table. Validates the table name doesn't already exist in metadata.
+Approve a Mermaid artifact and return a 100-row preview of the transformed table. Returns `409` if the table name belongs to another transformation or to a table this transformation did not write, and `503` if that cannot be checked. Apply checks the name again.
 
 **Auth:** Required + `requireActiveSubscription`
 
@@ -1378,7 +1380,7 @@ Approve a Mermaid artifact and return a 100-row preview of the transformed table
 
 ### 9.6 `POST /api/latest/transformations/{transformationId}/messages/{messageId}/apply?projectId={projectId}`
 
-Persist the approved transformation as a project table. Uploads parquet to Supabase storage and updates metadata.
+Persist the approved transformation as a project table. Uploads parquet to Supabase storage and updates metadata. The name is checked straight before the table is written: `409` if a table this transformation did not write has it, or a load takes it during the apply; `503` if that cannot be checked. A first apply of a name never replaces a stored file, so an upload that lands during the apply is kept and the apply answers `409`. The one exception is a re-apply over this transformation's own table while that table has no metadata key: a load that lands in the moment before the write can be overwritten, and the apply then answers `409`.
 
 **Auth:** Required + `requireActiveSubscription`
 
@@ -1394,7 +1396,7 @@ Persist the approved transformation as a project table. Uploads parquet to Supab
 
 ### 9.7 `POST /api/latest/transformations/{transformationId}/rollback?projectId={projectId}`
 
-Rollback workspace state and messages to a specific message ID.
+Rollback workspace state and messages to a specific message ID. Rolling back to an approved checkpoint rewrites its table under the same checks as apply (`409`, `503`). Rolling back to the start removes the table this transformation wrote; if a storage or cache step fails it answers `503`, keeps the messages, and can be retried.
 
 **Auth:** Required + `requireActiveSubscription`
 
@@ -1436,7 +1438,7 @@ Rollback workspace state and messages to a specific message ID.
 
 ### 9.9 `DELETE /api/latest/transformations/{transformationId}?projectId={projectId}`
 
-Delete a transformation workspace and its associated parquet file.
+Delete a transformation workspace and, if it was applied, its parquet file. A transformation that was never applied, was rolled back to the start, or lost its table through `deleteTable` owns no file, so a table of the same name stays. Answers 503 and keeps the transformation if a storage, cache or database step fails; the delete can be retried. A table loaded under that name between the attempts is not removed.
 
 **Response (200):**
 ```json
@@ -1547,6 +1549,8 @@ page's data is unchanged) and `refresh: true` to force regeneration.
   ]
 }
 ```
+
+An empty list means the project has no stored insights. If the stored file cannot be read the route returns 500, never an empty list.
 
 ---
 

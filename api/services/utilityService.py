@@ -131,9 +131,13 @@ class UtilityService:
             payloadText = self.payloadBuilder.build(context)
             cacheKey = self._computeCacheKey(imageToInsights.pageId, payloadText)
 
+            # Read even on refresh: a failed read should stop here, before the model
+            # is charged for a result that could not be saved.
+            existingRecords = self._loadDashboardInsightsFile(imageToInsights.projectId)
+
             if not imageToInsights.refresh:
                 cachedRecord = self._findCachedRecord(
-                    records=self._loadDashboardInsightsFile(imageToInsights.projectId),
+                    records=existingRecords,
                     pageId=imageToInsights.pageId,
                     cacheKey=cacheKey,
                 )
@@ -279,17 +283,26 @@ class UtilityService:
         """
         Loads dashboardInsights.json from Supabase storage.
 
+        The file is rewritten whole on every change, so a failed read must never
+        look like an empty file: that would erase every other page's records.
+
         Returns:
             list: Existing insight records, or empty list if file does not exist.
+
+        Raises:
+            Exception: If the file cannot be listed, read, or parsed as a list.
         """
         try:
             files = self.client.storage.from_("AnalyticsHub").list(path=projectId, options={"search": "dashboardInsights.json"})
             if "dashboardInsights.json" not in [x.get("name") for x in files]:
                 return []
             data = readJson(projectId, "dashboardInsights.json")
-            return data if isinstance(data, list) else []
-        except Exception:
-            return []
+            if not isinstance(data, list):
+                raise ValueError("dashboardInsights.json does not hold a list of records.")
+            return data
+        except Exception as e:
+            logger.error(f"Failed to read dashboardInsights.json for project {projectId}: {e}")
+            raise
 
     def getDashboardInsights(self, projectId: str) -> list:
         """
