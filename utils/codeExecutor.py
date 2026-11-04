@@ -20,7 +20,7 @@ from api.services.credits.creditService import creditService
 from utils.logger import logger
 from utils.sandboxLimits import currentRunLimits, defaultTimeoutSeconds
 from utils.sandboxRunner import runSandbox
-from utils.sandboxSlots import BUSY_MESSAGE, SandboxBusyError
+from utils.sandboxSlots import SandboxBusyError
 
 
 def _remove_code_fences(code: str) -> str:
@@ -83,7 +83,8 @@ class REPLManager:
         try:
             stdout, stderr, _, _, _, stopped = runSandbox("sandbox_launcher.py", projectId, codeString, self.timeoutSeconds)
         except SandboxBusyError:
-            return BUSY_MESSAGE
+            # Not output: callers must not treat a full sandbox as a code failure. The semaphore entry is released below.
+            raise
         except Exception as e:
             stderr = f"Error during subprocess execution: {e}\n"
         finally:

@@ -15,6 +15,7 @@ from langgraph.graph import StateGraph, START, END
 from utils.codeExecutor import REPLManager, _remove_code_fences
 from typing_extensions import TypedDict
 from utils.logger import logger
+from utils.sandboxSlots import BUSY_MESSAGE, SandboxBusyError
 import json
 import os
 
@@ -136,7 +137,11 @@ class ReportingToolWorkflow:
         Executes the generated code in a Python sandbox environment and captures the output.
         """
         code = _remove_code_fences(state["generatedCode"])
-        response = self.replManager.run(code, projectId=state["projectId"])
+        try:
+            response = self.replManager.run(code, projectId=state["projectId"])
+        except SandboxBusyError:
+            # A full sandbox is not a code failure: skip the debugger and the rerun, and show the retry copy as this chart's error.
+            response = json.dumps({"error": BUSY_MESSAGE})
         return {
             "codeOutput": response
         }

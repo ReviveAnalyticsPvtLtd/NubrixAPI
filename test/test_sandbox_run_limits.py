@@ -791,7 +791,7 @@ def test_busyBecomesA503ForTransformations(monkeypatch):
     assert (caught.value.statusCode, caught.value.errorCode, caught.value.uiMessage) == (503, "SANDBOX_BUSY", BUSY_COPY)
 
 
-def test_busyIsTheReplManagersText(monkeypatch):
+def test_busyRaisesFromTheReplManagerAndFreesItsSemaphoreEntry(monkeypatch):
     from utils import codeExecutor
 
     def busy(*args, **kwargs):
@@ -801,7 +801,9 @@ def test_busyIsTheReplManagersText(monkeypatch):
     redis = MagicMock()
     redis.zcard.return_value = 0
     monkeypatch.setattr(codeExecutor.creditService, "_redis", lambda: redis)
-    assert codeExecutor.REPLManager(timeoutSeconds=5, maxConcurrentPerProject=5).run("print(1)", "p1") == BUSY_COPY
+    with pytest.raises(SandboxBusyError) as caught:
+        codeExecutor.REPLManager(timeoutSeconds=5, maxConcurrentPerProject=5).run("print(1)", "p1")
+    assert str(caught.value) == BUSY_COPY
     redis.zrem.assert_called_once()
 
 

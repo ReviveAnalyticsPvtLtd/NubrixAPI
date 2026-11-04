@@ -13,6 +13,7 @@ from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor
 from api.commons import updateProjectModifiedAt
 from utils.exceptionHandler import CustomException
 from utils.codeExecutor import replManager, _remove_code_fences
+from utils.sandboxSlots import BUSY_CODE, BUSY_MESSAGE, isBusy
 from sqlalchemy import URL, create_engine
 from utils.projectStorage import readJson, readTableBytes
 from utils.logger import logger
@@ -278,7 +279,11 @@ class DashboardService:
                 raise ValueError("Filters and Refresh cannot be implemented simultaneously.")
             return pageInfo
         except Exception as e:
-            exception = CustomException(e)
+            if isBusy(e):
+                # Nothing was saved: the widgets keep their last data, and the caller can retry.
+                exception = CustomException(e, statusCode=503, uiMessage=BUSY_MESSAGE, errorCode=BUSY_CODE)
+            else:
+                exception = CustomException(e)
             logger.error(exception)
             raise exception
         
