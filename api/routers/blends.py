@@ -13,7 +13,7 @@ import asyncio
 from api.services.blendService import blendService
 from fastapi.responses import ORJSONResponse
 from fastapi import APIRouter, Depends
-from api.commons import verifyUser, requireProjectOwner, UserContext
+from api.commons import verifyUser, requireProjectOwner, requireTrialOrAbove, UserContext
 from api.models import (
     GetFieldsFromSources,
     CreateDataBlend
@@ -25,13 +25,13 @@ Router for blend-related endpoints.
 """
     
 @router.post("/createDataBlend")
-async def createDataBlend(blendDetails: CreateDataBlend, user: UserContext = Depends(verifyUser)):
+async def createDataBlend(blendDetails: CreateDataBlend, user: UserContext = Depends(requireTrialOrAbove)):
     """
     Create a new data blend using the provided blend details.
 
     Args:
         blendDetails (CreateDataBlend): The details required to create a data blend.
-        user: UserContext injected after session verification.
+        user: UserContext injected after the subscription check.
 
     Returns:
         ORJSONResponse: Success or error message.

@@ -845,6 +845,8 @@ Toggle the `isActive` flag for a table. Inactive tables are hidden from all LLM-
 
 Generate a profiling report (ydata-profiling) for all tables in a project.
 
+**Auth:** Required + `requireTrialOrAbove` (`403 FEATURE_BLOCKED` when the account has no access)
+
 **Response (200):**
 ```json
 {
@@ -899,7 +901,7 @@ Generate a single chart via the LLM workflow.
 
 Generate a panel chart (multiple charts in one view) without LLM.
 
-**Auth:** Required (`verifyToken`)
+**Auth:** Required + `requireTrialOrAbove` (`403 FEATURE_BLOCKED` when the account has no access)
 
 **Request Body:**
 ```json
@@ -1020,6 +1022,8 @@ Save a favourite query.
 All routes under `/api/latest/blends/`.
 
 ### 7.1 `POST /api/latest/blends/createDataBlend`
+
+**Auth:** Required + `requireTrialOrAbove` (`403 FEATURE_BLOCKED` when the account has no access)
 
 **Request Body:**
 ```json
@@ -1151,6 +1155,8 @@ All routes under `/api/latest/dashboard/`.
 
 ### 8.4 `POST /api/latest/dashboard/getData`
 
+**Auth:** Required. Non-empty `filters` or `refresh: true` also needs `requireTrialOrAbove` (`403 FEATURE_BLOCKED` when the account has no access); a plain read does not.
+
 **Request Body:**
 ```json
 {
@@ -1237,6 +1243,8 @@ All routes under `/api/latest/dashboard/`.
 ### 8.8 `GET /api/latest/dashboard/dashboardRefresh/{projectId}`
 
 Refresh all widget data in parallel.
+
+**Auth:** Required + `requireTrialOrAbove` (`403 FEATURE_BLOCKED` when the account has no access)
 
 **Response (200):**
 ```json
@@ -1563,6 +1571,8 @@ page's data is unchanged) and `refresh: true` to force regeneration.
 ### 10.5 `GET /api/latest/utils/sendForecasts`
 
 Trigger a forecasts Celery task.
+
+**Auth:** Required + `requireTrialOrAbove` (`403 FEATURE_BLOCKED` when the account has no access). The account must also own a project whose `triggers` value contains `forecast`, ignoring case (`403 TRIGGER_NOT_ASSIGNED` otherwise).
 
 **Response (200):**
 ```json

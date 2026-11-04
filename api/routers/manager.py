@@ -23,7 +23,7 @@ from api.models import (
     EditMetadata,
     RenameProject
 )
-from api.commons import verifyToken, verifyUser, requireCredits, requireProjectOwner, UserContext
+from api.commons import verifyToken, verifyUser, requireCredits, requireProjectOwner, requireTrialOrAbove, UserContext
 
 router = APIRouter()
 """
@@ -439,13 +439,13 @@ async def listTriggers(token = Depends(verifyToken)):
         raiseHttpException(e)
     
 @router.post("/generateReport/{projectId}")
-async def generateReport(projectId: str, user: UserContext = Depends(verifyUser)):
+async def generateReport(projectId: str, user: UserContext = Depends(requireTrialOrAbove)):
     """
     Generate a report for a given project.
 
     Args:
         projectId (str): The ID of the project.
-        user: UserContext injected after session verification.
+        user: UserContext injected after the subscription check.
 
     Returns:
         ORJSONResponse: Generated report HTML content or error message.

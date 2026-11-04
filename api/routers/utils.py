@@ -25,13 +25,23 @@ from api.services.utilityService import utilityService
 from nubrix.triggers.celery import celeryApp
 from api.commons import issueTaskId, sessionOwnsTask
 from fastapi.responses import ORJSONResponse
-from api.commons import verifyToken, verifyUser, requireCredits, requireProjectOwner, UserContext
+from api.commons import (
+    verifyToken,
+    verifyUser,
+    requireCredits,
+    requireProjectOwner,
+    requireTrialOrAbove,
+    requireTriggerOwner,
+    UserContext,
+)
 import asyncio
 
 router = APIRouter()
 """
 Router for utility-related endpoints.
 """
+
+FORECAST_TRIGGER = "forecast"
 
 
 def _websocketTokenIsValid(credentials: HTTPAuthorizationCredentials) -> bool:
@@ -123,19 +133,20 @@ async def updateDashboardInsightStatus(body: UpdateDashboardInsightStatus, user:
         raiseHttpException(e)
 
 @router.get("/sendForecasts")
-async def sendForecasts(user: UserContext = Depends(verifyUser)):
+async def sendForecasts(user: UserContext = Depends(requireTrialOrAbove)):
     """
     Send forecasts using the utility service.
 
     Args:
-        user: UserContext injected after session verification.
+        user: UserContext injected after the subscription check.
 
     Returns:
         ORJSONResponse: Task ID, trigger name, and task status or error message.
     """
+    await asyncio.to_thread(requireTriggerOwner, FORECAST_TRIGGER, user)
     try:
         r = utilityService.sendForecasts(taskId=issueTaskId(user.userId))
-        return ORJSONResponse(status_code = 200, content = {"taskId": r.task_id, "triggerName": "forecast", "taskStatus": r.status})
+        return ORJSONResponse(status_code = 200, content = {"taskId": r.task_id, "triggerName": FORECAST_TRIGGER, "taskStatus": r.status})
     except CustomException as e:
         raiseHttpException(e)
 

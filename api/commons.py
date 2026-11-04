@@ -17,6 +17,7 @@ __all__ = [
     "requireCredits",
     "requireWorkspaceOwner",
     "requireProjectOwner",
+    "requireTriggerOwner",
     "UserContext",
     "updateProjectModifiedAt",
     "issueTaskId",
@@ -402,6 +403,39 @@ def requireProjectOwner(projectId: str, user: UserContext) -> None:
             uiMessage="Project not found.",
             backendLogMessage=f"Project access denied: projectId={projectId}, userId={user.userId}",
             errorCode="PROJECT_NOT_FOUND",
+        )
+
+
+def requireTriggerOwner(triggerName: str, user: UserContext) -> None:
+    """
+    Allow only a user who owns a project carrying this trigger, for trigger
+    routes that take no project ID.
+
+    Trigger names are free text set by hand on the project, so the name is
+    matched anywhere in the column, ignoring case. Synchronous like
+    requireProjectOwner, and run the same way from async routes.
+    """
+    try:
+        rows = (
+            client.table("Projects")
+            .select("triggers")
+            .eq("ownerUserId", user.userId)
+            .execute().data
+        )
+    except Exception as exc:
+        logger.error("Trigger lookup failed for userId={}: {}", user.userId, type(exc).__name__)
+        raiseFeatureGateHttpException(
+            statusCode=status.HTTP_503_SERVICE_UNAVAILABLE,
+            uiMessage="Project access could not be verified. Please try again.",
+            backendLogMessage=f"Trigger lookup unavailable for userId={user.userId}",
+            errorCode="PROJECT_ACCESS_UNAVAILABLE",
+        )
+    if not any(triggerName in str(row.get("triggers") or "").casefold() for row in rows or []):
+        raiseFeatureGateHttpException(
+            statusCode=status.HTTP_403_FORBIDDEN,
+            uiMessage="This automation is not set up for your account.",
+            backendLogMessage=f"Trigger {triggerName} refused: userId={user.userId} owns no project with it",
+            errorCode="TRIGGER_NOT_ASSIGNED",
         )
 
 
