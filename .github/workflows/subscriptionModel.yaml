@@ -29,6 +29,23 @@ jobs:
       - name: Unit and regression tests (integration skips remain unverified)
         run: uv run --python 3.12 --frozen --group dev pytest -q
 
+  sandbox-isolation:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - name: Build the production image
+        run: docker build -t nubrix-sandbox .
+      - name: Sandbox tests as root in that image, where runs get their own uids
+        run: |
+          docker run --rm nubrix-sandbox bash -c '
+            set -o pipefail
+            uv run --group dev pytest test/test_sandbox_storage_reads.py -q -rs | tee /tmp/sandbox-tests.txt
+            status=$?
+            if grep -q "only a root parent" /tmp/sandbox-tests.txt; then echo "Separate-uid tests were skipped"; exit 1; fi
+            exit $status
+          '
+
   postgres:
     runs-on: ubuntu-latest
     timeout-minutes: 20

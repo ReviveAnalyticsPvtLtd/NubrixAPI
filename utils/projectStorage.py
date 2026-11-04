@@ -3,11 +3,12 @@ projectStorage.py
 
 Authenticated reads of project files in the private AnalyticsHub bucket.
 
-Runs in the API, the Celery worker and the sandbox subprocesses, so it reads
-SUPABASE_URL and SUPABASE_KEY at call time and must not import api.commons.
+Runs in the API and the Celery worker. Sandbox subprocesses import it too but
+hold no credentials, so it reads SUPABASE_URL and SUPABASE_KEY at call time and
+must not import api.commons.
 """
 
-__all__ = ["StorageReadError", "objectUrl", "authHeaders", "readBytes", "readJson", "readTableBytes", "readTablePage"]
+__all__ = ["StorageReadError", "objectUrl", "authHeaders", "readBytes", "readJson", "readTableBytes", "downloadTable", "readTablePage"]
 
 
 import httpx
@@ -21,6 +22,7 @@ from urllib.parse import quote
 
 _BUCKET = "AnalyticsHub"
 _READ_TIMEOUT_SECONDS = 60
+_DOWNLOAD_CHUNK_BYTES = 1024 * 1024
 _PAGE_BATCH_ROWS = 8192
 _UNSAFE_PATH_SEGMENT = re.compile(r"[/\\%\x00-\x1f]")
 _SSL_CONTEXT: ssl.SSLContext | None = None
@@ -82,6 +84,26 @@ def readJson(projectId: str, fileName: str) -> dict | list:
 def readTableBytes(projectId: str, tableName: str) -> bytes:
     """Read a table's whole parquet file."""
     return readBytes(projectId, f"{tableName}.parquet")
+
+
+def downloadTable(projectId: str, tableName: str, path: str, cancelled: threading.Event | None = None) -> None:
+    """Stream a table's parquet file to a new file, so a big table is never held in memory.
+
+    Setting `cancelled` stops it at the next chunk.
+    """
+    with httpx.stream(
+        "GET",
+        objectUrl(projectId, f"{tableName}.parquet"),
+        headers=authHeaders(),
+        timeout=_READ_TIMEOUT_SECONDS,
+        verify=_sslContext(),
+    ) as response:
+        response.raise_for_status()
+        with open(path, "xb") as table:
+            for chunk in response.iter_bytes(_DOWNLOAD_CHUNK_BYTES):
+                if cancelled is not None and cancelled.is_set():
+                    raise InterruptedError("Table download cancelled.")
+                table.write(chunk)
 
 
 class _TableFile(io.RawIOBase):

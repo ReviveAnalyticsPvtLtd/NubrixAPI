@@ -472,8 +472,11 @@ class ManagementService:
                 attributeInfo += f'- {field.name} ({field.type})\n'
             attributeInfo += f'SHAPE: ({num_rows}, {num_cols})\n'
             try:
-                sample_df = pf.read_row_group(0).slice(0, 1).to_pandas()
-                attributeInfo += 'SAMPLE ROW:\n' + str(sample_df.to_string()) + '\n'
+                sample = next(pf.iter_batches(batch_size=1), None)
+                if sample is None:
+                    attributeInfo += 'SAMPLE ROW: (no rows)\n'
+                else:
+                    attributeInfo += 'SAMPLE ROW:\n' + str(sample.to_pandas().to_string()) + '\n'
             except Exception:
                 attributeInfo += 'SAMPLE ROW: (failed to load)\n'
             return attributeInfo, [int(num_rows), int(num_cols)]

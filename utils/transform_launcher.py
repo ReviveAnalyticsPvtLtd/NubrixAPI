@@ -1,9 +1,14 @@
 """
 transform_launcher.py — subprocess entry point for transformation code execution.
 
-Reads JSON from stdin: {"projectId": ..., "code": ..., "result_path": ...}
-Executes the code, writes final_df as parquet to result_path.
+Reads JSON from stdin: {"projectId": ..., "code": ..., "result_path": ..., "preview_path": ..., "channel": ...}
+Executes the code, writes final_df as parquet to result_path and its first rows
+as JSON to preview_path, so the parent never has to decode what a run wrote.
 Writes error traceback to stderr if anything fails.
+
+The limits here only hold for a run that gets to them. Generated code runs in
+this process, so it can write both files itself and exit first, and the parent
+relies on none of these limits.
 """
 
 import sys
@@ -11,6 +16,43 @@ import os
 import json
 import io
 import traceback
+
+_PREVIEW_ROWS = 100
+_PREVIEW_CELL_CHARS = 1000
+_PREVIEW_CELL_ITEMS = 100
+
+
+def _clip_cell(value):
+    """Shorten what a preview shows of one cell. A hundred rows can be gigabytes of text."""
+    if isinstance(value, (str, bytes)):
+        return value[:_PREVIEW_CELL_CHARS]
+    if isinstance(value, list):
+        return [_clip_cell(item) for item in value[:_PREVIEW_CELL_ITEMS]]
+    if isinstance(value, dict):
+        return {key: _clip_cell(item) for key, item in list(value.items())[:_PREVIEW_CELL_ITEMS]}
+    return value
+
+
+def _preview_json(parquetBytes, maxBytes):
+    """Return the first rows of a result as JSON, dropping rows until it fits in `maxBytes`."""
+    import polars as pl
+    from utils.initMethods import serializer
+
+    rows = [
+        {name: _clip_cell(value) for name, value in row.items()}
+        for row in pl.read_parquet(io.BytesIO(parquetBytes), n_rows=_PREVIEW_ROWS).to_dicts()
+    ]
+    preview = json.dumps(rows, default=serializer)
+    while len(preview) > maxBytes and rows:
+        rows = rows[:len(rows) // 2]
+        preview = json.dumps(rows, default=serializer)
+    return preview
+
+
+def _refuse_oversized_result(arrowTable, memoryBytes):
+    """Stop an honest result too big to read back, as saving a table leads the API to decode all of it. A run that exits first skips this."""
+    if arrowTable.nbytes > memoryBytes // 2:
+        raise ValueError(f"Transformation result is too large: {arrowTable.num_rows} rows and {arrowTable.num_columns} columns.")
 
 
 def _scopedToProject(reader, allowedProjectId):
@@ -28,16 +70,21 @@ def main():
         projectId = input_data["projectId"]
         pythonCode = input_data["code"]
         result_path = input_data["result_path"]
+        preview_path = input_data["preview_path"]
     except Exception as e:
         sys.stderr.write(f"Failed to read/parse input JSON from stdin: {e}\n")
         sys.exit(1)
 
     from utils.initMethods import fetch_data, fetch_data_pl, scan_data, serializer
+    from utils.sandboxRunner import _MAX_PREVIEW_BYTES, enterSandbox
+    from utils.sizing import detect_resources
     import pandas as pd
     import numpy as np
     import datetime
     import math
     import re
+
+    enterSandbox(input_data["channel"])
 
     _ALLOWED_MODULES = frozenset({
         "pandas", "numpy", "datetime", "math", "re", "time",
@@ -104,6 +151,9 @@ def main():
             sys.stderr.write(f"final_df must be a pandas/polars DataFrame or LazyFrame, got {type(finalDf).__name__}.\n")
             sys.exit(1)
 
+        if arrow_table is not None:
+            _refuse_oversized_result(arrow_table, detect_resources()["total_memory_bytes"])
+
         with open(result_path, "wb") as f:
             buf = io.BytesIO()
             if pq is not None and arrow_table is not None:
@@ -114,6 +164,8 @@ def main():
                 )
                 df_to_write.to_parquet(buf, compression="snappy")
             f.write(buf.getvalue())
+        with open(preview_path, "w") as f:
+            f.write(_preview_json(buf.getvalue(), _MAX_PREVIEW_BYTES))
         # Success
         sys.exit(0)
     except SystemExit:

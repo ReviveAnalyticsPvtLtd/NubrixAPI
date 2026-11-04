@@ -15,6 +15,7 @@ from unittest.mock import MagicMock
 
 import httpx
 import polars as pl
+import pyarrow.parquet as pq
 import pytest
 from fastapi import HTTPException
 
@@ -270,6 +271,28 @@ def test_attributeInfoReadsTheParquetSchema(storage, client):
 
     assert shape == [3, 1] and "amount" in info
     _assertAuthenticated(storage, "sales.parquet")
+
+
+def test_attributeInfoDecodesOneRowForItsSample(storage, client, monkeypatch):
+    storage.put(PROJECT, "sales.parquet", _parquet({"amount": [7, 8, 9]}))
+
+    def refuse(*_args, **_kwargs):
+        raise AssertionError("the sample decoded a whole row group")
+
+    monkeypatch.setattr(pq.ParquetFile, "read_row_group", refuse)
+
+    info, _ = managementModule.managementService._attributeInfoFunc(PROJECT, "sales")
+
+    assert "SAMPLE ROW:\n" in info
+
+
+def test_attributeInfoSaysSoWhenATableHasNoRows(storage, client):
+    storage.put(PROJECT, "sales.parquet", _parquet({"amount": pl.Series([], dtype=pl.Int64)}))
+
+    info, shape = managementModule.managementService._attributeInfoFunc(PROJECT, "sales")
+
+    assert shape == [0, 1]
+    assert "SAMPLE ROW: (no rows)\n" in info
 
 
 def test_validateTableNameAvailableStillRejectsATakenName(storage, client):
