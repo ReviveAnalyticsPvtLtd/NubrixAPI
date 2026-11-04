@@ -27,7 +27,7 @@ __all__ = [
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from fastapi import status, HTTPException
 from supabase.lib.client_options import ClientOptions
-from supabase import create_client
+from utils.supabaseClient import createSupabaseClient
 from utils.logger import logger
 from utils.exceptionHandler import (
     raiseAccountAccessRevokedHttpException,
@@ -42,10 +42,10 @@ import os
 import uuid
 
 security = HTTPBearer()
-client = create_client(
-    supabase_url = os.environ["SUPABASE_URL"],
-    supabase_key = os.environ["SUPABASE_KEY"],
-    options = ClientOptions(
+client = createSupabaseClient(
+    os.environ["SUPABASE_URL"],
+    os.environ["SUPABASE_KEY"],
+    ClientOptions(
         auto_refresh_token = False,
         persist_session = False,
     )
@@ -145,7 +145,12 @@ def _verifyTokenInternal(credentials: HTTPAuthorizationCredentials, checkExpiry:
                 detail={"status": "FAILURE", "message": "Token expiry information missing"}
             )
 
-    client.table("Sessions").update({"lastActivity": str(datetime.now(timezone.utc))}).eq("accessToken", token).execute()
+    try:
+        client.table("Sessions").update({"lastActivity": str(datetime.now(timezone.utc))}).eq("accessToken", token).execute()
+    except Exception as exc:
+        # Bookkeeping only: nothing reads lastActivity, and the session is already verified.
+        # A dropped connection here used to turn a valid session check into a 500.
+        logger.warning("Session lastActivity update failed: {}", type(exc).__name__)
     return token
 
 def verifyToken(credentials: HTTPAuthorizationCredentials = Depends(security)):
