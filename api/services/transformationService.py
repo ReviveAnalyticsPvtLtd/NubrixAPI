@@ -13,6 +13,7 @@ from api.services.credits.creditTrackingCallback import CreditTrackingCallback
 from utils.exceptionHandler import CustomException
 from api.models import TransformationAgentResponse
 from api.commons import client, updateProjectModifiedAt
+from utils.projectStorage import authHeaders, objectUrl, readJson
 from utils.logger import logger
 from typing import TYPE_CHECKING
 import redis
@@ -69,8 +70,7 @@ class TransformationService:
 
     def _metadata_url(self, projectId: str) -> str:
         """Build the project metadata URL."""
-        fileUrlTemplate = os.environ["FILE_URL"]
-        return fileUrlTemplate.format(projectId=projectId, fileName="metadata.json").replace(".parquet", "")
+        return objectUrl(projectId, "metadata.json")
 
     def _preview_cache_key(self, projectId: str, transformationId: str, messageId: str, tableName: str) -> str:
         """Return the Redis preview cache key."""
@@ -104,7 +104,7 @@ class TransformationService:
             logger.warning(f"Metadata cache read failed for project {projectId}: {e}")
 
         async with httpx.AsyncClient(timeout=20) as httpClient:
-            response = await httpClient.get(self._metadata_url(projectId))
+            response = await httpClient.get(self._metadata_url(projectId), headers=authHeaders())
             response.raise_for_status()
             metadata = response.json()
 
@@ -149,9 +149,6 @@ class TransformationService:
         - Cannot overwrite a base dataset table in metadata.json (uploaded/imported tables).
         - CAN overwrite its own output table (rewriting versions within the same transformation chat).
         """
-        import time
-        from urllib.request import urlopen
-
         sanitizedTarget = self._sanitizeTableName(targetTableName)
 
         # 1. Fetch all transformations in the project excluding current
@@ -195,8 +192,7 @@ class TransformationService:
             files = self.supabase.storage.from_("AnalyticsHub").list(projectId)
             filenames = [x.get("name") for x in files]
             if "metadata.json" in filenames:
-                fileUrl = os.environ["FILE_URL"].format(projectId=projectId, fileName="metadata.json").replace(".parquet", "") + f"?cb={int(time.time())}"
-                metadata = json.loads(urlopen(fileUrl).read())
+                metadata = readJson(projectId, "metadata.json")
                 # If target table exists in metadata.json AND is not owned by ANY transformation workspace, it's a base dataset table!
                 if sanitizedTarget in metadata and sanitizedTarget not in allTransformationTables:
                     raise CustomException(

@@ -11,16 +11,14 @@ __all__ = ["blendService"]
 
 from api.commons import updateProjectModifiedAt
 from utils.exceptionHandler import CustomException
-from urllib.request import urlopen
+from utils.projectStorage import readJson
 from utils.logger import logger
 from api.commons import client
 from api.models import (
     CreateDataBlend,
     GetFieldsFromSources
 )
-import time
 import json
-import os
 import io
 
 class BlendService:
@@ -54,8 +52,7 @@ class BlendService:
                 "joinTypes": blendDetails.joinTypes
             }
             if "blendConfig.json" in [x.get("name") for x in self.client.storage.from_("AnalyticsHub").list(path = blendDetails.projectId)]:
-                fileUrl = os.environ["FILE_URL"].format(projectId = blendDetails.projectId, fileName = "blendConfig.json").replace(".parquet", "") + f"?cb={int(time.time())}"
-                blendConfig = json.loads(urlopen(fileUrl).read())
+                blendConfig = readJson(blendDetails.projectId, "blendConfig.json")
                 blendConfig[blendDetails.blendName] = joinConfig
             else:
                 blendConfig = {blendDetails.blendName: joinConfig}
@@ -85,16 +82,14 @@ class BlendService:
         """
         try:
             if "blendConfig.json" in [x.get("name") for x in self.client.storage.from_("AnalyticsHub").list(path = projectId)]:
-                blendConfigUrl = os.environ["FILE_URL"].format(projectId = projectId, fileName = "blendConfig.json").replace(".parquet", "") + f"?cb={int(time.time())}"
-                blendConfig = json.loads(urlopen(blendConfigUrl).read())
+                blendConfig = readJson(projectId, "blendConfig.json")
                 blendedTables = list(blendConfig.keys())
                 blends = [
                     {"blendName": x, "tables": blendConfig[x].get("tables"), "joinTypes": blendConfig[x].get("joinTypes"), "blendOn": blendConfig[x].get("blendOn")} for x in blendedTables
                 ]
             else:
                 blends, blendedTables = list(), list()
-            metadataUrl = os.environ["FILE_URL"].format(projectId = projectId, fileName = "metadata.json").replace(".parquet", "") + f"?cb={int(time.time())}"
-            metadata = json.loads(urlopen(metadataUrl).read())
+            metadata = readJson(projectId, "metadata.json")
             rawTables = [k for k, v in metadata.items() if not k.startswith("_") and v.get("isActive", True) is not False]
             dataSources = {
                 "blends": blends,
@@ -122,8 +117,7 @@ class BlendService:
         """
         try:
             allFiles = [x.get("name") for x in self.client.storage.from_("AnalyticsHub").list(path = details.projectId)]
-            metadataUrl = os.environ["FILE_URL"].format(projectId = details.projectId, fileName = "metadata.json").replace(".parquet", "") + f"?cb={int(time.time())}"
-            metadata = json.loads(urlopen(metadataUrl).read())
+            metadata = readJson(details.projectId, "metadata.json")
             if details.tableName in metadata.keys():
                 if metadata[details.tableName].get("isActive", True) is False:
                     raise CustomException(
@@ -133,8 +127,7 @@ class BlendService:
                     )
                 allFields = metadata[details.tableName]["columns"]
             elif "blendConfig.json" in allFiles:
-                blendConfigUrl = os.environ["FILE_URL"].format(projectId = details.projectId, fileName = "blendConfig.json").replace(".parquet", "") + f"?cb={int(time.time())}"
-                blendConfig = json.loads(urlopen(blendConfigUrl).read())
+                blendConfig = readJson(details.projectId, "blendConfig.json")
                 allFields = list()
                 tablesUsed = blendConfig[details.tableName].get("tables")
                 blendOn = blendConfig[details.tableName].get("blendOn")

@@ -55,10 +55,14 @@ NubrixAI Analytics Hub API — FastAPI + Celery + LangChain monolith.
 - `classify_table_size(projectId, table)` → `{rows_estimate, columns, size_class, hint}`. Drives workflow auto-routing.
 - `serializer` — converts Polars types for `json.dumps`.
 - `invalidate_data_cache(projectId, table)` — call after transformations.
+- Every AnalyticsHub read goes through `utils/projectStorage.py` with the service key, in the API, Celery and the sandboxes. Its sync reads raise `StorageReadError` for a bad status or a bad Range answer, because `httpx.HTTPStatusError` can't be unpickled and breaks a `ProcessPoolExecutor`. Transport errors such as `httpx.ConnectError` stay httpx types, which do pickle. The async reads in `reportingService.py` and `transformationService.py` keep `raise_for_status`. Never add a read through a public URL: `test_storage_read_paths.py` fails on `FILE_URL` and on stray `urlopen` calls. `DOMAIN_FILE_URL` is a separate public bucket.
 
 ## Table Viewer Endpoint
 - `GET /api/latest/projects/viewTable/{projectId}/{tableName}?page=1&pageSize=100`
-- Uses `pl.scan_parquet(url)` — only materializes requested rows. 10M-row table paginates as fast as 1k-row.
+- Uses `readTablePage` (`utils/projectStorage.py`): an authenticated HEAD for the size, then Range GETs for the parquet footer and the row groups holding the page, decoded batch by batch up to the end of the page.
+- Keep the HEAD. On the local file backend a one byte Range GET took 500 ms on a 280 MB object, against 9 ms for HEAD, so a Range GET for the size is only the fallback when an edge drops `Content-Length`.
+- Tables written with pandas are often one row group, so the whole group's bytes are fetched but must not be decoded whole. Keep `iter_batches` here, not `read_row_groups`.
+- Do not go back to `pl.scan_parquet` here. Polars 1.42 silently drops `storage_options` on HTTP URLs, and a signed URL makes storage read the whole object on Polars' HEAD.
 - Auth via `verifyToken`. Max page size 500.
 
 ## Active/Inactive Tables

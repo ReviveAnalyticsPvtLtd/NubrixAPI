@@ -674,7 +674,7 @@ Multipart form upload.
 
 ### 4.1 `GET /api/latest/projects/viewTable/{projectId}/{tableName}`
 
-Read a parquet table and return paginated rows. Uses `pl.scan_parquet` for lazy row-range materialization — a 10M-row table paginates as fast as a 1k-row table.
+Read a parquet table and return paginated rows. Only the parquet footer and the row groups holding the page are fetched, and rows are decoded only up to the end of the page, so a large table costs one row group per page, not the whole file.
 
 **Auth:** Required (`verifyToken`)
 

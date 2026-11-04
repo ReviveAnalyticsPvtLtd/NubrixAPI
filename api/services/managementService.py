@@ -30,6 +30,7 @@ from api.services.subscriptions.paymentValidationService import (
     normalizeChurnedSubscription,
 )
 from concurrent.futures import ProcessPoolExecutor
+from utils.projectStorage import readJson, readTableBytes
 from utils.logger import logger
 from urllib.request import urlopen
 from api.commons import client
@@ -458,14 +459,10 @@ class ManagementService:
             tuple: (attribute info string, deterministic [num_rows, num_cols] shape).
         """
         import pyarrow.parquet as pq
-        import httpx
         import io
 
         try:
-            url = os.environ["FILE_URL"].format(projectId = projectId, fileName = dataframeName)
-            resp = httpx.get(url, timeout=60, follow_redirects=True)
-            resp.raise_for_status()
-            file_like = io.BytesIO(resp.content)
+            file_like = io.BytesIO(readTableBytes(projectId, dataframeName))
             pf = pq.ParquetFile(file_like)
             schema = pf.schema_arrow
             num_rows = pf.metadata.num_rows
@@ -506,8 +503,7 @@ class ManagementService:
             filenames = [x.get("name") for x in files]
             if "metadata.json" not in filenames:
                 return
-            fileUrl = os.environ["FILE_URL"].format(projectId = projectId, fileName = "metadata.json").replace(".parquet", "") + f"?cb={int(time.time())}"
-            metadata = json.loads(urlopen(fileUrl).read())
+            metadata = readJson(projectId, "metadata.json")
             if tableName in metadata:
                 raise CustomException(
                     ValueError(f"Table name '{tableName}' already exists in this project."),
@@ -611,8 +607,7 @@ class ManagementService:
             filenames = [x.get("name") for x in files]
             existingMetadata = {}
             if "metadata.json" in filenames:
-                fileUrl = os.environ["FILE_URL"].format(projectId = projectId, fileName = "metadata.json").replace(".parquet", "") + f"?cb={int(time.time())}"
-                existingMetadata = json.loads(urlopen(fileUrl).read())
+                existingMetadata = readJson(projectId, "metadata.json")
             # Merge: new tables get isActive=True; existing tables being
             # re-generated preserve their previous isActive flag.
             for tableName in newMetadata:
@@ -643,9 +638,8 @@ class ManagementService:
         Run the LLM insight generation pipeline (domain KPI mapping + general insights)
         and return a flat list of {"query": str} dicts without id or isCharted fields.
         """
-        fileUrl = os.environ["FILE_URL"].format(projectId = projectId, fileName = "metadata.json").replace(".parquet", "") + f"?cb={int(time.time())}"
         domainFile = self.client.table("Projects").select("domainExpert").eq("projectId", projectId).execute().data[0].get("domainExpert") + ".json"
-        metadata = json.loads(urlopen(fileUrl).read())
+        metadata = readJson(projectId, "metadata.json")
         metadata = self.filterActiveTables(metadata)
 
         if domainFile in [x.get("name") for x in self.client.storage.from_("DomainSpecificKpis").list()]:
@@ -765,8 +759,7 @@ class ManagementService:
             CustomException: For any errors during retrieval.
         """
         try:
-            fileUrl = os.environ["FILE_URL"].format(projectId = projectId, fileName = "insights.json").replace(".parquet", "") + f"?cb={int(time.time())}"
-            jsonData = json.loads(urlopen(fileUrl).read())
+            jsonData = readJson(projectId, "insights.json")
             return jsonData
         except Exception as e:
             logger.error(CustomException(e))
@@ -797,8 +790,7 @@ class ManagementService:
             files = self.client.storage.from_("AnalyticsHub").list(projectId)
             filenames = [x.get("name") for x in files]
             if "metadata.json" in filenames:
-                fileUrl = os.environ["FILE_URL"].format(projectId = projectId, fileName = "metadata.json").replace(".parquet", "") + f"?cb={int(time.time())}"
-                jsonData = json.loads(urlopen(fileUrl).read())
+                jsonData = readJson(projectId, "metadata.json")
                 dataFiles = list()
                 metadataLastModifiedTime = None
                 for file in files:
@@ -854,8 +846,7 @@ class ManagementService:
             if "metadata.json" not in filenames:
                 return dict()
             else:
-                fileUrl = os.environ["FILE_URL"].format(projectId = projectId, fileName = "metadata.json").replace(".parquet", "") + f"?cb={int(time.time())}"
-                jsonData = json.loads(urlopen(fileUrl).read())
+                jsonData = readJson(projectId, "metadata.json")
                 newJson = {"tables": []}
                 for key in jsonData:
                     tableJson = {
@@ -886,8 +877,7 @@ class ManagementService:
             CustomException: For any errors during update.
         """
         try:
-            fileUrl = os.environ["FILE_URL"].format(projectId = modifiedMetadata.projectId, fileName = "metadata.json").replace(".parquet", "") + f"?cb={int(time.time())}"
-            jsonData = json.loads(urlopen(fileUrl).read())
+            jsonData = readJson(modifiedMetadata.projectId, "metadata.json")
             if modifiedMetadata.tableDescription and not (modifiedMetadata.columnName and modifiedMetadata.columnDescription):
                 jsonData[modifiedMetadata.tableName]["description"] = modifiedMetadata.tableDescription
             elif (modifiedMetadata.columnName and modifiedMetadata.columnDescription) and not modifiedMetadata.tableDescription:
@@ -925,8 +915,7 @@ class ManagementService:
             CustomException: If metadata.json or the table is not found, or update fails.
         """
         try:
-            fileUrl = os.environ["FILE_URL"].format(projectId = projectId, fileName = "metadata.json").replace(".parquet", "") + f"?cb={int(time.time())}"
-            jsonData = json.loads(urlopen(fileUrl).read())
+            jsonData = readJson(projectId, "metadata.json")
             if tableName not in jsonData:
                 raise CustomException(
                     ValueError(f"Table '{tableName}' not found in metadata for project '{projectId}'."),
@@ -1072,8 +1061,7 @@ class ManagementService:
             CustomException: For any errors during retrieval.
         """
         try:
-            fileUrl = os.environ["FILE_URL"].format(projectId = projectId, fileName = "generatedReport.json").replace(".parquet", "") + f"?cb={int(time.time())}"
-            jsonData = json.loads(urlopen(fileUrl).read())
+            jsonData = readJson(projectId, "generatedReport.json")
             htmlContent = jsonData.get(tableName)
             return htmlContent
         except Exception as e:

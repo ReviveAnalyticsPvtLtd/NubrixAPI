@@ -21,10 +21,9 @@ import pandas as pd
 import hashlib
 import json
 import uuid
-import time
 import os
 import io
-from urllib.request import urlopen
+from utils.projectStorage import readJson
 
 VALID_INSIGHT_STATUSES = {"new", "accepted", "rejected", "implemented"}
 
@@ -287,8 +286,7 @@ class UtilityService:
             files = self.client.storage.from_("AnalyticsHub").list(path=projectId)
             if "dashboardInsights.json" not in [x.get("name") for x in files]:
                 return []
-            fileUrl = os.environ["FILE_URL"].format(projectId=projectId, fileName="dashboardInsights.json").replace(".parquet", "") + f"?cb={int(time.time())}"
-            data = json.loads(urlopen(fileUrl).read())
+            data = readJson(projectId, "dashboardInsights.json")
             return data if isinstance(data, list) else []
         except Exception:
             return []

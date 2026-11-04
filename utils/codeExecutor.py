@@ -82,7 +82,7 @@ class REPLManager:
                 "PATH", "PYTHONPATH", "HOME", "LANG", "LC_ALL", "TZ",
                 "REDIS_HOST", "REDIS_PORT", "REDIS_PASSWORD", "REDIS_DB",
                 "REDIS_SEMAPHORE_DB", "SUPABASE_URL", "SUPABASE_KEY", "DATABASE_URL",
-                "FILE_URL", "STORAGE_URL",
+                "STORAGE_URL",
                 "GOOGLE_API_KEY", "GEMINI_API_KEY", "GROQ_API_KEY", "CEREBRAS_API_KEY",
                 "OPENAI_API_KEY", "LANGSMITH_API_KEY", "LOGTAIL_SOURCE_TOKEN",
                 "RAZORPAY_KEY_ID", "RAZORPAY_KEY_SECRET", "BREVO_API_KEY",

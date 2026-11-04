@@ -11,10 +11,10 @@ def _metadataUrl(projectId):
     return TransformationService._metadata_url(types.SimpleNamespace(), projectId)
 
 
-def test_metadataUrlRequiresFileUrl(monkeypatch):
-    monkeypatch.delenv("FILE_URL", raising=False)
+def test_metadataUrlRequiresSupabaseUrl(monkeypatch):
+    monkeypatch.delenv("SUPABASE_URL", raising=False)
     with pytest.raises(KeyError):
         _metadataUrl("p1")
 
-    monkeypatch.setenv("FILE_URL", "https://files.example.test/{projectId}/{fileName}.parquet")
-    assert _metadataUrl("p1") == "https://files.example.test/p1/metadata.json"
+    monkeypatch.setenv("SUPABASE_URL", "https://storage.example.test")
+    assert _metadataUrl("p1") == "https://storage.example.test/storage/v1/object/AnalyticsHub/p1/metadata.json"
