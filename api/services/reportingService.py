@@ -584,7 +584,7 @@ class ReportingService:
                 responses = [f.result() for f in futures]
 
             # Check if there is already an existing dashboard configuration
-            file_exists = "dashboardConfig.json" in [x.get("name") for x in self.client.storage.from_("AnalyticsHub").list(path = details.projectId)]
+            file_exists = "dashboardConfig.json" in [x.get("name") for x in self.client.storage.from_("AnalyticsHub").list(path = details.projectId, options = {"search": "dashboardConfig.json"})]
             dashboardConfig = {}
             if file_exists:
                 dashboardConfig = await self._fetchJson(self._projectMetadataUrl(details.projectId, "dashboardConfig.json"))
@@ -732,8 +732,8 @@ class ReportingService:
         This method checks for the presence of a data source or blend configuration, prepares the data, and generates the panel chart. It also generates the code used for chart creation using code templates.
         """
         try:
-            allFiles = [x.get("name") for x in self.client.storage.from_("AnalyticsHub").list(path = panelChartDetails.projectId)]
-            if "".join([panelChartDetails.dataSource, ".parquet"]) in allFiles:
+            dataFile = "".join([panelChartDetails.dataSource, ".parquet"])
+            if dataFile in [x.get("name") for x in self.client.storage.from_("AnalyticsHub").list(path = panelChartDetails.projectId, options = {"search": dataFile})]:
                 response = await asyncio.to_thread(
                     self._generatePanelChart,
                     projectId=panelChartDetails.projectId,
@@ -770,7 +770,7 @@ class ReportingService:
                     filters=panelChartDetails.filters,
                     geoCodeColumn='"{}"'.format(panelChartDetails.zipCodeColumn) if panelChartDetails.zipCodeColumn else "None"
                 )
-            elif "blendConfig.json" in allFiles:
+            elif "blendConfig.json" in [x.get("name") for x in self.client.storage.from_("AnalyticsHub").list(path = panelChartDetails.projectId, options = {"search": "blendConfig.json"})]:
                 blendConfig = await self._fetchJson(self._projectMetadataUrl(panelChartDetails.projectId, "blendConfig.json"))
                 tablesUsed = blendConfig[panelChartDetails.dataSource].get("tables")
                 joinTypes = blendConfig[panelChartDetails.dataSource].get("joinTypes")
@@ -833,8 +833,7 @@ class ReportingService:
         """
         try:
             queryId = str(uuid.uuid4())
-            allFiles = [x.get("name") for x in self.client.storage.from_("AnalyticsHub").list(path = details.projectId)]
-            if "queryConfig.json" in allFiles:
+            if "queryConfig.json" in [x.get("name") for x in self.client.storage.from_("AnalyticsHub").list(path = details.projectId, options = {"search": "queryConfig.json"})]:
                 queryConfig = await self._fetchJson(self._projectMetadataUrl(details.projectId, "queryConfig.json"))
                 if not isinstance(queryConfig, dict):
                     queryConfig = {}
@@ -857,7 +856,7 @@ class ReportingService:
         Retrieve all saved favourite queries for a project from the queryConfig.json file.
         """
         try:
-            if "queryConfig.json" in [x.get("name") for x in self.client.storage.from_("AnalyticsHub").list(path = projectId)]:
+            if "queryConfig.json" in [x.get("name") for x in self.client.storage.from_("AnalyticsHub").list(path = projectId, options = {"search": "queryConfig.json"})]:
                 queryConfig = await self._fetchJson(self._projectMetadataUrl(projectId, "queryConfig.json"))
                 if not isinstance(queryConfig, dict):
                     return {}

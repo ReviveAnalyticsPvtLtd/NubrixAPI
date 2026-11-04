@@ -65,7 +65,7 @@ class _FakeClient:
     def _bucket(self, bucketName):
         return types.SimpleNamespace(list=self._list if bucketName == "AnalyticsHub" else lambda *a, **k: [], upload=self._upload, remove=lambda *a, **k: None)
 
-    def _list(self, path=None):
+    def _list(self, path=None, options=None):
         prefix = f"AnalyticsHub/{path}/"
         return [
             {"name": key[len(prefix):], "metadata": {"lastModified": "2026-10-31T00:00:00.000Z"}}

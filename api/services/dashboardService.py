@@ -12,6 +12,7 @@ __all__ = ["dashboardService"]
 from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor
 from api.commons import updateProjectModifiedAt
 from utils.exceptionHandler import CustomException
+from utils.storageListing import listProjectFiles
 from utils.codeExecutor import replManager, _remove_code_fences
 from sqlalchemy import URL, create_engine
 from utils.projectStorage import readJson, readTableBytes
@@ -148,7 +149,7 @@ class DashboardService:
         """
         try:
             pageId = str(uuid.uuid4())
-            if "dashboardConfig.json" in [x.get("name") for x in self.client.storage.from_("AnalyticsHub").list(path = details.projectId)]:
+            if "dashboardConfig.json" in [x.get("name") for x in self.client.storage.from_("AnalyticsHub").list(path = details.projectId, options = {"search": "dashboardConfig.json"})]:
                 dashboardConfig = readJson(details.projectId, "dashboardConfig.json")
                 dashboardConfig[pageId] = {"name": details.pageName, "widgets": []}
             else:
@@ -178,7 +179,7 @@ class DashboardService:
             CustomException: For any errors during retrieval.
         """
         try:
-            if "dashboardConfig.json" in [x.get("name") for x in self.client.storage.from_("AnalyticsHub").list(path = projectId)]:
+            if "dashboardConfig.json" in [x.get("name") for x in self.client.storage.from_("AnalyticsHub").list(path = projectId, options = {"search": "dashboardConfig.json"})]:
                 dashboardConfig = readJson(projectId, "dashboardConfig.json")
                 pages = [{"pageName": dashboardConfig[x]["name"], "pageId": x} for x in dashboardConfig.keys()]
             else:
@@ -346,7 +347,7 @@ class DashboardService:
             # Load insights.json
             insightsFileNames = [
                 x.get("name")
-                for x in self.client.storage.from_("AnalyticsHub").list(path=projectId)
+                for x in self.client.storage.from_("AnalyticsHub").list(path=projectId, options={"search": "insights.json"})
             ]
             if "insights.json" not in insightsFileNames:
                 return
@@ -430,7 +431,7 @@ class DashboardService:
             CustomException: For any errors during retrieval.
         """
         try:
-            dataTables = ["".join(os.path.splitext(x.get("name"))[:-1]) for x in client.storage.from_("AnalyticsHub").list(path = projectId) if x.get("name").endswith(".parquet")]
+            dataTables = ["".join(os.path.splitext(x.get("name"))[:-1]) for x in listProjectFiles(client, projectId) if x.get("name").endswith(".parquet")]
             with ThreadPoolExecutor(max_workers = 5) as executor:
                 results = executor.map(self._getDataTypes, [projectId] * len(dataTables), dataTables)
             results = list(results)
@@ -479,7 +480,7 @@ class DashboardService:
             shapes (dict): ``{tableName: [rows, cols]}`` from the just-refreshed data.
         """
         try:
-            files = [x.get("name") for x in client.storage.from_("AnalyticsHub").list(path = projectId)]
+            files = [x.get("name") for x in client.storage.from_("AnalyticsHub").list(path = projectId, options = {"search": "metadata.json"})]
             if "metadata.json" not in files:
                 return
             metadata = readJson(projectId, "metadata.json")
@@ -515,7 +516,7 @@ class DashboardService:
             CustomException: For any errors encountered during data extraction or upload.
         """
         try:
-            if "connections.json" in [x.get("name") for x in client.storage.from_("AnalyticsHub").list(path = projectId)]:
+            if "connections.json" in [x.get("name") for x in client.storage.from_("AnalyticsHub").list(path = projectId, options = {"search": "connections.json"})]:
                 databaseConnections = readJson(projectId, "connections.json")
             else:
                 return {"status": "SUCCESS"}
