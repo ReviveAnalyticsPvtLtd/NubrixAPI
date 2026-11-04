@@ -15,6 +15,7 @@ import uuid
 import re
 from api.services.credits.creditService import creditService
 from utils.logger import logger
+from utils.sandboxLimits import defaultTimeoutSeconds
 from utils.sandboxRunner import runSandbox
 
 
@@ -33,8 +34,7 @@ class REPLManager:
 
     def __init__(self, timeoutSeconds: int | None = None, maxConcurrentPerProject: int = 50):
         if timeoutSeconds is None:
-            env_val = os.environ.get("CODE_EXEC_TIMEOUT_SECONDS", "0")
-            timeoutSeconds = int(env_val) if env_val else None
+            timeoutSeconds = defaultTimeoutSeconds("CODE_EXEC_TIMEOUT_SECONDS")
         self.timeoutSeconds = timeoutSeconds
         self.maxConcurrentPerProject = maxConcurrentPerProject
 
@@ -73,8 +73,9 @@ class REPLManager:
         # 2. Launch subprocess
         stdout = ""
         stderr = ""
+        stopped = None
         try:
-            stdout, stderr, *_ = runSandbox("sandbox_launcher.py", projectId, codeString, self.timeoutSeconds)
+            stdout, stderr, _, _, _, stopped = runSandbox("sandbox_launcher.py", projectId, codeString, self.timeoutSeconds)
         except Exception as e:
             stderr = f"Error during subprocess execution: {e}\n"
         finally:
@@ -84,6 +85,11 @@ class REPLManager:
                 except Exception as e:
                     logger.warning(f"Failed to release semaphore for project {projectId}: {e}")
 
+        if stopped:
+            # Tell the caller why the run ended, once, after whatever it printed.
+            if not stdout.strip():
+                return stopped
+            return stdout if stopped in stdout else stdout + "\n" + stopped
         if stdout:
             return stdout
         return stderr

@@ -23,6 +23,7 @@ __all__ = ["TransformationExecutor"]
 
 from utils.exceptionHandler import CustomException
 from utils.initMethods import fetch_data, fetch_data_pl, scan_data, serializer
+from utils.sandboxLimits import defaultTimeoutSeconds
 from utils.sandboxRunner import runSandbox
 from api.commons import client
 from utils.logger import logger
@@ -115,10 +116,9 @@ class TransformationExecutor:
     Uses subprocess isolation (close_fds=True) to avoid fork+Redis deadlocks.
     """
     def __init__(self, timeoutSeconds: int | None = None):
-        """Initialize the executor. timeoutSeconds=0/None means no hard timeout."""
+        """Initialize the executor. timeoutSeconds=0 means no hard timeout; None uses the 300 second default."""
         if timeoutSeconds is None:
-            env_val = os.environ.get("TRANSFORMATION_TIMEOUT_SECONDS", "0")
-            timeoutSeconds = int(env_val) if env_val else 0
+            timeoutSeconds = defaultTimeoutSeconds("TRANSFORMATION_TIMEOUT_SECONDS")
         self.timeoutSeconds = timeoutSeconds
         self.client = client
 
@@ -138,7 +138,9 @@ class TransformationExecutor:
 
     def _run_transformation(self, projectId: str, pythonCode: str) -> tuple[list[dict], bytes]:
         """Run transformation code and return the preview rows and the parquet bytes of `final_df`."""
-        _, stderr, rc, parquetBytes, previewBytes, _ = runSandbox("transform_launcher.py", projectId, pythonCode, self.timeoutSeconds, withResult=True)
+        _, stderr, rc, parquetBytes, previewBytes, stopped = runSandbox("transform_launcher.py", projectId, pythonCode, self.timeoutSeconds, withResult=True)
+        if stopped:
+            raise ValueError(stopped)
         if rc != 0:
             raise ValueError(stderr.strip() or "Transformation execution failed.")
         if not parquetBytes:

@@ -549,3 +549,68 @@ def test_watchdogThatFailsStopsTheRunAndLogsIt(storage, monkeypatch):
     assert result.returncode != 0
     assert time.time() - started < 10
     assert any("watchdog failed" in message for message in messages)
+
+
+STOP_MESSAGE = "The run was stopped: it used more than 4 GiB of memory."
+
+
+def test_executorsDefaultTo300Seconds(monkeypatch):
+    from utils.codeExecutor import REPLManager
+
+    monkeypatch.delenv("TRANSFORMATION_TIMEOUT_SECONDS", raising=False)
+    monkeypatch.delenv("CODE_EXEC_TIMEOUT_SECONDS", raising=False)
+    assert TransformationExecutor().timeoutSeconds == 300
+    assert REPLManager().timeoutSeconds == 300
+    monkeypatch.setenv("TRANSFORMATION_TIMEOUT_SECONDS", "0")
+    monkeypatch.setenv("CODE_EXEC_TIMEOUT_SECONDS", "0")
+    assert TransformationExecutor().timeoutSeconds == 0
+    assert REPLManager().timeoutSeconds == 0
+
+
+class _FakeRedis:
+    def zremrangebyscore(self, *args):
+        pass
+
+    def zcard(self, *args):
+        return 0
+
+    def zadd(self, *args, **kwargs):
+        pass
+
+    def expire(self, *args):
+        pass
+
+    def zrem(self, *args):
+        pass
+
+
+def _replWith(monkeypatch, result):
+    from utils import codeExecutor
+
+    monkeypatch.setattr(codeExecutor.creditService, "_redis", lambda: _FakeRedis())
+    monkeypatch.setattr(codeExecutor, "runSandbox", lambda *args, **kwargs: result)
+    return codeExecutor.REPLManager(timeoutSeconds=5)
+
+
+def test_replManagerKeepsTheStopMessageAfterOutput(monkeypatch):
+    result = sandboxRunner.SandboxResult(stdout="partial\n", stderr="", returncode=-9, resultBytes=None, previewBytes=None, stopped=STOP_MESSAGE)
+    text = _replWith(monkeypatch, result).run("print(1)", "p1")
+    assert "partial" in text
+    assert text.count(STOP_MESSAGE) == 1
+
+
+def test_replManagerReturnsJustTheStopMessageWhenThereIsNoOutput(monkeypatch):
+    result = sandboxRunner.SandboxResult(stdout=" \n", stderr=STOP_MESSAGE + "\n", returncode=-9, resultBytes=None, stopped=STOP_MESSAGE)
+    assert _replWith(monkeypatch, result).run("print(1)", "p1") == STOP_MESSAGE
+
+
+def test_previewShowsTheStopMessage(monkeypatch):
+    from nubrix.components import transformationExecutor as module
+    from utils.exceptionHandler import CustomException
+
+    result = sandboxRunner.SandboxResult(stdout="", stderr="Traceback noise\n" + STOP_MESSAGE, returncode=-9, resultBytes=None, stopped=STOP_MESSAGE)
+    monkeypatch.setattr(module, "runSandbox", lambda *args, **kwargs: result)
+    with pytest.raises(CustomException) as caught:
+        TransformationExecutor(timeoutSeconds=5).executeAndPreview("p1", "x = 1", "out")
+    assert caught.value.statusCode == 400
+    assert caught.value.uiMessage == STOP_MESSAGE
