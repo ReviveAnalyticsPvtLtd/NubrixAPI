@@ -11,6 +11,8 @@ __all__ = [
     "verifyToken",
     "verifyTokenWithExpiry",
     "verifyUser",
+    "requireProductAccess",
+    "requireProductAccessToken",
     "requireActiveSubscription",
     "requireTrialOrAbove",
     "requirePaidPlan",
@@ -58,6 +60,13 @@ from api.services.subscriptions.entitlementService import (
 )
 
 subscriptionEntitlementService = SubscriptionEntitlementService(client)
+
+from utils.productAccessCache import ProductAccessCache
+
+# Holds only "has a plan" answers, per worker, for a minute at most. Sessions are still checked on
+# every request, so a revoked or expired login is refused at once. Resolved at call time so tests
+# can swap the entitlement service.
+productAccessCache = ProductAccessCache(lambda userId: subscriptionEntitlementService.get(userId))
 
 from jose import jwt, JWTError
 
@@ -197,11 +206,50 @@ def _loadCurrentEntitlement(user: UserContext) -> SubscriptionEntitlement:
             errorCode="ENTITLEMENT_UNAVAILABLE",
         )
 
+
+def _refuseWithoutPlan(user: UserContext, gate: str, entitlement: SubscriptionEntitlement | None = None) -> None:
+    """No plan or trial at all: the frontend sends the user to Manage Plan on this code."""
+    detail = f", status={entitlement.status}, planType={entitlement.planType}" if entitlement else ""
+    raiseFeatureGateHttpException(
+        statusCode=status.HTTP_403_FORBIDDEN,
+        uiMessage="Your plan has ended. Choose a plan to keep using Nubrix.",
+        backendLogMessage=f"{gate} refused userId={user.userId} without a plan{detail}",
+        errorCode="SUBSCRIPTION_INACTIVE",
+    )
+
+
+def requireProductAccess(
+    user: UserContext = Depends(verifyUser),
+) -> UserContext:
+    """Gate for product data: requires a plan or trial, read through productAccessCache."""
+    try:
+        allowed = productAccessCache.check(user.userId)
+    except EntitlementUnavailableError:
+        raiseFeatureGateHttpException(
+            statusCode=status.HTTP_503_SERVICE_UNAVAILABLE,
+            uiMessage="Subscription access could not be verified. Please try again.",
+            backendLogMessage=f"Entitlement lookup unavailable for userId={user.userId}",
+            errorCode="ENTITLEMENT_UNAVAILABLE",
+        )
+    if not allowed:
+        _refuseWithoutPlan(user, "requireProductAccess")
+    return user
+
+
+def requireProductAccessToken(
+    user: UserContext = Depends(requireProductAccess),
+) -> str:
+    """requireProductAccess for routes that take the verified session token, as verifyToken returns it."""
+    return user.token
+
+
 def requireActiveSubscription(
     user: UserContext = Depends(verifyUser),
 ) -> UserContext:
     """Gate: requires an active (or cancelled-but-in-period) subscription."""
     entitlement = _loadCurrentEntitlement(user)
+    if not entitlement.trialOrAbove:
+        _refuseWithoutPlan(user, "requireActiveSubscription", entitlement)
     if not entitlement.activeSubscription:
         raiseFeatureGateHttpException(
             statusCode=status.HTTP_403_FORBIDDEN,
@@ -221,15 +269,7 @@ def requireTrialOrAbove(
     """Gate: requires at least a trial subscription."""
     entitlement = _loadCurrentEntitlement(user)
     if not entitlement.trialOrAbove:
-        raiseFeatureGateHttpException(
-            statusCode=status.HTTP_403_FORBIDDEN,
-            uiMessage="Start a free trial or subscribe to access this feature.",
-            backendLogMessage=(
-                f"Feature gate requireTrialOrAbove blocked userId={user.userId}, "
-                f"status={entitlement.status}, planType={entitlement.planType}"
-            ),
-            errorCode="FEATURE_BLOCKED",
-        )
+        _refuseWithoutPlan(user, "requireTrialOrAbove", entitlement)
     return user
 
 
@@ -238,6 +278,8 @@ def requirePaidPlan(
 ) -> UserContext:
     """Gate: requires a paid plan (pro or annual)."""
     entitlement = _loadCurrentEntitlement(user)
+    if not entitlement.trialOrAbove:
+        _refuseWithoutPlan(user, "requirePaidPlan", entitlement)
     if not entitlement.paidPlan:
         raiseFeatureGateHttpException(
             statusCode=status.HTTP_403_FORBIDDEN,
@@ -281,15 +323,7 @@ def requireCredits(operationType: str):
         # 1. Eligibility first — no quota read happens for ineligible users.
         entitlement = _loadCurrentEntitlement(user)
         if not entitlement.trialOrAbove:
-            raiseFeatureGateHttpException(
-                statusCode=status.HTTP_403_FORBIDDEN,
-                uiMessage="This feature requires an active subscription.",
-                backendLogMessage=(
-                    f"Credit gate blocked userId={user.userId}, "
-                    f"status={entitlement.status}, planType={entitlement.planType}"
-                ),
-                errorCode="FEATURE_BLOCKED",
-            )
+            _refuseWithoutPlan(user, "requireCredits", entitlement)
 
         minimum = getOperationMinimum(operationType)
         remaining = creditService.getRemainingTokens(user.userId)

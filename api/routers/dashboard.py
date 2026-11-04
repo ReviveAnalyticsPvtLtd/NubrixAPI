@@ -14,7 +14,7 @@ import asyncio
 from api.services.dashboardService import dashboardService
 from fastapi.responses import ORJSONResponse
 from fastapi import APIRouter, Depends
-from api.commons import verifyUser, requireProjectOwner, requireTrialOrAbove, UserContext
+from api.commons import requireProductAccess, requireProjectOwner, requireTrialOrAbove, UserContext
 from api.models import (
     DeleteDashboardElement,
     ExportToDashboard,
@@ -29,7 +29,7 @@ Router for dashboard-related endpoints.
 """
 
 @router.post("/createPage")
-async def createPage(details: CreatePage, user: UserContext = Depends(verifyUser)):
+async def createPage(details: CreatePage, user: UserContext = Depends(requireProductAccess)):
     """
     Create a new dashboard page.
 
@@ -48,7 +48,7 @@ async def createPage(details: CreatePage, user: UserContext = Depends(verifyUser
         raiseHttpException(e)
     
 @router.get("/getAllPages")
-async def getAllPages(projectId: str, user: UserContext = Depends(verifyUser)):
+async def getAllPages(projectId: str, user: UserContext = Depends(requireProductAccess)):
     """
     Retrieve all pages for a given project.
 
@@ -67,7 +67,7 @@ async def getAllPages(projectId: str, user: UserContext = Depends(verifyUser)):
         raiseHttpException(e)
     
 @router.post("/exportToDashboard")
-async def exportToDashboard(details: ExportToDashboard, user: UserContext = Depends(verifyUser)):
+async def exportToDashboard(details: ExportToDashboard, user: UserContext = Depends(requireProductAccess)):
     """
     Export a widget to the dashboard.
 
@@ -86,7 +86,7 @@ async def exportToDashboard(details: ExportToDashboard, user: UserContext = Depe
         raiseHttpException(e)
     
 @router.post("/getData")
-async def getData(details: GetData, user: UserContext = Depends(verifyUser)):
+async def getData(details: GetData, user: UserContext = Depends(requireProductAccess)):
     """
     Retrieve data for a dashboard page.
 
@@ -98,9 +98,6 @@ async def getData(details: GetData, user: UserContext = Depends(verifyUser)):
         ORJSONResponse: Page data or error message.
     """
     await asyncio.to_thread(requireProjectOwner, details.projectId, user)
-    # A plain read runs no compute, and every dashboard render makes one.
-    if details.filters or details.refresh:
-        await asyncio.to_thread(requireTrialOrAbove, user)
     try:
         pageInfo = dashboardService.getData(details = details)
         return ORJSONResponse(status_code = 200, content = {"status": "SUCCESS", "pageData": pageInfo})
@@ -108,7 +105,7 @@ async def getData(details: GetData, user: UserContext = Depends(verifyUser)):
         raiseHttpException(e)
     
 @router.put("/editWidgetPosition")
-async def editWidgetPosition(details: EditWidgetPosition, user: UserContext = Depends(verifyUser)):
+async def editWidgetPosition(details: EditWidgetPosition, user: UserContext = Depends(requireProductAccess)):
     """
     Edit the position of a widget on a dashboard page.
 
@@ -127,7 +124,7 @@ async def editWidgetPosition(details: EditWidgetPosition, user: UserContext = De
         raiseHttpException(e)
 
 @router.delete("/deleteDashboardElement")
-async def deleteDashboardElement(details: DeleteDashboardElement, user: UserContext = Depends(verifyUser)):
+async def deleteDashboardElement(details: DeleteDashboardElement, user: UserContext = Depends(requireProductAccess)):
     """
     Delete an element from the dashboard.
 
@@ -146,7 +143,7 @@ async def deleteDashboardElement(details: DeleteDashboardElement, user: UserCont
         raiseHttpException(e)
 
 @router.get("/getAllColumns/{projectId}")
-async def getAllColumns(projectId: str, user: UserContext = Depends(verifyUser)):
+async def getAllColumns(projectId: str, user: UserContext = Depends(requireProductAccess)):
     """
     Retrieve all columns for a given project.
 

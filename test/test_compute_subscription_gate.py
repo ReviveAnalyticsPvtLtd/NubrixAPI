@@ -201,7 +201,7 @@ def test_lapsed_account_is_refused_before_any_compute(entitlements, projects, wo
     entitlements.current = LAPSED
     response = call(clientFor(), name)
     assert response.status_code == 403
-    assert response.json()["errorCode"] == "FEATURE_BLOCKED"
+    assert response.json()["errorCode"] == "SUBSCRIPTION_INACTIVE"
     assert work.calls == []
 
 
@@ -247,13 +247,15 @@ def test_entitlement_read_stays_off_the_event_loop(entitlements, projects, work,
     {"filters": []},
     {"filters": [], "refresh": False},
 ])
-def test_plain_dashboard_read_costs_no_entitlement_read(entitlements, projects, work, body):
-    # The dashboard sends filters: [] on every page load, so this is the hot path.
-    entitlements.current = LAPSED
-    response = clientFor().post("/dashboard/getData", json={"projectId": PROJECT, "page": "p", **body})
-    assert response.status_code == 200
-    assert work.calls == ["getData"]
-    assert entitlements.reads == 0
+def test_repeated_dashboard_reads_share_one_entitlement_read(entitlements, projects, work, body):
+    # The dashboard sends filters: [] on every page load, so this is the hot path: a plan
+    # answer is remembered for a minute instead of read on every widget.
+    client = clientFor()
+    for _ in range(3):
+        response = client.post("/dashboard/getData", json={"projectId": PROJECT, "page": "p", **body})
+        assert response.status_code == 200
+    assert work.calls == ["getData"] * 3
+    assert entitlements.reads == 1
 
 
 @pytest.mark.parametrize("name", ["getData-filters", "getData-refresh", "dashboardRefresh", "generateReport"])
@@ -265,8 +267,8 @@ def test_another_users_project_still_reads_as_missing(entitlements, projects, wo
 
 
 def test_only_the_compute_routes_are_gated_up_front():
-    # getData is left out because its gate depends on the request body. A plain read
-    # picking up this gate here would be the rejected per-request entitlement read.
+    # getData is left out: every product-data route, getData included, has requireProductAccess,
+    # which remembers a plan answer for a minute instead of reading it on every request.
     gated = {path for path, route in productRoutes()
         if any(getattr(call, "__name__", "") == "requireTrialOrAbove" for call in dependencyCalls(route))}
     assert gated == GATED_UP_FRONT

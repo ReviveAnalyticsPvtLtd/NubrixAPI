@@ -400,7 +400,7 @@ def test_original_active_token_identity_is_blocked_after_database_suspension():
         with pytest.raises(HTTPException) as raised:
             requireActiveSubscription(user)
     assert raised.value.status_code == 403
-    assert raised.value.detail["errorCode"] == "FEATURE_BLOCKED"
+    assert raised.value.detail["errorCode"] == "SUBSCRIPTION_INACTIVE"
 
 
 def test_active_gate_uses_current_database_entitlement():
@@ -427,7 +427,7 @@ def test_active_gate_blocks_current_expired_database_state():
         with pytest.raises(HTTPException) as raised:
             requireActiveSubscription(_user())
     assert raised.value.status_code == 403
-    assert raised.value.detail["errorCode"] == "FEATURE_BLOCKED"
+    assert raised.value.detail["errorCode"] == "SUBSCRIPTION_INACTIVE"
 
 
 def test_trial_gate_allows_current_trial_but_paid_gate_does_not():

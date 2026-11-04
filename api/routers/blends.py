@@ -13,7 +13,7 @@ import asyncio
 from api.services.blendService import blendService
 from fastapi.responses import ORJSONResponse
 from fastapi import APIRouter, Depends
-from api.commons import verifyUser, requireProjectOwner, requireTrialOrAbove, UserContext
+from api.commons import requireProductAccess, requireProjectOwner, requireTrialOrAbove, UserContext
 from api.models import (
     GetFieldsFromSources,
     CreateDataBlend
@@ -44,7 +44,7 @@ async def createDataBlend(blendDetails: CreateDataBlend, user: UserContext = Dep
         raiseHttpException(e)
 
 @router.get("/getDataSources")
-async def getDataSources(projectId: str, user: UserContext = Depends(verifyUser)):
+async def getDataSources(projectId: str, user: UserContext = Depends(requireProductAccess)):
     """
     Retrieve available data sources for a given project.
 
@@ -63,7 +63,7 @@ async def getDataSources(projectId: str, user: UserContext = Depends(verifyUser)
         raiseHttpException(e)
 
 @router.post("/getFieldsFromSources")
-async def getFieldsFromSources(details: GetFieldsFromSources, user: UserContext = Depends(verifyUser)):
+async def getFieldsFromSources(details: GetFieldsFromSources, user: UserContext = Depends(requireProductAccess)):
     """
     Get fields from the specified data sources.
 

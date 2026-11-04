@@ -23,7 +23,7 @@ from api.models import (
     EditMetadata,
     RenameProject
 )
-from api.commons import verifyToken, verifyUser, requireCredits, requireProjectOwner, requireTrialOrAbove, UserContext
+from api.commons import verifyToken, requireProductAccess, requireProductAccessToken, requireCredits, requireProjectOwner, requireTrialOrAbove, UserContext
 
 router = APIRouter()
 """
@@ -31,7 +31,7 @@ Router for project and management-related endpoints.
 """
 
 @router.post("/createProject")
-async def createProject(projectDetails: CreateProject, user: UserContext = Depends(verifyUser)):
+async def createProject(projectDetails: CreateProject, user: UserContext = Depends(requireProductAccess)):
     """
     Create a new project.
 
@@ -59,7 +59,7 @@ async def createProject(projectDetails: CreateProject, user: UserContext = Depen
         raiseHttpException(e)
     
 @router.post("/createWorkspace/{workspaceName}")
-async def createWorkspace(workspaceName: str, token = Depends(verifyToken)):
+async def createWorkspace(workspaceName: str, token = Depends(requireProductAccessToken)):
     """
     Create a new workspace.
 
@@ -84,7 +84,7 @@ async def createWorkspace(workspaceName: str, token = Depends(verifyToken)):
         raiseHttpException(e)
     
 @router.get("/listProjects/{workspaceId}")
-async def listProjects(workspaceId: str, token = Depends(verifyToken)):
+async def listProjects(workspaceId: str, token = Depends(requireProductAccessToken)):
     """
     List all projects accessible to the user.
 
@@ -101,7 +101,7 @@ async def listProjects(workspaceId: str, token = Depends(verifyToken)):
         raiseHttpException(e)
     
 @router.get("/listWorkspaces")
-async def listWorkspaces(token = Depends(verifyToken)):
+async def listWorkspaces(token = Depends(requireProductAccessToken)):
     """
     List all workspaces accessible to the user.
 
@@ -118,7 +118,7 @@ async def listWorkspaces(token = Depends(verifyToken)):
         raiseHttpException(e)
 
 @router.patch("/updateCurrentWorkspace/{updatedWorkspaceId}")
-async def updateCurrentWorkspace(updatedWorkspaceId: str, token = Depends(verifyToken)):
+async def updateCurrentWorkspace(updatedWorkspaceId: str, token = Depends(requireProductAccessToken)):
     """
     Update the workspace id of a user.
 
@@ -136,7 +136,7 @@ async def updateCurrentWorkspace(updatedWorkspaceId: str, token = Depends(verify
         raiseHttpException(e)
 
 @router.patch("/updateWorkspaceName/{workspaceId}/{newWorkspaceName}")
-async def updateWorkspaceName(workspaceId: str, newWorkspaceName: str, token = Depends(verifyToken)):
+async def updateWorkspaceName(workspaceId: str, newWorkspaceName: str, token = Depends(requireProductAccessToken)):
     """
     Update the name of a workspace.
 
@@ -161,7 +161,7 @@ async def updateWorkspaceName(workspaceId: str, newWorkspaceName: str, token = D
         raiseHttpException(e)
 
 @router.delete("/deleteWorkspace/{workspaceId}")
-async def deleteWorkspace(workspaceId: str, token = Depends(verifyToken)):
+async def deleteWorkspace(workspaceId: str, token = Depends(requireProductAccessToken)):
     """
     Delete a workspace and all its projects.
 
@@ -184,7 +184,7 @@ async def deleteWorkspace(workspaceId: str, token = Depends(verifyToken)):
         raiseHttpException(e)
 
 @router.patch("/updateBookmark")
-async def updateBookmark(updateBookmarkDetails: UpdateProjectState, user: UserContext = Depends(verifyUser)):
+async def updateBookmark(updateBookmarkDetails: UpdateProjectState, user: UserContext = Depends(requireProductAccess)):
     """
     Update the bookmark status of a project.
 
@@ -203,7 +203,7 @@ async def updateBookmark(updateBookmarkDetails: UpdateProjectState, user: UserCo
         raiseHttpException(e)
     
 @router.patch("/updateArchive")
-async def updateArchive(updateArchiveDetails: UpdateProjectState, user: UserContext = Depends(verifyUser)):
+async def updateArchive(updateArchiveDetails: UpdateProjectState, user: UserContext = Depends(requireProductAccess)):
     """
     Update the archive status of a project.
 
@@ -222,7 +222,7 @@ async def updateArchive(updateArchiveDetails: UpdateProjectState, user: UserCont
         raiseHttpException(e)
     
 @router.patch("/updateTrash")
-async def updateTrash(updateTrashDetails: UpdateProjectState, user: UserContext = Depends(verifyUser)):
+async def updateTrash(updateTrashDetails: UpdateProjectState, user: UserContext = Depends(requireProductAccess)):
     """
     Update the trash status of a project.
 
@@ -283,7 +283,7 @@ async def generateKpis(projectId: str, preserveCharted: bool = False, user: User
         raiseHttpException(e)
     
 @router.get("/getInsights/{projectId}")
-async def getInsights(projectId: str, user: UserContext = Depends(verifyUser)):
+async def getInsights(projectId: str, user: UserContext = Depends(requireProductAccess)):
     """
     Retrieve insights and their status for a given project.
 
@@ -302,7 +302,7 @@ async def getInsights(projectId: str, user: UserContext = Depends(verifyUser)):
         raiseHttpException(e)
 
 @router.get("/getMetadata/{projectId}")
-async def getMetadata(projectId: str, user: UserContext = Depends(verifyUser)):
+async def getMetadata(projectId: str, user: UserContext = Depends(requireProductAccess)):
     """
     Retrieve metadata for a given project.
 
@@ -321,7 +321,7 @@ async def getMetadata(projectId: str, user: UserContext = Depends(verifyUser)):
         raiseHttpException(e)
 
 @router.put("/editMetadata")
-async def editMetadata(modifiedMetadata: EditMetadata, user: UserContext = Depends(verifyUser)):
+async def editMetadata(modifiedMetadata: EditMetadata, user: UserContext = Depends(requireProductAccess)):
     """
     Edit the metadata for a project.
 
@@ -340,7 +340,7 @@ async def editMetadata(modifiedMetadata: EditMetadata, user: UserContext = Depen
         raiseHttpException(e)
 
 @router.patch("/toggleTableActive/{projectId}/{tableName}")
-async def toggleTableActive(projectId: str, tableName: str, user: UserContext = Depends(verifyUser)):
+async def toggleTableActive(projectId: str, tableName: str, user: UserContext = Depends(requireProductAccess)):
     """
     Toggle the isActive flag for a table in a project's metadata.
 
@@ -358,7 +358,7 @@ async def toggleTableActive(projectId: str, tableName: str, user: UserContext = 
         raiseHttpException(e)
 
 @router.delete("/deleteProject")
-async def deleteProject(projectId: str, user: UserContext = Depends(verifyUser)):
+async def deleteProject(projectId: str, user: UserContext = Depends(requireProductAccess)):
     """
     Delete a project by its ID.
 
@@ -377,7 +377,7 @@ async def deleteProject(projectId: str, user: UserContext = Depends(verifyUser))
         raiseHttpException(e)
 
 @router.patch("/renameProject")
-async def renameProject(renameDetails: RenameProject, user: UserContext = Depends(verifyUser)):
+async def renameProject(renameDetails: RenameProject, user: UserContext = Depends(requireProductAccess)):
     """
     Rename an existing project.
 
@@ -403,7 +403,7 @@ async def renameProject(renameDetails: RenameProject, user: UserContext = Depend
         raiseHttpException(e)
     
 @router.get("/listTriggers/{projectId}")
-async def listTriggers(projectId: str, user: UserContext = Depends(verifyUser)):
+async def listTriggers(projectId: str, user: UserContext = Depends(requireProductAccess)):
     """
     List all triggers for a given project.
 
@@ -422,7 +422,7 @@ async def listTriggers(projectId: str, user: UserContext = Depends(verifyUser)):
         raiseHttpException(e)
     
 @router.get("/listTriggersUnderUserId")
-async def listTriggers(token = Depends(verifyToken)):
+async def listTriggers(token = Depends(requireProductAccessToken)):
     """
     List all triggers assigned to the current user.
 
@@ -458,7 +458,7 @@ async def generateReport(projectId: str, user: UserContext = Depends(requireTria
         raiseHttpException(e)
     
 @router.get("/getReport/{projectId}/{tableName}")
-async def getReport(projectId: str, tableName: str, user: UserContext = Depends(verifyUser)):
+async def getReport(projectId: str, tableName: str, user: UserContext = Depends(requireProductAccess)):
     """
     Retrieve a report for a specific table in a project.
 
@@ -569,7 +569,7 @@ async def viewTable(
     tableName: str,
     page: int = Query(default=1, ge=1),
     pageSize: int = Query(default=100, ge=1, le=500),
-    user: UserContext = Depends(verifyUser),
+    user: UserContext = Depends(requireProductAccess),
 ):
     """
     Read a parquet table from Supabase storage and return paginated rows.

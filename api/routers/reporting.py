@@ -23,7 +23,7 @@ from api.models import GenerateChartInput, PanelChartDetails, GenerateChartsInPa
 from api.services.reportingService import reportingService
 from fastapi.responses import ORJSONResponse
 from fastapi import APIRouter, Depends
-from api.commons import verifyUser, requireCredits, requireProjectOwner, requireTrialOrAbove, UserContext
+from api.commons import requireProductAccess, requireCredits, requireProjectOwner, requireTrialOrAbove, UserContext
 
 router = APIRouter()
 """
@@ -97,7 +97,7 @@ async def generateAndExportChartsInParallel(details: GenerateChartsInParallel, u
         raiseHttpException(e)
 
 @router.post("/saveQuery")
-async def saveQuery(details: SaveQuery, user: UserContext = Depends(verifyUser)):
+async def saveQuery(details: SaveQuery, user: UserContext = Depends(requireProductAccess)):
     """
     Save a user-marked favourite query to a queryConfig.json file in the project's Supabase storage folder.
 
@@ -119,7 +119,7 @@ async def saveQuery(details: SaveQuery, user: UserContext = Depends(verifyUser))
         raiseHttpException(e)
 
 @router.get("/getQueries/{projectId}")
-async def getQueries(projectId: str, user: UserContext = Depends(verifyUser)):
+async def getQueries(projectId: str, user: UserContext = Depends(requireProductAccess)):
     """
     Retrieve all saved favourite queries for a given project.
 
@@ -141,7 +141,7 @@ async def getQueries(projectId: str, user: UserContext = Depends(verifyUser)):
         raiseHttpException(e)
 
 @router.delete("/deleteQuery")
-async def deleteQuery(details: DeleteQuery, user: UserContext = Depends(verifyUser)):
+async def deleteQuery(details: DeleteQuery, user: UserContext = Depends(requireProductAccess)):
     """
     Delete a saved favourite query from the project's queryConfig.json file.
 
