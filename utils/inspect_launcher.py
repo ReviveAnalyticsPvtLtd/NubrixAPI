@@ -1,7 +1,7 @@
 """
 inspect_launcher.py — subprocess entry point for transformation inspection.
 
-Reads JSON from stdin: {"projectId": ..., "code": ...}
+Reads JSON from stdin: {"projectId": ..., "code": ..., "channel": ...}
 Executes the code and writes stdout to stdout, stderr to stderr.
 """
 
@@ -9,6 +9,15 @@ import sys
 import os
 import json
 import traceback
+
+
+def _scopedToProject(reader, allowedProjectId):
+    """Refuse other projects. The first argument keeps its name so generated code can pass it by keyword."""
+    def scopedReader(projectId, tableName, *args, **kwargs):
+        if projectId != allowedProjectId:
+            raise PermissionError(f"Access denied: You can only query data for project '{allowedProjectId}' (requested '{projectId}').")
+        return reader(projectId, tableName, *args, **kwargs)
+    return scopedReader
 
 
 def main():
@@ -21,11 +30,14 @@ def main():
         sys.exit(1)
 
     from utils.initMethods import fetch_data, fetch_data_pl, scan_data, serializer
+    from utils.sandboxRunner import enterSandbox
     import pandas as pd
     import numpy as np
     import datetime
     import math
     import re
+
+    enterSandbox(input_data["channel"])
 
     _ALLOWED_MODULES = frozenset({
         "pandas", "numpy", "datetime", "math", "re", "time",
@@ -50,9 +62,9 @@ def main():
     g = {
         "__builtins__": safe_builtins,
         "datetime": datetime,
-        "fetch_data": fetch_data,
-        "fetch_data_pl": fetch_data_pl,
-        "scan_data": scan_data,
+        "fetch_data": _scopedToProject(fetch_data, projectId),
+        "fetch_data_pl": _scopedToProject(fetch_data_pl, projectId),
+        "scan_data": _scopedToProject(scan_data, projectId),
         "math": math,
         "np": np,
         "pd": pd,

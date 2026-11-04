@@ -9,15 +9,13 @@ CPU/memory caps (RLIMIT_AS crashes polars import).
 __all__ = ["replManager", "REPLManager", "_remove_code_fences"]
 
 
-import sys
 import os
-import json
-import subprocess
 import time
 import uuid
 import re
 from api.services.credits.creditService import creditService
 from utils.logger import logger
+from utils.sandboxRunner import runSandbox
 
 
 def _remove_code_fences(code: str) -> str:
@@ -75,43 +73,9 @@ class REPLManager:
         # 2. Launch subprocess
         stdout = ""
         stderr = ""
-        launcher_path = os.path.join(os.path.dirname(__file__), "sandbox_launcher.py")
+        returnCode = None
         try:
-            app_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-            inherit_envs = (
-                "PATH", "PYTHONPATH", "HOME", "LANG", "LC_ALL", "TZ",
-                "REDIS_HOST", "REDIS_PORT", "REDIS_PASSWORD", "REDIS_DB",
-                "REDIS_SEMAPHORE_DB", "SUPABASE_URL", "SUPABASE_KEY", "DATABASE_URL",
-                "FILE_URL", "STORAGE_URL",
-                "GOOGLE_API_KEY", "GEMINI_API_KEY", "GROQ_API_KEY", "CEREBRAS_API_KEY",
-                "OPENAI_API_KEY", "LANGSMITH_API_KEY", "LOGTAIL_SOURCE_TOKEN",
-                "RAZORPAY_KEY_ID", "RAZORPAY_KEY_SECRET", "BREVO_API_KEY",
-                "LANGFUSE_SECRET_KEY", "LANGFUSE_PUBLIC_KEY", "LANGFUSE_HOST",
-                "POLARS_MAX_THREADS", "OPENBLAS_NUM_THREADS",
-                "DF_CACHE_MAX_BYTES", "DF_CACHE_MAX_ENTRIES",
-            )
-            clean_env = {k: os.environ[k] for k in inherit_envs if k in os.environ}
-            clean_env["PYTHONPATH"] = app_root + os.pathsep + clean_env.get("PYTHONPATH", "")
-            proc = subprocess.Popen(
-                [sys.executable, "-s", launcher_path],
-                stdin=subprocess.PIPE,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-                text=True,
-                env=clean_env,
-                close_fds=True,
-            )
-
-            payload = json.dumps({"projectId": projectId, "code": codeString})
-            try:
-                if self.timeoutSeconds:
-                    stdout, stderr = proc.communicate(input=payload, timeout=self.timeoutSeconds)
-                else:
-                    stdout, stderr = proc.communicate(input=payload)
-            except subprocess.TimeoutExpired:
-                proc.kill()
-                stdout, stderr = proc.communicate()
-                stderr += f"\nExecution timed out after {self.timeoutSeconds} seconds.\n"
+            stdout, stderr, returnCode, *_ = runSandbox("sandbox_launcher.py", projectId, codeString, self.timeoutSeconds)
         except Exception as e:
             stderr = f"Error during subprocess execution: {e}\n"
         finally:
@@ -121,9 +85,10 @@ class REPLManager:
                 except Exception as e:
                     logger.warning(f"Failed to release semaphore for project {projectId}: {e}")
 
-        if stdout:
-            return stdout
-        return stderr
+        # Callers accept any valid JSON as the result, so a failed run's partial stdout must not reach them.
+        if returnCode:
+            return stderr or f"Code execution exited with code {returnCode} and wrote no error output."
+        return stdout or stderr
 
 
 replManager = REPLManager(timeoutSeconds=None, maxConcurrentPerProject=50)

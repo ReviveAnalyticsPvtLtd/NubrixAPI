@@ -18,6 +18,7 @@ from api.commons import updateProjectModifiedAt
 from utils.exceptionHandler import CustomException
 from concurrent.futures import ThreadPoolExecutor
 from utils.initMethods import fetch_data, scan_data
+from utils.projectStorage import authHeaders, objectUrl
 from nubrix.utils import readYaml
 from utils.logger import logger
 from api.commons import client
@@ -92,18 +93,13 @@ class ReportingService:
 
     async def _fetchJson(self, url: str) -> dict | list:
         """Async fetch with a short in-memory cache to avoid re-fetching metadata within a session."""
-        response = await self._httpClient.get(url)
+        response = await self._httpClient.get(url, headers=authHeaders())
         response.raise_for_status()
         return response.json()
 
     def _projectMetadataUrl(self, projectId: str, fileName: str = "metadata.json") -> str:
-        """Build a cache-busting public URL for a project file."""
-        return (
-            os.environ["FILE_URL"]
-            .format(projectId=projectId, fileName=fileName)
-            .replace(".parquet", "")
-            + f"?cb={int(time.time())}"
-        )
+        """Build the authenticated URL for a project file."""
+        return objectUrl(projectId, fileName)
 
     @staticmethod
     def _augment_with_size_hints(metadata: dict, projectId: str) -> dict:
@@ -588,7 +584,7 @@ class ReportingService:
                 responses = [f.result() for f in futures]
 
             # Check if there is already an existing dashboard configuration
-            file_exists = "dashboardConfig.json" in [x.get("name") for x in self.client.storage.from_("AnalyticsHub").list(path = details.projectId)]
+            file_exists = "dashboardConfig.json" in [x.get("name") for x in self.client.storage.from_("AnalyticsHub").list(path = details.projectId, options = {"search": "dashboardConfig.json"})]
             dashboardConfig = {}
             if file_exists:
                 dashboardConfig = await self._fetchJson(self._projectMetadataUrl(details.projectId, "dashboardConfig.json"))
@@ -736,8 +732,8 @@ class ReportingService:
         This method checks for the presence of a data source or blend configuration, prepares the data, and generates the panel chart. It also generates the code used for chart creation using code templates.
         """
         try:
-            allFiles = [x.get("name") for x in self.client.storage.from_("AnalyticsHub").list(path = panelChartDetails.projectId)]
-            if "".join([panelChartDetails.dataSource, ".parquet"]) in allFiles:
+            dataFile = "".join([panelChartDetails.dataSource, ".parquet"])
+            if dataFile in [x.get("name") for x in self.client.storage.from_("AnalyticsHub").list(path = panelChartDetails.projectId, options = {"search": dataFile})]:
                 response = await asyncio.to_thread(
                     self._generatePanelChart,
                     projectId=panelChartDetails.projectId,
@@ -774,7 +770,7 @@ class ReportingService:
                     filters=panelChartDetails.filters,
                     geoCodeColumn='"{}"'.format(panelChartDetails.zipCodeColumn) if panelChartDetails.zipCodeColumn else "None"
                 )
-            elif "blendConfig.json" in allFiles:
+            elif "blendConfig.json" in [x.get("name") for x in self.client.storage.from_("AnalyticsHub").list(path = panelChartDetails.projectId, options = {"search": "blendConfig.json"})]:
                 blendConfig = await self._fetchJson(self._projectMetadataUrl(panelChartDetails.projectId, "blendConfig.json"))
                 tablesUsed = blendConfig[panelChartDetails.dataSource].get("tables")
                 joinTypes = blendConfig[panelChartDetails.dataSource].get("joinTypes")
@@ -837,8 +833,7 @@ class ReportingService:
         """
         try:
             queryId = str(uuid.uuid4())
-            allFiles = [x.get("name") for x in self.client.storage.from_("AnalyticsHub").list(path = details.projectId)]
-            if "queryConfig.json" in allFiles:
+            if "queryConfig.json" in [x.get("name") for x in self.client.storage.from_("AnalyticsHub").list(path = details.projectId, options = {"search": "queryConfig.json"})]:
                 queryConfig = await self._fetchJson(self._projectMetadataUrl(details.projectId, "queryConfig.json"))
                 if not isinstance(queryConfig, dict):
                     queryConfig = {}
@@ -861,7 +856,7 @@ class ReportingService:
         Retrieve all saved favourite queries for a project from the queryConfig.json file.
         """
         try:
-            if "queryConfig.json" in [x.get("name") for x in self.client.storage.from_("AnalyticsHub").list(path = projectId)]:
+            if "queryConfig.json" in [x.get("name") for x in self.client.storage.from_("AnalyticsHub").list(path = projectId, options = {"search": "queryConfig.json"})]:
                 queryConfig = await self._fetchJson(self._projectMetadataUrl(projectId, "queryConfig.json"))
                 if not isinstance(queryConfig, dict):
                     return {}

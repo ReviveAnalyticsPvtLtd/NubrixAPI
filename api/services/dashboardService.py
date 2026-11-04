@@ -12,9 +12,10 @@ __all__ = ["dashboardService"]
 from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor
 from api.commons import updateProjectModifiedAt
 from utils.exceptionHandler import CustomException
+from utils.storageListing import listProjectFiles
 from utils.codeExecutor import replManager, _remove_code_fences
 from sqlalchemy import URL, create_engine
-from urllib.request import urlopen
+from utils.projectStorage import readJson, readTableBytes
 from utils.logger import logger
 from api.commons import client
 from api.models import (
@@ -28,7 +29,6 @@ import pandas as pd
 import tempfile
 import uuid
 import json
-import time
 import ast
 import os
 import io
@@ -105,8 +105,7 @@ class DashboardService:
         Returns:
             list[dict]: List of dictionaries containing column metadata.
         """
-        fileUrl = os.environ["FILE_URL"].format(projectId = projectId, fileName = tableName)
-        df = pd.read_parquet(fileUrl)
+        df = pd.read_parquet(io.BytesIO(readTableBytes(projectId, tableName)))
         numericals = ["int64", "float64", "float32", "int32"]
         categoricals = ["bool", "category", "object", "string"]
         datetimeTypes = ["datetime64[ns]", "datetime64[ns, tz]"]
@@ -150,9 +149,8 @@ class DashboardService:
         """
         try:
             pageId = str(uuid.uuid4())
-            if "dashboardConfig.json" in [x.get("name") for x in self.client.storage.from_("AnalyticsHub").list(path = details.projectId)]:
-                fileUrl = os.environ["FILE_URL"].format(projectId = details.projectId, fileName = "dashboardConfig.json").replace(".parquet", "") + f"?cb={int(time.time())}"
-                dashboardConfig = json.loads(urlopen(fileUrl).read())
+            if "dashboardConfig.json" in [x.get("name") for x in self.client.storage.from_("AnalyticsHub").list(path = details.projectId, options = {"search": "dashboardConfig.json"})]:
+                dashboardConfig = readJson(details.projectId, "dashboardConfig.json")
                 dashboardConfig[pageId] = {"name": details.pageName, "widgets": []}
             else:
                 dashboardConfig = {pageId: {"name": details.pageName, "widgets": []}}
@@ -181,9 +179,8 @@ class DashboardService:
             CustomException: For any errors during retrieval.
         """
         try:
-            if "dashboardConfig.json" in [x.get("name") for x in self.client.storage.from_("AnalyticsHub").list(path = projectId)]:
-                fileUrl = os.environ["FILE_URL"].format(projectId = projectId, fileName = "dashboardConfig.json").replace(".parquet", "") + f"?cb={int(time.time())}"
-                dashboardConfig = json.loads(urlopen(fileUrl).read())
+            if "dashboardConfig.json" in [x.get("name") for x in self.client.storage.from_("AnalyticsHub").list(path = projectId, options = {"search": "dashboardConfig.json"})]:
+                dashboardConfig = readJson(projectId, "dashboardConfig.json")
                 pages = [{"pageName": dashboardConfig[x]["name"], "pageId": x} for x in dashboardConfig.keys()]
             else:
                 pages = list()
@@ -207,8 +204,7 @@ class DashboardService:
             CustomException: For any errors during export.
         """
         try:
-            fileUrl = os.environ["FILE_URL"].format(projectId = details.projectId, fileName = "dashboardConfig.json").replace(".parquet", "") + f"?cb={int(time.time())}"
-            dashboardConfig = json.loads(urlopen(fileUrl).read())
+            dashboardConfig = readJson(details.projectId, "dashboardConfig.json")
             pageDict = dashboardConfig.get(details.page)
             widgetId = str(uuid.uuid4())
             newWidget = {
@@ -250,8 +246,7 @@ class DashboardService:
             CustomException: For any errors during data retrieval.
         """
         try:
-            fileUrl = os.environ["FILE_URL"].format(projectId = details.projectId, fileName = "dashboardConfig.json").replace(".parquet", "") + f"?cb={int(time.time())}"
-            dashboardConfig = json.loads(urlopen(fileUrl).read())
+            dashboardConfig = readJson(details.projectId, "dashboardConfig.json")
             pageInfo = dashboardConfig.get(details.page)
             pageInfo["id"] = details.page
             if (not details.filters) and (not details.refresh):
@@ -302,8 +297,7 @@ class DashboardService:
             CustomException: For any errors during update.
         """
         try:
-            fileUrl = os.environ["FILE_URL"].format(projectId = details.projectId, fileName = "dashboardConfig.json").replace(".parquet", "") + f"?cb={int(time.time())}"
-            dashboardConfig = json.loads(urlopen(fileUrl).read())
+            dashboardConfig = readJson(details.projectId, "dashboardConfig.json")
             pageInfo = dashboardConfig.get(details.pageId)
             pageInfo["name"] = details.pageName
             widgets = pageInfo.get("widgets")
@@ -353,15 +347,12 @@ class DashboardService:
             # Load insights.json
             insightsFileNames = [
                 x.get("name")
-                for x in self.client.storage.from_("AnalyticsHub").list(path=projectId)
+                for x in self.client.storage.from_("AnalyticsHub").list(path=projectId, options={"search": "insights.json"})
             ]
             if "insights.json" not in insightsFileNames:
                 return
 
-            insightsUrl = os.environ["FILE_URL"].format(
-                projectId=projectId, fileName="insights.json"
-            ).replace(".parquet", "") + f"?cb={int(time.time())}"
-            insights = json.loads(urlopen(insightsUrl).read())
+            insights = readJson(projectId, "insights.json")
 
             # Reset isCharted for insights whose query is no longer on the dashboard
             changed = False
@@ -399,8 +390,7 @@ class DashboardService:
             CustomException: For any errors during deletion.
         """
         try:
-            fileUrl = os.environ["FILE_URL"].format(projectId = details.projectId, fileName = "dashboardConfig.json").replace(".parquet", "") + f"?cb={int(time.time())}"
-            dashboardConfig = json.loads(urlopen(fileUrl).read())
+            dashboardConfig = readJson(details.projectId, "dashboardConfig.json")
             if details.deletionObject == "page":
                 dashboardConfig.pop(details.id)
             elif details.deletionObject == "widget":
@@ -441,7 +431,7 @@ class DashboardService:
             CustomException: For any errors during retrieval.
         """
         try:
-            dataTables = ["".join(os.path.splitext(x.get("name"))[:-1]) for x in client.storage.from_("AnalyticsHub").list(path = projectId) if x.get("name").endswith(".parquet")]
+            dataTables = ["".join(os.path.splitext(x.get("name"))[:-1]) for x in listProjectFiles(client, projectId) if x.get("name").endswith(".parquet")]
             with ThreadPoolExecutor(max_workers = 5) as executor:
                 results = executor.map(self._getDataTypes, [projectId] * len(dataTables), dataTables)
             results = list(results)
@@ -490,11 +480,10 @@ class DashboardService:
             shapes (dict): ``{tableName: [rows, cols]}`` from the just-refreshed data.
         """
         try:
-            files = [x.get("name") for x in client.storage.from_("AnalyticsHub").list(path = projectId)]
+            files = [x.get("name") for x in client.storage.from_("AnalyticsHub").list(path = projectId, options = {"search": "metadata.json"})]
             if "metadata.json" not in files:
                 return
-            metadataUrl = os.environ["FILE_URL"].format(projectId = projectId, fileName = "metadata.json").replace(".parquet", "") + f"?cb={int(time.time())}"
-            metadata = json.loads(urlopen(metadataUrl).read())
+            metadata = readJson(projectId, "metadata.json")
             changed = False
             for tableName, shape in shapes.items():
                 if metadata.get(tableName, {}).get("shape") != shape:
@@ -527,9 +516,8 @@ class DashboardService:
             CustomException: For any errors encountered during data extraction or upload.
         """
         try:
-            if "connections.json" in [x.get("name") for x in client.storage.from_("AnalyticsHub").list(path = projectId)]:
-                databaseConnectionsUrl = os.environ["FILE_URL"].format(projectId = projectId, fileName = "connections.json").replace(".parquet", "") + f"?cb={int(time.time())}"
-                databaseConnections = json.loads(urlopen(databaseConnectionsUrl).read())
+            if "connections.json" in [x.get("name") for x in client.storage.from_("AnalyticsHub").list(path = projectId, options = {"search": "connections.json"})]:
+                databaseConnections = readJson(projectId, "connections.json")
             else:
                 return {"status": "SUCCESS"}
             connections = databaseConnections.values()

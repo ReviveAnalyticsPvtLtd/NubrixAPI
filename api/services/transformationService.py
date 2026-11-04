@@ -11,8 +11,10 @@ __all__ = ["TransformationService", "transformationService"]
 
 from api.services.credits.creditTrackingCallback import CreditTrackingCallback
 from utils.exceptionHandler import CustomException
+from utils.initMethods import forget_table
 from api.models import TransformationAgentResponse
-from api.commons import client, updateProjectModifiedAt
+from api.commons import client, tableFileState, updateProjectModifiedAt
+from utils.projectStorage import authHeaders, objectUrl, readJson
 from utils.logger import logger
 from typing import TYPE_CHECKING
 import redis
@@ -20,6 +22,7 @@ import httpx
 import orjson
 import json
 import os
+from api.commons import giveTableNameBack
 
 if TYPE_CHECKING:
     from nubrix.components.transformationAgent import TransformationAgent
@@ -69,8 +72,7 @@ class TransformationService:
 
     def _metadata_url(self, projectId: str) -> str:
         """Build the project metadata URL."""
-        fileUrlTemplate = os.environ["FILE_URL"]
-        return fileUrlTemplate.format(projectId=projectId, fileName="metadata.json").replace(".parquet", "")
+        return objectUrl(projectId, "metadata.json")
 
     def _preview_cache_key(self, projectId: str, transformationId: str, messageId: str, tableName: str) -> str:
         """Return the Redis preview cache key."""
@@ -104,7 +106,7 @@ class TransformationService:
             logger.warning(f"Metadata cache read failed for project {projectId}: {e}")
 
         async with httpx.AsyncClient(timeout=20) as httpClient:
-            response = await httpClient.get(self._metadata_url(projectId))
+            response = await httpClient.get(self._metadata_url(projectId), headers=authHeaders())
             response.raise_for_status()
             metadata = response.json()
 
@@ -140,6 +142,7 @@ class TransformationService:
         projectId: str,
         targetTableName: str,
         currentTransformationId: str | None = None,
+        ignoreOwnClaim: bool = False,
     ) -> None:
         """
         Validate that targetTableName can be created or updated by currentTransformationId.
@@ -147,11 +150,11 @@ class TransformationService:
         Rules:
         - Cannot overwrite a table owned by ANOTHER transformation in this project.
         - Cannot overwrite a base dataset table in metadata.json (uploaded/imported tables).
+        - Cannot overwrite a table file with no key yet, such as an upload still being registered.
         - CAN overwrite its own output table (rewriting versions within the same transformation chat).
-        """
-        import time
-        from urllib.request import urlopen
 
+        ignoreOwnClaim: the caller has just claimed the name, so its own artifact proves nothing.
+        """
         sanitizedTarget = self._sanitizeTableName(targetTableName)
 
         # 1. Fetch all transformations in the project excluding current
@@ -177,37 +180,228 @@ class TransformationService:
                 uiMessage=f"A transformation named '{sanitizedTarget}' already exists in this project. Please use a different name."
             )
 
-        # 2. Find table names owned by ALL transformations in this project (including current)
+        # 2. Find tables written by ALL transformations in this project (including current). Only the
+        # artifact proves that: a draft's own name can belong to an upload. Other rows' names were refused above.
         allTransformations = self.supabase.table("transformations").select("*").eq("project_id", projectId).execute().data or []
         allTransformationTables = set()
         for t in allTransformations:
-            tname = t.get("transformation_name")
-            if tname:
-                allTransformationTables.add(self._sanitizeTableName(tname))
             latest = t.get("latest_approved_artifact")
             if isinstance(latest, dict) and latest.get("table_name"):
                 allTransformationTables.add(self._sanitizeTableName(latest.get("table_name")))
-        if currentTransformationId is None:
-            allTransformationTables.add(sanitizedTarget)
+        if ignoreOwnClaim:
+            # Other rows' names were refused above, so this drops only the caller's own claim.
+            allTransformationTables.discard(sanitizedTarget)
 
         # 3. Check metadata.json to block overwriting base dataset tables
         try:
-            files = self.supabase.storage.from_("AnalyticsHub").list(projectId)
+            files = self.supabase.storage.from_("AnalyticsHub").list(projectId, {"search": "metadata.json"})
             filenames = [x.get("name") for x in files]
             if "metadata.json" in filenames:
-                fileUrl = os.environ["FILE_URL"].format(projectId=projectId, fileName="metadata.json").replace(".parquet", "") + f"?cb={int(time.time())}"
-                metadata = json.loads(urlopen(fileUrl).read())
+                metadata = readJson(projectId, "metadata.json")
                 # If target table exists in metadata.json AND is not owned by ANY transformation workspace, it's a base dataset table!
                 if sanitizedTarget in metadata and sanitizedTarget not in allTransformationTables:
-                    raise CustomException(
-                        ValueError(f"Table '{sanitizedTarget}' is a base dataset and cannot be overwritten."),
-                        statusCode=409,
-                        uiMessage=f"A base dataset named '{sanitizedTarget}' already exists in this project and cannot be overwritten by a transformation."
-                    )
+                    # A key alone proves nothing: earlier transformation deletes left theirs behind.
+                    if self._table_file_exists(projectId, sanitizedTarget):
+                        raise CustomException(
+                            ValueError(f"Table '{sanitizedTarget}' is a base dataset and cannot be overwritten."),
+                            statusCode=409,
+                            uiMessage=f"A base dataset named '{sanitizedTarget}' already exists in this project and cannot be overwritten by a transformation."
+                        )
+            # A load writes its file before its key, and keeps no key if registering it fails.
+            if sanitizedTarget not in allTransformationTables and self._table_file_exists(projectId, sanitizedTarget):
+                raise CustomException(
+                    ValueError(f"Table '{sanitizedTarget}' is already stored in this project."),
+                    statusCode=409,
+                    uiMessage=f"A table named '{sanitizedTarget}' is already stored in this project. Please use a different name."
+                )
         except CustomException:
             raise
         except Exception as e:
-            logger.warning(f"_validate_transformation_table_name metadata check warning for {projectId}/{sanitizedTarget}: {e}")
+            # Refuse rather than skip: a base table this check misses is overwritten on apply.
+            exception = CustomException(e, statusCode=503, uiMessage="We could not check this table name right now. Please try again.")
+            logger.error(exception)
+            raise exception
+
+    def _table_file_exists(self, projectId: str, tableName: str) -> bool:
+        """Check for the exact table file. A search also returns longer names and other casings."""
+        tableFile = f"{tableName}.parquet"
+        tableFiles = self.supabase.storage.from_("AnalyticsHub").list(projectId, {"search": tableFile})
+        return tableFile in [x.get("name") for x in tableFiles]
+
+    def _remove_table_from_metadata(self, projectId: str, tableName: str) -> None:
+        """Drop a deleted table's key from metadata.json. generateMetadata only ever adds keys."""
+        bucket = self.supabase.storage.from_("AnalyticsHub")
+        files = bucket.list(projectId, {"search": "metadata.json"})
+        if "metadata.json" not in [x.get("name") for x in files]:
+            return
+        metadataPath = f"{projectId}/metadata.json"
+        metadata = json.loads(bucket.download(metadataPath))
+        if tableName not in metadata:
+            return
+        metadata.pop(tableName)
+        bucket.upload(
+            path=metadataPath,
+            file=json.dumps(metadata, indent=4).encode("utf-8"),
+            file_options={"upsert": "true"},
+        )
+
+    def _remove_table_if_unchanged(self, projectId: str, transformationId: str, artifact: dict) -> None:
+        """Remove the table this transformation's artifact names, unless it is no longer this transformation's.
+
+        The claim is released first, filtered on the name read. If no row comes back, a load released it first,
+        so the file under that name is the load's and nothing is removed. Otherwise the file, then its key, then
+        the caches go, each safe to repeat. A file that differs from the recorded `table_file` was written since,
+        so it is kept with its key and only the caches are cleared. With no file left, the key and caches still
+        go, so a retry finishes. An artifact with no `table_file` (applied before files were recorded, or the
+        record failed) has its table removed as before. No lock is held: a load that writes between the file
+        check and the remove still loses its upload, and storage has no delete that is conditional on the file.
+
+        If a step after the release fails, the claim is given back while the file is still the recorded one, or
+        gone, so a retry removes the rest. With no record it goes back only once the file is gone: a file there
+        could be an upload that landed after the release. Otherwise a retry keeps the file as an ordinary table,
+        which deleteTable can still remove.
+        """
+        tableName = artifact["table_name"]
+        recorded = artifact.get("table_file")
+        released = self.supabase.table("transformations").update({"latest_approved_artifact": None}).eq("project_id", projectId).eq("transformation_id", transformationId).eq("latest_approved_artifact->>table_name", tableName).execute().data
+        if not released:
+            return
+        # With a record, the file on the remove path is that record or gone; with none, only gone counts.
+        ownFiles = (recorded, None)
+        try:
+            current = tableFileState(self.supabase, projectId, tableName)
+            if current is not None and recorded is not None and current != recorded:
+                forget_table(projectId, tableName)
+                return
+            if current is not None:
+                self.supabase.storage.from_("AnalyticsHub").remove([f"{projectId}/{tableName}.parquet"])
+            self._remove_table_from_metadata(projectId, tableName)
+            forget_table(projectId, tableName)
+        except Exception:
+            giveTableNameBack(self.supabase, projectId, transformationId, tableName, artifact, ownFiles)
+            raise
+
+    def _claim_table_name(self, projectId: str, transformationId: str, tableName: str) -> tuple[bool, dict | None]:
+        """Check the name and claim it for this row, straight before its table is written.
+
+        A load releases every claim on a name it accepts, so a claim gone by the second check means
+        a load is writing that table. The second check also catches a file written since the first.
+        The claim is written only over the artifact read here, so a claim a load released since is not put back.
+        A claim on the same name keeps the recorded `table_file`: until this write lands the file is still that
+        one, and once it lands the file differs from the record, which only ever stops a give-back or a remove.
+
+        Returns whether the row already owned the name, and its artifact before the claim.
+        """
+        row = self._ensure_transformation(projectId=projectId, transformationId=transformationId)
+        priorArtifact = row.get("latest_approved_artifact") if isinstance(row.get("latest_approved_artifact"), dict) else None
+        priorTable = (priorArtifact or {}).get("table_name")
+        ownedBefore = priorTable == tableName
+        self._validate_transformation_table_name(projectId=projectId, targetTableName=tableName, currentTransformationId=transformationId)
+
+        claimed = stillClaimed = False
+        try:
+            claim = self.supabase.table("transformations").update({
+                "latest_approved_artifact": {
+                    **{key: value for key, value in (priorArtifact or {}).items() if ownedBefore or key != "table_file"},
+                    "table_name": tableName,
+                },
+            }).eq("transformation_id", transformationId)
+            if priorTable:
+                claim = claim.eq("latest_approved_artifact->>table_name", priorTable)
+            else:
+                claim = claim.is_("latest_approved_artifact->>table_name", "null")
+            claimed = bool(claim.execute().data)
+            stillClaimed = claimed and bool(
+                self.supabase.table("transformations").select("transformation_id")
+                .eq("transformation_id", transformationId)
+                .eq("latest_approved_artifact->>table_name", tableName)
+                .execute().data
+            )
+            if stillClaimed:
+                self._validate_transformation_table_name(
+                    projectId=projectId,
+                    targetTableName=tableName,
+                    currentTransformationId=transformationId,
+                    ignoreOwnClaim=not ownedBefore,
+                )
+        except Exception as e:
+            if claimed:
+                self._restore_artifact(transformationId, tableName, priorArtifact)
+            if isinstance(e, CustomException):
+                raise
+            exception = CustomException(e, statusCode=503, uiMessage="We could not check this table name right now. Please try again.")
+            logger.error(exception)
+            raise exception
+        if not stillClaimed:
+            raise CustomException(
+                ValueError(f"Table '{tableName}' was taken by a load before it was written."),
+                statusCode=409,
+                uiMessage=f"A table named '{tableName}' was just added to this project. Please use a different name."
+            )
+        return ownedBefore, priorArtifact
+
+    def _write_claimed_table(self, projectId: str, transformationId: str, tableName: str, parquetBytes: bytes) -> None:
+        """Claim the name, then write the table. Only a row that already owned the name may replace a file,
+        so an upload that lands between the last check and a first write is kept, and this answers 409.
+        """
+        ownedBefore, priorArtifact = self._claim_table_name(projectId, transformationId, tableName)
+        try:
+            self.executor.apply(projectId=projectId, parquetBytes=parquetBytes, tableName=tableName, overwrite=ownedBefore)
+        except CustomException as e:
+            if e.statusCode == 409:
+                self._restore_artifact(transformationId, tableName, priorArtifact)
+            raise
+
+    def _restore_artifact(self, transformationId: str, tableName: str, priorArtifact: dict | None) -> None:
+        """Undo a claim this row made, unless something has replaced it since."""
+        try:
+            self.supabase.table("transformations").update({"latest_approved_artifact": priorArtifact}).eq("transformation_id", transformationId).eq("latest_approved_artifact->>table_name", tableName).execute()
+        except Exception as e:
+            logger.error(f"Could not undo the claim on '{tableName}' for transformation {transformationId}: {e}")
+
+    def _record_applied_artifact(self, projectId: str, transformationId: str, latestArtifact: dict, parquetBytes: bytes) -> None:
+        """Point the row at the table it just wrote, unless a load has taken the name meanwhile.
+
+        It also records the file storage now holds, so a failed load gives the name back only while that file is
+        unchanged. A load that wrote first releases the name after its write, which clears this record with it.
+
+        A load that took the name and wrote nothing leaves this row with no claim. The row then takes the name back
+        onto its own file, as a failed load gives one back: only while storage reports this write's content (an
+        MD5 eTag of parquetBytes) and the file is unchanged since it was read, only onto a row with no artifact,
+        and released again if the file changes as it does. A load that wrote meanwhile changed the content, so its
+        upload is never taken. Storage that reports no such eTag, as for a multipart upload, gets the 409.
+        """
+        tableName = latestArtifact["table_name"]
+        try:
+            fileState = tableFileState(self.supabase, projectId, tableName)
+        except Exception as e:
+            fileState = None
+            logger.warning(f"Could not record the file for '{tableName}'; a failed load gives the name back only while no load has written it since: {e}")
+        if fileState:
+            latestArtifact = {**latestArtifact, "table_file": fileState}
+        try:
+            updated = self.supabase.table("transformations").update({
+                "latest_approved_artifact": latestArtifact,
+            }).eq("transformation_id", transformationId).eq("latest_approved_artifact->>table_name", tableName).execute().data
+        except Exception as e:
+            # The table is written and still claimed by this row, so applying again is safe.
+            exception = CustomException(e, statusCode=503, uiMessage="We could not finish saving this table. Please try again.")
+            logger.error(exception)
+            raise exception
+        if not updated and fileState and self._holds_written_content(fileState, parquetBytes):
+            updated = giveTableNameBack(self.supabase, projectId, transformationId, tableName, latestArtifact, (fileState,))
+        if not updated:
+            raise CustomException(
+                ValueError(f"Table '{tableName}' was taken by a load while it was written."),
+                statusCode=409,
+                uiMessage=f"A table named '{tableName}' was just added to this project. Please use a different name."
+            )
+
+    @staticmethod
+    def _holds_written_content(fileState: dict, parquetBytes: bytes) -> bool:
+        """Whether storage reports parquetBytes as the file's content: a single-part upload's eTag is its MD5."""
+        import hashlib
+        return str(fileState.get("eTag") or "").strip('"') == hashlib.md5(parquetBytes).hexdigest()
 
     def _get_messages_from_db(self, projectId: str, transformationId: str) -> list[dict]:
         """Load messages list directly from transformations table."""
@@ -323,7 +517,14 @@ class TransformationService:
                 .order("created_at", desc=True)
                 .execute()
             )
-            return response.data or []
+            # table_file is the server's record of storage's file, for name ownership; the browser has no use for it.
+            listed = []
+            for row in response.data or []:
+                artifact = row.get("latest_approved_artifact")
+                if isinstance(artifact, dict) and "table_file" in artifact:
+                    row = {**row, "latest_approved_artifact": {key: value for key, value in artifact.items() if key != "table_file"}}
+                listed.append(row)
+            return listed
         except Exception as e:
             exception = CustomException(e, statusCode=400, uiMessage="Failed to list transformations.")
             logger.error(exception)
@@ -550,19 +751,13 @@ class TransformationService:
                     tableName=newTransformedTableName,
                 )
 
-            self.executor.apply(
-                projectId=projectId,
-                parquetBytes=parquetBytes,
-                tableName=newTransformedTableName,
-            )
-            latestArtifact = {
+            # Checked here, not at approve: an upload can take the name while the code runs.
+            self._write_claimed_table(projectId, transformationId, newTransformedTableName, parquetBytes)
+            self._record_applied_artifact(projectId, transformationId, {
                 "mermaid_code": artifact.get("code"),
                 "message_id": messageId,
                 "table_name": newTransformedTableName,
-            }
-            self.supabase.table("transformations").update({
-                "latest_approved_artifact": latestArtifact,
-            }).eq("transformation_id", transformationId).execute()
+            }, parquetBytes)
 
             artifact["is_approved"] = True
             target_msg["artifact"] = artifact
@@ -643,35 +838,34 @@ class TransformationService:
                     pythonCode=pythonCode,
                     tableName=newTransformedTableName,
                 )
-                self.executor.apply(
-                    projectId=projectId,
-                    parquetBytes=parquetBytes,
-                    tableName=newTransformedTableName,
-                )
+                # The table may have been deleted and its name taken since that checkpoint was applied.
+                self._write_claimed_table(projectId, transformationId, newTransformedTableName, parquetBytes)
                 
                 # Update latest approved artifact to point to this checkpoint
-                latestArtifact = {
+                self._record_applied_artifact(projectId, transformationId, {
                     "mermaid_code": (lastApprovedMsg.get("artifact") or {}).get("code"),
                     "message_id": lastApprovedMsg.get("message_id"),
                     "table_name": newTransformedTableName,
-                }
-                self.supabase.table("transformations").update({
-                    "latest_approved_artifact": latestArtifact,
-                }).eq("transformation_id", transformationId).execute()
+                }, parquetBytes)
                 
                 # Keep the approved checkpoint's status intact
                 approvedArtifact = lastApprovedMsg.get("artifact") or {}
                 approvedArtifact["is_approved"] = True
                 lastApprovedMsg["artifact"] = approvedArtifact
             else:
-                # No approved transformation exists in truncated history — clean slate
-                logger.info(f"Rolling back to pre-transformation state. Deleting table '{newTransformedTableName}' if exists.")
-                try:
-                    storagePath = f"{projectId}/{newTransformedTableName}.parquet"
-                    self.supabase.storage.from_("AnalyticsHub").remove(storagePath)
-                except Exception as e:
-                    logger.warning(f"Could not remove rolled-back table file: {e}")
-                
+                # No approved transformation exists in truncated history — clean slate.
+                # Only the table the artifact names is this row's; a file under its name without one is an upload.
+                latestApproved = row.get("latest_approved_artifact")
+                appliedTable = latestApproved.get("table_name") if isinstance(latestApproved, dict) else None
+                if appliedTable:
+                    logger.info(f"Rolling back to pre-transformation state. Deleting table '{appliedTable}'.")
+                    try:
+                        self._remove_table_if_unchanged(projectId, transformationId, latestApproved)
+                    except Exception as e:
+                        exception = CustomException(e, statusCode=503, uiMessage="We could not roll back this transformation right now. Please try again.")
+                        logger.error(exception)
+                        raise exception
+
                 self.supabase.table("transformations").update({
                     "latest_approved_artifact": None,
                 }).eq("transformation_id", transformationId).execute()
@@ -771,31 +965,34 @@ class TransformationService:
         try:
             # 1. Fetch transformation to find the associated table name
             row = self._ensure_transformation(projectId=projectId, transformationId=transformationId)
-            tableName = None
+            appliedTable = None
             latest_approved = row.get("latest_approved_artifact")
             if latest_approved and isinstance(latest_approved, dict):
-                tableName = latest_approved.get("table_name")
-            if not tableName:
-                transformationName = row.get("transformation_name")
-                tableName = self._sanitizeTableName(transformationName if transformationName else "table")
+                appliedTable = latest_approved.get("table_name")
+            transformationName = row.get("transformation_name")
+            tableName = self._sanitizeTableName(transformationName if transformationName else "table")
 
-            # 2. Delete the transformation row from database
-            self.supabase.table("transformations").delete().eq("project_id", projectId).eq("transformation_id", transformationId).execute()
-
-            # 3. Delete parquet file from storage if exists
-            if tableName:
-                try:
-                    storagePath = f"{projectId}/{tableName}.parquet"
-                    self.supabase.storage.from_("AnalyticsHub").remove(storagePath)
-                except Exception as e:
-                    logger.warning(f"Could not remove transformation table file during deletion: {e}")
-
-            # 4. Regenerate project metadata so the deleted table is no longer registered in metadata.json
+            # 2. Remove the table from storage, metadata.json and the caches. Each step is safe to
+            # repeat, and the row goes last: a failure here keeps it, so the delete can be retried.
             try:
-                from api.services.managementService import managementService
-                managementService.generateMetadata(projectId=projectId, userId=userId)
+                if appliedTable:
+                    self._remove_table_if_unchanged(projectId, transformationId, latest_approved)
+                # With no artifact the row owns no file: one under its name is an upload, so leave its key.
+                elif not self._table_file_exists(projectId, tableName):
+                    self._remove_table_from_metadata(projectId, tableName)
+                    forget_table(projectId, tableName)
             except Exception as e:
-                logger.warning(f"Failed to generate metadata after deleting transformation: {e}")
+                exception = CustomException(e, statusCode=503, uiMessage="We could not delete this transformation right now. Please try again.")
+                logger.error(exception)
+                raise exception
+
+            # 3. Delete the transformation row from database
+            try:
+                self.supabase.table("transformations").delete().eq("project_id", projectId).eq("transformation_id", transformationId).execute()
+            except Exception as e:
+                exception = CustomException(e, statusCode=503, uiMessage="We could not delete this transformation right now. Please try again.")
+                logger.error(exception)
+                raise exception
 
             updateProjectModifiedAt(projectId)
             return {"status": "200", "message": "Transformation deleted successfully."}

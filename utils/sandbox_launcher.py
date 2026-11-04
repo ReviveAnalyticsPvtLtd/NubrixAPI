@@ -15,6 +15,9 @@ def main():
 
     # 2. Setup data fetchers and sanitize imports
     from utils.initMethods import fetch_data, fetch_data_pl, scan_data, serializer
+    from utils.sandboxRunner import enterSandbox
+
+    enterSandbox(input_data["channel"])
 
     def safe_fetch_data(targetProjectId, tableName, *args, **kwargs):
         if targetProjectId != projectId:
@@ -31,9 +34,8 @@ def main():
             raise PermissionError(f"Access denied: You can only query data for project '{projectId}' (requested '{targetProjectId}').")
         return scan_data(targetProjectId, tableName, *args, **kwargs)
 
-    # 3. Environment is NOT cleared — fetch_data* needs REDIS/SUPABASE env vars
-    # at call time. Security is enforced via safe builtins (no open, no __import__
-    # except whitelist, no subprocess access).
+    # 3. The parent reads tables for this process, so it holds no credentials. Safe
+    # builtins below only catch mistakes: pandas and NumPy expose os and file reads.
 
     # 4. Define safe builtins — allow __import__ for whitelisted modules only
     _ALLOWED_MODULES = frozenset({

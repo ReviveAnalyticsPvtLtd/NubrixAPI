@@ -21,10 +21,9 @@ import pandas as pd
 import hashlib
 import json
 import uuid
-import time
 import os
 import io
-from urllib.request import urlopen
+from utils.projectStorage import readJson
 
 VALID_INSIGHT_STATUSES = {"new", "accepted", "rejected", "implemented"}
 
@@ -132,9 +131,13 @@ class UtilityService:
             payloadText = self.payloadBuilder.build(context)
             cacheKey = self._computeCacheKey(imageToInsights.pageId, payloadText)
 
+            # Read even on refresh: a failed read should stop here, before the model
+            # is charged for a result that could not be saved.
+            existingRecords = self._loadDashboardInsightsFile(imageToInsights.projectId)
+
             if not imageToInsights.refresh:
                 cachedRecord = self._findCachedRecord(
-                    records=self._loadDashboardInsightsFile(imageToInsights.projectId),
+                    records=existingRecords,
                     pageId=imageToInsights.pageId,
                     cacheKey=cacheKey,
                 )
@@ -280,18 +283,26 @@ class UtilityService:
         """
         Loads dashboardInsights.json from Supabase storage.
 
+        The file is rewritten whole on every change, so a failed read must never
+        look like an empty file: that would erase every other page's records.
+
         Returns:
             list: Existing insight records, or empty list if file does not exist.
+
+        Raises:
+            Exception: If the file cannot be listed, read, or parsed as a list.
         """
         try:
-            files = self.client.storage.from_("AnalyticsHub").list(path=projectId)
+            files = self.client.storage.from_("AnalyticsHub").list(path=projectId, options={"search": "dashboardInsights.json"})
             if "dashboardInsights.json" not in [x.get("name") for x in files]:
                 return []
-            fileUrl = os.environ["FILE_URL"].format(projectId=projectId, fileName="dashboardInsights.json").replace(".parquet", "") + f"?cb={int(time.time())}"
-            data = json.loads(urlopen(fileUrl).read())
-            return data if isinstance(data, list) else []
-        except Exception:
-            return []
+            data = readJson(projectId, "dashboardInsights.json")
+            if not isinstance(data, list):
+                raise ValueError("dashboardInsights.json does not hold a list of records.")
+            return data
+        except Exception as e:
+            logger.error(f"Failed to read dashboardInsights.json for project {projectId}: {e}")
+            raise
 
     def getDashboardInsights(self, projectId: str) -> list:
         """
@@ -359,9 +370,12 @@ class UtilityService:
             logger.error(exception)
             raise exception
         
-    def sendForecasts(self) -> AsyncResult:
+    def sendForecasts(self, taskId: str) -> AsyncResult:
         """
         Sends a task to generate forecasts asynchronously using Celery.
+
+        Args:
+            taskId (str): The task ID, from issueTaskId for the user starting the task.
 
         Returns:
             AsyncResult: The result object for the Celery task.
@@ -369,7 +383,7 @@ class UtilityService:
             CustomException: If the task submission fails.
         """
         try:
-            return celeryApp.send_task("NubrixAI.generateForecasts")
+            return celeryApp.send_task("NubrixAI.generateForecasts", task_id=taskId)
         except Exception as e:
             exception  = CustomException(e)
             logger.error(exception)

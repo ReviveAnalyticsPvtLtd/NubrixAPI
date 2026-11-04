@@ -21,7 +21,7 @@ This file documents changes made to the NubrixAI Analytics Hub API codebase.
 - **`scan_data(projectId, "table")`**: Returns `pl.LazyFrame` for predicate/projection pushdown.
 - **`fetch_data()`**: Still returns `pd.DataFrame` (backward compat).
 - **Redis cache**: Arrow IPC bytes (smaller than parquet, faster deserialize).
-- **Cold path**: `httpx.get(url)` + `pq.read_table(BytesIO)` — PyArrow can't read HTTPS directly.
+- **Cold path**: `readTableBytes` (authenticated `httpx.get`) + `pq.read_table(BytesIO)` — PyArrow can't read HTTPS directly.
 - **Filter translation**: `_translate_to_pyarrow_filter()` maps filter dicts to PyArrow compute expressions.
 - **Size classification**: `classify_table_size(projectId, table)` buckets tables as `small|medium|large|massive` using cached Arrow `num_rows` (O(1)).
   - Buckets: `<10k=small`, `10k-100k=medium`, `100k-1M=large`, `>1M=massive`.
@@ -32,20 +32,21 @@ This file documents changes made to the NubrixAI Analytics Hub API codebase.
 ### 2. Subprocess Sandbox — Code Execution (`utils/codeExecutor.py`, `utils/sandbox_launcher.py`)
 
 - **Subprocess-based**: LLM-generated code runs in a fresh subprocess (`subprocess.Popen` with `close_fds=True`). No fork, no inherited Redis/HTTP sockets, no deadlock.
-- **No RLIMIT caps**: `RLIMIT_AS` / `RLIMIT_CPU` removed — they crashed polars import in containers. Isolation is via subprocess + restricted builtins.
-- **Restricted builtins**: `__import__` whitelisted to `polars`, `json`, `math`, `datetime`, `numpy`, `pandas`, etc. No `open`, `subprocess`, `os`.
-- **Project-scoped fetchers**: `safe_fetch_data` / `safe_fetch_data_pl` / `safe_scan_data` reject cross-tenant access.
+- **No RLIMIT caps**: `RLIMIT_AS` / `RLIMIT_CPU` removed — they crashed polars import in containers. Isolation is a separate uid per run and a child that holds no credentials.
+- **Restricted builtins**: `__import__` whitelisted to `polars`, `json`, `math`, `datetime`, `numpy`, `pandas`, etc. No `open`, `subprocess`, `os`. These only catch mistakes: pandas and NumPy expose `os`, file reads and HTTP reads.
+- **Project-scoped fetchers**: `safe_fetch_data` / `safe_fetch_data_pl` / `safe_scan_data` give a clear error for another project. The boundary is the parent, which reads tables for the child over a private socket (`utils/sandboxRunner.py`).
 - **Timeout**: Configurable via `CODE_EXEC_TIMEOUT_SECONDS` env (default `0` = no timeout). Set to N to re-enable N-second cap.
 - **Concurrency**: Soft per-project Redis ZSET semaphore (default 50/project).
 
 ### 3. Subprocess Transformation Executor (`nubrix/components/transformationExecutor.py`, `utils/transform_launcher.py`, `utils/inspect_launcher.py`)
 
 - **Subprocess-based**: Transformation code runs in a fresh subprocess (same `close_fds=True` pattern). Replaced multiprocessing fork which deadlocked on inherited Redis sockets.
-- **Temp-file IPC**: Child writes `final_df` as parquet to a temp file; parent reads it. No multiprocessing Queue pickle overhead.
-- **Polars preview**: `executeAndPreview` uses `pl.read_parquet(...).head(100).to_dicts()` — only loads 100 rows, not full table.
+- **Temp-file IPC**: Child writes `final_df` as parquet to a file in its run folder; parent reads it. No multiprocessing Queue pickle overhead.
+- **Polars preview**: `transform_launcher.py` writes the first 100 rows as JSON, and `executeAndPreview` only reads that — the parent never decodes a result.
 - **Accepts**: `pl.LazyFrame` (auto-collects), `pl.DataFrame` (via `.to_arrow()`), `pd.DataFrame` (via `pa.Table.from_pandas`).
 - **Timeout**: Configurable via `TRANSFORMATION_TIMEOUT_SECONDS` env (default `0` = no timeout).
 - **Restricted imports**: Same whitelist as sandbox.
+- **Project-scoped fetchers**: `fetch_data` / `fetch_data_pl` / `scan_data` raise `PermissionError` for any other project, as in the code execution sandbox. Rebinding `projectId` in generated code doesn't change the allowed project, and the parent reads only the project it started the run for.
 
 ### 4. Workflow Auto-Routing (`nubrix/workflows/reportingToolWorkflow.py`, `parallelReportingToolWorkflow.py`)
 
@@ -75,7 +76,7 @@ This file documents changes made to the NubrixAI Analytics Hub API codebase.
 ### 8. Table Viewer Endpoint (`api/routers/manager.py`)
 
 - `GET /viewTable/{projectId}/{tableName}?page=1&pageSize=100`
-- Uses `pl.scan_parquet(url)` — only materializes the requested row range. A 10M-row table returns page 1 as fast as a 1k-row table.
+- Uses `readTablePage` — Range GETs for the parquet footer and the row groups holding the page, decoded batch by batch up to the end of the page. `pl.scan_parquet` can't authenticate on HTTP URLs.
 - Auth via `verifyToken`. Max page size 500.
 - Response includes `rows` + `pagination` (page, pageSize, totalRows, totalPages).
 
@@ -125,11 +126,12 @@ Every table entry in `metadata.json` now has an `isActive` boolean. Inactive tab
 No new table (from data load or transformation) can take a name that already exists in `metadata.json` — active or inactive. Raises `409` with message `"A table named '{tableName}' already exists in this project."`
 
 Called at every entry point where a new table is created:
-- Transformation preview (`transformationService.executeAndPreviewArtifact`) — validated once at preview, not re-validated at apply.
+- Transformations (`transformationService._validate_transformation_table_name`) — checked at approve, then again at apply and rollback straight before the write: `_claim_table_name` claims the name only over the artifact it read, checks again, and a first write never replaces an existing file.
 
-**Carve-out**: `transformationService.approveMessage` skips the check when the transformation's own `latest_approved_artifact.table_name` matches `newTransformedTableName` — i.e., a transformation may re-approve / overwrite its own output. Re-using a name that belongs to a *different* table still raises 409.
+**Carve-out**: a transformation may overwrite the table its own `latest_approved_artifact.table_name` names. Re-using a name that belongs to a *different* table still raises 409. Loads release that claim when they accept the name. A load that fails before writing gives it back only while the file is still the one apply or rollback recorded in the artifact's `table_file` after writing, and releases it again if a re-check finds the file changed. A claim with no `table_file` (applied before files were recorded, or the record failed) is compared instead with the file as the load read it before reading the claims; no file then and none now also counts as unchanged. After every write a load releases the name again (retried, and the load answers 503 if it still fails) and always clears the table's caches. A re-apply under the same name keeps its `table_file` until the new write is recorded. If a load takes the name while an apply or a checkpoint rollback is writing and then writes nothing, the apply takes the name back, but only onto its own file: storage must report the MD5 of the bytes it wrote as the eTag, as single-part uploads do, and the file must be unchanged. Otherwise it answers 409 as before. Delete and rollback to the start release the claim first and remove nothing if a load released it already. They keep a file that differs from `table_file`, and only clear its caches. With no file left they still remove the key and caches. A claim with no `table_file` has its table removed as before. If a later step fails, the claim is given back while the file is still the recorded one or gone (with no record, only once it is gone), so a retry finishes; otherwise the retry keeps the file as an ordinary table, which `deleteTable` removes. A re-apply whose record step fails keeps the old record, so a later delete keeps its new file the same way. No lock is held, and storage has no conditional delete, so a load that writes between the file check and the remove still loses its upload. `listTransformations` does not return `table_file`.
 - CSV upload (`dataLoadService.loadCsvData`)
 - Excel upload (`dataLoadService.loadExcelData`)
+- PDF upload (`dataLoadService.loadPdfData`)
 - MySQL load (`dataLoadService.loadMySql`)
 - PostgreSQL load (`dataLoadService.loadPostgreSQL`)
 - MongoDB load (`dataLoadService.loadMongoDB`)
@@ -145,7 +147,7 @@ These were added during the refactor and then reverted because they broke produc
 | `SupabaseClientProxy` in `commons.py` | Added lazy-init wrapper around `create_client` — unnecessary, direct client works fine |
 | Async auth deps in `commons.py` | Changed `verifyToken` etc. to `async def` — changed behavior, no benefit |
 | Redis session caching in `commons.py` | Could serve stale tokens, added complexity |
-| `verifyProjectOwnership` / `verifyMultipartProjectOwnership` in `commons.py` | Overengineered auth layer — routers use `verifyToken` |
+| `verifyProjectOwnership` / `verifyMultipartProjectOwnership` in `commons.py` | Overengineered auth layer — routers use `verifyToken`. Superseded: every route taking a project ID now calls the one synchronous `requireProjectOwner` check |
 | `requireTenantSlot` / `releaseTenantSlot` in `commons.py` | Per-tenant concurrency caps — could deadlock, unnecessary |
 | CORS `ALLOWED_ORIGINS` env logic in `main.py` | `["*"]` was working fine |
 | `supervisord.conf` split into compute/billing queues | Single celery worker was fine, split added complexity |
@@ -194,4 +196,4 @@ These were added during the refactor and then reverted because they broke produc
 
 ## TL;DR
 
-Polars is the default data engine for LLM-generated code. Sandboxes run in subprocesses with `close_fds=True` (no fork deadlock, no RLIMIT caps). Transformation executor uses subprocess + temp-file IPC + Polars head-only preview. Workflow post-processor auto-routes 1M+ row tables to lazy `scan_data`. `json.dumps` calls normalized to single `default=serializer`. `viewTable` endpoint paginates any table via `pl.scan_parquet`. Active/inactive tables: every metadata entry has `isActive`, all LLM consumers filter to active only, `PATCH /toggleTableActive` toggles state, `validateTableNameAvailable` prevents name collisions at all entry points. Everything else — auth, CORS, Celery, supervisord, Docker, sizing — is original, untouched.
+Polars is the default data engine for LLM-generated code. Sandboxes run in subprocesses with `close_fds=True` (no fork deadlock, no RLIMIT caps). Transformation executor uses subprocess + temp-file IPC + Polars head-only preview. Workflow post-processor auto-routes 1M+ row tables to lazy `scan_data`. `json.dumps` calls normalized to single `default=serializer`. `viewTable` endpoint paginates any table via `readTablePage`. Active/inactive tables: every metadata entry has `isActive`, all LLM consumers filter to active only, `PATCH /toggleTableActive` toggles state, `validateTableNameAvailable` prevents name collisions at all entry points. Everything else — auth, CORS, Celery, supervisord, Docker, sizing — is original, untouched.
