@@ -32,10 +32,10 @@ This file documents changes made to the NubrixAI Analytics Hub API codebase.
 ### 2. Subprocess Sandbox — Code Execution (`utils/codeExecutor.py`, `utils/sandbox_launcher.py`)
 
 - **Subprocess-based**: LLM-generated code runs in a fresh subprocess (`subprocess.Popen` with `close_fds=True`). No fork, no inherited Redis/HTTP sockets, no deadlock.
-- **No RLIMIT caps**: `RLIMIT_AS` / `RLIMIT_CPU` removed — they crashed polars import in containers. Isolation is a separate uid per run and a child that holds no credentials.
+- **Run limits** (AGENTS.md, "Run limits", has the full table and the revert switches): `RLIMIT_AS` stays out (VmPeak was 12 GB on 32 CPUs, so it crashed polars import). The old `RLIMIT_CPU` failure was most likely the CPU time of 32 threads adding up, so it is back at 1200 s with 4 threads. `RLIMIT_DATA` (4 GiB per process) is used together with the thread caps. A watchdog also stops a run over 4 GiB of memory in total, 2 GiB of disk or 10000 files in `work/`. Other limits: 64 processes, 2 GiB per file, first place for the OOM killer, a seccomp filter against network sockets, and 12 concurrent runs per container. Isolation is still a separate uid per run and a child that holds no credentials.
 - **Restricted builtins**: `__import__` whitelisted to `polars`, `json`, `math`, `datetime`, `numpy`, `pandas`, etc. No `open`, `subprocess`, `os`. These only catch mistakes: pandas and NumPy expose `os`, file reads and HTTP reads.
 - **Project-scoped fetchers**: `safe_fetch_data` / `safe_fetch_data_pl` / `safe_scan_data` give a clear error for another project. The boundary is the parent, which reads tables for the child over a private socket (`utils/sandboxRunner.py`).
-- **Timeout**: Configurable via `CODE_EXEC_TIMEOUT_SECONDS` env (default `0` = no timeout). Set to N to re-enable N-second cap.
+- **Timeout**: `CODE_EXEC_TIMEOUT_SECONDS` env, 300 seconds when unset; `0` = no timeout.
 - **Concurrency**: Soft per-project Redis ZSET semaphore (default 50/project).
 
 ### 3. Subprocess Transformation Executor (`nubrix/components/transformationExecutor.py`, `utils/transform_launcher.py`, `utils/inspect_launcher.py`)
@@ -44,7 +44,7 @@ This file documents changes made to the NubrixAI Analytics Hub API codebase.
 - **Temp-file IPC**: Child writes `final_df` as parquet to a file in its run folder; parent reads it. No multiprocessing Queue pickle overhead.
 - **Polars preview**: `transform_launcher.py` writes the first 100 rows as JSON, and `executeAndPreview` only reads that — the parent never decodes a result.
 - **Accepts**: `pl.LazyFrame` (auto-collects), `pl.DataFrame` (via `.to_arrow()`), `pd.DataFrame` (via `pa.Table.from_pandas`).
-- **Timeout**: Configurable via `TRANSFORMATION_TIMEOUT_SECONDS` env (default `0` = no timeout).
+- **Timeout**: `TRANSFORMATION_TIMEOUT_SECONDS` env, 300 seconds when unset; `0` = no timeout.
 - **Restricted imports**: Same whitelist as sandbox.
 - **Project-scoped fetchers**: `fetch_data` / `fetch_data_pl` / `scan_data` raise `PermissionError` for any other project, as in the code execution sandbox. Rebinding `projectId` in generated code doesn't change the allowed project, and the parent reads only the project it started the run for.
 
@@ -195,4 +195,4 @@ These were added during the refactor and then reverted because they broke produc
 
 ## TL;DR
 
-Polars is the default data engine for LLM-generated code. Sandboxes run in subprocesses with `close_fds=True` (no fork deadlock, no RLIMIT caps). Transformation executor uses subprocess + temp-file IPC + Polars head-only preview. Workflow post-processor auto-routes 1M+ row tables to lazy `scan_data`. `json.dumps` calls normalized to single `default=serializer`. `viewTable` endpoint paginates any table via `readTablePage`. Active/inactive tables: every metadata entry has `isActive`, all LLM consumers filter to active only, `PATCH /toggleTableActive` toggles state, `validateTableNameAvailable` prevents name collisions at all entry points. Everything else — auth, CORS, Celery, supervisord, Docker, sizing — is original, untouched.
+Polars is the default data engine for LLM-generated code. Sandboxes run in subprocesses with `close_fds=True` (no fork deadlock; per-run memory, CPU, process, disk and concurrency limits, see AGENTS.md). Transformation executor uses subprocess + temp-file IPC + Polars head-only preview. Workflow post-processor auto-routes 1M+ row tables to lazy `scan_data`. `json.dumps` calls normalized to single `default=serializer`. `viewTable` endpoint paginates any table via `readTablePage`. Active/inactive tables: every metadata entry has `isActive`, all LLM consumers filter to active only, `PATCH /toggleTableActive` toggles state, `validateTableNameAvailable` prevents name collisions at all entry points. Everything else — auth, CORS, Celery, supervisord, Docker, sizing — is original, untouched.
