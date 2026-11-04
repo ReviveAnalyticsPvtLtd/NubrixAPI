@@ -1,16 +1,28 @@
 """Run limits are read from the environment with safe fallbacks."""
 
 import json
+import os
+import signal
+import subprocess
+import sys
+import threading
+import time
+from concurrent.futures import ThreadPoolExecutor
+from unittest.mock import MagicMock
 
 import pytest
 
 from nubrix.components.transformationExecutor import TransformationExecutor
+from test.test_sandbox_storage_reads import PROJECT, _liveRunUidProcesses, separateUids, storage  # noqa: F401  (fixture)
+from utils import sandboxRunner, sandboxSlots
 from utils.sandboxLimits import (
     RunLimits,
     _formatBytes,
     currentRunLimits,
     defaultTimeoutSeconds,
 )
+from utils.sandboxSlots import SandboxBusyError, acquireRunSlot, releaseRunSlot
+from utils.sandboxWatchdog import RunWatchdog, workUsage
 
 GIB = 1024**3
 
@@ -87,19 +99,23 @@ def test_revertValuesRestoreTodaysLimits(monkeypatch):
         assert getattr(limits, field) == 0, field
 
 
-@pytest.mark.parametrize("bad", ["abc", "-5", "", "1.5"])
+@pytest.mark.parametrize("bad", ["abc", "-5", ""])
 def test_badValueFallsBackToTheDefault(monkeypatch, bad):
-    for name, field in VARIABLES.items():
+    for name in VARIABLES:
         monkeypatch.setenv(name, bad)
     limits = currentRunLimits()
-    if bad == "1.5":
-        # Only the slot wait is fractional; every other number stays an int.
-        assert limits.slotWaitSeconds == 1.5
-        bad_fields = [f for f in DEFAULTS if f != "slotWaitSeconds"]
-    else:
-        bad_fields = list(DEFAULTS)
-    for field in bad_fields:
-        assert getattr(limits, field) == DEFAULTS[field], field
+    for field, expected in DEFAULTS.items():
+        assert getattr(limits, field) == expected, field
+
+
+def test_fractionalValueIsAcceptedOnlyForTheSlotWait(monkeypatch):
+    for name in VARIABLES:
+        monkeypatch.setenv(name, "1.5")
+    limits = currentRunLimits()
+    assert limits.slotWaitSeconds == 1.5
+    for field, expected in DEFAULTS.items():
+        if field != "slotWaitSeconds":
+            assert getattr(limits, field) == expected, field
 
 
 def test_fractionalSlotWaitIsAccepted(monkeypatch):
@@ -141,10 +157,8 @@ def test_formatBytes():
 
 
 
-PROJECT = "11111111-2222-4333-8444-555555555555"
-
-
 def test_runSeesTheThreadCaps(monkeypatch):
+    monkeypatch.setenv("SANDBOX_RUN_THREADS", "2")
     monkeypatch.setenv("POLARS_MAX_THREADS", "32")
     monkeypatch.setenv("OPENBLAS_NUM_THREADS", "32")
     code = (
@@ -153,28 +167,20 @@ def test_runSeesTheThreadCaps(monkeypatch):
         ' env.get("MKL_NUM_THREADS"), env.get("NUMEXPR_MAX_THREADS"))\n'
     )
     output = TransformationExecutor(timeoutSeconds=60).executeInspection(PROJECT, code)
-    assert output.split() == ["4", "4", "4", "4", "4"]
+    assert output.split() == ["2", "2", "2", "2", "2"]
 
 
-def test_arrowPoolsAreCapped():
+def test_arrowPoolsAreCapped(monkeypatch):
+    monkeypatch.setenv("SANDBOX_RUN_THREADS", "2")
     code = (
         'pa = pd.io.common.os.sys.modules["pyarrow"]\n'
         "print(pa.cpu_count(), pa.io_thread_count())\n"
     )
     output = TransformationExecutor(timeoutSeconds=60).executeInspection(PROJECT, code)
-    assert output.split() == ["4", "4"]
+    assert output.split() == ["2", "2"]
 
 
 # Kernel limits in a real run. They apply to a run uid on Linux, so these need a root parent.
-import os
-import signal
-import threading
-import time
-
-from nubrix.components.transformationExecutor import TransformationExecutor
-from test.test_sandbox_storage_reads import PROJECT, separateUids, storage  # noqa: F401  (fixture)
-from utils import sandboxRunner
-
 READ_STATUS = (
     'os = pd.io.common.os\n'
     'fd = os.open("/proc/self/status", os.O_RDONLY)\n'
@@ -289,21 +295,50 @@ def test_runIsFirstInLineForTheOomKiller(storage):
     assert "1000" in output
 
 
+LIMITS_FILE = (
+    'os = pd.io.common.os\n'
+    'fd = os.open("/proc/self/limits", os.O_RDONLY)\n'
+    'text = os.read(fd, 65536).decode()\n'
+    'os.close(fd)\n'
+    'rows = {}\n'
+    'for line in text.splitlines()[1:]:\n'
+    '    rows[line[:25].strip()] = line[25:].split()[:2]\n'
+    'print(*rows["Max data size"], *rows["Max cpu time"])\n'
+)
+
+
+@separateUids
+def test_runGetsTheDataAndCpuLimitsItWasGiven(storage, monkeypatch):
+    monkeypatch.setenv("SANDBOX_MAX_PROCESS_MEMORY_BYTES", str(1 << 30))
+    monkeypatch.setenv("SANDBOX_MAX_CPU_SECONDS", "100")
+
+    output = TransformationExecutor(timeoutSeconds=120).executeInspection(PROJECT, LIMITS_FILE)
+
+    assert output.split() == [str(1 << 30), str(1 << 30), "100", "110"]
+
+
+@separateUids
+def test_zeroMeansTheDataAndCpuLimitsAreNotSet(storage, monkeypatch):
+    monkeypatch.setenv("SANDBOX_MAX_PROCESS_MEMORY_BYTES", "0")
+    monkeypatch.setenv("SANDBOX_MAX_CPU_SECONDS", "0")
+
+    output = TransformationExecutor(timeoutSeconds=120).executeInspection(PROJECT, LIMITS_FILE)
+
+    assert output.split() == ["unlimited"] * 4
+
+
 @separateUids
 def test_honestWorkloadFinishesUnderDefaultLimits(storage):
     code = HONEST_WORKLOAD + READ_STATUS + 'print("Threads", fields["Threads"], "VmHWM", fields["VmHWM"])\n'
 
     output = TransformationExecutor(timeoutSeconds=300).executeInspection(PROJECT, code)
 
-    print(output)
     assert "rows" in output and "Threads" in output, output
     threads = int(output.split("Threads")[1].split()[0])
     assert threads <= 32
 
 
 # The watchdog: measuring a run and stopping it when it passes a limit.
-from utils.sandboxWatchdog import RunWatchdog, workUsage
-
 
 @pytest.mark.skipif(os.name != "posix", reason="sparse files and block counts are posix")
 def test_workUsageCountsAllocatedBlocksNotSparseSize(tmp_path):
@@ -366,15 +401,12 @@ def _assertStopped(result, sentence: str, started: float, seconds: float = 10) -
 
 @separateUids
 def test_forksThatAddUpPastTheRunLimitAreStopped(storage, monkeypatch):
-    from test.test_sandbox_storage_reads import _liveRunUidProcesses
-
     monkeypatch.setenv("SANDBOX_MAX_RUN_MEMORY_BYTES", "536870912")
     started = time.time()
 
     result = sandboxRunner.runSandbox("inspect_launcher.py", PROJECT, _forkingCode(300), timeoutSeconds=60)
 
     _assertStopped(result, "used more than 512 MiB of memory", started)
-    print("memory stop latency", time.time() - started)
     assert _liveRunUidProcesses() == []
 
 
@@ -393,7 +425,6 @@ def test_sharedAnonymousMemoryCounts(storage, monkeypatch):
     result = sandboxRunner.runSandbox("inspect_launcher.py", PROJECT, code, timeoutSeconds=60)
 
     _assertStopped(result, "used more than 512 MiB of memory", started)
-    print("shared memory stop latency", time.time() - started)
 
 
 @separateUids
@@ -515,8 +546,6 @@ def test_runThatHidesItsProcessEntryIsStillCheckedForMemoryPriority(storage):
 
 @separateUids
 def test_failedPriorityWriteFailsTheRunClosed(storage, monkeypatch):
-    from test.test_sandbox_storage_reads import _liveRunUidProcesses
-
     runRoot = os.environ["SANDBOX_RUN_ROOT"]
     before = set(os.listdir(runRoot))
 
@@ -617,14 +646,6 @@ def test_previewShowsTheStopMessage(monkeypatch):
 
 
 # Container-wide slot cap.
-import subprocess
-import sys
-from concurrent.futures import ThreadPoolExecutor
-from unittest.mock import MagicMock
-
-from utils import sandboxSlots
-from utils.sandboxSlots import SandboxBusyError, acquireRunSlot, releaseRunSlot
-
 BUSY_COPY = "Too many analyses are running right now. Please try again in a moment."
 flockable = pytest.mark.skipif(sys.platform == "win32", reason="Slots use fcntl.flock, which Windows doesn't have.")
 
@@ -715,9 +736,9 @@ def test_slotsQueueAFanOutInsteadOfRefusingIt(tmp_path):
 
 @flockable
 def test_heldSlotIsNotInheritedByChildren(tmp_path):
-    fd = acquireRunSlot(str(tmp_path), 1, 0)
     import fcntl
 
+    fd = acquireRunSlot(str(tmp_path), 1, 0)
     try:
         assert os.get_inheritable(fd) is False
         assert fcntl.fcntl(fd, fcntl.F_GETFD) & fcntl.FD_CLOEXEC
