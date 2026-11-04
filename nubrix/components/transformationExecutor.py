@@ -25,7 +25,7 @@ from utils.exceptionHandler import CustomException
 from utils.initMethods import fetch_data, fetch_data_pl, scan_data, serializer
 from utils.sandboxLimits import defaultTimeoutSeconds
 from utils.sandboxRunner import runSandbox
-from utils.sandboxSlots import BUSY_MESSAGE, SandboxBusyError
+from utils.sandboxSlots import BUSY_CODE, BUSY_MESSAGE, SandboxBusyError
 from api.commons import client
 from utils.logger import logger
 import multiprocessing as mp
@@ -135,7 +135,10 @@ class TransformationExecutor:
 
     def _execute_code(self, projectId: str, pythonCode: str) -> None:
         """Execute generated code and raise if it fails. A validation run, so nothing it wrote is kept."""
-        self._run_transformation(projectId, pythonCode)
+        try:
+            self._run_transformation(projectId, pythonCode)
+        except SandboxBusyError as e:
+            raise self._busy(e)
 
     def _run_transformation(self, projectId: str, pythonCode: str) -> tuple[list[dict], bytes]:
         """Run transformation code and return the preview rows and the parquet bytes of `final_df`."""
@@ -174,7 +177,7 @@ class TransformationExecutor:
 
     def _busy(self, error: SandboxBusyError) -> CustomException:
         """Every run slot stayed taken: tell the caller to retry."""
-        exception = CustomException(error, statusCode=503, uiMessage=BUSY_MESSAGE, errorCode="SANDBOX_BUSY")
+        exception = CustomException(error, statusCode=503, uiMessage=BUSY_MESSAGE, errorCode=BUSY_CODE)
         logger.error(exception)
         return exception
 

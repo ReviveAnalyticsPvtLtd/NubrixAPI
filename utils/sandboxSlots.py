@@ -12,6 +12,7 @@ from utils.logger import logger
 
 SLOT_POLL_SECONDS = 0.1
 SLOTS_FOLDER = "slots"
+BUSY_CODE = "SANDBOX_BUSY"
 BUSY_MESSAGE = "Too many analyses are running right now. Please try again in a moment."
 
 
@@ -20,6 +21,11 @@ class SandboxBusyError(RuntimeError):
 
     def __init__(self, message: str = BUSY_MESSAGE) -> None:
         super().__init__(message)
+
+
+def isBusy(error: BaseException) -> bool:
+    """True for the busy error itself, or for the 503 an executor made from it."""
+    return isinstance(error, SandboxBusyError) or getattr(error, "errorCode", None) == BUSY_CODE
 
 
 def _slotsFolder(runRoot: str) -> str:
@@ -68,8 +74,12 @@ def acquireRunSlot(runRoot: str | None, maxRuns: int, waitSeconds: float) -> int
             try:
                 fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
                 return fd
-            except OSError:
+            except BlockingIOError:  # Held by another run.
                 os.close(fd)
+            except OSError as e:
+                os.close(fd)
+                logger.error(f"Could not lock sandbox slot {number}: {e}")
+                raise SandboxBusyError() from e
         if time.monotonic() >= deadline:
             raise SandboxBusyError()
         time.sleep(SLOT_POLL_SECONDS)

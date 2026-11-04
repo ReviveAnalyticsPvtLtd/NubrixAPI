@@ -15,7 +15,7 @@ import uuid
 import re
 from api.services.credits.creditService import creditService
 from utils.logger import logger
-from utils.sandboxLimits import defaultTimeoutSeconds
+from utils.sandboxLimits import currentRunLimits, defaultTimeoutSeconds
 from utils.sandboxRunner import runSandbox
 from utils.sandboxSlots import BUSY_MESSAGE, SandboxBusyError
 
@@ -51,15 +51,17 @@ class REPLManager:
         sem_key = f"semaphore:{projectId}"
         slot_id = str(uuid.uuid4())
 
+        # An entry may wait for a run slot as well as run, so it isn't stale before both are over.
+        staleSeconds = self.timeoutSeconds + 60 + currentRunLimits().slotWaitSeconds
         acquired = False
         start_time = time.time()
         while time.time() - start_time < 30.0:
             try:
-                r.zremrangebyscore(sem_key, 0, time.time() - (self.timeoutSeconds + 60))
+                r.zremrangebyscore(sem_key, 0, time.time() - staleSeconds)
                 count = r.zcard(sem_key)
                 if count < self.maxConcurrentPerProject:
                     r.zadd(sem_key, {slot_id: time.time()})
-                    r.expire(sem_key, self.timeoutSeconds + 60)
+                    r.expire(sem_key, int(staleSeconds))
                     acquired = True
                     break
             except Exception as e:

@@ -14,6 +14,7 @@ from langchain_core.messages import AIMessage, BaseMessage, HumanMessage, System
 from langchain_core.tools import tool
 from utils.llm import getGenaiLlm
 from utils.exceptionHandler import CustomException
+from utils.sandboxSlots import isBusy
 from api.models import TransformationAgentResponse
 from nubrix.utils import getConfig, readYaml
 from collections import OrderedDict
@@ -351,6 +352,8 @@ class TransformationAgent:
                             try:
                                 tool_result = inspect_dataset.invoke(args)
                             except Exception as tool_e:
+                                if isBusy(tool_e):  # Not a code failure: stop and tell the caller.
+                                    raise
                                 tool_result = f"Error executing inspection: {tool_e}"
                             messages_list.append(ToolMessage(content=tool_result, tool_call_id=call_id))
                         else:
@@ -395,6 +398,8 @@ class TransformationAgent:
                     logger.info(f"Generated python code executed successfully on attempt {attempt + 1}.")
                     return response
                 except Exception as e:
+                    if isBusy(e):  # Not a code failure: no rewrite, no new attempt.
+                        raise
                     error_msg = str(e)
                     logger.warning(f"Transformation code execution failed on attempt {attempt + 1}: {error_msg}")
                     code_snippet = response.pythonCode[:1500] if response.pythonCode else ""
@@ -428,6 +433,8 @@ class TransformationAgent:
             )
 
         except Exception as e:
+            if isBusy(e):
+                raise
             exception = CustomException(e)
             logger.error(exception)
             raise exception

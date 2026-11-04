@@ -52,7 +52,7 @@ from utils.logger import logger
 from utils.sandbox_reaper import _SHARED_TEMP_FOLDERS
 from utils.sandboxLimits import RunLimits, currentRunLimits
 from utils.sandboxSeccomp import installFilter
-from utils.sandboxSlots import acquireRunSlot, releaseRunSlot
+from utils.sandboxSlots import SLOTS_FOLDER, acquireRunSlot, releaseRunSlot
 from utils.sandboxWatchdog import RunWatchdog
 
 # Below 65536, the range a user namespace normally maps. The same number of uids above
@@ -225,6 +225,8 @@ def _removeRun(runFolder: str, uidIsClear: bool) -> None:
 
 def _sweepRun(runRoot: str, name: str) -> None:
     """Clear one folder of the run root, unless a live worker holds it."""
+    if name == SLOTS_FOLDER:  # The run slots, not a run.
+        return
     runUid = name.removeprefix("sandbox-")
     if not runUid.isdigit() or not _FIRST_RUN_UID <= int(runUid) < _FIRST_RUN_UID + _RUN_UID_COUNT:
         logger.warning(f"Sandbox sweep left {name!r}, which is not a run folder.")

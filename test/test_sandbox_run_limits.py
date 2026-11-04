@@ -632,22 +632,26 @@ flockable = pytest.mark.skipif(sys.platform == "win32", reason="Slots use fcntl.
 @flockable
 def test_slotIsRefusedWhenAllAreHeld(tmp_path):
     held = [acquireRunSlot(str(tmp_path), 2, 0) for _ in range(2)]
-    started = time.monotonic()
-    with pytest.raises(SandboxBusyError, match="Too many analyses"):
-        acquireRunSlot(str(tmp_path), 2, 0.3)
-    assert time.monotonic() - started >= 0.3
-    for fd in held:
-        releaseRunSlot(fd)
+    try:
+        started = time.monotonic()
+        with pytest.raises(SandboxBusyError, match="Too many analyses"):
+            acquireRunSlot(str(tmp_path), 2, 0.3)
+        assert time.monotonic() - started >= 0.3
+    finally:
+        for fd in held:
+            releaseRunSlot(fd)
 
 
 @flockable
 def test_waitOfZeroRefusesAtOnce(tmp_path):
     held = acquireRunSlot(str(tmp_path), 1, 0)
-    started = time.monotonic()
-    with pytest.raises(SandboxBusyError):
-        acquireRunSlot(str(tmp_path), 1, 0)
-    assert time.monotonic() - started < 0.1
-    releaseRunSlot(held)
+    try:
+        started = time.monotonic()
+        with pytest.raises(SandboxBusyError):
+            acquireRunSlot(str(tmp_path), 1, 0)
+        assert time.monotonic() - started < 0.1
+    finally:
+        releaseRunSlot(held)
 
 
 @flockable
@@ -683,23 +687,40 @@ def test_slotIsFreedWhenItsHolderDies(tmp_path):
 
 @flockable
 def test_slotsQueueAFanOutInsteadOfRefusingIt(tmp_path):
+    lock = threading.Lock()
+    inFlight = peak = 0
+
     def one(_):
+        nonlocal inFlight, peak
+        started = time.monotonic()
         fd = acquireRunSlot(str(tmp_path), 12, 5)
+        waited = time.monotonic() - started
+        with lock:
+            inFlight += 1
+            peak = max(peak, inFlight)
         try:
             time.sleep(0.2)
         finally:
+            with lock:
+                inFlight -= 1
             releaseRunSlot(fd)
-        return True
+        return waited
 
     with ThreadPoolExecutor(max_workers=16) as pool:
-        assert list(pool.map(one, range(16))) == [True] * 16
+        waits = list(pool.map(one, range(16)))
+    assert len(waits) == 16
+    assert peak <= 12
+    assert max(waits) >= 0.15  # Some of the 16 had to queue.
 
 
 @flockable
 def test_heldSlotIsNotInheritedByChildren(tmp_path):
     fd = acquireRunSlot(str(tmp_path), 1, 0)
+    import fcntl
+
     try:
         assert os.get_inheritable(fd) is False
+        assert fcntl.fcntl(fd, fcntl.F_GETFD) & fcntl.FD_CLOEXEC
     finally:
         releaseRunSlot(fd)
 
@@ -800,3 +821,91 @@ def test_sweepIgnoresTheSlotsFolder(tmp_path, monkeypatch):
     sandboxRunner.sweepOrphanedRuns()
     clear.assert_not_called()
     assert (tmp_path / "slots" / "0").exists()
+
+
+@flockable
+def test_slotLockErrorOtherThanHeldRefusesAtOnce(tmp_path, monkeypatch):
+    import fcntl
+
+    def broken(*args):
+        raise OSError(5, "I/O error")
+
+    monkeypatch.setattr(fcntl, "flock", broken)
+    started = time.monotonic()
+    with pytest.raises(SandboxBusyError):
+        acquireRunSlot(str(tmp_path), 1, 30)
+    assert time.monotonic() - started < 1
+
+
+# A busy sandbox reaches the caller as a 503, and the agent doesn't treat it as a code failure.
+class _FakeLlm:
+    def __init__(self, calls):
+        self.responses = calls
+        self.calls = 0
+
+    def bind_tools(self, tools):
+        return self
+
+    async def ainvoke(self, messages, config=None):
+        self.calls += 1
+        return self.responses[min(self.calls, len(self.responses)) - 1]
+
+
+def _agentWith(monkeypatch, responses):
+    from langchain_core.messages import AIMessage
+
+    from nubrix.components import transformationExecutor as module
+    from nubrix.components.transformationAgent import TransformationAgent
+    from utils import llm as llmModule
+
+    def busy(*args, **kwargs):
+        raise SandboxBusyError()
+
+    async def noMessages(*args, **kwargs):
+        return []
+
+    monkeypatch.setattr(module, "runSandbox", busy)
+    monkeypatch.setattr(llmModule, "getLangfuseConfig", lambda **kwargs: {})
+    agent = TransformationAgent.__new__(TransformationAgent)
+    agent.systemPrompt = "{metadata} {user_request}"
+    agent.llm = _FakeLlm([AIMessage(content="", tool_calls=[call]) for call in responses])
+    monkeypatch.setattr(agent, "_getMessages", noMessages)
+    return agent
+
+
+def _invoke(agent):
+    import asyncio
+
+    return asyncio.run(agent.invoke("p1", "t1", "sum it", {}, []))
+
+
+def _finalAnswer():
+    return {"name": "TransformationAgentResponse", "id": "c1", "args": {"pythonCode": "final_df = 1", "mermaidCode": "graph TD", "userFacingResponse": "ok"}}
+
+
+def test_busyDuringTheAgentsValidationIsA503AndIsNotRetried(monkeypatch):
+    from utils.exceptionHandler import CustomException
+
+    agent = _agentWith(monkeypatch, [_finalAnswer()])
+    with pytest.raises(CustomException) as caught:
+        _invoke(agent)
+    assert (caught.value.statusCode, caught.value.errorCode, caught.value.uiMessage) == (503, "SANDBOX_BUSY", BUSY_COPY)
+    assert agent.llm.calls == 1
+
+
+def test_busyDuringTheAgentsInspectionIsA503AndIsNotFedToTheModel(monkeypatch):
+    from utils.exceptionHandler import CustomException
+
+    inspect = {"name": "inspect_dataset", "id": "c0", "args": {"pythonCode": "print(1)"}}
+    agent = _agentWith(monkeypatch, [inspect, _finalAnswer()])
+    with pytest.raises(CustomException) as caught:
+        _invoke(agent)
+    assert (caught.value.statusCode, caught.value.errorCode, caught.value.uiMessage) == (503, "SANDBOX_BUSY", BUSY_COPY)
+    assert agent.llm.calls == 1
+
+
+def test_sweepSkipsTheSlotsFolderWithoutAWarning(tmp_path, monkeypatch):
+    warned = MagicMock()
+    monkeypatch.setattr(sandboxRunner.logger, "warning", warned)
+    sandboxRunner._sweepRun(str(tmp_path), "slots")
+    warned.assert_not_called()
