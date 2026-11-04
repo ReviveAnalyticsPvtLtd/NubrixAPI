@@ -12,8 +12,9 @@ that child, so it can write both files itself and exit before the launcher
 does, and neither has to obey the launcher's limits. So the parent only moves a
 result's bytes, because a file can decode to far more than the parent can hold,
 whatever its footer says, and it keeps a preview as rows.
-No hard timeout/SIGKILL is enforced by default; set TRANSFORMATION_TIMEOUT_SECONDS
-env var to re-enable one.
+A run ends after 300 seconds by default (TRANSFORMATION_TIMEOUT_SECONDS=0 turns the
+timeout off), and the sandbox's memory, CPU, disk and process limits apply to it
+(see utils/sandboxLimits.py).
 """
 
 __version__ = "1.1.0"
@@ -144,6 +145,7 @@ class TransformationExecutor:
         """Run transformation code and return the preview rows and the parquet bytes of `final_df`."""
         _, stderr, rc, parquetBytes, previewBytes, stopped = runSandbox("transform_launcher.py", projectId, pythonCode, self.timeoutSeconds, withResult=True)
         if stopped:
+            logger.warning(f"Transformation run for project {projectId} was stopped: {stopped} stderr tail: {(stderr or '')[-2000:]}")
             raise ValueError(stopped)
         if rc != 0:
             raise ValueError(stderr.strip() or "Transformation execution failed.")

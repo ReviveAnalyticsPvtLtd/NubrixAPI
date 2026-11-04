@@ -639,10 +639,14 @@ def test_previewShowsTheStopMessage(monkeypatch):
 
     result = sandboxRunner.SandboxResult(stdout="", stderr="Traceback noise\n" + STOP_MESSAGE, returncode=-9, resultBytes=None, stopped=STOP_MESSAGE)
     monkeypatch.setattr(module, "runSandbox", lambda *args, **kwargs: result)
+    warned = MagicMock()
+    monkeypatch.setattr(module.logger, "warning", warned)
     with pytest.raises(CustomException) as caught:
         TransformationExecutor(timeoutSeconds=5).executeAndPreview("p1", "x = 1", "out")
     assert caught.value.statusCode == 400
     assert caught.value.uiMessage == STOP_MESSAGE
+    logged = " ".join(str(part) for call in warned.call_args_list for part in call.args)
+    assert "p1" in logged and STOP_MESSAGE in logged and "Traceback noise" in logged
 
 
 # Container-wide slot cap.

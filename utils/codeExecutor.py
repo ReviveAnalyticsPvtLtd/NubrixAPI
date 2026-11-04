@@ -2,8 +2,11 @@
 codeExecutor.py — sandboxed subprocess code execution with per-project concurrency lock.
 
 Runs LLM-generated code in an isolated subprocess with stdout/stderr capture.
-Uses a Redis Sorted Set (ZSET) soft concurrency gate per projectId; no hard
-CPU/memory caps (RLIMIT_AS crashes polars import).
+Uses a Redis Sorted Set (ZSET) soft concurrency gate per projectId. Each run
+also gets the sandbox's limits (utils/sandboxLimits.py): a 300 second default
+timeout, caps on threads, processes, memory, CPU, disk and files, and a
+container-wide cap on how many runs go at once. RLIMIT_AS is not used because it
+counts address space that polars reserves without using.
 """
 
 __all__ = ["replManager", "REPLManager", "_remove_code_fences"]
