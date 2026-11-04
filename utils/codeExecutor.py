@@ -78,15 +78,11 @@ class REPLManager:
         launcher_path = os.path.join(os.path.dirname(__file__), "sandbox_launcher.py")
         try:
             app_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+            # Generated code can read its whole environment: pass only what a table read uses.
             inherit_envs = (
                 "PATH", "PYTHONPATH", "HOME", "LANG", "LC_ALL", "TZ",
                 "REDIS_HOST", "REDIS_PORT", "REDIS_PASSWORD", "REDIS_DB",
-                "REDIS_SEMAPHORE_DB", "SUPABASE_URL", "SUPABASE_KEY", "DATABASE_URL",
-                "STORAGE_URL",
-                "GOOGLE_API_KEY", "GEMINI_API_KEY", "GROQ_API_KEY", "CEREBRAS_API_KEY",
-                "OPENAI_API_KEY", "LANGSMITH_API_KEY", "LOGTAIL_SOURCE_TOKEN",
-                "RAZORPAY_KEY_ID", "RAZORPAY_KEY_SECRET", "BREVO_API_KEY",
-                "LANGFUSE_SECRET_KEY", "LANGFUSE_PUBLIC_KEY", "LANGFUSE_HOST",
+                "REDIS_SEMAPHORE_DB", "SUPABASE_URL", "SUPABASE_KEY",
                 "POLARS_MAX_THREADS", "OPENBLAS_NUM_THREADS",
                 "DF_CACHE_MAX_BYTES", "DF_CACHE_MAX_ENTRIES",
             )

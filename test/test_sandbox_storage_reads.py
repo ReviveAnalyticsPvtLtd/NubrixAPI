@@ -26,6 +26,18 @@ READ_EVERY_WAY = (
     f'b = fetch_data_pl("{PROJECT}", "sales")\n'
     f'c = scan_data("{PROJECT}", "sales").collect()\n'
 )
+PARENT_SECRETS = (
+    "DATABASE_URL", "STORAGE_URL",
+    "GOOGLE_API_KEY", "GEMINI_API_KEY", "GROQ_API_KEY", "CEREBRAS_API_KEY", "OPENAI_API_KEY",
+    "RAZORPAY_KEY_ID", "RAZORPAY_KEY_SECRET", "BREVO_API_KEY",
+    "LANGFUSE_SECRET_KEY", "LANGFUSE_PUBLIC_KEY", "LANGFUSE_HOST",
+    "LANGSMITH_API_KEY", "LOGTAIL_SOURCE_TOKEN",
+)
+SECRET_VALUE = "parent-only-secret"
+READ_AND_LIST_SECRETS = READ_EVERY_WAY + (
+    "env = pd.io.common.os.environ\n"
+    f'seen = ",".join(sorted(k for k, v in env.items() if v == "{SECRET_VALUE}"))\n'
+)
 
 
 @pytest.fixture(autouse=True)
@@ -54,6 +66,12 @@ def storage(monkeypatch):
     monkeypatch.setenv("REDIS_PORT", "1")
     yield fake
     fake.close()
+
+
+@pytest.fixture
+def parentSecrets(storage, monkeypatch):
+    for name in PARENT_SECRETS:
+        monkeypatch.setenv(name, SECRET_VALUE)
 
 
 def _assertReadWithTheServiceKey(storage):
@@ -86,6 +104,36 @@ def test_inspectionSandboxReadsTheBucket(storage):
     executor = TransformationExecutor(timeoutSeconds=120)
 
     output = executor.executeInspection(PROJECT, READ_EVERY_WAY + "print(len(a), b.height, c.height)")
+
+    assert output.strip() == "3 3 3"
+    _assertReadWithTheServiceKey(storage)
+
+
+def test_codeExecutionSandboxReadsWithoutTheParentSecrets(storage, parentSecrets, monkeypatch):
+    monkeypatch.setattr(codeExecutor.creditService, "_redis", lambda: MagicMock(zcard=lambda _key: 0))
+    manager = codeExecutor.REPLManager(timeoutSeconds=120)
+
+    output = manager.run(READ_AND_LIST_SECRETS + "print(len(a), b.height, c.height, seen)", projectId=PROJECT)
+
+    assert output.strip() == "3 3 3"
+    _assertReadWithTheServiceKey(storage)
+
+
+def test_transformationSandboxReadsWithoutTheParentSecrets(storage, parentSecrets):
+    executor = TransformationExecutor(timeoutSeconds=120)
+    code = READ_AND_LIST_SECRETS + 'final_df = pd.DataFrame({"rows": [len(a), b.height, c.height], "seen": seen})'
+
+    frame = executor._execute_code(PROJECT, code)
+
+    assert list(frame["rows"]) == [3, 3, 3]
+    assert list(frame["seen"]) == ["", "", ""]
+    _assertReadWithTheServiceKey(storage)
+
+
+def test_inspectionSandboxReadsWithoutTheParentSecrets(storage, parentSecrets):
+    executor = TransformationExecutor(timeoutSeconds=120)
+
+    output = executor.executeInspection(PROJECT, READ_AND_LIST_SECRETS + "print(len(a), b.height, c.height, seen)")
 
     assert output.strip() == "3 3 3"
     _assertReadWithTheServiceKey(storage)
