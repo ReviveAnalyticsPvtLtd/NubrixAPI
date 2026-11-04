@@ -23,6 +23,7 @@ from api.models import SpeechToTextModel, ImageToInsightsModel, UpdateDashboardI
 from fastapi.security import HTTPAuthorizationCredentials
 from api.services.utilityService import utilityService
 from nubrix.triggers.celery import celeryApp
+from api.commons import issueTaskId, sessionOwnsTask
 from fastapi.responses import ORJSONResponse
 from api.commons import verifyToken, verifyUser, requireCredits, requireProjectOwner, UserContext
 import asyncio
@@ -122,18 +123,18 @@ async def updateDashboardInsightStatus(body: UpdateDashboardInsightStatus, user:
         raiseHttpException(e)
 
 @router.get("/sendForecasts")
-async def sendForecasts(token = Depends(verifyToken)):
+async def sendForecasts(user: UserContext = Depends(verifyUser)):
     """
     Send forecasts using the utility service.
 
     Args:
-        token: Authorization token dependency.
+        user: UserContext injected after session verification.
 
     Returns:
         ORJSONResponse: Task ID, trigger name, and task status or error message.
     """
     try:
-        r = utilityService.sendForecasts()
+        r = utilityService.sendForecasts(taskId=issueTaskId(user.userId))
         return ORJSONResponse(status_code = 200, content = {"taskId": r.task_id, "triggerName": "forecast", "taskStatus": r.status})
     except CustomException as e:
         raiseHttpException(e)
@@ -158,9 +159,12 @@ async def getTaskStatus(websocket: WebSocket):
     if not _websocketTokenIsValid(credentials):
         await websocket.close(code = status.WS_1008_POLICY_VIOLATION)
         return
+    taskId = websocket.query_params.get("taskId")
+    if not sessionOwnsTask(token, taskId):
+        await websocket.close(code = status.WS_1008_POLICY_VIOLATION)
+        return
     await websocket.send_json({"status": "RUNNING"})
     try:
-        taskId = websocket.query_params.get("taskId")
         r = celeryApp.AsyncResult(taskId)
         while not r.ready():
             await asyncio.sleep(5)

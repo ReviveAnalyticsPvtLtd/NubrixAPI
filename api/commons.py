@@ -15,9 +15,12 @@ __all__ = [
     "requireTrialOrAbove",
     "requirePaidPlan",
     "requireCredits",
+    "requireWorkspaceOwner",
     "requireProjectOwner",
     "UserContext",
     "updateProjectModifiedAt",
+    "issueTaskId",
+    "sessionOwnsTask",
 ]
 
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
@@ -32,7 +35,10 @@ from utils.exceptionHandler import (
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from fastapi import Depends
+import hashlib
+import hmac
 import os
+import uuid
 
 security = HTTPBearer()
 client = create_client(
@@ -333,6 +339,38 @@ def requireCredits(operationType: str):
     return _dependency
 
 
+def requireWorkspaceOwner(workspaceId: str, user: UserContext) -> None:
+    """
+    Allow only the workspace's owner, with the same responses as
+    requireProjectOwner: someone else's workspace reads as missing, and a
+    failed lookup never falls through.
+    """
+    try:
+        rows = (
+            client.table("Workspaces")
+            .select("ownerId")
+            .eq("id", workspaceId)
+            .limit(1)
+            .execute().data
+        )
+    except Exception as exc:
+        logger.error("Workspace owner lookup failed for workspaceId={}: {}", workspaceId, type(exc).__name__)
+        raiseFeatureGateHttpException(
+            statusCode=status.HTTP_503_SERVICE_UNAVAILABLE,
+            uiMessage="Workspace access could not be verified. Please try again.",
+            backendLogMessage=f"Workspace owner lookup unavailable for workspaceId={workspaceId}",
+            errorCode="WORKSPACE_ACCESS_UNAVAILABLE",
+        )
+    if not rows or rows[0].get("ownerId") != user.userId:
+        logger.warning("Workspace access denied: workspaceId={}, userId={}", workspaceId, user.userId)
+        raiseFeatureGateHttpException(
+            statusCode=status.HTTP_404_NOT_FOUND,
+            uiMessage="Workspace not found.",
+            backendLogMessage=f"Workspace access denied: workspaceId={workspaceId}, userId={user.userId}",
+            errorCode="WORKSPACE_NOT_FOUND",
+        )
+
+
 def requireProjectOwner(projectId: str, user: UserContext) -> None:
     """
     Allow only the project's owner. Someone else's project reads as missing,
@@ -384,3 +422,29 @@ def updateProjectModifiedAt(projectId: str) -> None:
         }).eq("projectId", projectId).execute()
     except Exception as e:
         logger.error(f"Failed to update modifiedAt for project {projectId}: {e}")
+
+
+def _taskSignature(nonce: str, userId: str) -> str:
+    message = f"taskOwner:{nonce}:{userId}".encode()
+    return hmac.new(os.environ["SECRET_KEY"].encode(), message, hashlib.sha256).hexdigest()
+
+
+def issueTaskId(userId: str) -> str:
+    """
+    Build a Celery task ID that is tied to the user who started the task.
+
+    Celery keeps no owner for a task, so the ID carries a signature of it.
+    Nothing is stored, and the ID does not contain the user ID.
+    """
+    nonce = uuid.uuid4().hex
+    return f"{nonce}-{_taskSignature(nonce, userId)}"
+
+
+def sessionOwnsTask(token: str, taskId: str | None) -> bool:
+    """
+    True only for a task issued to this session's user. Scheduled jobs have
+    plain Celery IDs, so no session owns them. Call after verifying the token.
+    """
+    userId = jwt.decode(token, os.environ["SECRET_KEY"], algorithms=["HS256"])["userId"]
+    nonce, _, signature = (taskId or "").partition("-")
+    return hmac.compare_digest(signature.encode(), _taskSignature(nonce, userId).encode())

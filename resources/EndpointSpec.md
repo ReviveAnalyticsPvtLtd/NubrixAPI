@@ -237,6 +237,8 @@ All routes under `/api/latest/projects/`. Auth via `verifyToken` unless otherwis
 
 ### 2.1 `POST /api/latest/projects/createProject`
 
+**Auth:** Required, and `workspaceId` must be a workspace the session's user owns (`404 WORKSPACE_NOT_FOUND` otherwise; `503 WORKSPACE_ACCESS_UNAVAILABLE` when the owner lookup fails).
+
 **Request Body:**
 ```json
 {
@@ -1581,6 +1583,8 @@ the task then fails with an error naming the variable, before it connects.
 ### 10.6 `WS /api/latest/utils/ws/getTaskStatus?token={jwt}&taskId={taskId}`
 
 WebSocket for polling Celery task status. Emits JSON status updates every 5 seconds until the task is ready.
+
+Only the user who started the task can read it. Any other `taskId`, including a scheduled job's, closes with 1008 before a message is sent. Treat the ID as opaque: it comes from `sendForecasts` and is not a plain UUID.
 
 **Connection:**
 ```
