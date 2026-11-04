@@ -526,7 +526,12 @@ def test_dataLayerColdPathReadsWithTheServiceKey(storage, coldDataCache, read, r
 
 
 def _viewTable(tableName="sales", page=1, pageSize=2):
-    return asyncio.run(manager.viewTable(PROJECT, tableName, page=page, pageSize=pageSize, token="session"))
+    original = manager.requireProjectOwner
+    manager.requireProjectOwner = lambda *_args: None
+    try:
+        return asyncio.run(manager.viewTable(PROJECT, tableName, page=page, pageSize=pageSize, user=MagicMock(userId="user_1")))
+    finally:
+        manager.requireProjectOwner = original
 
 
 def test_viewTablePagesAPrivateTable(storage):
