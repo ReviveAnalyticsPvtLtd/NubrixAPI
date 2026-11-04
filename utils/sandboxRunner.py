@@ -86,6 +86,8 @@ _INHERITED_ENV = (
     "PATH", "PYTHONPATH", "LANG", "LC_ALL", "TZ", "SYSTEMROOT",
     "DF_CACHE_MAX_BYTES", "DF_CACHE_MAX_ENTRIES",
 )
+# Passed through only when the thread cap is off; with a cap they are set to it.
+_THREAD_TUNING_ENV = ("POLARS_MAX_THREADS", "OPENBLAS_NUM_THREADS")
 
 
 class SandboxResult(NamedTuple):
@@ -297,6 +299,8 @@ def _startChild(launcherName: str, runUid: int | None, workFolder: str, childEnd
     if limits.threads > 0:
         # Each library sizes its pool when it loads, so the cap has to be in the environment before the child starts.
         env.update(dict.fromkeys(_THREAD_VARIABLES, str(limits.threads)))
+    else:
+        env.update({k: os.environ[k] for k in _THREAD_TUNING_ENV if k in os.environ})
     env.update(HOME=workFolder, TMPDIR=workFolder, USER="sandbox", LOGNAME="sandbox")
     options: dict = {}
     if runUid is not None:
@@ -366,8 +370,8 @@ def _readOutput(output: IO[bytes]) -> str:
 
 
 def _watchRun(proc: subprocess.Popen, runUid: int | None, workFolder: str, limits: RunLimits) -> RunWatchdog | None:
-    """Start the watchdog for a run uid. A development run under the parent's own uid has none."""
-    if runUid is None:
+    """Start the watchdog for a run uid. A development run under the parent's own uid has none, nor has a run whose watched limits are all off."""
+    if runUid is None or not (limits.maxRunMemory or limits.oomScoreAdj or limits.maxDiskBytes or limits.maxFiles):
         return None
     watchdog = RunWatchdog(runUid, workFolder, limits, lambda reason: proc.kill())
     watchdog.start()

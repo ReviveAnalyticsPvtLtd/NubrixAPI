@@ -94,9 +94,11 @@ class RunLimits:
 
 def currentRunLimits(**overrides: Any) -> RunLimits:
     """Read the limits from the environment, then apply keyword overrides."""
+    threads = overrides["threads"] if "threads" in overrides else _readInt("SANDBOX_RUN_THREADS", 4)
     values: dict[str, Any] = {
-        "threads": _readInt("SANDBOX_RUN_THREADS", 4),
-        "maxProcesses": _readInt("SANDBOX_MAX_RUN_PROCESSES", 64),
+        "threads": threads,
+        # With no thread cap, library pools size from the CPU count and each thread counts as a process, so 64 would stop honest runs.
+        "maxProcesses": _readInt("SANDBOX_MAX_RUN_PROCESSES", 1024 if threads == 0 else 64),
         "maxProcessMemory": _readInt("SANDBOX_MAX_PROCESS_MEMORY_BYTES", 4 * _GIB),
         "maxRunMemory": _readInt("SANDBOX_MAX_RUN_MEMORY_BYTES", 4 * _GIB),
         "oomScoreAdj": _readInt("SANDBOX_OOM_SCORE_ADJ", 1000),

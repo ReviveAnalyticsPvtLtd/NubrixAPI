@@ -936,3 +936,76 @@ def test_sweepSkipsTheSlotsFolderWithoutAWarning(tmp_path, monkeypatch):
     monkeypatch.setattr(sandboxRunner.logger, "warning", warned)
     sandboxRunner._sweepRun(str(tmp_path), "slots")
     warned.assert_not_called()
+
+
+# Each limit has to be safe to revert on its own.
+
+def test_processLimitDefaultsTo1024WhenThreadsAreUncapped(monkeypatch):
+    monkeypatch.setenv("SANDBOX_RUN_THREADS", "0")
+    assert currentRunLimits().maxProcesses == 1024
+    assert currentRunLimits(threads=0).maxProcesses == 1024
+    monkeypatch.setenv("SANDBOX_MAX_RUN_PROCESSES", "nope")
+    assert currentRunLimits().maxProcesses == 1024
+
+
+def test_anExplicitProcessLimitAlwaysWins(monkeypatch):
+    monkeypatch.setenv("SANDBOX_RUN_THREADS", "0")
+    monkeypatch.setenv("SANDBOX_MAX_RUN_PROCESSES", "64")
+    assert currentRunLimits().maxProcesses == 64
+    assert currentRunLimits(maxProcesses=7).maxProcesses == 7
+
+
+def test_processLimitStaysAt64WhileThreadsAreCapped(monkeypatch):
+    monkeypatch.setenv("SANDBOX_RUN_THREADS", "4")
+    assert currentRunLimits().maxProcesses == 64
+
+
+def test_childKeepsTheParentsThreadSettingsWhenTheCapIsOff(monkeypatch, tmp_path):
+    import socket
+
+    monkeypatch.setenv("OPENBLAS_NUM_THREADS", "2")
+    monkeypatch.setenv("POLARS_MAX_THREADS", "3")
+    monkeypatch.setenv("OMP_NUM_THREADS", "9")
+    popen = MagicMock()
+    monkeypatch.setattr(sandboxRunner.subprocess, "Popen", popen)
+    left, right = socket.socketpair()
+    with left, right:
+        sandboxRunner._startChild("inspect_launcher.py", None, str(tmp_path), right, MagicMock(), MagicMock(), currentRunLimits(threads=0))
+    env = popen.call_args.kwargs["env"]
+    assert env["OPENBLAS_NUM_THREADS"] == "2"
+    assert env["POLARS_MAX_THREADS"] == "3"
+    assert "OMP_NUM_THREADS" not in env
+
+
+def test_childGetsTheCapNotTheParentsThreadSettingsWhenCapped(monkeypatch, tmp_path):
+    import socket
+
+    monkeypatch.setenv("OPENBLAS_NUM_THREADS", "32")
+    popen = MagicMock()
+    monkeypatch.setattr(sandboxRunner.subprocess, "Popen", popen)
+    left, right = socket.socketpair()
+    with left, right:
+        sandboxRunner._startChild("inspect_launcher.py", None, str(tmp_path), right, MagicMock(), MagicMock(), currentRunLimits(threads=2))
+    assert popen.call_args.kwargs["env"]["OPENBLAS_NUM_THREADS"] == "2"
+
+
+@separateUids
+def test_honestWorkloadFinishesWithTheThreadCapReverted(storage, monkeypatch):
+    monkeypatch.setenv("SANDBOX_RUN_THREADS", "0")
+    code = HONEST_WORKLOAD + LIMITS_FILE + 'print("nproc", rows["Max processes"][0])\n'
+
+    output = TransformationExecutor(timeoutSeconds=300).executeInspection(PROJECT, code)
+
+    assert "rows" in output, output
+    assert "nproc 1024" in output, output
+
+
+def test_noWatchdogStartsWhenItsFourLimitsAreOff(monkeypatch, tmp_path):
+    started = []
+    monkeypatch.setattr(RunWatchdog, "start", lambda self: started.append(self))
+    off = currentRunLimits(maxRunMemory=0, oomScoreAdj=0, maxDiskBytes=0, maxFiles=0)
+    assert sandboxRunner._watchRun(MagicMock(), 70000, str(tmp_path), off) is None
+    assert started == []
+    for field in ("maxRunMemory", "oomScoreAdj", "maxDiskBytes", "maxFiles"):
+        sandboxRunner._watchRun(MagicMock(), 70000, str(tmp_path), currentRunLimits(**{**dict(maxRunMemory=0, oomScoreAdj=0, maxDiskBytes=0, maxFiles=0), field: 1}))
+    assert len(started) == 4
