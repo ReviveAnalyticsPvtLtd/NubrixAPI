@@ -28,7 +28,7 @@ from api.commons import issueTaskId, sessionOwnsTask
 from fastapi.responses import ORJSONResponse
 from api.commons import (
     verifyToken,
-    verifyUser,
+    requireProductAccess,
     requireCredits,
     requireProjectOwner,
     requireTrialOrAbove,
@@ -129,7 +129,7 @@ async def getInsightsFromImage(imageToInsights: ImageToInsightsModel, user: User
         raiseHttpException(e)
 
 @router.get("/getDashboardInsights/{projectId}")
-async def getDashboardInsights(projectId: str, user: UserContext = Depends(verifyUser)):
+async def getDashboardInsights(projectId: str, user: UserContext = Depends(requireProductAccess)):
     """
     Retrieve all persisted dashboard insights for a project.
 
@@ -148,7 +148,7 @@ async def getDashboardInsights(projectId: str, user: UserContext = Depends(verif
         raiseHttpException(e)
 
 @router.patch("/updateDashboardInsightStatus")
-async def updateDashboardInsightStatus(body: UpdateDashboardInsightStatus, user: UserContext = Depends(verifyUser)):
+async def updateDashboardInsightStatus(body: UpdateDashboardInsightStatus, user: UserContext = Depends(requireProductAccess)):
     """
     Update the lifecycle status of a persisted dashboard insight.
 

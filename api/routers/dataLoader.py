@@ -19,7 +19,7 @@ import asyncio
 from fastapi import APIRouter, Depends, UploadFile, File, Form
 from api.services.dataLoadService import dataLoadService
 from fastapi.responses import ORJSONResponse
-from api.commons import verifyUser, requireCredits, requireProjectOwner, UserContext
+from api.commons import requireProductAccess, requireCredits, requireProjectOwner, UserContext
 from typing import Annotated
 
 router = APIRouter()
@@ -151,7 +151,7 @@ async def loadMongoDB(connection: LoadMongoDB, user: UserContext = Depends(requi
         raiseHttpException(e)
 
 @router.delete("/deleteTable")
-async def deleteTable(tableDetails: DeleteTable, user: UserContext = Depends(verifyUser)):
+async def deleteTable(tableDetails: DeleteTable, user: UserContext = Depends(requireProductAccess)):
     """
     Delete a table from the data source.
 

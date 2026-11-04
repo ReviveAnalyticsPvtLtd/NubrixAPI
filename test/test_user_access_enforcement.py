@@ -108,6 +108,7 @@ def successfulAuthenticationService(client):
     }
     service._ensureSubscriptionSnapshot = lambda _userId: subscription
     service._refreshLifecycleSnapshot = lambda _userId, _subscription: 2
+    service._sessionSubscription = lambda _userId, _subscription: {}
     service._getCreditSnapshot = lambda _userId: {
         "monthlyQuota": 100,
         "monthlyUsed": 0,

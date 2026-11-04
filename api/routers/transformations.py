@@ -18,7 +18,7 @@ from utils.exceptionHandler import CustomException, raiseHttpException
 import asyncio
 from fastapi.responses import ORJSONResponse, StreamingResponse
 from fastapi import APIRouter, Depends
-from api.commons import verifyUser, requireActiveSubscription, requireCredits, requireProjectOwner, UserContext
+from api.commons import requireProductAccess, requireActiveSubscription, requireCredits, requireProjectOwner, UserContext
 
 
 router = APIRouter()
@@ -49,7 +49,7 @@ async def createTransformation(
 
 
 @router.get("")
-async def listTransformations(projectId: str, user: UserContext = Depends(verifyUser)):
+async def listTransformations(projectId: str, user: UserContext = Depends(requireProductAccess)):
     """
     List all transformations for a project.
     """
@@ -65,7 +65,7 @@ async def listTransformations(projectId: str, user: UserContext = Depends(verify
 async def getTransformationMessages(
     transformation_id: str,
     projectId: str,
-    user: UserContext = Depends(verifyUser),
+    user: UserContext = Depends(requireProductAccess),
 ):
     """
     Return persisted chat history for a transformation.
@@ -176,7 +176,7 @@ async def renameTransformation(
     transformation_id: str,
     projectId: str,
     request: RenameTransformationRequest,
-    user: UserContext = Depends(verifyUser),
+    user: UserContext = Depends(requireProductAccess),
 ):
     """
     Rename an existing transformation workspace.
@@ -197,7 +197,7 @@ async def renameTransformation(
 async def deleteTransformation(
     transformation_id: str,
     projectId: str,
-    user: UserContext = Depends(verifyUser),
+    user: UserContext = Depends(requireProductAccess),
 ):
     """
     Delete a transformation workspace and its associated parquet file if it exists.

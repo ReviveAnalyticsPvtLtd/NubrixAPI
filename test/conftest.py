@@ -29,6 +29,16 @@ import pytest  # noqa: E402
 
 
 @pytest.fixture(autouse=True)
+def _freshProductAccessCache():
+    """The plan check remembers answers per process; no test may inherit another's."""
+    import sys
+    commons = sys.modules.get("api.commons")
+    if commons is not None and hasattr(commons, "productAccessCache"):
+        commons.productAccessCache.clear()
+    yield
+
+
+@pytest.fixture(autouse=True)
 def _freshPaymentWorkerHeartbeat(request):
     """The recovery/refund worker deploys with the backend and beats every minute; Pay requires it.
 
