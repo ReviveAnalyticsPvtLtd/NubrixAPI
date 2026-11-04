@@ -159,6 +159,22 @@ class AuthenticationService:
             "subscription": subscription,
         }
 
+    def _sessionSubscription(self, userId: str, subscription: dict | None) -> dict:
+        """The plan snapshot /auth/verify returns, so a sign-in needs no second check.
+
+        Reuses the snapshot the unified-phase projection already read, and loads it otherwise.
+        """
+        from api.services.billing.manualBillingPresentation import serializeSubscriptionSnapshot
+        from api.services.subscriptions import subscriptionSnapshotService
+        snapshot = (subscription or {}).get("_subscriptionSnapshot")
+        if snapshot is None:
+            try:
+                snapshot = subscriptionSnapshotService.getSubscriptionSnapshotService().get(userId)
+            except Exception as exc:
+                raise CustomException(exc, statusCode=503, errorCode="SUBSCRIPTION_AUTHORITY_UNAVAILABLE",
+                    uiMessage="Subscription access could not be verified. Please try again.") from exc
+        return serializeSubscriptionSnapshot(snapshot)
+
     def _refreshLifecycleSnapshot(self, userId: str, subscription: dict | None) -> int:
         from api.services.subscriptions.subscriptionCompatibility import usesUnifiedSubscription, refreshSubscriptionProjection
         if usesUnifiedSubscription():
@@ -463,6 +479,7 @@ class AuthenticationService:
                 subscription.get("billing_mode") if subscription else None,
                 subscription.get("status") if subscription else None,
             )
+            sessionSubscription = self._sessionSubscription(dataSlice["userId"], subscription)
             # Compatibility metadata only. Backend authorization loads current
             # entitlement state from subscriptions and must not trust these claims.
             tokenPayload = {
@@ -498,6 +515,7 @@ class AuthenticationService:
                 "subscriptionDaysLeft": subscriptionDaysLeft,
                 "subscriptionPlan": subscriptionPlan,
                     **subscriptionDisplayFacts(subscription),
+                "subscription": sessionSubscription,
                 "profileImage": profileImage,
                 "credits": credits,
             }
@@ -602,6 +620,7 @@ class AuthenticationService:
                     subscription.get("status"),
                 )
 
+            sessionSubscription = self._sessionSubscription(userData["userId"], subscription)
             sessionStartTime = datetime.datetime.now(datetime.timezone.utc)
             expiresAt = sessionStartTime + datetime.timedelta(hours=24)
             # Compatibility metadata only. Backend authorization loads current
@@ -640,6 +659,7 @@ class AuthenticationService:
                 "subscriptionDaysLeft": subscriptionDaysLeft,
                 "subscriptionPlan": subscriptionPlan,
                     **subscriptionDisplayFacts(subscription),
+                "subscription": sessionSubscription,
                 "profileImage": profileImage,
                 "credits": credits,
             }
