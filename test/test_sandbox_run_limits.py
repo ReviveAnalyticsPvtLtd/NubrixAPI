@@ -481,3 +481,71 @@ def test_stopReasonNamesTheLimitThatEndedTheRun(returncode, watchdogReason, time
     limits = currentRunLimits(maxCpuSeconds=7)
 
     assert sandboxRunner._stopReason(returncode, watchdogReason, timeoutNote, limits) == expected
+
+
+HIDE_ENTRY = (
+    'os = pd.io.common.os\n'
+    'ctypes = np.ctypeslib.ctypes\n'
+    'assert ctypes.CDLL(None).prctl(4, 0, 0, 0, 0) == 0\n'  # Not dumpable: the files in the process's /proc folder are then root's.
+    'assert os.stat("/proc/self/status").st_uid == 0\n'
+)
+
+
+@separateUids
+def test_runThatHidesItsProcessEntryIsStillCountedForMemory(storage, monkeypatch):
+    monkeypatch.setenv("SANDBOX_MAX_RUN_MEMORY_BYTES", "536870912")
+    code = HIDE_ENTRY + 'block = np.ones((600 << 20) // 8)\nos.sys.modules["time"].sleep(30)\n'
+    started = time.time()
+
+    result = sandboxRunner.runSandbox("inspect_launcher.py", PROJECT, code, timeoutSeconds=60)
+
+    _assertStopped(result, "used more than 512 MiB of memory", started)
+
+
+@separateUids
+def test_runThatHidesItsProcessEntryIsStillCheckedForMemoryPriority(storage):
+    lower = 'fd = os.open("/proc/self/oom_score_adj", os.O_WRONLY)\nos.write(fd, b"0")\nos.close(fd)\n'
+    code = 'os = pd.io.common.os\n' + lower + HIDE_ENTRY + 'os.sys.modules["time"].sleep(30)\n'
+    started = time.time()
+
+    result = sandboxRunner.runSandbox("inspect_launcher.py", PROJECT, code, timeoutSeconds=60)
+
+    _assertStopped(result, "changed its own memory priority", started)
+
+
+@separateUids
+def test_failedPriorityWriteFailsTheRunClosed(storage, monkeypatch):
+    from test.test_sandbox_storage_reads import _liveRunUidProcesses
+
+    runRoot = os.environ["SANDBOX_RUN_ROOT"]
+    before = set(os.listdir(runRoot))
+
+    def refuse(pid, value):
+        raise PermissionError("refused")
+
+    monkeypatch.setattr(sandboxRunner, "_writeOomAdjustment", refuse)
+
+    with pytest.raises(PermissionError):
+        sandboxRunner.runSandbox("inspect_launcher.py", PROJECT, 'print("never")', timeoutSeconds=60)
+
+    assert _liveRunUidProcesses() == []
+    assert set(os.listdir(runRoot)) == before
+
+
+@separateUids
+def test_watchdogThatFailsStopsTheRunAndLogsIt(storage, monkeypatch):
+    messages = []
+    monkeypatch.setattr("utils.sandboxWatchdog.logger.exception", lambda message, *args: messages.append(message))
+
+    def broken(self):
+        raise RuntimeError("scan failed")
+
+    monkeypatch.setattr(RunWatchdog, "_watch", broken)
+    started = time.time()
+
+    result = sandboxRunner.runSandbox("inspect_launcher.py", PROJECT, 'pd.io.common.os.sys.modules["time"].sleep(30)', timeoutSeconds=60)
+
+    assert result.stopped == "The run was stopped: the server ran out of memory."
+    assert result.returncode != 0
+    assert time.time() - started < 10
+    assert any("watchdog failed" in message for message in messages)

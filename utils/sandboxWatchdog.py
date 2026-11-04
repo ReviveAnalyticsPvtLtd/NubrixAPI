@@ -41,8 +41,8 @@ def _runFields(statusPath: str) -> tuple[int, int] | None:
 def scanRun(runUid: int, wanted: int) -> tuple[int, bool]:
     """One pass over /proc: the memory the run's processes hold, and whether any has an OOM adjustment below `wanted`.
 
-    Memory counts anonymous plus shared anonymous pages, which RSS alone would miss. A process owned by another
-    uid is skipped by its folder's owner, before anything in it is opened, because a run's processes can't change uid.
+    Memory counts anonymous plus shared anonymous pages, which RSS alone would miss. A process whose entry belongs
+    to neither the run uid nor root is skipped before anything in it is opened, because a run's processes can't change uid.
     A process that exits while being read counts as zero.
     """
     total = 0
@@ -52,7 +52,8 @@ def scanRun(runUid: int, wanted: int) -> tuple[int, bool]:
             if not entry.name.isdigit():
                 continue
             try:
-                if entry.stat().st_uid != runUid:
+                # A process that is not dumpable can have its entry owned by root, so root's are read too.
+                if entry.stat().st_uid not in (runUid, 0):
                     continue
                 fields = _runFields(f"/proc/{entry.name}/status")
                 if fields is None or fields[0] != runUid:

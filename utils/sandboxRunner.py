@@ -371,13 +371,17 @@ def _watchRun(proc: subprocess.Popen, runUid: int | None, workFolder: str, limit
     return watchdog
 
 
+def _writeOomAdjustment(pid: int, value: int) -> None:
+    with open(f"/proc/{pid}/oom_score_adj", "w") as target:
+        target.write(str(value))
+
+
 def _giveRunPriority(proc: subprocess.Popen, runUid: int | None, limits: RunLimits) -> None:
     """Set the run's OOM adjustment from the parent, before any generated code exists, so the watchdog can judge every process. A failed write ends the run."""
     if runUid is None or not limits.oomScoreAdj:
         return
     try:
-        with open(f"/proc/{proc.pid}/oom_score_adj", "w") as target:
-            target.write(str(limits.oomScoreAdj))
+        _writeOomAdjustment(proc.pid, limits.oomScoreAdj)
     except OSError:
         proc.kill()
         proc.wait()
