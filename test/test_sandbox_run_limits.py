@@ -614,3 +614,189 @@ def test_previewShowsTheStopMessage(monkeypatch):
         TransformationExecutor(timeoutSeconds=5).executeAndPreview("p1", "x = 1", "out")
     assert caught.value.statusCode == 400
     assert caught.value.uiMessage == STOP_MESSAGE
+
+
+# Container-wide slot cap.
+import subprocess
+import sys
+from concurrent.futures import ThreadPoolExecutor
+from unittest.mock import MagicMock
+
+from utils import sandboxSlots
+from utils.sandboxSlots import SandboxBusyError, acquireRunSlot, releaseRunSlot
+
+BUSY_COPY = "Too many analyses are running right now. Please try again in a moment."
+flockable = pytest.mark.skipif(sys.platform == "win32", reason="Slots use fcntl.flock, which Windows doesn't have.")
+
+
+@flockable
+def test_slotIsRefusedWhenAllAreHeld(tmp_path):
+    held = [acquireRunSlot(str(tmp_path), 2, 0) for _ in range(2)]
+    started = time.monotonic()
+    with pytest.raises(SandboxBusyError, match="Too many analyses"):
+        acquireRunSlot(str(tmp_path), 2, 0.3)
+    assert time.monotonic() - started >= 0.3
+    for fd in held:
+        releaseRunSlot(fd)
+
+
+@flockable
+def test_waitOfZeroRefusesAtOnce(tmp_path):
+    held = acquireRunSlot(str(tmp_path), 1, 0)
+    started = time.monotonic()
+    with pytest.raises(SandboxBusyError):
+        acquireRunSlot(str(tmp_path), 1, 0)
+    assert time.monotonic() - started < 0.1
+    releaseRunSlot(held)
+
+
+@flockable
+def test_freedSlotIsReused(tmp_path):
+    first = acquireRunSlot(str(tmp_path), 1, 0)
+    releaseRunSlot(first)
+    second = acquireRunSlot(str(tmp_path), 1, 0)
+    assert second is not None
+    releaseRunSlot(second)
+
+
+@flockable
+def test_slotIsFreedWhenItsHolderDies(tmp_path):
+    code = (
+        "import sys, time\n"
+        "from utils.sandboxSlots import acquireRunSlot\n"
+        "fd = acquireRunSlot(sys.argv[1], 1, 0)\n"
+        "print('held', flush=True)\n"
+        "time.sleep(60)\n"
+    )
+    holder = subprocess.Popen([sys.executable, "-c", code, str(tmp_path)], stdout=subprocess.PIPE, text=True)
+    try:
+        assert holder.stdout.readline().strip() == "held"
+        with pytest.raises(SandboxBusyError):
+            acquireRunSlot(str(tmp_path), 1, 0)
+    finally:
+        holder.kill()
+        holder.wait()
+    started = time.monotonic()
+    releaseRunSlot(acquireRunSlot(str(tmp_path), 1, 0))
+    assert time.monotonic() - started < 0.5
+
+
+@flockable
+def test_slotsQueueAFanOutInsteadOfRefusingIt(tmp_path):
+    def one(_):
+        fd = acquireRunSlot(str(tmp_path), 12, 5)
+        try:
+            time.sleep(0.2)
+        finally:
+            releaseRunSlot(fd)
+        return True
+
+    with ThreadPoolExecutor(max_workers=16) as pool:
+        assert list(pool.map(one, range(16))) == [True] * 16
+
+
+@flockable
+def test_heldSlotIsNotInheritedByChildren(tmp_path):
+    fd = acquireRunSlot(str(tmp_path), 1, 0)
+    try:
+        assert os.get_inheritable(fd) is False
+    finally:
+        releaseRunSlot(fd)
+
+
+@flockable
+@pytest.mark.skipif(sys.platform == "win32" or os.geteuid() != 0, reason="Needs a root parent.")
+def test_looseSlotsFolderIsTightenedForARootParent(tmp_path):
+    (tmp_path / "slots").mkdir(mode=0o777)
+    os.chmod(tmp_path / "slots", 0o777)
+    releaseRunSlot(acquireRunSlot(str(tmp_path), 1, 0))
+    assert (tmp_path / "slots").stat().st_mode & 0o777 == 0o700
+    assert (tmp_path / "slots").stat().st_uid == 0
+
+
+@flockable
+def test_slotsFolderThatCannotBeUsedRefusesInsteadOfRunningUncapped(tmp_path):
+    (tmp_path / "slots").write_text("not a folder")
+    with pytest.raises(SandboxBusyError):
+        acquireRunSlot(str(tmp_path), 1, 0)
+
+
+def test_noCapMeansNoSlot(tmp_path):
+    assert acquireRunSlot(None, 12, 1) is None
+    assert acquireRunSlot(str(tmp_path), 0, 1) is None
+    releaseRunSlot(None)
+    assert not (tmp_path / "slots").exists()
+
+
+def test_busyBecomesA503ForTransformations(monkeypatch):
+    from nubrix.components import transformationExecutor as module
+    from utils.exceptionHandler import CustomException
+
+    def busy(*args, **kwargs):
+        raise SandboxBusyError()
+
+    monkeypatch.setattr(module, "runSandbox", busy)
+    executor = TransformationExecutor(timeoutSeconds=5)
+    with pytest.raises(CustomException) as caught:
+        executor.executeAndPreview("p1", "x = 1", "out")
+    assert (caught.value.statusCode, caught.value.errorCode, caught.value.uiMessage) == (503, "SANDBOX_BUSY", BUSY_COPY)
+    with pytest.raises(CustomException) as caught:
+        executor.executeInspection("p1", "x = 1")
+    assert (caught.value.statusCode, caught.value.errorCode, caught.value.uiMessage) == (503, "SANDBOX_BUSY", BUSY_COPY)
+
+
+def test_busyIsTheReplManagersText(monkeypatch):
+    from utils import codeExecutor
+
+    def busy(*args, **kwargs):
+        raise SandboxBusyError()
+
+    monkeypatch.setattr(codeExecutor, "runSandbox", busy)
+    redis = MagicMock()
+    redis.zcard.return_value = 0
+    monkeypatch.setattr(codeExecutor.creditService, "_redis", lambda: redis)
+    assert codeExecutor.REPLManager(timeoutSeconds=5, maxConcurrentPerProject=5).run("print(1)", "p1") == BUSY_COPY
+    redis.zrem.assert_called_once()
+
+
+def test_runWaitsForASlotBeforeClaimingAUidAndFreesItOnEveryExit(tmp_path, monkeypatch):
+    events = []
+    monkeypatch.setenv("SANDBOX_RUN_ROOT", str(tmp_path))
+    monkeypatch.setattr(sandboxRunner, "acquireRunSlot", lambda *args: events.append(("acquire", args)) or 7)
+    monkeypatch.setattr(sandboxRunner, "releaseRunSlot", lambda fd: events.append(("release", fd)))
+
+    def failingClaim():
+        events.append(("claim",))
+        raise RuntimeError("no uid")
+
+    monkeypatch.setattr(sandboxRunner, "_claimRun", failingClaim)
+    with pytest.raises(RuntimeError, match="no uid"):
+        sandboxRunner.runSandbox("inspect_launcher.py", "p1", "", 1)
+    assert [event[0] for event in events] == ["acquire", "claim", "release"]
+    assert events[0][1] == (str(tmp_path), 12, 120.0)
+    assert events[2] == ("release", 7)
+
+
+def test_refusedRunClaimsNothing(tmp_path, monkeypatch):
+    monkeypatch.setenv("SANDBOX_RUN_ROOT", str(tmp_path))
+
+    def busy(*args):
+        raise SandboxBusyError()
+
+    monkeypatch.setattr(sandboxRunner, "acquireRunSlot", busy)
+    claim = MagicMock()
+    monkeypatch.setattr(sandboxRunner, "_claimRun", claim)
+    with pytest.raises(SandboxBusyError):
+        sandboxRunner.runSandbox("inspect_launcher.py", "p1", "", 1)
+    claim.assert_not_called()
+
+
+def test_sweepIgnoresTheSlotsFolder(tmp_path, monkeypatch):
+    (tmp_path / "slots").mkdir()
+    (tmp_path / "slots" / "0").write_text("")
+    monkeypatch.setenv("SANDBOX_RUN_ROOT", str(tmp_path))
+    clear = MagicMock()
+    monkeypatch.setattr(sandboxRunner, "_clearUid", clear)
+    sandboxRunner.sweepOrphanedRuns()
+    clear.assert_not_called()
+    assert (tmp_path / "slots" / "0").exists()

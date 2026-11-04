@@ -17,6 +17,7 @@ from api.services.credits.creditService import creditService
 from utils.logger import logger
 from utils.sandboxLimits import defaultTimeoutSeconds
 from utils.sandboxRunner import runSandbox
+from utils.sandboxSlots import BUSY_MESSAGE, SandboxBusyError
 
 
 def _remove_code_fences(code: str) -> str:
@@ -76,6 +77,8 @@ class REPLManager:
         stopped = None
         try:
             stdout, stderr, _, _, _, stopped = runSandbox("sandbox_launcher.py", projectId, codeString, self.timeoutSeconds)
+        except SandboxBusyError:
+            return BUSY_MESSAGE
         except Exception as e:
             stderr = f"Error during subprocess execution: {e}\n"
         finally:

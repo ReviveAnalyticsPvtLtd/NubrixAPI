@@ -52,6 +52,7 @@ from utils.logger import logger
 from utils.sandbox_reaper import _SHARED_TEMP_FOLDERS
 from utils.sandboxLimits import RunLimits, currentRunLimits
 from utils.sandboxSeccomp import installFilter
+from utils.sandboxSlots import acquireRunSlot, releaseRunSlot
 from utils.sandboxWatchdog import RunWatchdog
 
 # Below 65536, the range a user namespace normally maps. The same number of uids above
@@ -453,23 +454,28 @@ def runSandbox(launcherName: str, projectId: str, code: str, timeoutSeconds: int
     Only a launcher that writes a result sets `withResult`: the file is the child's, so it isn't read otherwise.
     """
     limits = currentRunLimits()
-    runUid, runFolder, lock = _claimRun()
-    uidIsClear = False
+    # The slot comes first, so a run that waits holds no uid and no folder.
+    slot = acquireRunSlot(os.environ.get("SANDBOX_RUN_ROOT"), limits.maxConcurrentRuns, limits.slotWaitSeconds)
     try:
-        # A worker that died mid-run can leave a process holding this uid, so nothing is handed over until it's gone.
-        uidIsClear = _clearUid(runUid, runFolder)
-        if not uidIsClear:
-            raise RuntimeError("Could not clear the sandbox run's uid.")
-        tablesFolder, workFolder = _prepareFolders(runUid, runFolder)
+        runUid, runFolder, lock = _claimRun()
         uidIsClear = False
         try:
-            return _runChild(launcherName, projectId, code, timeoutSeconds, withResult, runUid, runFolder, tablesFolder, workFolder, limits)
-        finally:
+            # A worker that died mid-run can leave a process holding this uid, so nothing is handed over until it's gone.
             uidIsClear = _clearUid(runUid, runFolder)
+            if not uidIsClear:
+                raise RuntimeError("Could not clear the sandbox run's uid.")
+            tablesFolder, workFolder = _prepareFolders(runUid, runFolder)
+            uidIsClear = False
+            try:
+                return _runChild(launcherName, projectId, code, timeoutSeconds, withResult, runUid, runFolder, tablesFolder, workFolder, limits)
+            finally:
+                uidIsClear = _clearUid(runUid, runFolder)
+        finally:
+            _removeRun(runFolder, uidIsClear)
+            if lock is not None:
+                os.close(lock)
     finally:
-        _removeRun(runFolder, uidIsClear)
-        if lock is not None:
-            os.close(lock)
+        releaseRunSlot(slot)
 
 
 def _withinHardLimit(wanted: int, hard: int) -> int:

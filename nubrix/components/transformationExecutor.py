@@ -25,6 +25,7 @@ from utils.exceptionHandler import CustomException
 from utils.initMethods import fetch_data, fetch_data_pl, scan_data, serializer
 from utils.sandboxLimits import defaultTimeoutSeconds
 from utils.sandboxRunner import runSandbox
+from utils.sandboxSlots import BUSY_MESSAGE, SandboxBusyError
 from api.commons import client
 from utils.logger import logger
 import multiprocessing as mp
@@ -171,9 +172,18 @@ class TransformationExecutor:
             raise ValueError("Transformation produced no readable preview.")
         return rows
 
+    def _busy(self, error: SandboxBusyError) -> CustomException:
+        """Every run slot stayed taken: tell the caller to retry."""
+        exception = CustomException(error, statusCode=503, uiMessage=BUSY_MESSAGE, errorCode="SANDBOX_BUSY")
+        logger.error(exception)
+        return exception
+
     def executeInspection(self, projectId: str, pythonCode: str) -> str:
         """Execute inspection code in the sandbox and return stdout + stderr."""
-        stdout, stderr, rc, *_ = runSandbox("inspect_launcher.py", projectId, pythonCode, self.timeoutSeconds)
+        try:
+            stdout, stderr, rc, *_ = runSandbox("inspect_launcher.py", projectId, pythonCode, self.timeoutSeconds)
+        except SandboxBusyError as e:
+            raise self._busy(e)
         if rc != 0 and stderr:
             return f"Stdout:\n{stdout}\nStderr/Errors:\n{stderr}"
         return stdout if stdout else "Inspection executed successfully with no output."
@@ -183,6 +193,8 @@ class TransformationExecutor:
         try:
             self._validate_table_name(tableName)
             return self._run_transformation(projectId, pythonCode)
+        except SandboxBusyError as e:
+            raise self._busy(e)
         except Exception as e:
             exception = CustomException(e, statusCode=400, uiMessage=str(e))
             logger.error(exception)
