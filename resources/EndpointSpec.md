@@ -1290,7 +1290,7 @@ Create a new transformation workspace.
 
 ### 9.2 `GET /api/latest/transformations?projectId={projectId}`
 
-List all transformations for a project.
+List all transformations for a project. The artifact's stored `table_file`, the server's record of the table's file, is not returned.
 
 **Response (200):**
 ```json
@@ -1396,7 +1396,7 @@ Persist the approved transformation as a project table. Uploads parquet to Supab
 
 ### 9.7 `POST /api/latest/transformations/{transformationId}/rollback?projectId={projectId}`
 
-Rollback workspace state and messages to a specific message ID. Rolling back to an approved checkpoint rewrites its table under the same checks as apply (`409`, `503`). Rolling back to the start removes the table this transformation wrote; if a storage or cache step fails it answers `503`, keeps the messages, and can be retried.
+Rollback workspace state and messages to a specific message ID. Rolling back to an approved checkpoint rewrites its table under the same checks as apply (`409`, `503`). Rolling back to the start removes the table this transformation wrote; if a storage or cache step fails it answers `503`, keeps the messages, and can be retried. The table is kept when a load has taken its name, or when the file has changed since this transformation recorded it; only its caches are cleared then.
 
 **Auth:** Required + `requireActiveSubscription`
 
@@ -1438,7 +1438,7 @@ Rollback workspace state and messages to a specific message ID. Rolling back to 
 
 ### 9.9 `DELETE /api/latest/transformations/{transformationId}?projectId={projectId}`
 
-Delete a transformation workspace and, if it was applied, its parquet file. A transformation that was never applied, was rolled back to the start, or lost its table through `deleteTable` owns no file, so a table of the same name stays. Answers 503 and keeps the transformation if a storage, cache or database step fails; the delete can be retried. A table loaded under that name between the attempts is not removed.
+Delete a transformation workspace and, if it was applied, its parquet file. A transformation that was never applied, was rolled back to the start, or lost its table through `deleteTable` owns no file, so a table of the same name stays. Answers 503 and keeps the transformation if a storage, cache or database step fails; the delete can be retried. A table loaded under that name between the attempts is not removed. The table is also kept when a load has taken its name, or when the file has changed since this transformation recorded it; only its caches are cleared then. A transformation applied before files were recorded has its table removed as before.
 
 **Response (200):**
 ```json

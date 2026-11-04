@@ -11,7 +11,7 @@ __all__ = ["dataLoadService"]
 
 from nubrix.components.pdfTableExtractor import PdfTableExtractor
 from api.services.credits.creditTrackingCallback import CreditTrackingCallback
-from api.commons import tableFileState, updateProjectModifiedAt
+from api.commons import giveTableNameBack, tableFileState, updateProjectModifiedAt
 from utils.exceptionHandler import CustomException
 from utils.initMethods import forget_table
 from pymongo.mongo_client import MongoClient
@@ -22,6 +22,7 @@ from utils.projectStorage import readJson
 from utils.logger import logger
 from api.commons import client
 from typing import Annotated
+from time import sleep
 from api.models import (
     LoadMySQLorPostgreSQL,
     LoadMongoDB,
@@ -36,6 +37,10 @@ import os
 import gc
 import re
 import csv
+
+# Seconds to wait before each retry of the release after a load's write.
+RELEASE_RETRY_PAUSES = (0.2, 0.5)
+
 
 class DataLoadService:
     """
@@ -87,50 +92,48 @@ class DataLoadService:
         """Give a name back to the transformations a load took it from, when the load wrote nothing over their table.
 
         Only while the file is still the one the transformation recorded when it wrote it, so another load's
-        upload is never handed to it. The file is checked again after the name is given back, and the name is
-        released again if the file changed or could not be checked. A load writing later releases it after its
-        own write. A row that has claimed anything since keeps it.
+        upload is never handed to it. A claim with no recorded `table_file` is compared with the file as this load
+        read it before it read the claims. No file then and none now also counts as unchanged, as for an apply
+        whose write failed. The file is checked again after the name is given back, and the name is released
+        again if the file changed or could not be checked. A load writing later releases it after its own write.
+        A row that has claimed anything since keeps it.
         """
         for claim in claims:
             prior = claim["latest_approved_artifact"]
             if not prior:
                 continue
-            transformationId = claim["transformation_id"]
-            recorded = prior.get("table_file")
-            attempted = False
-            try:
-                if tableFileState(self.client, projectId, tableName) != recorded:
-                    continue
-                attempted = True
-                if not self.client.table("transformations").update({"latest_approved_artifact": prior}).eq("project_id", projectId).eq("transformation_id", transformationId).is_("latest_approved_artifact", "null").execute().data:
-                    continue
-                if tableFileState(self.client, projectId, tableName) == recorded:
-                    continue
-            except Exception as e:
-                logger.error(f"Could not give '{tableName}' back to transformation {transformationId}: {e}")
-                if not attempted:
-                    continue
-            try:
-                self.client.table("transformations").update({"latest_approved_artifact": None}).eq("project_id", projectId).eq("transformation_id", transformationId).eq("latest_approved_artifact->>table_name", tableName).execute()
-            except Exception as e:
-                logger.error(f"Could not release '{tableName}' again for transformation {transformationId}: {e}")
+            ownFile = prior.get("table_file") or claim.get("file_before_release")
+            giveTableNameBack(self.client, projectId, claim["transformation_id"], tableName, prior, (ownFile,))
 
     def _acceptTableName(self, projectId: str, tableName: str) -> list[dict]:
         """Refuse a name already in the project, then release it. Loads release it again once the file is written.
 
-        Returns the claims it took, for _writeTable to give back if the load writes nothing.
+        Returns the claims it took, for _writeTable to give back if the load writes nothing. Each carries the
+        file as it was read before the claims were, for a claim with no recorded `table_file` (applied before
+        files were recorded, or the record failed). A load that writes releases the name after its write, so a
+        claim still there when the claims are read means no load finished a write since that read: the file read
+        is the transformation's. Read after the claims, it could be another load's upload.
         """
         from api.services.managementService import managementService
         managementService.validateTableNameAvailable(projectId=projectId, tableName=tableName)
-        return self._releaseTableName(projectId, tableName)
+        try:
+            fileBeforeRelease = tableFileState(self.client, projectId, tableName)
+        except Exception as e:
+            # Then only a claim whose table has no file is given back, as before files were read here.
+            fileBeforeRelease = None
+            logger.warning(f"Could not read '{tableName}' before taking its name; a failed load gives it back only to a transformation that recorded its file or has none: {e}")
+        claims = self._releaseTableName(projectId, tableName)
+        return [{**claim, "file_before_release": fileBeforeRelease} for claim in claims]
 
     def _writeTable(self, projectId: str, tableName: str, claims: list[dict], writeParquet) -> None:
         """Write a load's table under a name it accepted, then release the name again.
 
         writeParquet(path) produces the file. If it fails, nothing was written, so the claims are given back
-        and a transformation's table keeps its owner. A failed upload may still have landed, so after one the
+        while the file is unchanged (see _restoreClaims, which also covers no file and no record) and a
+        transformation's table keeps its owner. A failed upload may still have landed, so after one the
         claims stay released. After the write the name is released again and the table's caches are cleared,
-        whether or not this load saw a claim: another load may have taken it first.
+        whether or not this load saw a claim: another load may have taken it first. That release is retried,
+        the caches are cleared even if it keeps failing, and the load then answers 503.
         """
         uploading = False
         try:
@@ -146,11 +149,24 @@ class DataLoadService:
             if not uploading:
                 self._restoreClaims(projectId, tableName, claims)
             raise
-        self._releaseTableName(projectId, tableName)
+        releaseError = None
+        for pause in (*RELEASE_RETRY_PAUSES, None):
+            try:
+                self._releaseTableName(projectId, tableName)
+                releaseError = None
+                break
+            except CustomException as e:
+                releaseError = e
+                if pause is not None:
+                    sleep(pause)
         try:
             forget_table(projectId, tableName)
         except Exception as e:
             logger.warning(f"Could not clear caches for {tableName} after a load replaced it: {e}")
+        if releaseError:
+            # A transformation may still claim this upload. Deleting it then keeps the upload only if it recorded its file.
+            logger.error(f"Load wrote '{tableName}' in project {projectId} but could not release the name from its transformations.")
+            raise releaseError
 
     @staticmethod
     def _sanitizeDfForParquet(df: pd.DataFrame) -> pd.DataFrame:

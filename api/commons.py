@@ -340,6 +340,37 @@ def requireCredits(operationType: str):
     return _dependency
 
 
+def giveTableNameBack(supabaseClient, projectId: str, transformationId: str, tableName: str, artifact: dict, fileStates: tuple) -> bool:
+    """Put a claim on tableName back onto a transformation whose claim was released, while the file is one of fileStates.
+
+    fileStates are the states known to be that transformation's file, or None for no file. Any write moves the
+    state, so a file some load wrote since never matches. The claim goes back only onto a row with no artifact,
+    so a row that has claimed anything since keeps it. The file is checked again afterwards, and the claim is
+    released again if it changed, could not be checked, or the write errored. A load writing later releases it
+    after its own write.
+
+    Returns whether the transformation holds the claim at the end.
+    """
+    attempted = False
+    try:
+        if tableFileState(supabaseClient, projectId, tableName) not in fileStates:
+            return False
+        attempted = True
+        if not supabaseClient.table("transformations").update({"latest_approved_artifact": artifact}).eq("project_id", projectId).eq("transformation_id", transformationId).is_("latest_approved_artifact", "null").execute().data:
+            return False
+        if tableFileState(supabaseClient, projectId, tableName) in fileStates:
+            return True
+    except Exception as e:
+        logger.error(f"Could not give '{tableName}' back to transformation {transformationId}: {e}")
+        if not attempted:
+            return False
+    try:
+        supabaseClient.table("transformations").update({"latest_approved_artifact": None}).eq("project_id", projectId).eq("transformation_id", transformationId).eq("latest_approved_artifact->>table_name", tableName).execute()
+    except Exception as e:
+        logger.error(f"Could not release '{tableName}' again for transformation {transformationId}: {e}")
+    return False
+
+
 def tableFileState(supabaseClient, projectId: str, tableName: str) -> dict | None:
     """What storage reports for a table's file, or None when there is none. Any write to the file changes it."""
     fileName = f"{tableName}.parquet"

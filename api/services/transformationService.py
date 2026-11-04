@@ -22,6 +22,7 @@ import httpx
 import orjson
 import json
 import os
+from api.commons import giveTableNameBack
 
 if TYPE_CHECKING:
     from nubrix.components.transformationAgent import TransformationAgent
@@ -244,11 +245,41 @@ class TransformationService:
             file_options={"upsert": "true"},
         )
 
-    def _remove_owned_table(self, projectId: str, tableName: str) -> None:
-        """Remove a table this transformation produced: the file, then its key, then the caches. Each step is safe to repeat."""
-        self.supabase.storage.from_("AnalyticsHub").remove([f"{projectId}/{tableName}.parquet"])
-        self._remove_table_from_metadata(projectId, tableName)
-        forget_table(projectId, tableName)
+    def _remove_table_if_unchanged(self, projectId: str, transformationId: str, artifact: dict) -> None:
+        """Remove the table this transformation's artifact names, unless it is no longer this transformation's.
+
+        The claim is released first, filtered on the name read. If no row comes back, a load released it first,
+        so the file under that name is the load's and nothing is removed. Otherwise the file, then its key, then
+        the caches go, each safe to repeat. A file that differs from the recorded `table_file` was written since,
+        so it is kept with its key and only the caches are cleared. With no file left, the key and caches still
+        go, so a retry finishes. An artifact with no `table_file` (applied before files were recorded, or the
+        record failed) has its table removed as before. No lock is held: a load that writes between the file
+        check and the remove still loses its upload, and storage has no delete that is conditional on the file.
+
+        If a step after the release fails, the claim is given back while the file is still the recorded one, or
+        gone, so a retry removes the rest. With no record it goes back only once the file is gone: a file there
+        could be an upload that landed after the release. Otherwise a retry keeps the file as an ordinary table,
+        which deleteTable can still remove.
+        """
+        tableName = artifact["table_name"]
+        recorded = artifact.get("table_file")
+        released = self.supabase.table("transformations").update({"latest_approved_artifact": None}).eq("project_id", projectId).eq("transformation_id", transformationId).eq("latest_approved_artifact->>table_name", tableName).execute().data
+        if not released:
+            return
+        # With a record, the file on the remove path is that record or gone; with none, only gone counts.
+        ownFiles = (recorded, None)
+        try:
+            current = tableFileState(self.supabase, projectId, tableName)
+            if current is not None and recorded is not None and current != recorded:
+                forget_table(projectId, tableName)
+                return
+            if current is not None:
+                self.supabase.storage.from_("AnalyticsHub").remove([f"{projectId}/{tableName}.parquet"])
+            self._remove_table_from_metadata(projectId, tableName)
+            forget_table(projectId, tableName)
+        except Exception:
+            giveTableNameBack(self.supabase, projectId, transformationId, tableName, artifact, ownFiles)
+            raise
 
     def _claim_table_name(self, projectId: str, transformationId: str, tableName: str) -> tuple[bool, dict | None]:
         """Check the name and claim it for this row, straight before its table is written.
@@ -256,6 +287,8 @@ class TransformationService:
         A load releases every claim on a name it accepts, so a claim gone by the second check means
         a load is writing that table. The second check also catches a file written since the first.
         The claim is written only over the artifact read here, so a claim a load released since is not put back.
+        A claim on the same name keeps the recorded `table_file`: until this write lands the file is still that
+        one, and once it lands the file differs from the record, which only ever stops a give-back or a remove.
 
         Returns whether the row already owned the name, and its artifact before the claim.
         """
@@ -269,7 +302,7 @@ class TransformationService:
         try:
             claim = self.supabase.table("transformations").update({
                 "latest_approved_artifact": {
-                    **{key: value for key, value in (priorArtifact or {}).items() if key != "table_file"},
+                    **{key: value for key, value in (priorArtifact or {}).items() if ownedBefore or key != "table_file"},
                     "table_name": tableName,
                 },
             }).eq("transformation_id", transformationId)
@@ -326,18 +359,24 @@ class TransformationService:
         except Exception as e:
             logger.error(f"Could not undo the claim on '{tableName}' for transformation {transformationId}: {e}")
 
-    def _record_applied_artifact(self, projectId: str, transformationId: str, latestArtifact: dict) -> None:
+    def _record_applied_artifact(self, projectId: str, transformationId: str, latestArtifact: dict, parquetBytes: bytes) -> None:
         """Point the row at the table it just wrote, unless a load has taken the name meanwhile.
 
         It also records the file storage now holds, so a failed load gives the name back only while that file is
         unchanged. A load that wrote first releases the name after its write, which clears this record with it.
+
+        A load that took the name and wrote nothing leaves this row with no claim. The row then takes the name back
+        onto its own file, as a failed load gives one back: only while storage reports this write's content (an
+        MD5 eTag of parquetBytes) and the file is unchanged since it was read, only onto a row with no artifact,
+        and released again if the file changes as it does. A load that wrote meanwhile changed the content, so its
+        upload is never taken. Storage that reports no such eTag, as for a multipart upload, gets the 409.
         """
         tableName = latestArtifact["table_name"]
         try:
             fileState = tableFileState(self.supabase, projectId, tableName)
         except Exception as e:
             fileState = None
-            logger.warning(f"Could not record the file for '{tableName}'; a failed load will not give the name back: {e}")
+            logger.warning(f"Could not record the file for '{tableName}'; a failed load gives the name back only while no load has written it since: {e}")
         if fileState:
             latestArtifact = {**latestArtifact, "table_file": fileState}
         try:
@@ -349,12 +388,20 @@ class TransformationService:
             exception = CustomException(e, statusCode=503, uiMessage="We could not finish saving this table. Please try again.")
             logger.error(exception)
             raise exception
+        if not updated and fileState and self._holds_written_content(fileState, parquetBytes):
+            updated = giveTableNameBack(self.supabase, projectId, transformationId, tableName, latestArtifact, (fileState,))
         if not updated:
             raise CustomException(
                 ValueError(f"Table '{tableName}' was taken by a load while it was written."),
                 statusCode=409,
                 uiMessage=f"A table named '{tableName}' was just added to this project. Please use a different name."
             )
+
+    @staticmethod
+    def _holds_written_content(fileState: dict, parquetBytes: bytes) -> bool:
+        """Whether storage reports parquetBytes as the file's content: a single-part upload's eTag is its MD5."""
+        import hashlib
+        return str(fileState.get("eTag") or "").strip('"') == hashlib.md5(parquetBytes).hexdigest()
 
     def _get_messages_from_db(self, projectId: str, transformationId: str) -> list[dict]:
         """Load messages list directly from transformations table."""
@@ -470,7 +517,14 @@ class TransformationService:
                 .order("created_at", desc=True)
                 .execute()
             )
-            return response.data or []
+            # table_file is the server's record of storage's file, for name ownership; the browser has no use for it.
+            listed = []
+            for row in response.data or []:
+                artifact = row.get("latest_approved_artifact")
+                if isinstance(artifact, dict) and "table_file" in artifact:
+                    row = {**row, "latest_approved_artifact": {key: value for key, value in artifact.items() if key != "table_file"}}
+                listed.append(row)
+            return listed
         except Exception as e:
             exception = CustomException(e, statusCode=400, uiMessage="Failed to list transformations.")
             logger.error(exception)
@@ -703,7 +757,7 @@ class TransformationService:
                 "mermaid_code": artifact.get("code"),
                 "message_id": messageId,
                 "table_name": newTransformedTableName,
-            })
+            }, parquetBytes)
 
             artifact["is_approved"] = True
             target_msg["artifact"] = artifact
@@ -792,7 +846,7 @@ class TransformationService:
                     "mermaid_code": (lastApprovedMsg.get("artifact") or {}).get("code"),
                     "message_id": lastApprovedMsg.get("message_id"),
                     "table_name": newTransformedTableName,
-                })
+                }, parquetBytes)
                 
                 # Keep the approved checkpoint's status intact
                 approvedArtifact = lastApprovedMsg.get("artifact") or {}
@@ -806,7 +860,7 @@ class TransformationService:
                 if appliedTable:
                     logger.info(f"Rolling back to pre-transformation state. Deleting table '{appliedTable}'.")
                     try:
-                        self._remove_owned_table(projectId, appliedTable)
+                        self._remove_table_if_unchanged(projectId, transformationId, latestApproved)
                     except Exception as e:
                         exception = CustomException(e, statusCode=503, uiMessage="We could not roll back this transformation right now. Please try again.")
                         logger.error(exception)
@@ -922,7 +976,7 @@ class TransformationService:
             # repeat, and the row goes last: a failure here keeps it, so the delete can be retried.
             try:
                 if appliedTable:
-                    self._remove_owned_table(projectId, appliedTable)
+                    self._remove_table_if_unchanged(projectId, transformationId, latest_approved)
                 # With no artifact the row owns no file: one under its name is an upload, so leave its key.
                 elif not self._table_file_exists(projectId, tableName):
                     self._remove_table_from_metadata(projectId, tableName)
