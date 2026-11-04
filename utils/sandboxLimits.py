@@ -17,7 +17,7 @@ _MIB = 1024**2
 _DEFAULT_TIMEOUT_SECONDS = 300
 
 
-def _readInt(name: str, default: int) -> int:
+def _readInt(name: str, default: int, maximum: int | None = None) -> int:
     raw = os.environ.get(name)
     if raw is None:
         return default
@@ -25,7 +25,7 @@ def _readInt(name: str, default: int) -> int:
         value = int(raw.strip())
     except ValueError:
         value = -1
-    if value < 0:
+    if value < 0 or (maximum is not None and value > maximum):
         logger.warning(f"Ignoring {name}={raw!r}: using the default {default}.")
         return default
     return value
@@ -101,7 +101,7 @@ def currentRunLimits(**overrides: Any) -> RunLimits:
         "maxProcesses": _readInt("SANDBOX_MAX_RUN_PROCESSES", 1024 if threads == 0 else 64),
         "maxProcessMemory": _readInt("SANDBOX_MAX_PROCESS_MEMORY_BYTES", 4 * _GIB),
         "maxRunMemory": _readInt("SANDBOX_MAX_RUN_MEMORY_BYTES", 4 * _GIB),
-        "oomScoreAdj": _readInt("SANDBOX_OOM_SCORE_ADJ", 1000),
+        "oomScoreAdj": _readInt("SANDBOX_OOM_SCORE_ADJ", 1000, maximum=1000),
         "maxCpuSeconds": _readInt("SANDBOX_MAX_CPU_SECONDS", 1200),
         "maxDiskBytes": _readInt("SANDBOX_MAX_DISK_BYTES", 2 * _GIB),
         "maxFiles": _readInt("SANDBOX_MAX_FILES", 10000),

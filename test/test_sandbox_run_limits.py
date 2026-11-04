@@ -1000,6 +1000,18 @@ def test_honestWorkloadFinishesWithTheThreadCapReverted(storage, monkeypatch):
     assert "nproc 1024" in output, output
 
 
+@pytest.mark.parametrize("value", ["1001", "99999999", "-1", "abc"])
+def test_oomScoreAdjOutsideTheKernelsRangeFallsBackToTheDefault(monkeypatch, value):
+    monkeypatch.setenv("SANDBOX_OOM_SCORE_ADJ", value)
+    assert currentRunLimits().oomScoreAdj == 1000
+
+
+@pytest.mark.parametrize("value, expected", [("0", 0), ("500", 500), ("1000", 1000)])
+def test_oomScoreAdjInRangeIsKept(monkeypatch, value, expected):
+    monkeypatch.setenv("SANDBOX_OOM_SCORE_ADJ", value)
+    assert currentRunLimits().oomScoreAdj == expected
+
+
 def test_noWatchdogStartsWhenItsFourLimitsAreOff(monkeypatch, tmp_path):
     started = []
     monkeypatch.setattr(RunWatchdog, "start", lambda self: started.append(self))
