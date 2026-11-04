@@ -7,7 +7,7 @@ the default and logs a warning, so a typo cannot break the request path.
 
 import math
 import os
-from dataclasses import dataclass, fields
+from dataclasses import asdict, dataclass, fields
 from typing import Any
 
 from utils.logger import logger
@@ -75,20 +75,7 @@ class RunLimits:
 
     def toChannel(self) -> dict:
         """A JSON-serialisable dict for the private channel to the child."""
-        return {
-            "threads": self.threads,
-            "maxProcesses": self.maxProcesses,
-            "maxProcessMemory": self.maxProcessMemory,
-            "maxRunMemory": self.maxRunMemory,
-            "oomScoreAdj": self.oomScoreAdj,
-            "maxCpuSeconds": self.maxCpuSeconds,
-            "maxDiskBytes": self.maxDiskBytes,
-            "maxFiles": self.maxFiles,
-            "maxFileBytes": self.maxFileBytes,
-            "blockNetwork": self.blockNetwork,
-            "maxConcurrentRuns": self.maxConcurrentRuns,
-            "slotWaitSeconds": self.slotWaitSeconds,
-        }
+        return asdict(self)
 
     @classmethod
     def fromChannel(cls, data: dict) -> "RunLimits":

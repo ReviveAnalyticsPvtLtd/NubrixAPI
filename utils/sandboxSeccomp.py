@@ -61,9 +61,10 @@ def buildFilter(machine: str) -> list[tuple[int, int, int, int]]:
         ("jeq", arch, "arch_ok", "kill"),
         ("label", "arch_ok"),
     ]
+    rows += [("ld", _OFFSET_NR)]
     if machine == "x86_64":
-        rows += [("ld", _OFFSET_NR), ("jge", _X32_FLAG, "kill", "numbered")]
-    rows += [("label", "numbered"), ("ld", _OFFSET_NR)]
+        rows += [("jge", _X32_FLAG, "kill", "numbered")]
+    rows += [("label", "numbered")]
     for name in _SOCKET_CALLS:
         rows += [("jeq", numbers[name], "family", f"after_{name}"), ("label", f"after_{name}")]
     for name in _REFUSED_CALLS:
@@ -110,7 +111,7 @@ def installFilter(machine: str | None = None) -> None:
     machine = machine or platform.machine()
     rows = buildFilter(machine)
     instructions = (_Filter * len(rows))(*[_Filter(*row) for row in rows])
-    program = _Program(len(rows), instructions)  # `instructions` stays referenced until prctl returns.
+    program = _Program(len(rows), instructions)  # ctypes keeps `instructions` alive for as long as `program` is, which covers the syscall below.
     libc = ctypes.CDLL(None, use_errno=True)
     zero = ctypes.c_ulong(0)
     if libc.prctl(_PR_SET_NO_NEW_PRIVS, ctypes.c_ulong(1), zero, zero, zero) != 0:
@@ -120,4 +121,3 @@ def installFilter(machine: str | None = None) -> None:
     result = libc.syscall(_SECCOMP_SYSCALL[machine], _SECCOMP_SET_MODE_FILTER, _SECCOMP_FILTER_FLAG_TSYNC, ctypes.byref(program))
     if result != 0:
         raise OSError(ctypes.get_errno() if result == -1 else errno.EBUSY, "could not install the seccomp filter")
-    del instructions
