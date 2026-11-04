@@ -22,6 +22,7 @@ from urllib.request import urlopen
 from utils.logger import logger
 from api.commons import client
 from typing import Annotated
+from time import sleep
 from api.models import (
     LoadMySQLorPostgreSQL,
     LoadMongoDB,
@@ -158,7 +159,7 @@ class DataLoadService:
             except CustomException as e:
                 releaseError = e
                 if pause is not None:
-                    time.sleep(pause)
+                    sleep(pause)
         try:
             forget_table(projectId, tableName)
         except Exception as e:
