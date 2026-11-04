@@ -15,6 +15,7 @@ __all__ = [
     "requireTrialOrAbove",
     "requirePaidPlan",
     "requireCredits",
+    "requireProjectOwner",
     "UserContext",
     "updateProjectModifiedAt",
 ]
@@ -330,6 +331,40 @@ def requireCredits(operationType: str):
         return user
 
     return _dependency
+
+
+def requireProjectOwner(projectId: str, user: UserContext) -> None:
+    """
+    Allow only the project's owner. Someone else's project reads as missing,
+    so a denial never confirms that a project ID exists.
+
+    Synchronous like the other auth checks. Async routes run it with
+    asyncio.to_thread so the lookup never blocks the worker's event loop.
+    """
+    try:
+        rows = (
+            client.table("Projects")
+            .select("ownerUserId")
+            .eq("projectId", projectId)
+            .limit(1)
+            .execute().data
+        )
+    except Exception as exc:
+        logger.error("Project owner lookup failed for projectId={}: {}", projectId, type(exc).__name__)
+        raiseFeatureGateHttpException(
+            statusCode=status.HTTP_503_SERVICE_UNAVAILABLE,
+            uiMessage="Project access could not be verified. Please try again.",
+            backendLogMessage=f"Project owner lookup unavailable for projectId={projectId}",
+            errorCode="PROJECT_ACCESS_UNAVAILABLE",
+        )
+    if not rows or rows[0].get("ownerUserId") != user.userId:
+        logger.warning("Project access denied: projectId={}, userId={}", projectId, user.userId)
+        raiseFeatureGateHttpException(
+            statusCode=status.HTTP_404_NOT_FOUND,
+            uiMessage="Project not found.",
+            backendLogMessage=f"Project access denied: projectId={projectId}, userId={user.userId}",
+            errorCode="PROJECT_NOT_FOUND",
+        )
 
 
 def updateProjectModifiedAt(projectId: str) -> None:

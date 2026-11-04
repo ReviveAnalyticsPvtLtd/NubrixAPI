@@ -10,10 +10,11 @@ __all__ = ["router"]
 
 
 from utils.exceptionHandler import CustomException, raiseHttpException
+import asyncio
 from api.services.dashboardService import dashboardService
 from fastapi.responses import ORJSONResponse
 from fastapi import APIRouter, Depends
-from api.commons import verifyToken
+from api.commons import verifyUser, requireProjectOwner, UserContext
 from api.models import (
     DeleteDashboardElement,
     ExportToDashboard,
@@ -28,17 +29,18 @@ Router for dashboard-related endpoints.
 """
 
 @router.post("/createPage")
-async def createPage(details: CreatePage, token = Depends(verifyToken)):
+async def createPage(details: CreatePage, user: UserContext = Depends(verifyUser)):
     """
     Create a new dashboard page.
 
     Args:
         details (CreatePage): The details required to create a new page.
-        token: Authorization token dependency.
+        user: UserContext injected after session verification.
 
     Returns:
         ORJSONResponse: Success message with the new page ID or error message.
     """
+    await asyncio.to_thread(requireProjectOwner, details.projectId, user)
     try:
         pageId = dashboardService.createPage(details = details)
         return ORJSONResponse(status_code = 200, content = {"status": "SUCCESS", "pageId": pageId})
@@ -46,17 +48,18 @@ async def createPage(details: CreatePage, token = Depends(verifyToken)):
         raiseHttpException(e)
     
 @router.get("/getAllPages")
-async def getAllPages(projectId: str, token = Depends(verifyToken)):
+async def getAllPages(projectId: str, user: UserContext = Depends(verifyUser)):
     """
     Retrieve all pages for a given project.
 
     Args:
         projectId (str): The ID of the project.
-        token: Authorization token dependency.
+        user: UserContext injected after session verification.
 
     Returns:
         ORJSONResponse: List of pages or error message.
     """
+    await asyncio.to_thread(requireProjectOwner, projectId, user)
     try:
         pages = dashboardService.getAllPages(projectId = projectId)
         return ORJSONResponse(status_code = 200, content = {"status": "SUCCESS", "pages": pages})
@@ -64,17 +67,18 @@ async def getAllPages(projectId: str, token = Depends(verifyToken)):
         raiseHttpException(e)
     
 @router.post("/exportToDashboard")
-async def exportToDashboard(details: ExportToDashboard, token = Depends(verifyToken)):
+async def exportToDashboard(details: ExportToDashboard, user: UserContext = Depends(verifyUser)):
     """
     Export a widget to the dashboard.
 
     Args:
         details (ExportToDashboard): The details required to export a widget.
-        token: Authorization token dependency.
+        user: UserContext injected after session verification.
 
     Returns:
         ORJSONResponse: Success message with the widget ID or error message.
     """
+    await asyncio.to_thread(requireProjectOwner, details.projectId, user)
     try:
         widgetId = dashboardService.exportToDashboard(details = details)
         return ORJSONResponse(status_code = 200, content = {"status": "SUCCESS", "widgetId": widgetId})
@@ -82,17 +86,18 @@ async def exportToDashboard(details: ExportToDashboard, token = Depends(verifyTo
         raiseHttpException(e)
     
 @router.post("/getData")
-async def getData(details: GetData, token = Depends(verifyToken)):
+async def getData(details: GetData, user: UserContext = Depends(verifyUser)):
     """
     Retrieve data for a dashboard page.
 
     Args:
         details (GetData): The details specifying which data to retrieve.
-        token: Authorization token dependency.
+        user: UserContext injected after session verification.
 
     Returns:
         ORJSONResponse: Page data or error message.
     """
+    await asyncio.to_thread(requireProjectOwner, details.projectId, user)
     try:
         pageInfo = dashboardService.getData(details = details)
         return ORJSONResponse(status_code = 200, content = {"status": "SUCCESS", "pageData": pageInfo})
@@ -100,17 +105,18 @@ async def getData(details: GetData, token = Depends(verifyToken)):
         raiseHttpException(e)
     
 @router.put("/editWidgetPosition")
-async def editWidgetPosition(details: EditWidgetPosition, token = Depends(verifyToken)):
+async def editWidgetPosition(details: EditWidgetPosition, user: UserContext = Depends(verifyUser)):
     """
     Edit the position of a widget on a dashboard page.
 
     Args:
         details (EditWidgetPosition): The details for editing widget position.
-        token: Authorization token dependency.
+        user: UserContext injected after session verification.
 
     Returns:
         ORJSONResponse: Updated page data or error message.
     """
+    await asyncio.to_thread(requireProjectOwner, details.projectId, user)
     try:
         pageInfo = dashboardService.editWidgetPosition(details = details)
         return ORJSONResponse(status_code = 200, content = {"status": "SUCCESS", "pageData": pageInfo})
@@ -118,17 +124,18 @@ async def editWidgetPosition(details: EditWidgetPosition, token = Depends(verify
         raiseHttpException(e)
 
 @router.delete("/deleteDashboardElement")
-async def deleteDashboardElement(details: DeleteDashboardElement, token = Depends(verifyToken)):
+async def deleteDashboardElement(details: DeleteDashboardElement, user: UserContext = Depends(verifyUser)):
     """
     Delete an element from the dashboard.
 
     Args:
         details (DeleteDashboardElement): The details of the element to delete.
-        token: Authorization token dependency.
+        user: UserContext injected after session verification.
 
     Returns:
         ORJSONResponse: Success or error message.
     """
+    await asyncio.to_thread(requireProjectOwner, details.projectId, user)
     try:
         dashboardService.deleteDashboardElement(details = details)
         return ORJSONResponse(status_code = 200, content = {"status": "SUCCESS", "message": "element deleted successfully."})
@@ -136,17 +143,18 @@ async def deleteDashboardElement(details: DeleteDashboardElement, token = Depend
         raiseHttpException(e)
 
 @router.get("/getAllColumns/{projectId}")
-async def getAllColumns(projectId: str, token = Depends(verifyToken)):
+async def getAllColumns(projectId: str, user: UserContext = Depends(verifyUser)):
     """
     Retrieve all columns for a given project.
 
     Args:
         projectId (str): The ID of the project.
-        token: Authorization token dependency.
+        user: UserContext injected after session verification.
 
     Returns:
         ORJSONResponse: Details of columns or error message.
     """
+    await asyncio.to_thread(requireProjectOwner, projectId, user)
     try:
         results = dashboardService.getAllColumns(projectId = projectId)
         return ORJSONResponse(status_code = 200, content = {"status": "SUCCESS", "details": results})
@@ -154,7 +162,8 @@ async def getAllColumns(projectId: str, token = Depends(verifyToken)):
         raiseHttpException(e)
     
 @router.get("/dashboardRefresh/{projectId}")
-async def dashboardRefresh(projectId: str, token = Depends(verifyToken)):
+async def dashboardRefresh(projectId: str, user: UserContext = Depends(verifyUser)):
+    await asyncio.to_thread(requireProjectOwner, projectId, user)
     try:
         result = dashboardService.pullDataInParallel(projectId = projectId)
         result.update({"message": "Data refreshed successfully."})
