@@ -13,6 +13,15 @@ import io
 import traceback
 
 
+def _scopedToProject(reader, allowedProjectId):
+    """Refuse other projects. The first argument keeps its name so generated code can pass it by keyword."""
+    def scopedReader(projectId, tableName, *args, **kwargs):
+        if projectId != allowedProjectId:
+            raise PermissionError(f"Access denied: You can only query data for project '{allowedProjectId}' (requested '{projectId}').")
+        return reader(projectId, tableName, *args, **kwargs)
+    return scopedReader
+
+
 def main():
     try:
         input_data = json.load(sys.stdin)
@@ -53,9 +62,9 @@ def main():
     g = {
         "__builtins__": safe_builtins,
         "datetime": datetime,
-        "fetch_data": fetch_data,
-        "fetch_data_pl": fetch_data_pl,
-        "scan_data": scan_data,
+        "fetch_data": _scopedToProject(fetch_data, projectId),
+        "fetch_data_pl": _scopedToProject(fetch_data_pl, projectId),
+        "scan_data": _scopedToProject(scan_data, projectId),
         "math": math,
         "np": np,
         "pd": pd,
