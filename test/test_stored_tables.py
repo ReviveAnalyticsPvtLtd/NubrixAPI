@@ -1,6 +1,8 @@
 """Stored-table marker, bounded footer read and the API's writer."""
 
 import io
+import json
+import os
 
 import numpy as np
 import pandas as pd
@@ -8,7 +10,8 @@ import pyarrow as pa
 import pyarrow.parquet as pq
 import pytest
 
-from utils import storedTables
+from utils import sandboxRunner, storedTables
+from utils.sandboxSlots import SandboxBusyError
 from utils.storedTables import (
     MARKER_KEY,
     TableTooLargeError,
@@ -241,3 +244,79 @@ def test_missingKeyWarnsOnce(monkeypatch, warnings):
     for _ in range(5):
         tableMarker("p", "t")
     assert len([m for m in warnings.messages if "SUPABASE_KEY" in m]) == 1
+
+
+TRUSTED_ECHO = "trusted_echo_launcher.py"
+separateUids = pytest.mark.skipif(
+    os.name != "posix" or os.geteuid() != 0,
+    reason="only a root parent on Linux can run a child as another uid",
+)
+
+
+@pytest.fixture
+def trustedEcho(monkeypatch):
+    """The test launcher is allowed for one test only: production code has no way to name it."""
+    assert TRUSTED_ECHO not in sandboxRunner._TRUSTED_LAUNCHERS
+    monkeypatch.setitem(sandboxRunner._TRUSTED_LAUNCHERS, TRUSTED_ECHO, "test/trusted_echo_launcher.py")
+
+
+def test_trustedRunReadsItsInputAndReturnsItsResult(trustedEcho):
+    data = bytes(range(256)) * 40
+    result = sandboxRunner.runTrustedSandbox(TRUSTED_ECHO, "p1", data, {"mode": "echo"}, 120, 1 << 20)
+    assert result.returncode == 0, result.stderr
+    assert result.resultBytes == data
+    assert result.previewBytes is None
+    assert result.stopped is None
+
+
+@separateUids
+def test_trustedRunCannotWriteOrReplaceItsInput(trustedEcho):
+    result = sandboxRunner.runTrustedSandbox(TRUSTED_ECHO, "p1", b"abc", {"mode": "probe", "marker": "m-1"}, 120, 1 << 20)
+    assert result.returncode == 0, result.stderr
+    report = json.loads(result.resultBytes)
+    assert sandboxRunner._FIRST_RUN_UID <= report["uid"] < sandboxRunner._FIRST_RUN_UID + sandboxRunner._RUN_UID_COUNT
+    assert report["inputUid"] == 0
+    assert report["inputMode"] == "0o640"
+    assert report["writable"] is False
+    for attempt in ("append", "replace", "unlink", "createBeside"):
+        assert report[attempt] == "PermissionError", attempt
+    # The same lock-down as a code run: process limit and the seccomp filter.
+    assert report["nproc"] == sandboxRunner.currentRunLimits().maxProcesses
+    assert report["network"] == "PermissionError"
+
+
+def test_trustedRunHoldsNoSecretAndNoTableAccess(trustedEcho, monkeypatch):
+    monkeypatch.setenv("SUPABASE_KEY", "unit-test-key")
+    result = sandboxRunner.runTrustedSandbox(TRUSTED_ECHO, "p1", b"abc", {"mode": "probe", "marker": "m-1"}, 120, 1 << 20)
+    assert result.returncode == 0, result.stderr
+    report = json.loads(result.resultBytes)
+    assert report["request"] == {"mode": "probe", "marker": "m-1"}
+    assert {"input_path", "request", "result_path", "channel"} <= set(report["payloadKeys"])
+    assert "unit-test-key" not in report["seen"]
+    assert "Could not read" in report["tableRead"] or "no table" in report["tableRead"].lower()
+
+
+def test_trustedRunRefusesALauncherOutsideTheAllowList():
+    for name in ("sandbox_launcher.py", "../test/trusted_echo_launcher.py", TRUSTED_ECHO, ""):
+        with pytest.raises(ValueError):
+            sandboxRunner.runTrustedSandbox(name, "p1", b"abc", {}, 5, 1024)
+
+
+def test_trustedRunRaisesBusyWhenNoSlotIsFree(trustedEcho, monkeypatch, tmp_path):
+    def busy(*_args):
+        raise SandboxBusyError()
+
+    monkeypatch.setattr(sandboxRunner, "acquireRunSlot", busy)
+    with pytest.raises(SandboxBusyError):
+        sandboxRunner.runTrustedSandbox(TRUSTED_ECHO, "p1", b"abc", {"mode": "echo"}, 5, 1024)
+
+
+def test_trustedRunTimesOutLikeAnyRun(trustedEcho):
+    result = sandboxRunner.runTrustedSandbox(TRUSTED_ECHO, "p1", b"abc", {"mode": "hang"}, 2, 1024)
+    assert result.stopped == "Execution timed out after 2 seconds."
+    assert result.resultBytes is None
+
+
+def test_trustedResultOverTheCapIsRefused(trustedEcho):
+    with pytest.raises(ValueError, match="too large"):
+        sandboxRunner.runTrustedSandbox(TRUSTED_ECHO, "p1", b"x" * 5000, {"mode": "echo"}, 120, 1000)
