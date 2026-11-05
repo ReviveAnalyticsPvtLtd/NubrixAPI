@@ -6,8 +6,11 @@ Reads JSON from stdin: {"input_path": ..., "result_path": ..., "request": {"mark
 "channel": ...}. The marker is the value the parent computed for this table; the child never holds the key behind it.
 
 The input is streamed batch by batch and refused once the decoded batches pass `maxDecodedBytes` (0 = no limit),
-which exits with `EXIT_TOO_LARGE`. The output is written with the API's own settings and a fresh schema: no
-metadata from the input is kept except a pandas entry that fits the table, and the only marker is the new one.
+which exits with `EXIT_TOO_LARGE`. Each batch is counted with every dictionary, at any depth, decoded to its values,
+so a small dictionary repeated over many rows counts at its full size. Dictionaries nested inside a column are
+written as plain values; a top-level dictionary (a pandas categorical) is kept as it is. The output is written with
+the API's own settings and a fresh schema: no metadata from the input is kept except a pandas entry that fits the
+table, and the only marker is the new one.
 Any other failure exits 1 with the error on stderr.
 """
 
@@ -31,6 +34,8 @@ def _normalise(inputPath: str, resultPath: str, marker: str, limit: int) -> None
         ROW_GROUP_ROWS,
         WRITE_SETTINGS,
         TableTooLargeError,
+        hasDictionary,
+        plainType,
         trustedPandasMetadata,
     )
 
@@ -42,17 +47,24 @@ def _normalise(inputPath: str, resultPath: str, marker: str, limit: int) -> None
         metadata[b"pandas"] = pandasEntry
     if marker:
         metadata[MARKER_KEY] = marker.encode("ascii")
+    plainTypes = [plainType(field.type) for field in source]
+    keepTopLevel = [pa.types.is_dictionary(field.type) for field in source]
     # Fields are rebuilt too, so no field carries metadata from the input.
-    schema = pa.schema([pa.field(field.name, field.type, field.nullable) for field in source], metadata=metadata or None)
+    schema = pa.schema(
+        [pa.field(field.name, field.type if keep else plain, field.nullable) for field, plain, keep in zip(source, plainTypes, keepTopLevel)],
+        metadata=metadata or None,
+    )
     decoded = 0
     pending: list = []
     pendingRows = 0
     with pq.ParquetWriter(resultPath, schema, **WRITE_SETTINGS) as writer:
         for batch in parquet.iter_batches(batch_size=NORMALISE_BATCH_ROWS):
-            decoded += batch.nbytes
+            dense = [column.cast(plain) if hasDictionary(column.type) else column for column, plain in zip(batch.columns, plainTypes)]
+            decoded += sum(column.nbytes for column in dense)
             if limit and decoded > limit:
                 raise TableTooLargeError(f"The decoded batches passed {limit} bytes.")
-            pending.append(pa.RecordBatch.from_arrays(batch.columns, schema=schema))
+            columns = [original if keep else plain for original, plain, keep in zip(batch.columns, dense, keepTopLevel)]
+            pending.append(pa.RecordBatch.from_arrays(columns, schema=schema))
             pendingRows += batch.num_rows
             # Batches are gathered into whole row groups, as the API's writer lays them out.
             while pendingRows >= ROW_GROUP_ROWS:

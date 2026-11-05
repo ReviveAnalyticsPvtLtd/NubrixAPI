@@ -5,11 +5,12 @@ Started by `storedTables.readUntrusted*` through `runTrustedSandbox`, with RLIMI
 TABLE_READER_MEMORY_BYTES and no table access. Reads JSON from stdin: {"input_path": ..., "result_path": ...,
 "request": {"op": "table" | "page" | "info", "maxDecodedBytes": ..., "offset": ..., "limit": ...}, "channel": ...}.
 
-Before decoding, the row groups a read needs are checked against `maxDecodedBytes` (0 = no limit); a read over it
-exits with `EXIT_TOO_LARGE`. "table" and "page" answer with an uncompressed Arrow IPC stream: dictionary columns are
-decoded to their values, so the parent's result cap bounds what it holds, and the schema keeps only a pandas entry
-that fits the table (and, for a page, the table's row count). "info" answers with the JSON `storedTables.tableInfo`
-builds. Any other failure exits 1 with the error on stderr.
+Before decoding, the whole table's encoded, uncompressed size is checked against `maxDecodedBytes` (0 = no limit).
+"table" and "page" then exit with `EXIT_TOO_LARGE`; "info" answers with the shape and no sample. "table" and "page"
+answer with an uncompressed Arrow IPC stream: dictionaries at any depth are decoded to their values here, under this
+child's limit, so the parent's result cap bounds what it holds; the schema keeps only a pandas entry that fits the
+table (and, for a page, the table's row count). "info" answers with the JSON `storedTables.tableInfo` builds, its
+sample cut to `MAX_SAMPLE_CHARS`. Any other failure exits 1 with the error on stderr.
 """
 
 import json
@@ -23,10 +24,10 @@ os.environ["OPENBLAS_NUM_THREADS"] = "1"
 
 
 def _plainTable(table, extra: dict):
-    """The table with dictionary columns decoded and no metadata but a valid pandas entry and `extra`."""
+    """The table with dictionaries at every depth decoded and no metadata but a valid pandas entry and `extra`."""
     import pyarrow as pa
 
-    from utils.storedTables import trustedPandasMetadata
+    from utils.storedTables import hasDictionary, plainType, trustedPandasMetadata
 
     metadata: dict[bytes, bytes] = {}
     pandasEntry = trustedPandasMetadata(table.schema)
@@ -35,8 +36,8 @@ def _plainTable(table, extra: dict):
     metadata.update(extra)
     columns, fields = [], []
     for field, column in zip(table.schema, table.columns):
-        if pa.types.is_dictionary(column.type):
-            column = pa.chunked_array([chunk.dictionary_decode() for chunk in column.chunks], type=column.type.value_type)
+        if hasDictionary(column.type):
+            column = column.cast(plainType(column.type))
         columns.append(column)
         fields.append(pa.field(field.name, column.type, field.nullable))
     return pa.Table.from_arrays(columns, schema=pa.schema(fields, metadata=metadata or None))
@@ -45,12 +46,14 @@ def _plainTable(table, extra: dict):
 def _answer(inputPath: str, resultPath: str, request: dict) -> None:
     import pyarrow as pa
 
-    from utils.storedTables import PAGE_ROWS_KEY, TableTooLargeError, decodePage, decodeTable, tableInfo
+    from utils.storedTables import MAX_SAMPLE_CHARS, PAGE_ROWS_KEY, TableTooLargeError, decodePage, decodeTable, tableInfo
 
     limit = int(request["maxDecodedBytes"])
     op = request["op"]
     if op == "info":
         info = tableInfo(inputPath, limit)
+        if info["sample"] is not None:
+            info["sample"] = info["sample"][:MAX_SAMPLE_CHARS]
         with open(resultPath, "w") as target:
             json.dump(info, target)
         return
