@@ -15,6 +15,7 @@ from langgraph.graph import StateGraph, START, END
 from utils.codeExecutor import REPLManager, _remove_code_fences
 from typing_extensions import TypedDict
 from utils.logger import logger
+from utils.mapPointLabels import ensureScatterMapPointLabels
 import json
 import os
 
@@ -191,6 +192,7 @@ class ReportingToolWorkflow:
                 response = json.loads(state["codeOutput"])
             except Exception as e:
                 response = {"error": f"Endpoint says: {e}"}
+            ensureScatterMapPointLabels(response)
             return {
                 "finalOutput": response
             }
