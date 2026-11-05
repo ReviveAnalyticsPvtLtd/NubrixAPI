@@ -649,8 +649,9 @@ class ReportingService:
             
             for widget, originalQuery in zip(responses, uniqueQueries):
                 widgetId = str(uuid.uuid4())
-                chartType = widget.get("finalOutput", {}).get("chartType")
-                data = widget.get("finalOutput", {}).get("data")
+                chart_output = widget.get("finalOutput", {})
+                chartType = chart_output.get("chartType")
+                data = chart_output.get("data")
                 if chartType == "card":
                     if isinstance(data, (int, float)):
                         data = float(f"{data:.2f}")
@@ -667,18 +668,21 @@ class ReportingService:
                         "generatedCode": widget.get("generatedCode")
                     })
                 else:
-                    newWidgets.append({
+                    dashboard_widget = {
                         "id": widgetId,
                         "chartType": chartType,
-                        "title": widget.get("finalOutput", {}).get("title"),
-                        "label": widget.get("finalOutput", {}).get("label"),
-                        "xLabels": widget.get("finalOutput", {}).get("xLabels"),
-                        "yLabels": widget.get("finalOutput", {}).get("yLabels"),
+                        "title": chart_output.get("title"),
+                        "label": chart_output.get("label"),
+                        "xLabels": chart_output.get("xLabels"),
+                        "yLabels": chart_output.get("yLabels"),
                         "data": data,
                         "query": originalQuery,
                         "layout": {"x": 0, "y": 0, "w": 6, "h": 10},
                         "generatedCode": widget.get("generatedCode")
-                    })
+                    }
+                    if chartType in ("geoMap", "geo-map") and "map" in chart_output:
+                        dashboard_widget["map"] = chart_output["map"]
+                    newWidgets.append(dashboard_widget)
             
             allWidgets = existingWidgets + newWidgets
             cards = [w for w in allWidgets if w.get("chartType") == "card"]

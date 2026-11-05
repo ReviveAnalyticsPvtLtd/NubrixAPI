@@ -963,12 +963,13 @@ codeGeneratorAgentPrompt: |
             "mapType": "scatterMap",
             "data": {{
                 "points": [
-                    {{"id": "<unique_id>", "lat": <latitude>, "long": <longitude>}}
+                    {{"id": "<unique_id>", "lat": <latitude>, "long": <longitude>, "label": "<point hover text>"}}
                 ]
             }}
         }}
     }}
     ```
+      - Every point MUST have the exact top-level key `label` with a nonempty string. Use the hover information requested by the user when available. Otherwise use the source row's label, city, or location code, then the coordinates. Use only values available in the plotted data.
     - **Table Chart Rules:**
       - Use `chartType: "table"` when the user wants to see raw data rows, a filtered subset, or specific columns — NOT an aggregated chart.
       - The `columns` array MUST list every column name present in the `data` records, in the order they should appear.
@@ -1416,6 +1417,7 @@ codeDebuggerAgentPrompt: |
     ### Chart.js Structure Errors
     - Incorrect JSON structure for the chart type
     - Missing or misnamed JSON keys
+    - For `geoMap` scatter maps, preserve or populate each point's top-level `label` string. Use the requested hover text or source location text, then the coordinates.
     - Nested dictionary/list structure issues
     - Data type inconsistencies (lists vs. single values)
     - Serialization issues with complex objects
