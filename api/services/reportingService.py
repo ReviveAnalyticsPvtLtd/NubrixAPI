@@ -205,7 +205,7 @@ class ReportingService:
             return lf.group_by(x).agg(expr.alias(y)).collect()
 
         single_table = tablesUsed if not isinstance(tablesUsed, list) else None
-        use_lazy = _use_lazy(single_table) and not hasFilters and chartType != "pivot"
+        use_lazy = _use_lazy(single_table) and not hasFilters and chartType not in ("pivot", "geoMap")
 
         if use_lazy:
             import polars as pl
@@ -423,9 +423,11 @@ class ReportingService:
                     geocode_cache[value] = None
                 return geocode_cache[value]
 
-            for _, row in finalResult.iterrows():
+            label_values = finalResult.get("label")
+            for row_index, (_, row) in enumerate(finalResult.iterrows()):
                 lat = None
                 lon = None
+                location_label = ""
 
                 if xAxis in finalResult.columns and yAxis in finalResult.columns:
                     latEx = row[xAxis]
@@ -444,12 +446,24 @@ class ReportingService:
                             if pd.notna(latC) and pd.notna(lonC):
                                 lat = latC
                                 lon = lonC
+                                location_label = g.strip()
 
                 if lat is not None and lon is not None:
+                    # Read the original column value since iterrows can coerce integers to floats.
+                    label_value = label_values.iloc[row_index] if isinstance(label_values, pd.Series) else None
+                    label = ""
+                    if pd.api.types.is_scalar(label_value) and pd.notna(label_value):
+                        is_numeric_zero = (
+                            pd.api.types.is_number(label_value)
+                            and not pd.api.types.is_bool(label_value)
+                            and label_value == 0
+                        )
+                        label = "0" if is_numeric_zero else str(label_value).strip()
                     points.append({
                         "id": "".join(random.choice(string.ascii_letters + string.digits) for i in range(16)),
                         "lat": lat,
-                        "long": lon
+                        "long": lon,
+                        "label": label or location_label or f"{lat}, {lon}",
                     })
 
             response = {
