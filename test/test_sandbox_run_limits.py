@@ -633,6 +633,21 @@ def test_replManagerReturnsJustTheStopMessageWhenThereIsNoOutput(monkeypatch):
     assert _replWith(monkeypatch, result).run("print(1)", "p1") == STOP_MESSAGE
 
 
+def test_replManagerNeverReturnsParseableJsonForAStoppedRun(monkeypatch):
+    # Callers accept any valid JSON as a result, so a stopped run's output must not parse, even when it already holds the sentence.
+    printed = json.dumps({"data": [1, 2], "note": STOP_MESSAGE})
+    result = sandboxRunner.SandboxResult(stdout=printed, stderr="", returncode=-9, resultBytes=None, previewBytes=None, stopped=STOP_MESSAGE)
+    text = _replWith(monkeypatch, result).run("print(1)", "p1")
+    assert STOP_MESSAGE in text
+    with pytest.raises(json.JSONDecodeError):
+        json.loads(text)
+
+
+def test_replManagerReturnsStderrForAFailedRunThatPrintedJson(monkeypatch):
+    result = sandboxRunner.SandboxResult(stdout='{"data": [1]}', stderr="Traceback: boom", returncode=1, resultBytes=None, previewBytes=None, stopped=None)
+    assert _replWith(monkeypatch, result).run("print(1)", "p1") == "Traceback: boom"
+
+
 def test_previewShowsTheStopMessage(monkeypatch):
     from nubrix.components import transformationExecutor as module
     from utils.exceptionHandler import CustomException

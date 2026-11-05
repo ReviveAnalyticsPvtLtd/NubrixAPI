@@ -189,8 +189,9 @@ class TransformationExecutor:
             stdout, stderr, rc, *_ = runSandbox("inspect_launcher.py", projectId, pythonCode, self.timeoutSeconds)
         except SandboxBusyError as e:
             raise self._busy(e)
-        if rc != 0 and stderr:
-            return f"Stdout:\n{stdout}\nStderr/Errors:\n{stderr}"
+        if rc != 0:
+            errors = stderr or f"Inspection exited with code {rc} and wrote no error output."
+            return f"Stdout:\n{stdout}\nStderr/Errors:\n{errors}"
         return stdout if stdout else "Inspection executed successfully with no output."
 
     def executeAndPreview(self, projectId: str, pythonCode: str, tableName: str) -> tuple[list[dict], bytes]:
@@ -205,22 +206,32 @@ class TransformationExecutor:
             logger.error(exception)
             raise exception
 
-    def apply(self, projectId: str, parquetBytes: bytes, tableName: str) -> None:
-        """Upload parquet bytes to Supabase storage and drop the table from the fetch_data caches."""
+    def apply(self, projectId: str, parquetBytes: bytes, tableName: str, overwrite: bool = True) -> None:
+        """Upload parquet bytes to Supabase storage and drop the table from the fetch_data caches.
+
+        With overwrite=False storage keeps any file already there, and this answers 409.
+        """
         try:
             self._validate_table_name(tableName)
             storagePath = f"{projectId}/{tableName}.parquet"
-            self.client.storage.from_("AnalyticsHub").upload(
-                path=storagePath,
-                file=parquetBytes,
-                file_options={"upsert": "true"},
-            )
+            try:
+                self.client.storage.from_("AnalyticsHub").upload(
+                    path=storagePath,
+                    file=parquetBytes,
+                    file_options={"upsert": "true" if overwrite else "false"},
+                )
+            except Exception as e:
+                if not overwrite and (str(getattr(e, "status", "")) == "409" or getattr(e, "code", None) == "Duplicate"):
+                    raise CustomException(e, statusCode=409, uiMessage=f"A table named '{tableName}' was just added to this project. Please use a different name.")
+                raise
             self._redis_client().delete(f"{projectId}::{tableName}")
             try:
                 from utils.initMethods import invalidate_data_cache
                 invalidate_data_cache(projectId=projectId, tableName=tableName)
             except Exception:
                 pass
+        except CustomException:
+            raise
         except Exception as e:
             exception = CustomException(e, statusCode=500, uiMessage="Failed to apply transformation.")
             logger.error(exception)

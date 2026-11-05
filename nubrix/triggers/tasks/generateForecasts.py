@@ -4,9 +4,9 @@ __all__ = ["GenerateForecasts"]
 
 
 from contextlib import contextmanager
-from sqlalchemy import create_engine
+from sqlalchemy import URL, create_engine
 from lightgbm import LGBMRegressor
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from functools import lru_cache
 from utils.logger import logger
 from io import StringIO
@@ -20,6 +20,14 @@ import base64
 import html
 import os
 
+_DATABASE_ENVIRONMENT = (
+    "FORECAST_DB_USER",
+    "FORECAST_DB_PASSWORD",
+    "FORECAST_DB_HOST",
+    "FORECAST_DB_PORT",
+    "FORECAST_DB_NAME",
+)
+
 @contextmanager
 def captureLoguruLogs(level="INFO"):
     buffer = StringIO()
@@ -31,16 +39,32 @@ def captureLoguruLogs(level="INFO"):
 
 @dataclass
 class GenerateForecastsConfig:
-    postgreUser: str = "admin"
-    postgrePassword: str = "nLDbKmvMU4Fge8VY7HJ7J0CpbBLU0j9f"
-    postgreHost: str = "dpg-d1rk4eer433s73ae3qpg-a.singapore-postgres.render.com"
-    postgrePort: int = 5432
-    postgreDB: str = "moneymanagement"
+    postgreUser: str
+    postgrePassword: str = field(repr = False)
+    postgreHost: str
+    postgrePort: int
+    postgreDB: str
+
+    @classmethod
+    def fromEnvironment(cls) -> "GenerateForecastsConfig":
+        values = {name: os.environ.get(name, "").strip() for name in _DATABASE_ENVIRONMENT}
+        missing = [name for name, value in values.items() if not value]
+        if missing:
+            raise RuntimeError(f"Forecast database is not configured, missing: {', '.join(missing)}")
+        if not values["FORECAST_DB_PORT"].isdecimal():
+            raise RuntimeError("FORECAST_DB_PORT must be a port number")
+        return cls(
+            postgreUser = values["FORECAST_DB_USER"],
+            postgrePassword = values["FORECAST_DB_PASSWORD"],
+            postgreHost = values["FORECAST_DB_HOST"],
+            postgrePort = int(values["FORECAST_DB_PORT"]),
+            postgreDB = values["FORECAST_DB_NAME"],
+        )
 
 
 class GenerateForecasts:
     def __init__(self):
-        self.generateForecastsConfig = GenerateForecastsConfig()
+        self.generateForecastsConfig = GenerateForecastsConfig.fromEnvironment()
 
     @staticmethod
     @lru_cache(maxsize=512)
@@ -90,15 +114,15 @@ class GenerateForecasts:
         try:
             with captureLoguruLogs() as logStream:
                 logger.info("Reading data from source")
-                CONNECTION_STRING = 'postgresql+psycopg2://{POSTGRE_USER}:{POSTGRE_PASSWORD}@{POSTGRE_HOST}:{POSTGRE_PORT}/{POSTGRE_DB}'
-                CONNECTION_STRING = CONNECTION_STRING.format(
-                    POSTGRE_USER = self.generateForecastsConfig.postgreUser,
-                    POSTGRE_PASSWORD = self.generateForecastsConfig.postgrePassword,
-                    POSTGRE_HOST = self.generateForecastsConfig.postgreHost,
-                    POSTGRE_PORT = self.generateForecastsConfig.postgrePort,
-                    POSTGRE_DB = self.generateForecastsConfig.postgreDB
+                CONNECTION_URL = URL.create(
+                    "postgresql+psycopg2",
+                    username = self.generateForecastsConfig.postgreUser,
+                    password = self.generateForecastsConfig.postgrePassword,
+                    host = self.generateForecastsConfig.postgreHost,
+                    port = self.generateForecastsConfig.postgrePort,
+                    database = self.generateForecastsConfig.postgreDB
                 )
-                engine = create_engine(CONNECTION_STRING)
+                engine = create_engine(CONNECTION_URL)
                 dfOrig = pd.read_sql("emptykegsdata", engine).rename(columns={"sum(Quantity)": "Quantity"})
                 logger.info(f"Loaded {len(dfOrig)} rows")
                 data = dfOrig.copy()

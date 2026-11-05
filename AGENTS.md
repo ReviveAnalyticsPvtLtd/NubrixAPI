@@ -38,7 +38,7 @@ NubrixAI Analytics Hub API — FastAPI + Celery + LangChain monolith.
 - Celery: beat schedule is in `nubrix/triggers/celery.py` (UTC). All times are UTC. `pastDueSuspension` and `entitlementBoundary` run every 30 min; `reconciliation` every 15 min; `creditReconciliation` hourly; billing/expiry sweeps are daily at 00:00–02:00 UTC. No queue split — single celery worker handles all tasks.
 - `pyproject.toml` has no `[tool.pytest]` / lint config and there is no test directory — there are no automated tests. CI is a single GitHub Actions workflow `.github/workflows/subscriptionCron.yaml` that runs `python nubrix/components/subscriptionManager.py` daily. Do not invent a test command.
 - `prompts.yaml`, `codeTemplates.yaml`, `config.ini` are loaded by absolute path via `os.path.join(os.getcwd(), ...)` in `CodeGenerator` and friends — run from repo root.
-- `.env` is required and gitignored. Required keys: `SECRET_KEY`, `SUPABASE_URL`, `SUPABASE_KEY`, `DATABASE_URL`, `REDIS_HOST/PORT/PASSWORD`, plus provider keys (`GEMINI_API_KEY`/`GOOGLE_API_KEY`, `GROQ_API_KEY`, `CEREBRAS_API_KEY`, `OPENAI_API_KEY`, `LANGSMITH_*`, `LOGTAIL_*`, `RAZORPAY_*`, `BREVO_API_KEY`, `BREVO_SENDER_EMAIL`, `BREVO_SENDER_NAME`, `DASHBOARD_BASE_URL`, `LANGFUSE_*`).
+- `.env` is required and gitignored. Required keys: `SECRET_KEY`, `SUPABASE_URL`, `SUPABASE_KEY`, `DATABASE_URL`, `REDIS_HOST/PORT/PASSWORD`, plus provider keys (`GEMINI_API_KEY`/`GOOGLE_API_KEY`, `GROQ_API_KEY`, `CEREBRAS_API_KEY`, `OPENAI_API_KEY`, `LANGSMITH_*`, `LOGTAIL_*`, `RAZORPAY_*`, `BREVO_API_KEY`, `BREVO_SENDER_EMAIL`, `BREVO_SENDER_NAME`, `DASHBOARD_BASE_URL`, `LANGFUSE_*`). The forecast task also needs `FORECAST_DB_USER`, `FORECAST_DB_PASSWORD`, `FORECAST_DB_HOST`, `FORECAST_DB_PORT` and `FORECAST_DB_NAME`; it fails naming any that are missing when it starts, and the app and worker run without them.
 - `AGENTS.md` and `CLAUDE.md` are gitignored on purpose — this file is for the local agent, not for git.
 - `OPENBLAS_NUM_THREADS=2` is set in `.env` to throttle BLAS (numpy/scipy) in the container.
 
@@ -116,8 +116,8 @@ NubrixAI Analytics Hub API — FastAPI + Celery + LangChain monolith.
 
 ## Table Name Collision Guard
 - `managementService.validateTableNameAvailable(projectId, tableName)` — raises `409` if name exists in metadata (active or inactive).
-- Called at every table creation entry point: CSV/Excel/MySQL/PostgreSQL/MongoDB load + transformation preview.
-- Transformation: validated at preview only, not re-validated at apply (name already confirmed).
+- Called at every table creation entry point: CSV/Excel/PDF/MySQL/PostgreSQL/MongoDB load, through `dataLoadService._acceptTableName`, which also clears any transformation artifact naming that table, and again once the file is written.
+- Transformation: `_validate_transformation_table_name` runs at create, rename and approve, and again straight before apply and rollback write the table (`_claim_table_name`: check, claim in `latest_approved_artifact`, check again). A table file the transformation did not write is refused, with or without a metadata key.
 
 ## Quick orientation for new tasks
 - New HTTP endpoint: add a function to the relevant `api/routers/*.py` (or a new router + `app.include_router` in `main.py:77-88`), put logic in `api/services/`, secure with `Depends(verifyUser)` or stronger dep from `api/commons.py`.

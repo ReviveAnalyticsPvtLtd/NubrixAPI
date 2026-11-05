@@ -79,9 +79,10 @@ class REPLManager:
         # 2. Launch subprocess
         stdout = ""
         stderr = ""
+        returnCode = None
         stopped = None
         try:
-            stdout, stderr, _, _, _, stopped = runSandbox("sandbox_launcher.py", projectId, codeString, self.timeoutSeconds)
+            stdout, stderr, returnCode, _, _, stopped = runSandbox("sandbox_launcher.py", projectId, codeString, self.timeoutSeconds)
         except SandboxBusyError:
             # Not output: callers must not treat a full sandbox as a code failure. The semaphore entry is released below.
             raise
@@ -95,13 +96,15 @@ class REPLManager:
                     logger.warning(f"Failed to release semaphore for project {projectId}: {e}")
 
         if stopped:
-            # Tell the caller why the run ended, once, after whatever it printed.
+            # Tell the caller why the run ended, after whatever it printed. The sentence on the end keeps a stopped
+            # run's output from parsing as a result, even when the output already holds it.
             if not stdout.strip():
                 return stopped
-            return stdout if stopped in stdout else stdout + "\n" + stopped
-        if stdout:
-            return stdout
-        return stderr
+            return stdout + "\n" + stopped
+        # Callers accept any valid JSON as the result, so a failed run's partial stdout must not reach them.
+        if returnCode:
+            return stderr or f"Code execution exited with code {returnCode} and wrote no error output."
+        return stdout or stderr
 
 
 replManager = REPLManager(timeoutSeconds=None, maxConcurrentPerProject=50)

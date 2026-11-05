@@ -65,7 +65,7 @@ class _FakeClient:
     def _bucket(self, bucketName):
         return types.SimpleNamespace(list=self._list if bucketName == "AnalyticsHub" else lambda *a, **k: [], upload=self._upload, remove=lambda *a, **k: None)
 
-    def _list(self, path=None):
+    def _list(self, path=None, options=None):
         prefix = f"AnalyticsHub/{path}/"
         return [
             {"name": key[len(prefix):], "metadata": {"lastModified": "2026-10-31T00:00:00.000Z"}}
@@ -410,6 +410,7 @@ def test_transformationMetadataIsReadWithTheServiceKey(storage):
 
 def test_transformationCannotOverwriteABaseTable(storage):
     storage.putJson(PROJECT, "metadata.json", {"sales": {}})
+    storage.put(PROJECT, "sales.parquet", b"table")
 
     with pytest.raises(CustomException) as caught:
         _transformationService(storage)._validate_transformation_table_name(PROJECT, "sales", currentTransformationId="t1")
@@ -549,7 +550,12 @@ def test_dataLayerColdPathReadsWithTheServiceKey(storage, coldDataCache, read, r
 
 
 def _viewTable(tableName="sales", page=1, pageSize=2):
-    return asyncio.run(manager.viewTable(PROJECT, tableName, page=page, pageSize=pageSize, token="session"))
+    original = manager.requireProjectOwner
+    manager.requireProjectOwner = lambda *_args: None
+    try:
+        return asyncio.run(manager.viewTable(PROJECT, tableName, page=page, pageSize=pageSize, user=MagicMock(userId="user_1")))
+    finally:
+        manager.requireProjectOwner = original
 
 
 def test_viewTablePagesAPrivateTable(storage):

@@ -317,6 +317,7 @@ def test_all_login_variants_share_exact_boundary(database, kind, offset, expecte
     with patch('api.services.billing.manualBillingRepository.getManualBillingRepository', return_value=repository), \
          patch('test.test_manual_billing_runtime.NOW', evaluated), \
          patch.object(service, '_getCreditSnapshot', return_value={}), \
+         patch.object(service, '_sessionSubscription', return_value={}), \
          patch('api.services.subscriptions.paymentValidationService.utcNow', return_value=evaluated):
         if kind == 'password':
             result = service.login(Login(email='user@example.test', password='secret'))

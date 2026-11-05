@@ -51,7 +51,7 @@ class BlendService:
                 "blendOn": blendDetails.blendOn,
                 "joinTypes": blendDetails.joinTypes
             }
-            if "blendConfig.json" in [x.get("name") for x in self.client.storage.from_("AnalyticsHub").list(path = blendDetails.projectId)]:
+            if "blendConfig.json" in [x.get("name") for x in self.client.storage.from_("AnalyticsHub").list(path = blendDetails.projectId, options = {"search": "blendConfig.json"})]:
                 blendConfig = readJson(blendDetails.projectId, "blendConfig.json")
                 blendConfig[blendDetails.blendName] = joinConfig
             else:
@@ -81,7 +81,7 @@ class BlendService:
             CustomException: For any errors during retrieval.
         """
         try:
-            if "blendConfig.json" in [x.get("name") for x in self.client.storage.from_("AnalyticsHub").list(path = projectId)]:
+            if "blendConfig.json" in [x.get("name") for x in self.client.storage.from_("AnalyticsHub").list(path = projectId, options = {"search": "blendConfig.json"})]:
                 blendConfig = readJson(projectId, "blendConfig.json")
                 blendedTables = list(blendConfig.keys())
                 blends = [
@@ -116,7 +116,6 @@ class BlendService:
             CustomException: For any errors during extraction.
         """
         try:
-            allFiles = [x.get("name") for x in self.client.storage.from_("AnalyticsHub").list(path = details.projectId)]
             metadata = readJson(details.projectId, "metadata.json")
             if details.tableName in metadata.keys():
                 if metadata[details.tableName].get("isActive", True) is False:
@@ -126,7 +125,7 @@ class BlendService:
                         uiMessage=f"Table '{details.tableName}' is inactive. Activate it first to use it."
                     )
                 allFields = metadata[details.tableName]["columns"]
-            elif "blendConfig.json" in allFiles:
+            elif "blendConfig.json" in [x.get("name") for x in self.client.storage.from_("AnalyticsHub").list(path = details.projectId, options = {"search": "blendConfig.json"})]:
                 blendConfig = readJson(details.projectId, "blendConfig.json")
                 allFields = list()
                 tablesUsed = blendConfig[details.tableName].get("tables")

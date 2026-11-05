@@ -101,7 +101,7 @@ class TestRequireCreditsMonthly(unittest.TestCase):
             with self.assertRaises(HTTPException) as ctx:
                 dep(user=_FakeUser())
         self.assertEqual(ctx.exception.status_code, 403)
-        self.assertEqual(ctx.exception.detail["errorCode"], "FEATURE_BLOCKED")
+        self.assertEqual(ctx.exception.detail["errorCode"], "SUBSCRIPTION_INACTIVE")
         # quota was never even consulted
         mockRemaining.assert_not_called()
 

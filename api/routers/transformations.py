@@ -15,9 +15,10 @@ from api.models import (
 )
 from api.services.transformationService import transformationService
 from utils.exceptionHandler import CustomException, raiseHttpException
+import asyncio
 from fastapi.responses import ORJSONResponse, StreamingResponse
 from fastapi import APIRouter, Depends
-from api.commons import verifyToken, verifyUser, requireActiveSubscription, requireCredits, UserContext
+from api.commons import requireProductAccess, requireActiveSubscription, requireCredits, requireProjectOwner, UserContext
 
 
 router = APIRouter()
@@ -35,6 +36,7 @@ async def createTransformation(
     """
     Create a new transformation workspace for a project.
     """
+    await asyncio.to_thread(requireProjectOwner, projectId, user)
     try:
         result = await transformationService.createTransformation(
             projectId=projectId,
@@ -47,10 +49,11 @@ async def createTransformation(
 
 
 @router.get("")
-async def listTransformations(projectId: str, token=Depends(verifyToken)):
+async def listTransformations(projectId: str, user: UserContext = Depends(requireProductAccess)):
     """
     List all transformations for a project.
     """
+    await asyncio.to_thread(requireProjectOwner, projectId, user)
     try:
         result = await transformationService.listTransformations(projectId=projectId)
         return ORJSONResponse(status_code=200, content={"data": result})
@@ -62,11 +65,12 @@ async def listTransformations(projectId: str, token=Depends(verifyToken)):
 async def getTransformationMessages(
     transformation_id: str,
     projectId: str,
-    token=Depends(verifyToken),
+    user: UserContext = Depends(requireProductAccess),
 ):
     """
     Return persisted chat history for a transformation.
     """
+    await asyncio.to_thread(requireProjectOwner, projectId, user)
     try:
         result = await transformationService.getMessages(
             projectId=projectId,
@@ -87,6 +91,7 @@ async def sendTransformationMessage(
     """
     Send a user message and stream the assistant response over SSE.
     """
+    await asyncio.to_thread(requireProjectOwner, projectId, user)
     return StreamingResponse(
         transformationService.sendMessageStream(
             projectId=projectId,
@@ -108,6 +113,7 @@ async def approveTransformationMessage(
     """
     Approve a Mermaid artifact and return a transformed table preview.
     """
+    await asyncio.to_thread(requireProjectOwner, projectId, user)
     try:
         result = await transformationService.approveMessage(
             projectId=projectId,
@@ -129,6 +135,7 @@ async def applyTransformationMessage(
     """
     Persist an approved transformation output as a project table.
     """
+    await asyncio.to_thread(requireProjectOwner, projectId, user)
     try:
         result = await transformationService.applyTransformation(
             projectId=projectId,
@@ -151,6 +158,7 @@ async def rollbackTransformation(
     """
     Rollback workspace state and messages to a specific message ID.
     """
+    await asyncio.to_thread(requireProjectOwner, projectId, user)
     try:
         result = await transformationService.rollbackTransformation(
             projectId=projectId,
@@ -168,11 +176,12 @@ async def renameTransformation(
     transformation_id: str,
     projectId: str,
     request: RenameTransformationRequest,
-    token=Depends(verifyToken),
+    user: UserContext = Depends(requireProductAccess),
 ):
     """
     Rename an existing transformation workspace.
     """
+    await asyncio.to_thread(requireProjectOwner, projectId, user)
     try:
         result = await transformationService.renameTransformation(
             projectId=projectId,
@@ -188,11 +197,12 @@ async def renameTransformation(
 async def deleteTransformation(
     transformation_id: str,
     projectId: str,
-    user: UserContext = Depends(verifyUser),
+    user: UserContext = Depends(requireProductAccess),
 ):
     """
     Delete a transformation workspace and its associated parquet file if it exists.
     """
+    await asyncio.to_thread(requireProjectOwner, projectId, user)
     try:
         result = await transformationService.deleteTransformation(
             projectId=projectId,

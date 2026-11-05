@@ -17,6 +17,7 @@ from api.services.credits.creditTrackingCallback import CreditTrackingCallback
 from utils.llmOutputParser import parseModelJsonOutput
 from api.commons import updateProjectModifiedAt
 from utils.exceptionHandler import CustomException
+from utils.storageListing import listProjectFiles
 from api.services.authenticationService import DEFAULT_PROFILE_IMAGE
 from api.services.subscriptions.subscriptionFieldUtils import (
     CANONICAL_SUBSCRIPTION_SELECT,
@@ -499,10 +500,11 @@ class ManagementService:
 
     def validateTableNameAvailable(self, projectId: str, tableName: str) -> None:
         """Check that a table name does not already exist in metadata.json (active or inactive).
-        Raises CustomException(409) if the name is already taken.
+        Raises CustomException(409) if the name is already taken, and
+        CustomException(503) if metadata.json cannot be read.
         """
         try:
-            files = self.client.storage.from_("AnalyticsHub").list(projectId)
+            files = self.client.storage.from_("AnalyticsHub").list(projectId, {"search": "metadata.json"})
             filenames = [x.get("name") for x in files]
             if "metadata.json" not in filenames:
                 return
@@ -516,7 +518,10 @@ class ManagementService:
         except CustomException:
             raise
         except Exception as e:
-            logger.warning(f"validateTableNameAvailable check failed for {projectId}/{tableName}: {e}")
+            # Refuse rather than skip: a table this check misses is overwritten on upload.
+            exception = CustomException(e, statusCode=503, uiMessage="We could not check this table name right now. Please try again.")
+            logger.error(exception)
+            raise exception
 
     def _generateMetadata(self, projectId: str, userId: str | None = None, tableNames: list[str] | None = None) -> dict:
         """
@@ -539,7 +544,7 @@ class ManagementService:
             if tableNames is not None:
                 dataFiles = [f"{name}.parquet" for name in tableNames]
             else:
-                dataFiles = [x.get("name") for x in self.client.storage.from_("AnalyticsHub").list(path = projectId) if x.get("name").endswith(".parquet")]
+                dataFiles = [x.get("name") for x in listProjectFiles(self.client, projectId) if x.get("name").endswith(".parquet")]
             results = ""
             tableShapes: dict = {}
             for fileName in dataFiles:
@@ -606,7 +611,7 @@ class ManagementService:
                 projectId=projectId, userId=userId, tableNames=tableNames
             )
             # Load existing metadata.json (if it exists)
-            files = self.client.storage.from_("AnalyticsHub").list(projectId)
+            files = self.client.storage.from_("AnalyticsHub").list(projectId, {"search": "metadata.json"})
             filenames = [x.get("name") for x in files]
             existingMetadata = {}
             if "metadata.json" in filenames:
@@ -790,7 +795,7 @@ class ManagementService:
             CustomException: For any errors during metadata generation or upload.
         """
         try:
-            files = self.client.storage.from_("AnalyticsHub").list(projectId)
+            files = listProjectFiles(self.client, projectId)
             filenames = [x.get("name") for x in files]
             if "metadata.json" in filenames:
                 jsonData = readJson(projectId, "metadata.json")
@@ -798,7 +803,7 @@ class ManagementService:
                 metadataLastModifiedTime = None
                 for file in files:
                     if file["name"] == "metadata.json":
-                        metadataLastModifiedTime = datetime.datetime.strptime(file["metadata"]["lastModified"], '%Y-%m-%dT%H:%M:%S.000Z')
+                        metadataLastModifiedTime = self._storageTime(file["metadata"]["lastModified"])
                     elif os.path.splitext(file["name"])[-1] == ".parquet":
                         dataFiles.append(file)
                     else:
@@ -806,7 +811,7 @@ class ManagementService:
                 # Find tables added/modified after metadata.json was last updated
                 if metadataLastModifiedTime is not None:
                     updatedFiles = [os.path.splitext(x.get("name"))[0] for x in dataFiles
-                                    if datetime.datetime.strptime(x["metadata"]["lastModified"], '%Y-%m-%dT%H:%M:%S.000Z') > metadataLastModifiedTime]
+                                    if self._storageTime(x["metadata"]["lastModified"]) > metadataLastModifiedTime]
                 else:
                     updatedFiles = [os.path.splitext(x.get("name"))[0] for x in dataFiles]
                 if updatedFiles:
@@ -829,6 +834,11 @@ class ManagementService:
             exception = CustomException(e)
             logger.error(exception)
             raise exception   
+
+    @staticmethod
+    def _storageTime(value: str) -> datetime.datetime:
+        """Parse a storage lastModified time, which may carry real milliseconds or none."""
+        return datetime.datetime.fromisoformat(value.replace("Z", "+00:00"))
         
     def getMetadata(self, projectId: str) -> dict:
         """
@@ -844,7 +854,7 @@ class ManagementService:
             CustomException: For any errors during retrieval.
         """
         try:
-            files = self.client.storage.from_("AnalyticsHub").list(projectId)
+            files = self.client.storage.from_("AnalyticsHub").list(projectId, {"search": "metadata.json"})
             filenames = [x.get("name") for x in files]
             if "metadata.json" not in filenames:
                 return dict()
@@ -952,10 +962,11 @@ class ManagementService:
         """
         try:
             _ = self.client.table("Projects").delete().eq("projectId", projectId).execute()
-            allFiles = self.client.storage.from_("AnalyticsHub").list(projectId)
+            allFiles = listProjectFiles(self.client, projectId)
             fileNames = [os.path.join(projectId, x.get("name")) for x in allFiles]
-            if fileNames:
-                _ = self.client.storage.from_("AnalyticsHub").remove(fileNames)
+            # Storage refuses more than 1000 paths in one remove.
+            for start in range(0, len(fileNames), 1000):
+                _ = self.client.storage.from_("AnalyticsHub").remove(fileNames[start : start + 1000])
             return
         except Exception as e:
             exception = CustomException(e)

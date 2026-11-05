@@ -237,6 +237,8 @@ All routes under `/api/latest/projects/`. Auth via `verifyToken` unless otherwis
 
 ### 2.1 `POST /api/latest/projects/createProject`
 
+**Auth:** Required, and `workspaceId` must be a workspace the session's user owns (`404 WORKSPACE_NOT_FOUND` otherwise; `503 WORKSPACE_ACCESS_UNAVAILABLE` when the owner lookup fails).
+
 **Request Body:**
 ```json
 {
@@ -535,6 +537,8 @@ Multipart form upload.
 
 All routes under `/api/latest/dataLoader/`. Auth via `verifyToken` unless noted.
 
+CSV, Excel, MySQL, PostgreSQL and MongoDB loads check the table name first. A name already in the project returns `409`. If `metadata.json` cannot be read the load is refused with `503` and can be retried.
+
 ### 3.1 `POST /api/latest/dataLoader/loadCsvData`
 
 Multipart form upload.
@@ -649,6 +653,8 @@ Multipart form upload.
 ---
 
 ### 3.7 `DELETE /api/latest/dataLoader/deleteTable`
+
+Also clears `latest_approved_artifact` on the transformation that produced the table, once the table is gone. The transformation stays, and deleting it later leaves any new table of that name alone. Every load clears it too for the name it takes.
 
 **Request Body:**
 ```json
@@ -843,6 +849,8 @@ Toggle the `isActive` flag for a table. Inactive tables are hidden from all LLM-
 
 Generate a profiling report (ydata-profiling) for all tables in a project.
 
+**Auth:** Required + `requireTrialOrAbove` (`403 FEATURE_BLOCKED` when the account has no access)
+
 **Response (200):**
 ```json
 {
@@ -897,7 +905,7 @@ Generate a single chart via the LLM workflow.
 
 Generate a panel chart (multiple charts in one view) without LLM.
 
-**Auth:** Required (`verifyToken`)
+**Auth:** Required + `requireTrialOrAbove` (`403 FEATURE_BLOCKED` when the account has no access)
 
 **Request Body:**
 ```json
@@ -1018,6 +1026,8 @@ Save a favourite query.
 All routes under `/api/latest/blends/`.
 
 ### 7.1 `POST /api/latest/blends/createDataBlend`
+
+**Auth:** Required + `requireTrialOrAbove` (`403 FEATURE_BLOCKED` when the account has no access)
 
 **Request Body:**
 ```json
@@ -1149,6 +1159,8 @@ All routes under `/api/latest/dashboard/`.
 
 ### 8.4 `POST /api/latest/dashboard/getData`
 
+**Auth:** Required. Non-empty `filters` or `refresh: true` also needs `requireTrialOrAbove` (`403 FEATURE_BLOCKED` when the account has no access); a plain read does not.
+
 **Request Body:**
 ```json
 {
@@ -1236,6 +1248,8 @@ All routes under `/api/latest/dashboard/`.
 
 Refresh all widget data in parallel.
 
+**Auth:** Required + `requireTrialOrAbove` (`403 FEATURE_BLOCKED` when the account has no access)
+
 **Response (200):**
 ```json
 {
@@ -1276,7 +1290,7 @@ Create a new transformation workspace.
 
 ### 9.2 `GET /api/latest/transformations?projectId={projectId}`
 
-List all transformations for a project.
+List all transformations for a project. The artifact's stored `table_file`, the server's record of the table's file, is not returned.
 
 **Response (200):**
 ```json
@@ -1349,7 +1363,7 @@ Send a user message and stream the assistant response via SSE.
 
 ### 9.5 `POST /api/latest/transformations/{transformationId}/messages/{messageId}?projectId={projectId}`
 
-Approve a Mermaid artifact and return a 100-row preview of the transformed table. Validates the table name doesn't already exist in metadata.
+Approve a Mermaid artifact and return a 100-row preview of the transformed table. Returns `409` if the table name belongs to another transformation or to a table this transformation did not write, and `503` if that cannot be checked. Apply checks the name again.
 
 **Auth:** Required + `requireActiveSubscription`
 
@@ -1366,7 +1380,7 @@ Approve a Mermaid artifact and return a 100-row preview of the transformed table
 
 ### 9.6 `POST /api/latest/transformations/{transformationId}/messages/{messageId}/apply?projectId={projectId}`
 
-Persist the approved transformation as a project table. Uploads parquet to Supabase storage and updates metadata.
+Persist the approved transformation as a project table. Uploads parquet to Supabase storage and updates metadata. The name is checked straight before the table is written: `409` if a table this transformation did not write has it, or a load takes it during the apply; `503` if that cannot be checked. A first apply of a name never replaces a stored file, so an upload that lands during the apply is kept and the apply answers `409`. The one exception is a re-apply over this transformation's own table while that table has no metadata key: a load that lands in the moment before the write can be overwritten, and the apply then answers `409`.
 
 **Auth:** Required + `requireActiveSubscription`
 
@@ -1382,7 +1396,7 @@ Persist the approved transformation as a project table. Uploads parquet to Supab
 
 ### 9.7 `POST /api/latest/transformations/{transformationId}/rollback?projectId={projectId}`
 
-Rollback workspace state and messages to a specific message ID.
+Rollback workspace state and messages to a specific message ID. Rolling back to an approved checkpoint rewrites its table under the same checks as apply (`409`, `503`). Rolling back to the start removes the table this transformation wrote; if a storage or cache step fails it answers `503`, keeps the messages, and can be retried. The table is kept when a load has taken its name, or when the file has changed since this transformation recorded it; only its caches are cleared then.
 
 **Auth:** Required + `requireActiveSubscription`
 
@@ -1424,7 +1438,7 @@ Rollback workspace state and messages to a specific message ID.
 
 ### 9.9 `DELETE /api/latest/transformations/{transformationId}?projectId={projectId}`
 
-Delete a transformation workspace and its associated parquet file.
+Delete a transformation workspace and, if it was applied, its parquet file. A transformation that was never applied, was rolled back to the start, or lost its table through `deleteTable` owns no file, so a table of the same name stays. Answers 503 and keeps the transformation if a storage, cache or database step fails; the delete can be retried. A table loaded under that name between the attempts is not removed. The table is also kept when a load has taken its name, or when the file has changed since this transformation recorded it; only its caches are cleared then. A transformation applied before files were recorded has its table removed as before.
 
 **Response (200):**
 ```json
@@ -1536,6 +1550,8 @@ page's data is unchanged) and `refresh: true` to force regeneration.
 }
 ```
 
+An empty list means the project has no stored insights. If the stored file cannot be read the route returns 500, never an empty list.
+
 ---
 
 ### 10.4 `PATCH /api/latest/utils/updateDashboardInsightStatus`
@@ -1562,6 +1578,8 @@ page's data is unchanged) and `refresh: true` to force regeneration.
 
 Trigger a forecasts Celery task.
 
+**Auth:** Required + `requireTrialOrAbove` (`403 FEATURE_BLOCKED` when the account has no access). The account must also own a project whose `triggers` value contains `forecast`, ignoring case (`403 TRIGGER_NOT_ASSIGNED` otherwise).
+
 **Response (200):**
 ```json
 {
@@ -1571,11 +1589,18 @@ Trigger a forecasts Celery task.
 }
 ```
 
+The task reads `emptykegsdata` and replaces `forecasts` in an external PostgreSQL database, so the login needs both
+rights. Its connection comes from `FORECAST_DB_USER`, `FORECAST_DB_PASSWORD`, `FORECAST_DB_HOST`, `FORECAST_DB_PORT`
+and `FORECAST_DB_NAME`, all required. If any is missing or the port is not a number, this route still returns 200 and
+the task then fails with an error naming the variable, before it connects.
+
 ---
 
 ### 10.6 `WS /api/latest/utils/ws/getTaskStatus?token={jwt}&taskId={taskId}`
 
-WebSocket for polling Celery task status. Emits JSON status updates every 5 seconds until the task is ready.
+WebSocket for watching a Celery task. Sends `RUNNING` once, checks the task every 5 seconds, then sends one last message and closes. A watch ends after 30 minutes, or as soon as the client leaves. The session is re-checked on each poll: a refused session closes with 1008, while a failed check keeps watching and holds any result until a check succeeds.
+
+Only the user who started the task can read it. Any other `taskId`, including a scheduled job's, closes with 1008 before a message is sent. Treat the ID as opaque: it comes from `sendForecasts` and is not a plain UUID.
 
 **Connection:**
 ```
@@ -1586,7 +1611,15 @@ ws://api.example.com/api/latest/utils/ws/getTaskStatus?token=eyJ...&taskId=celer
 ```json
 { "status": "RUNNING" }
 { "taskId": "uuid", "status": "SUCCESS", "taskResponseCode": { ... } }
+{ "taskId": "uuid", "status": "FAILURE", "taskResponseCode": 500 }
+{ "taskId": "uuid", "status": "FAILURE", "taskResponseCode": null }
+{ "taskId": "uuid", "status": "UNKNOWN", "taskResponseCode": null }
+{ "status": "ERROR", "errorDetail": "Task status is unavailable." }
 ```
+
+- `FAILURE`: the task failed or was revoked (`taskResponseCode` is null), or it finished with a code of 400 or above.
+- `UNKNOWN`: the watch limit was reached. The task may still be running, so open a new socket to keep watching.
+- `ERROR`: polling itself failed. The task's outcome is unknown.
 
 ---
 

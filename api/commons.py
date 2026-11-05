@@ -11,18 +11,25 @@ __all__ = [
     "verifyToken",
     "verifyTokenWithExpiry",
     "verifyUser",
+    "requireProductAccess",
+    "requireProductAccessToken",
     "requireActiveSubscription",
     "requireTrialOrAbove",
     "requirePaidPlan",
     "requireCredits",
+    "requireWorkspaceOwner",
+    "requireProjectOwner",
+    "requireTriggerOwner",
     "UserContext",
     "updateProjectModifiedAt",
+    "issueTaskId",
+    "sessionOwnsTask",
 ]
 
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from fastapi import status, HTTPException
 from supabase.lib.client_options import ClientOptions
-from supabase import create_client
+from utils.supabaseClient import createSupabaseClient
 from utils.logger import logger
 from utils.exceptionHandler import (
     raiseAccountAccessRevokedHttpException,
@@ -31,13 +38,16 @@ from utils.exceptionHandler import (
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from fastapi import Depends
+import hashlib
+import hmac
 import os
+import uuid
 
 security = HTTPBearer()
-client = create_client(
-    supabase_url = os.environ["SUPABASE_URL"],
-    supabase_key = os.environ["SUPABASE_KEY"],
-    options = ClientOptions(
+client = createSupabaseClient(
+    os.environ["SUPABASE_URL"],
+    os.environ["SUPABASE_KEY"],
+    ClientOptions(
         auto_refresh_token = False,
         persist_session = False,
     )
@@ -50,6 +60,13 @@ from api.services.subscriptions.entitlementService import (
 )
 
 subscriptionEntitlementService = SubscriptionEntitlementService(client)
+
+from utils.productAccessCache import ProductAccessCache
+
+# Holds only "has a plan" answers, per worker, for a minute at most. Sessions are still checked on
+# every request, so a revoked or expired login is refused at once. Resolved at call time so tests
+# can swap the entitlement service.
+productAccessCache = ProductAccessCache(lambda userId: subscriptionEntitlementService.get(userId))
 
 from jose import jwt, JWTError
 
@@ -137,7 +154,12 @@ def _verifyTokenInternal(credentials: HTTPAuthorizationCredentials, checkExpiry:
                 detail={"status": "FAILURE", "message": "Token expiry information missing"}
             )
 
-    client.table("Sessions").update({"lastActivity": str(datetime.now(timezone.utc))}).eq("accessToken", token).execute()
+    try:
+        client.table("Sessions").update({"lastActivity": str(datetime.now(timezone.utc))}).eq("accessToken", token).execute()
+    except Exception as exc:
+        # Bookkeeping only: nothing reads lastActivity, and the session is already verified.
+        # A dropped connection here used to turn a valid session check into a 500.
+        logger.warning("Session lastActivity update failed: {}", type(exc).__name__)
     return token
 
 def verifyToken(credentials: HTTPAuthorizationCredentials = Depends(security)):
@@ -184,11 +206,50 @@ def _loadCurrentEntitlement(user: UserContext) -> SubscriptionEntitlement:
             errorCode="ENTITLEMENT_UNAVAILABLE",
         )
 
+
+def _refuseWithoutPlan(user: UserContext, gate: str, entitlement: SubscriptionEntitlement | None = None) -> None:
+    """No plan or trial at all: the frontend sends the user to Manage Plan on this code."""
+    detail = f", status={entitlement.status}, planType={entitlement.planType}" if entitlement else ""
+    raiseFeatureGateHttpException(
+        statusCode=status.HTTP_403_FORBIDDEN,
+        uiMessage="Your plan has ended. Choose a plan to keep using Nubrix.",
+        backendLogMessage=f"{gate} refused userId={user.userId} without a plan{detail}",
+        errorCode="SUBSCRIPTION_INACTIVE",
+    )
+
+
+def requireProductAccess(
+    user: UserContext = Depends(verifyUser),
+) -> UserContext:
+    """Gate for product data: requires a plan or trial, read through productAccessCache."""
+    try:
+        allowed = productAccessCache.check(user.userId)
+    except EntitlementUnavailableError:
+        raiseFeatureGateHttpException(
+            statusCode=status.HTTP_503_SERVICE_UNAVAILABLE,
+            uiMessage="Subscription access could not be verified. Please try again.",
+            backendLogMessage=f"Entitlement lookup unavailable for userId={user.userId}",
+            errorCode="ENTITLEMENT_UNAVAILABLE",
+        )
+    if not allowed:
+        _refuseWithoutPlan(user, "requireProductAccess")
+    return user
+
+
+def requireProductAccessToken(
+    user: UserContext = Depends(requireProductAccess),
+) -> str:
+    """requireProductAccess for routes that take the verified session token, as verifyToken returns it."""
+    return user.token
+
+
 def requireActiveSubscription(
     user: UserContext = Depends(verifyUser),
 ) -> UserContext:
     """Gate: requires an active (or cancelled-but-in-period) subscription."""
     entitlement = _loadCurrentEntitlement(user)
+    if not entitlement.trialOrAbove:
+        _refuseWithoutPlan(user, "requireActiveSubscription", entitlement)
     if not entitlement.activeSubscription:
         raiseFeatureGateHttpException(
             statusCode=status.HTTP_403_FORBIDDEN,
@@ -208,15 +269,7 @@ def requireTrialOrAbove(
     """Gate: requires at least a trial subscription."""
     entitlement = _loadCurrentEntitlement(user)
     if not entitlement.trialOrAbove:
-        raiseFeatureGateHttpException(
-            statusCode=status.HTTP_403_FORBIDDEN,
-            uiMessage="Start a free trial or subscribe to access this feature.",
-            backendLogMessage=(
-                f"Feature gate requireTrialOrAbove blocked userId={user.userId}, "
-                f"status={entitlement.status}, planType={entitlement.planType}"
-            ),
-            errorCode="FEATURE_BLOCKED",
-        )
+        _refuseWithoutPlan(user, "requireTrialOrAbove", entitlement)
     return user
 
 
@@ -225,6 +278,8 @@ def requirePaidPlan(
 ) -> UserContext:
     """Gate: requires a paid plan (pro or annual)."""
     entitlement = _loadCurrentEntitlement(user)
+    if not entitlement.trialOrAbove:
+        _refuseWithoutPlan(user, "requirePaidPlan", entitlement)
     if not entitlement.paidPlan:
         raiseFeatureGateHttpException(
             statusCode=status.HTTP_403_FORBIDDEN,
@@ -268,15 +323,7 @@ def requireCredits(operationType: str):
         # 1. Eligibility first — no quota read happens for ineligible users.
         entitlement = _loadCurrentEntitlement(user)
         if not entitlement.trialOrAbove:
-            raiseFeatureGateHttpException(
-                statusCode=status.HTTP_403_FORBIDDEN,
-                uiMessage="This feature requires an active subscription.",
-                backendLogMessage=(
-                    f"Credit gate blocked userId={user.userId}, "
-                    f"status={entitlement.status}, planType={entitlement.planType}"
-                ),
-                errorCode="FEATURE_BLOCKED",
-            )
+            _refuseWithoutPlan(user, "requireCredits", entitlement)
 
         minimum = getOperationMinimum(operationType)
         remaining = creditService.getRemainingTokens(user.userId)
@@ -332,6 +379,149 @@ def requireCredits(operationType: str):
     return _dependency
 
 
+def giveTableNameBack(supabaseClient, projectId: str, transformationId: str, tableName: str, artifact: dict, fileStates: tuple) -> bool:
+    """Put a claim on tableName back onto a transformation whose claim was released, while the file is one of fileStates.
+
+    fileStates are the states known to be that transformation's file, or None for no file. Any write moves the
+    state, so a file some load wrote since never matches. The claim goes back only onto a row with no artifact,
+    so a row that has claimed anything since keeps it. The file is checked again afterwards, and the claim is
+    released again if it changed, could not be checked, or the write errored. A load writing later releases it
+    after its own write.
+
+    Returns whether the transformation holds the claim at the end.
+    """
+    attempted = False
+    try:
+        if tableFileState(supabaseClient, projectId, tableName) not in fileStates:
+            return False
+        attempted = True
+        if not supabaseClient.table("transformations").update({"latest_approved_artifact": artifact}).eq("project_id", projectId).eq("transformation_id", transformationId).is_("latest_approved_artifact", "null").execute().data:
+            return False
+        if tableFileState(supabaseClient, projectId, tableName) in fileStates:
+            return True
+    except Exception as e:
+        logger.error(f"Could not give '{tableName}' back to transformation {transformationId}: {e}")
+        if not attempted:
+            return False
+    try:
+        supabaseClient.table("transformations").update({"latest_approved_artifact": None}).eq("project_id", projectId).eq("transformation_id", transformationId).eq("latest_approved_artifact->>table_name", tableName).execute()
+    except Exception as e:
+        logger.error(f"Could not release '{tableName}' again for transformation {transformationId}: {e}")
+    return False
+
+
+def tableFileState(supabaseClient, projectId: str, tableName: str) -> dict | None:
+    """What storage reports for a table's file, or None when there is none. Any write to the file changes it."""
+    fileName = f"{tableName}.parquet"
+    for entry in supabaseClient.storage.from_("AnalyticsHub").list(projectId, {"search": fileName}):
+        if entry.get("name") == fileName:
+            return {
+                "id": entry.get("id"),
+                "updated_at": entry.get("updated_at"),
+                "eTag": (entry.get("metadata") or {}).get("eTag"),
+            }
+    return None
+
+
+def requireWorkspaceOwner(workspaceId: str, user: UserContext) -> None:
+    """
+    Allow only the workspace's owner, with the same responses as
+    requireProjectOwner: someone else's workspace reads as missing, and a
+    failed lookup never falls through.
+    """
+    try:
+        rows = (
+            client.table("Workspaces")
+            .select("ownerId")
+            .eq("id", workspaceId)
+            .limit(1)
+            .execute().data
+        )
+    except Exception as exc:
+        logger.error("Workspace owner lookup failed for workspaceId={}: {}", workspaceId, type(exc).__name__)
+        raiseFeatureGateHttpException(
+            statusCode=status.HTTP_503_SERVICE_UNAVAILABLE,
+            uiMessage="Workspace access could not be verified. Please try again.",
+            backendLogMessage=f"Workspace owner lookup unavailable for workspaceId={workspaceId}",
+            errorCode="WORKSPACE_ACCESS_UNAVAILABLE",
+        )
+    if not rows or rows[0].get("ownerId") != user.userId:
+        logger.warning("Workspace access denied: workspaceId={}, userId={}", workspaceId, user.userId)
+        raiseFeatureGateHttpException(
+            statusCode=status.HTTP_404_NOT_FOUND,
+            uiMessage="Workspace not found.",
+            backendLogMessage=f"Workspace access denied: workspaceId={workspaceId}, userId={user.userId}",
+            errorCode="WORKSPACE_NOT_FOUND",
+        )
+
+
+def requireProjectOwner(projectId: str, user: UserContext) -> None:
+    """
+    Allow only the project's owner. Someone else's project reads as missing,
+    so a denial never confirms that a project ID exists.
+
+    Synchronous like the other auth checks. Async routes run it with
+    asyncio.to_thread so the lookup never blocks the worker's event loop.
+    """
+    try:
+        rows = (
+            client.table("Projects")
+            .select("ownerUserId")
+            .eq("projectId", projectId)
+            .limit(1)
+            .execute().data
+        )
+    except Exception as exc:
+        logger.error("Project owner lookup failed for projectId={}: {}", projectId, type(exc).__name__)
+        raiseFeatureGateHttpException(
+            statusCode=status.HTTP_503_SERVICE_UNAVAILABLE,
+            uiMessage="Project access could not be verified. Please try again.",
+            backendLogMessage=f"Project owner lookup unavailable for projectId={projectId}",
+            errorCode="PROJECT_ACCESS_UNAVAILABLE",
+        )
+    if not rows or rows[0].get("ownerUserId") != user.userId:
+        logger.warning("Project access denied: projectId={}, userId={}", projectId, user.userId)
+        raiseFeatureGateHttpException(
+            statusCode=status.HTTP_404_NOT_FOUND,
+            uiMessage="Project not found.",
+            backendLogMessage=f"Project access denied: projectId={projectId}, userId={user.userId}",
+            errorCode="PROJECT_NOT_FOUND",
+        )
+
+
+def requireTriggerOwner(triggerName: str, user: UserContext) -> None:
+    """
+    Allow only a user who owns a project carrying this trigger, for trigger
+    routes that take no project ID.
+
+    Trigger names are free text set by hand on the project, so the name is
+    matched anywhere in the column, ignoring case. Synchronous like
+    requireProjectOwner, and run the same way from async routes.
+    """
+    try:
+        rows = (
+            client.table("Projects")
+            .select("triggers")
+            .eq("ownerUserId", user.userId)
+            .execute().data
+        )
+    except Exception as exc:
+        logger.error("Trigger lookup failed for userId={}: {}", user.userId, type(exc).__name__)
+        raiseFeatureGateHttpException(
+            statusCode=status.HTTP_503_SERVICE_UNAVAILABLE,
+            uiMessage="Project access could not be verified. Please try again.",
+            backendLogMessage=f"Trigger lookup unavailable for userId={user.userId}",
+            errorCode="PROJECT_ACCESS_UNAVAILABLE",
+        )
+    if not any(triggerName in str(row.get("triggers") or "").casefold() for row in rows or []):
+        raiseFeatureGateHttpException(
+            statusCode=status.HTTP_403_FORBIDDEN,
+            uiMessage="This automation is not set up for your account.",
+            backendLogMessage=f"Trigger {triggerName} refused: userId={user.userId} owns no project with it",
+            errorCode="TRIGGER_NOT_ASSIGNED",
+        )
+
+
 def updateProjectModifiedAt(projectId: str) -> None:
     """
     Update the modifiedAt field of a project to the current UTC timestamp.
@@ -349,3 +539,29 @@ def updateProjectModifiedAt(projectId: str) -> None:
         }).eq("projectId", projectId).execute()
     except Exception as e:
         logger.error(f"Failed to update modifiedAt for project {projectId}: {e}")
+
+
+def _taskSignature(nonce: str, userId: str) -> str:
+    message = f"taskOwner:{nonce}:{userId}".encode()
+    return hmac.new(os.environ["SECRET_KEY"].encode(), message, hashlib.sha256).hexdigest()
+
+
+def issueTaskId(userId: str) -> str:
+    """
+    Build a Celery task ID that is tied to the user who started the task.
+
+    Celery keeps no owner for a task, so the ID carries a signature of it.
+    Nothing is stored, and the ID does not contain the user ID.
+    """
+    nonce = uuid.uuid4().hex
+    return f"{nonce}-{_taskSignature(nonce, userId)}"
+
+
+def sessionOwnsTask(token: str, taskId: str | None) -> bool:
+    """
+    True only for a task issued to this session's user. Scheduled jobs have
+    plain Celery IDs, so no session owns them. Call after verifying the token.
+    """
+    userId = jwt.decode(token, os.environ["SECRET_KEY"], algorithms=["HS256"])["userId"]
+    nonce, _, signature = (taskId or "").partition("-")
+    return hmac.compare_digest(signature.encode(), _taskSignature(nonce, userId).encode())
