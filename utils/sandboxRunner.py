@@ -26,7 +26,7 @@ run from a live one.
         work/         this run's own: cwd, HOME, TMPDIR and the result file
 """
 
-__all__ = ["runSandbox", "runTrustedSandbox", "sweepOrphanedRuns", "serveTables", "readResult", "enterSandbox", "SandboxResult"]
+__all__ = ["runSandbox", "runTrustedSandbox", "sweepOrphanedRuns", "serveTables", "readResult", "ResultTooLargeError", "enterSandbox", "SandboxResult"]
 
 
 import base64
@@ -112,6 +112,10 @@ class _RunKind:
     servesTables: bool = True
     script: str | None = None
     payload: dict | None = None
+
+
+class ResultTooLargeError(ValueError):
+    """A file the child wrote is over the cap given to `readResult`. Any other ValueError from it means the file is unsafe."""
 
 
 class SandboxResult(NamedTuple):
@@ -377,7 +381,7 @@ def readResult(path: str, runUid: int | None, maxBytes: int | None = None) -> by
         if not stat.S_ISREG(info.st_mode) or (runUid is not None and info.st_uid != runUid):
             raise ValueError("Sandbox result is not a regular file.")
         if info.st_size > maxBytes:
-            raise ValueError(f"Sandbox result is too large: {info.st_size} bytes.")
+            raise ResultTooLargeError(f"Sandbox result is too large: {info.st_size} bytes.")
         return result.read(maxBytes)
 
 
@@ -444,7 +448,7 @@ def _stopReason(returncode: int, watchdogReason: str | None, timeoutNote: str, l
 
 
 def _runChild(launcherName: str, projectId: str, code: str, timeoutSeconds: int | None, withResult: bool, runUid: int | None, runFolder: str, tablesFolder: str, workFolder: str, limits: RunLimits, kind: _RunKind = _RunKind()) -> SandboxResult:
-    """Start the launcher, serve its table reads and collect what it produced."""
+    """Start the launcher, serve its table reads (a trusted run is refused them) and collect what it produced."""
     resultPath = os.path.join(workFolder, kind.resultName)
     previewPath = os.path.join(workFolder, kind.previewName) if kind.previewName else None
     parentEnd, childEnd = socket.socketpair()
@@ -551,9 +555,16 @@ def runTrustedSandbox(launcherName: str, projectId: str, inputBytes: bytes, requ
 
     The run is given no table access and no secret: `request` is the only thing besides the input that reaches it,
     so it must hold no credential. The launcher must call `enterSandbox` before it reads the input. Its answer is
-    the file `work/result`, read through `readResult` up to `maxResultBytes`; a larger one raises ValueError.
+    the file `work/result`, read through `readResult` up to `maxResultBytes`; a larger one raises ResultTooLargeError.
+    The slot cap and the slot wait come from the environment (`currentRunLimits()`), not from `limits`.
+    `request` must be a JSON-serialisable dict and `maxResultBytes` positive; both are checked before a slot is taken.
     Raises SandboxBusyError when no slot is free, as `runSandbox` does.
     """
+    if not isinstance(request, dict):
+        raise TypeError("A trusted run's request must be a dict.")
+    json.dumps(request)  # Raises TypeError or ValueError for anything the child could not be sent.
+    if maxResultBytes <= 0:
+        raise ValueError("A trusted run needs a positive result cap.")
     script = _TRUSTED_LAUNCHERS.get(launcherName)
     if script is None:
         raise ValueError(f"{launcherName!r} is not a trusted launcher.")

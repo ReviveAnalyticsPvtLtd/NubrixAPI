@@ -276,6 +276,7 @@ def test_trustedRunCannotWriteOrReplaceItsInput(trustedEcho):
     report = json.loads(result.resultBytes)
     assert sandboxRunner._FIRST_RUN_UID <= report["uid"] < sandboxRunner._FIRST_RUN_UID + sandboxRunner._RUN_UID_COUNT
     assert report["inputUid"] == 0
+    assert report["inputGid"] == report["uid"]
     assert report["inputMode"] == "0o640"
     assert report["writable"] is False
     for attempt in ("append", "replace", "unlink", "createBeside"):
@@ -293,7 +294,8 @@ def test_trustedRunHoldsNoSecretAndNoTableAccess(trustedEcho, monkeypatch):
     assert report["request"] == {"mode": "probe", "marker": "m-1"}
     assert {"input_path", "request", "result_path", "channel"} <= set(report["payloadKeys"])
     assert "unit-test-key" not in report["seen"]
-    assert "Could not read" in report["tableRead"] or "no table" in report["tableRead"].lower()
+    assert "This run has no table access." in report["tableRead"]
+    assert report["tables"] == ["input"]
 
 
 def test_trustedRunRefusesALauncherOutsideTheAllowList():
@@ -302,7 +304,7 @@ def test_trustedRunRefusesALauncherOutsideTheAllowList():
             sandboxRunner.runTrustedSandbox(name, "p1", b"abc", {}, 5, 1024)
 
 
-def test_trustedRunRaisesBusyWhenNoSlotIsFree(trustedEcho, monkeypatch, tmp_path):
+def test_trustedRunRaisesBusyWhenNoSlotIsFree(trustedEcho, monkeypatch):
     def busy(*_args):
         raise SandboxBusyError()
 
@@ -318,5 +320,27 @@ def test_trustedRunTimesOutLikeAnyRun(trustedEcho):
 
 
 def test_trustedResultOverTheCapIsRefused(trustedEcho):
-    with pytest.raises(ValueError, match="too large"):
+    with pytest.raises(sandboxRunner.ResultTooLargeError, match="too large"):
         sandboxRunner.runTrustedSandbox(TRUSTED_ECHO, "p1", b"x" * 5000, {"mode": "echo"}, 120, 1000)
+
+
+def test_trustedRunChecksItsArgumentsBeforeTakingASlot(trustedEcho, monkeypatch):
+    def noSlot(*_args):
+        raise AssertionError("took a slot")
+
+    monkeypatch.setattr(sandboxRunner, "acquireRunSlot", noSlot)
+    with pytest.raises(TypeError):
+        sandboxRunner.runTrustedSandbox(TRUSTED_ECHO, "p1", b"abc", ["not", "a", "dict"], 5, 1024)
+    with pytest.raises(TypeError):
+        sandboxRunner.runTrustedSandbox(TRUSTED_ECHO, "p1", b"abc", {"x": object()}, 5, 1024)
+    for cap in (0, -1):
+        with pytest.raises(ValueError):
+            sandboxRunner.runTrustedSandbox(TRUSTED_ECHO, "p1", b"abc", {}, 5, cap)
+
+
+def test_unsafeTrustedResultIsNotATooLargeError(tmp_path):
+    result = tmp_path / "result"
+    result.write_bytes(b"abc")
+    with pytest.raises(ValueError) as caught:  # a file the run's uid does not own
+        sandboxRunner.readResult(str(result), 12345, 10)
+    assert not isinstance(caught.value, sandboxRunner.ResultTooLargeError)

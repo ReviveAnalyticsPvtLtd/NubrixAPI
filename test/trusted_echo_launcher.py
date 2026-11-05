@@ -34,7 +34,7 @@ def main():
     open(scratch, "wb").close()
     report = {"uid": os.getuid() if hasattr(os, "getuid") else -1, "request": request, "payloadKeys": sorted(payload)}
     info = os.stat(inputPath)
-    report.update(inputUid=info.st_uid, inputMode=oct(info.st_mode & 0o777), writable=os.access(inputPath, os.W_OK))
+    report.update(inputUid=info.st_uid, inputGid=info.st_gid, tables=sorted(os.listdir(os.path.dirname(inputPath))), inputMode=oct(info.st_mode & 0o777), writable=os.access(inputPath, os.W_OK))
     for name, attempt in (
         ("append", lambda: open(inputPath, "ab").close()),
         ("replace", lambda: os.replace(scratch, inputPath)),
