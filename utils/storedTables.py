@@ -147,12 +147,12 @@ def encodedUncompressedBytes(metadata: "pq.FileMetaData") -> int:
     )
 
 
-def writeStoredTable(table: "pa.Table | pd.DataFrame", projectId: str, tableName: str) -> bytes:
-    """Serialise a table with this table's marker, in small pages and row groups.
+def _markedTable(table: "pa.Table | pd.DataFrame", projectId: str, tableName: str) -> "pa.Table":
+    """The table to store: size-checked, with this table's marker and no metadata from the input.
 
-    The schema metadata is replaced, so a marker or other metadata carried by
-    the input is dropped. For a DataFrame, the pandas entry is the one built
-    here from the frame itself, which keeps nullable dtypes round-tripping.
+    The schema metadata is replaced, so a marker or other metadata carried by the input is dropped. For a
+    DataFrame, the pandas entry is the one built here from the frame itself, which keeps nullable dtypes
+    round-tripping. Raises TableTooLargeError for a table over STORED_TABLE_MAX_DECODED_BYTES.
     """
     pandasMetadata = None
     if isinstance(table, pd.DataFrame):
@@ -167,10 +167,21 @@ def writeStoredTable(table: "pa.Table | pd.DataFrame", projectId: str, tableName
     marker = tableMarker(projectId, tableName)
     if marker:
         metadata[MARKER_KEY] = marker
-    table = table.replace_schema_metadata(metadata)
+    return table.replace_schema_metadata(metadata)
+
+
+def writeStoredTable(table: "pa.Table | pd.DataFrame", projectId: str, tableName: str) -> bytes:
+    """Serialise a table with this table's marker, in small pages and row groups."""
+    table = _markedTable(table, projectId, tableName)
     sink = io.BytesIO()
     pq.write_table(table, sink, **WRITE_SETTINGS, row_group_size=ROW_GROUP_ROWS)
     return sink.getvalue()
+
+
+def writeStoredTableToPath(table: "pa.Table | pd.DataFrame", projectId: str, tableName: str, path: str) -> None:
+    """`writeStoredTable` into a file, for writers that upload from a path. Nothing is written for a refused table."""
+    table = _markedTable(table, projectId, tableName)
+    pq.write_table(table, path, **WRITE_SETTINGS, row_group_size=ROW_GROUP_ROWS)
 
 
 def readerMemoryBytes() -> int:
@@ -597,4 +608,17 @@ def tableReadException(error: BaseException) -> "CustomException | None":
         return CustomException(error, statusCode=413, uiMessage=str(error), errorCode=TOO_LARGE_CODE)
     if isinstance(error, TableUnreadableError):
         return CustomException(error, statusCode=422, uiMessage=str(error), errorCode=UNREADABLE_CODE)
+    return None
+
+
+def tableWriteException(error: BaseException) -> "CustomException | None":
+    """The answer for a table the API refused to store, or None for any other error.
+
+    Separate from `tableReadException`: the writer's own message is internal text, so the user's copy is built here.
+    """
+    from utils.exceptionHandler import CustomException
+
+    if isinstance(error, TableTooLargeError):
+        limit = _formatBytes(maxDecodedBytes())
+        return CustomException(error, statusCode=413, uiMessage=f"This table is too large to load (over {limit}).", errorCode=TOO_LARGE_CODE)
     return None

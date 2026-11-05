@@ -143,6 +143,42 @@ def test_writeRefusesATableOverTheLimit(monkeypatch):
         writeStoredTable(big, "p1", "orders")
 
 
+def test_pathWriterMatchesTheBytesWriter(tmp_path):
+    from utils.storedTables import writeStoredTableToPath
+
+    path = tmp_path / "orders.parquet"
+    writeStoredTableToPath(_frame(), "p1", "orders", str(path))
+    data = path.read_bytes()
+
+    assert markerIsValid(_footer(data), "p1", "orders")
+    assert data == writeStoredTable(_frame(), "p1", "orders")
+    assert _footer(data).row_group(0).column(0).compression == "ZSTD"
+
+
+def test_pathWriterRefusesATableOverTheLimitAndWritesNothing(monkeypatch, tmp_path):
+    from utils.storedTables import writeStoredTableToPath
+
+    monkeypatch.setenv("STORED_TABLE_MAX_DECODED_BYTES", "1024")
+    path = tmp_path / "orders.parquet"
+    with pytest.raises(TableTooLargeError):
+        writeStoredTableToPath(pd.DataFrame({"a": np.arange(10_000, dtype="int64")}), "p1", "orders", str(path))
+    assert not path.exists()
+
+
+def test_writerRefusalHasItsOwnCopy(monkeypatch):
+    from utils.storedTables import tableReadException, tableWriteException
+
+    refusal = TableTooLargeError("Table is 99 bytes decoded, over the limit of 1.")
+    monkeypatch.setenv("STORED_TABLE_MAX_DECODED_BYTES", "1073741824")
+    mapped = tableWriteException(refusal)
+
+    assert mapped is not None
+    assert (mapped.statusCode, mapped.errorCode) == (413, "TABLE_TOO_LARGE")
+    assert mapped.uiMessage == "This table is too large to load (over 1 GiB)."
+    assert tableWriteException(ValueError("other")) is None
+    assert tableReadException(refusal).uiMessage != mapped.uiMessage
+
+
 def test_zeroLimitMeansNoLimit(monkeypatch):
     monkeypatch.setenv("STORED_TABLE_MAX_DECODED_BYTES", "0")
     assert storedTables.maxDecodedBytes() == 0
