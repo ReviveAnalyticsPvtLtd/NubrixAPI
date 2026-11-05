@@ -1604,6 +1604,7 @@ def test_previewCachesNormalisedBytes(monkeypatch):
     service._save_messages_to_db = lambda **_kwargs: None
     assert asyncio.run(service.approveMessage(PROJECT_ID, "t1", "m1")) == {"data": [{"row": 1}]}
     (preview,) = cached.values()
+    assert list(cached) == [service._preview_cache_key(PROJECT_ID, "t1", "m1", "summary")]
     assert markerIsValid(_footer(preview), PROJECT_ID, "summary")
 
     service._claim_table_name = lambda *_args: (True, None)
@@ -1612,6 +1613,52 @@ def test_previewCachesNormalisedBytes(monkeypatch):
     assert uploaded == preview
     # Storage's eTag of the upload is the MD5 of these same bytes, so the table file record still matches it.
     assert TransformationService._holds_written_content({"eTag": f'"{hashlib.md5(uploaded).hexdigest()}"'}, preview)
+
+
+def test_previewCacheKeyIsVersioned():
+    from api.services.transformationService import TransformationService
+
+    key = object.__new__(TransformationService)._preview_cache_key(PROJECT_ID, "t1", "m1", "summary")
+    # A preview cached before normalising existed sat under the unversioned key; nothing may find it now.
+    assert key == f"{PROJECT_ID}::transformation_preview::v2::t1::m1::summary"
+    assert key != f"{PROJECT_ID}::transformation_preview::t1::m1::summary"
+    # The user-erasure sweep deletes everything under this prefix.
+    assert key.startswith(f"{PROJECT_ID}::")
+
+
+def test_everyPreviewCacheAccessUsesThePreviewCacheKey():
+    import ast
+
+    source = (REPOSITORY / "api" / "services" / "transformationService.py").read_text(encoding="utf-8")
+    tree = ast.parse(source)
+    assert source.count("transformation_preview") == 1
+
+    def isKeyCall(node):
+        return isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute) and node.func.attr == "_preview_cache_key"
+
+    accesses = 0
+    for function in (node for node in ast.walk(tree) if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))):
+        if function.name in ("_get_metadata", "_preview_cache_key"):
+            continue
+        assigned = {}
+        for node in ast.walk(function):
+            if isinstance(node, ast.Assign) and len(node.targets) == 1 and isinstance(node.targets[0], ast.Name):
+                assigned.setdefault(node.targets[0].id, []).append(node.value)
+        for node in ast.walk(function):
+            if not (isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute) and node.func.attr in ("get", "set", "delete", "unlink", "setex")):
+                continue
+            receiver = ast.unparse(node.func.value)
+            if "redis" not in receiver.lower():
+                continue
+            keyArgument = node.args[0] if node.args else next(keyword.value for keyword in node.keywords if keyword.arg == "name")
+            if isKeyCall(keyArgument):
+                accesses += 1
+            else:
+                assert isinstance(keyArgument, ast.Name), ast.unparse(node)
+                assert assigned[keyArgument.id] and all(isKeyCall(value) for value in assigned[keyArgument.id]), ast.unparse(node)
+                accesses += 1
+    # approveMessage writes, applyTransformation reads and deletes, the rollback deletes twice.
+    assert accesses == 5
 
 
 @pytest.mark.parametrize(
@@ -1638,6 +1685,56 @@ def test_validationRunIsNotNormalised(monkeypatch):
     monkeypatch.setattr(executorModule, "normaliseRunOutput", refuse, raising=False)
     monkeypatch.setattr(storedTables, "normaliseRunOutput", refuse)
     executor._execute_code(PROJECT_ID, "code")
+
+
+# ---- Routes that call a blocking service keep it off the event loop and still answer a busy reader with 503 ----
+
+ROUTES = [("dashboard", "dashboardService", "getAllColumns"), ("manager", "managementService", "generateMetadata"), ("manager", "managementService", "generateReport")]
+
+
+def _route(monkeypatch, moduleName, serviceName, name):
+    import importlib
+
+    module = importlib.import_module(f"api.routers.{moduleName}")
+    monkeypatch.setattr(module, "requireProjectOwner", lambda *_args: None)
+    user = MagicMock(userId="user_1")
+    return getattr(module, serviceName), lambda: getattr(module, name)(PROJECT_ID, user=user)
+
+
+@pytest.mark.parametrize("moduleName, serviceName, name", ROUTES, ids=[route[2] for route in ROUTES])
+def test_blockingRoutesRunTheServiceOffTheEventLoop(monkeypatch, moduleName, serviceName, name):
+    import threading
+
+    service, call = _route(monkeypatch, moduleName, serviceName, name)
+    ranOnLoopThread = []
+
+    def run(**_kwargs):
+        ranOnLoopThread.append(threading.current_thread() is loopThread[0])
+        return {}
+
+    loopThread = []
+
+    async def serve():
+        loopThread.append(threading.current_thread())
+        return await call()
+
+    monkeypatch.setattr(service, name, run)
+    assert asyncio.run(serve()).status_code == 200
+    assert ranOnLoopThread == [False]
+
+
+@pytest.mark.parametrize("moduleName, serviceName, name", ROUTES, ids=[route[2] for route in ROUTES])
+def test_blockingRoutesAnswerBusyWith503(monkeypatch, moduleName, serviceName, name):
+    service, call = _route(monkeypatch, moduleName, serviceName, name)
+
+    def busy(**_kwargs):
+        raise CustomException(SandboxBusyError(), statusCode=503, uiMessage=BUSY_MESSAGE, errorCode=BUSY_CODE)
+
+    monkeypatch.setattr(service, name, busy)
+    with pytest.raises(HTTPException) as caught:
+        asyncio.run(call())
+    assert caught.value.status_code == 503
+    assert (caught.value.detail["errorCode"], caught.value.detail["message"]) == (BUSY_CODE, BUSY_MESSAGE)
 
 
 # ---- An honest table the API did not mark still opens everywhere ----
@@ -1735,7 +1832,7 @@ def test_unmarkedHonestTableStillOpensEverywhere(monkeypatch, storage):
 # ---- Nothing decodes a stored table around the choke point ----
 
 # A Parquet decode in any spelling pandas, polars and pyarrow offer.
-_DECODE = re.compile(r"read_parquet|scan_parquet|\bread_table\b|ParquetFile|ParquetDataset|iter_batches|read_row_groups?\b|read_metadata|read_schema|read_pandas")
+_DECODE = re.compile(r"read_parquet|scan_parquet|\bread_table\b|ParquetFile|ParquetDataset|iter_batches|read_row_groups?\b|read_metadata|read_schema|read_pandas|pyarrow\.dataset|\bds\.dataset\(|ParquetReader")
 # Parent-side files where a decode is allowed, and the lines (None = the whole file).
 _DECODERS = {
     # The choke point and the bounded decoders it shares with the reader child.
@@ -1743,9 +1840,11 @@ _DECODERS = {
     # sandboxRunner's child-side readTable: a run decodes the tables it was served, under its own limits.
     "utils/sandboxRunner.py": {"return pq.read_table(path)"},
 }
-# Every *_launcher.py runs in a sandbox child under the run limits: transform_launcher reads back its own output for
-# the preview, normalise_launcher and table_reader_launcher are the normaliser and the reader.
-_CHILD_SIDE = re.compile(r"utils/[a-z_]+_launcher\.py")
+# The launchers that decode run in a sandbox child under the run limits: transform_launcher reads back its own output for
+# the preview, normalise_launcher and table_reader_launcher are the normaliser and the reader. inspect_launcher and
+# sandbox_launcher decode nothing themselves (they read tables only through sandboxRunner's channel), so they are not
+# listed: a decode added to either one must be reviewed and named here.
+_CHILD_SIDE = {"utils/transform_launcher.py", "utils/normalise_launcher.py", "utils/table_reader_launcher.py"}
 
 
 def _decodeLines():
@@ -1759,12 +1858,15 @@ def _decodeLines():
 
 def test_noOtherStoredTableDecodeRemains():
     for spelling in ("pd.read_parquet(io.BytesIO(readTableBytes(p, t)))", "pq.read_table(io.BytesIO(x))", "pq.ParquetFile(file_like)",
-                     "pl.scan_parquet(url)", "pl.read_parquet(buffer)", "pf.iter_batches(batch_size=1)", "pq.read_metadata(f)"):
+                     "pl.scan_parquet(url)", "pl.read_parquet(buffer)", "pf.iter_batches(batch_size=1)", "pq.read_metadata(f)",
+                     "import pyarrow.dataset as ds", "from pyarrow.dataset import dataset", "pyarrow.dataset.dataset(path)",
+                     "table = ds.dataset(source, format='parquet').to_table()", "reader = ParquetReader()"):
         assert _DECODE.search(spelling), spelling
     assert not _DECODE.search("pq.write_table(table, sink)")
+    assert not _DECODE.search("fields = ds.field('a')")
     offenders = []
     for relative, number, line in _decodeLines():
-        if _CHILD_SIDE.fullmatch(relative):
+        if relative in _CHILD_SIDE:
             continue
         if relative in _DECODERS and (_DECODERS[relative] is None or line in _DECODERS[relative]):
             continue

@@ -254,7 +254,7 @@ async def generateMetadata(projectId: str, user: UserContext = Depends(requireCr
     """
     await asyncio.to_thread(requireProjectOwner, projectId, user)
     try:
-        jsonData = managementService.generateMetadata(projectId=projectId, userId=user.userId)
+        jsonData = await asyncio.to_thread(managementService.generateMetadata, projectId=projectId, userId=user.userId)
         return ORJSONResponse(status_code = 200, content = {"status": "SUCCESS", "metadata": jsonData})
     except CustomException as e:
         raiseHttpException(e)
@@ -452,7 +452,7 @@ async def generateReport(projectId: str, user: UserContext = Depends(requireTria
     """
     await asyncio.to_thread(requireProjectOwner, projectId, user)
     try:
-        reports = managementService.generateReport(projectId = projectId)
+        reports = await asyncio.to_thread(managementService.generateReport, projectId = projectId)
         return ORJSONResponse(status_code = 200, content = {"status": "SUCCESS", "reportHtmlContent": reports})
     except CustomException as e:
         raiseHttpException(e)

@@ -13,6 +13,10 @@ from urllib.parse import unquote, urlsplit
 
 SERVICE_KEY = "test-service-key"
 
+_OBJECT_PREFIX = "/storage/v1/object/"
+_NOT_FOUND = {"statusCode": "404", "error": "not_found", "message": "Object not found"}
+_NO_BUCKET = {"statusCode": "404", "error": "Bucket not found", "message": "Bucket not found"}
+
 
 def markedParquet(body: bytes, projectId: str, tableName: str) -> bytes:
     """`body` rewritten with the table's marker, keeping its row groups and compression.
@@ -33,9 +37,6 @@ def markedParquet(body: bytes, projectId: str, tableName: str) -> bytes:
     sink = io.BytesIO()
     pq.write_table(table, sink, row_group_size=groupRows or None, compression=compression)
     return sink.getvalue()
-_OBJECT_PREFIX = "/storage/v1/object/"
-_NOT_FOUND = {"statusCode": "404", "error": "not_found", "message": "Object not found"}
-_NO_BUCKET = {"statusCode": "404", "error": "Bucket not found", "message": "Bucket not found"}
 
 
 class FakePrivateStorage:

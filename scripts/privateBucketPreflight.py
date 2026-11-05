@@ -25,7 +25,8 @@ if str(REPOSITORY_ROOT) not in sys.path:
 from dotenv import load_dotenv
 import httpx
 
-from utils.projectStorage import StorageReadError, authHeaders, objectUrl, readJson, readTablePage
+from utils.projectStorage import StorageReadError, authHeaders, objectUrl, openTableFile, readJson
+from utils.storedTables import readTailFooter
 
 _REFUSED_STATUSES = {400, 401, 403, 404}
 
@@ -45,8 +46,12 @@ def _checkAuthenticatedRead(projectId: str) -> dict:
 
 def _checkPagedRead(projectId: str, tableName: str) -> dict:
     try:
-        _, totalRows = readTablePage(projectId, tableName, offset=0, limit=1)
-        return {"pagedReadRows": totalRows}
+        # The row count is in the footer: read from the file's tail by range, so nothing is downloaded whole or decoded.
+        with openTableFile(projectId, tableName) as tableFile:
+            footer = readTailFooter(tableFile)
+        if footer is None:
+            raise StorageReadError(f"{tableName}.parquet has no readable footer")
+        return {"pagedReadRows": footer.num_rows}
     except Exception as e:
         return {"pagedReadRows": None, "pagedReadError": _errorText(e)}
 
