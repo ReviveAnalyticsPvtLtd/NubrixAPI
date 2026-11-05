@@ -33,6 +33,7 @@ This file documents changes made to the NubrixAI Analytics Hub API codebase.
 
 - **Subprocess-based**: LLM-generated code runs in a fresh subprocess (`subprocess.Popen` with `close_fds=True`). No fork, no inherited Redis/HTTP sockets, no deadlock.
 - **Run limits** (AGENTS.md, "Run limits", has the full table and the revert switches): `RLIMIT_AS` stays out (VmPeak was 12 GB on a many-core host, so it crashed polars import). The old `RLIMIT_CPU` failure was most likely the CPU time of many threads adding up, so it is back at 1200 s with 4 threads. `RLIMIT_DATA` (4 GiB per process) is used together with the thread caps. A watchdog also stops a run over 4 GiB of memory in total, 2 GiB of disk or 10000 files in `work/`. Other limits: 64 processes, 2 GiB per file, first place for the OOM killer, a seccomp filter against network sockets, and 12 concurrent runs per container. Isolation is still a separate uid per run and a child that holds no credentials.
+- **Bounded stored-table reads** (`utils/storedTables.py`; AGENTS.md "Stored tables" has the detail): every API decode of a stored table goes through one choke point. Tables the API writes carry an HMAC marker and are decoded in the worker; a run's output is rewritten by a normaliser before it is stored; any unmarked table is decoded in a reader child with `TABLE_READER_MEMORY_BYTES` (4 GiB) of memory; writers refuse a table over `STORED_TABLE_MAX_DECODED_BYTES` (2 GiB decoded). Refusals are 413 `TABLE_TOO_LARGE` and 422 `TABLE_UNREADABLE`. Values and revert values: `STORED_TABLE_NORMALISE` 1 (revert `0`), `STORED_TABLE_MAX_DECODED_BYTES` 2147483648 (revert `0`), `TABLE_READER_MEMORY_BYTES` 4294967296 (revert `0` = decode in the worker as today). An unmarked table costs a reader run per data-grid page, column-type read and metadata read.
 - **Restricted builtins**: `__import__` whitelisted to `polars`, `json`, `math`, `datetime`, `numpy`, `pandas`, etc. No `open`, `subprocess`, `os`. These only catch mistakes: pandas and NumPy expose `os`, file reads and HTTP reads.
 - **Project-scoped fetchers**: `safe_fetch_data` / `safe_fetch_data_pl` / `safe_scan_data` give a clear error for another project. The boundary is the parent, which reads tables for the child over a private socket (`utils/sandboxRunner.py`).
 - **Timeout**: `CODE_EXEC_TIMEOUT_SECONDS` env, 300 seconds when unset; `0` = no timeout.
@@ -76,13 +77,13 @@ This file documents changes made to the NubrixAI Analytics Hub API codebase.
 ### 8. Table Viewer Endpoint (`api/routers/manager.py`)
 
 - `GET /viewTable/{projectId}/{tableName}?page=1&pageSize=100`
-- Uses `readTablePage` — Range GETs for the parquet footer and the row groups holding the page, decoded batch by batch up to the end of the page. `pl.scan_parquet` can't authenticate on HTTP URLs.
+- Uses `readStoredTablePage`. A marked table goes to `readTablePage` — Range GETs for the parquet footer and the row groups holding the page, decoded batch by batch up to the end of the page. `pl.scan_parquet` can't authenticate on HTTP URLs. An unmarked (older) table is downloaded whole and read by a reader child, one run per page; a table over the decoded-size limit answers 413 and an unreadable one 422.
 - Auth via `verifyToken`. Max page size 500.
 - Response includes `rows` + `pagination` (page, pageSize, totalRows, totalPages).
 
 ### 9. `_generateAttributeInfo` Fix (`api/services/managementService.py`)
 
-- Replaced `pd.read_parquet(url)` (fails on HTTPS) with `httpx.get()` + `pq.ParquetFile(BytesIO)`. Reads schema + first row only, not full table.
+- Replaced `pd.read_parquet(url)` (fails on HTTPS) with `httpx.get()` + `pq.ParquetFile(BytesIO)`. Reads schema + first row only, not full table. Now `storedTableInfo` does the read: in the worker for a marked table, in a reader child for an unmarked one. `getAllColumns`, `generateMetadata` and `generateReport` run off the event loop.
 
 ### 10. Active/Inactive Tables (`metadata.json`)
 
