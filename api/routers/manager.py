@@ -10,7 +10,7 @@ __all__ = ["router"]
 
 
 from utils.exceptionHandler import CustomException, raiseHttpException
-from utils.projectStorage import readTablePage
+from utils.storedTables import readStoredTablePage, tableReadException
 import asyncio
 from fastapi import APIRouter, Depends, Form, Request, Query
 from api.services.managementService import managementService
@@ -580,7 +580,7 @@ async def viewTable(
     await asyncio.to_thread(requireProjectOwner, projectId, user)
     try:
         def _read_page() -> dict:
-            frame, totalRows = readTablePage(projectId, tableName, offset=(page - 1) * pageSize, limit=pageSize)
+            frame, totalRows = readStoredTablePage(projectId, tableName, offset=(page - 1) * pageSize, limit=pageSize)
             rows = frame.to_dicts()
             from utils.initMethods import serializer
             import json as _json
@@ -600,5 +600,5 @@ async def viewTable(
     except CustomException as e:
         raiseHttpException(e)
     except Exception as e:
-        exc = CustomException(e, statusCode=500, uiMessage=f"Failed to read table: {e}")
+        exc = tableReadException(e) or CustomException(e, statusCode=500, uiMessage=f"Failed to read table: {e}")
         raiseHttpException(exc)

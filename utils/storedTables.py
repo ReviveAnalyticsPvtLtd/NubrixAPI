@@ -10,6 +10,9 @@ A run's output is rewritten by `normaliseRunOutput` in a limited child before it
 can be stored, and an unmarked table is decoded by the `readUntrusted*`
 functions in a limited child too: a Parquet file can decode to far more memory
 than its size, so neither is decoded in the API's own process.
+
+`decodeStoredTable`, `readStoredTablePage` and `storedTableInfo` are the only way
+API code decodes a stored table: they pick between the two.
 """
 
 import hmac
@@ -55,6 +58,11 @@ _STDERR_TAIL_CHARS = 2000
 _INFO_KEYS = {"columns", "rows", "cols", "sample", "sampleFailed"}
 _SAVE_FAILED = "The transformation's result could not be read safely."
 _READ_FAILED = "This table could not be read safely."
+TOO_LARGE_CODE = "TABLE_TOO_LARGE"
+UNREADABLE_CODE = "TABLE_UNREADABLE"
+# How much of a stored file's end is read first for its footer, as Arrow itself reads it.
+_TAIL_READ_BYTES = 64 * 1024
+_PAGE_BATCH_ROWS = 8192
 
 _missingKeyWarned = False
 
@@ -246,28 +254,46 @@ def decodeTable(data: "bytes | str", limit: int) -> "pa.Table":
     return pq.read_table(_source(data))
 
 
+def _pageBatches(parquet, rowGroups: list, firstRow: int, offset: int, limit: int) -> list:
+    """Decode only up to the end of the page. pandas writes a million rows as one row group."""
+    batches, batchStart = [], firstRow
+    for batch in parquet.iter_batches(batch_size=_PAGE_BATCH_ROWS, row_groups=rowGroups):
+        batchEnd = batchStart + batch.num_rows
+        if batchEnd > offset:
+            start = max(offset, batchStart)
+            batches.append(batch.slice(start - batchStart, offset + limit - start))
+        batchStart = batchEnd
+        if batchStart >= offset + limit:
+            break
+    return batches
+
+
+def _readPage(parquet: "pq.ParquetFile", offset: int, limit: int) -> "pa.Table":
+    """The rows `offset` to `offset + limit`, decoding only the row groups that hold them."""
+    metadata = parquet.metadata
+    rowGroups, firstRow, nextRow = [], offset, 0
+    for index in range(metadata.num_row_groups):
+        groupRows = metadata.row_group(index).num_rows
+        if nextRow < offset + limit and nextRow + groupRows > offset:
+            if not rowGroups:
+                firstRow = nextRow
+            rowGroups.append(index)
+        nextRow += groupRows
+    batches = _pageBatches(parquet, rowGroups, firstRow, offset, limit)
+    return pa.Table.from_batches(batches, schema=parquet.schema_arrow)
+
+
 def decodePage(data: "bytes | str", offset: int, limit: int, maxDecoded: int) -> tuple["pa.Table", int]:
     """Decode the rows `offset` to `offset + limit` and return them with the table's row count.
 
     The whole table is checked against `maxDecoded` first, as for `decodeTable`; then only the row groups holding the
     page are decoded, as the data grid reads them.
     """
-    from utils.projectStorage import _pageBatches
-
     with pq.ParquetFile(_source(data)) as parquet:
         metadata = parquet.metadata
         if _overDecodedLimit(metadata, maxDecoded):
             raise _tooLargeToOpen(maxDecoded)
-        rowGroups, firstRow, nextRow = [], offset, 0
-        for index in range(metadata.num_row_groups):
-            groupRows = metadata.row_group(index).num_rows
-            if nextRow < offset + limit and nextRow + groupRows > offset:
-                if not rowGroups:
-                    firstRow = nextRow
-                rowGroups.append(index)
-            nextRow += groupRows
-        batches = _pageBatches(parquet, rowGroups, firstRow, offset, limit)
-        return pa.Table.from_batches(batches, schema=parquet.schema_arrow), metadata.num_rows
+        return _readPage(parquet, offset, limit), metadata.num_rows
 
 
 def tableInfo(data: "bytes | str", maxDecoded: int) -> dict:
@@ -470,3 +496,105 @@ def readUntrustedInfo(projectId: str, tableName: str, data: bytes) -> dict:
         _logChildFailure("Reading a table's info", projectId, tableName, error=ValueError("malformed answer"))
         raise TableUnreadableError(_READ_FAILED)
     return info
+
+
+# ---- The choke point: the only way API code decodes a stored table ----
+
+
+def readTailFooter(tableFile) -> "pq.FileMetaData | None":
+    """Parse the footer of a seekable stored file from its end, as `readFooter` does for whole bytes.
+
+    Reads the last 64 KiB, and then the rest of the footer when it is longer, only for a footer of at most 1 MiB.
+    None for anything else; a failed read of the file itself raises.
+    """
+    size = tableFile.seek(0, io.SEEK_END)
+    if size < 12:
+        return None
+    tailLength = min(size, _TAIL_READ_BYTES)
+    tableFile.seek(size - tailLength)
+    tail = tableFile.read(tailLength)
+    if len(tail) != tailLength or tail[-4:] != _PARQUET_MAGIC:
+        return None
+    footerLength = int.from_bytes(tail[-8:-4], "little")
+    if footerLength == 0 or footerLength > MAX_INPROCESS_FOOTER_BYTES or footerLength > size - 12:
+        return None
+    if footerLength + 8 <= tailLength:
+        footer = tail[-(footerLength + 8):]
+    else:
+        tableFile.seek(size - 8 - footerLength)
+        footer = tableFile.read(footerLength) + tail[-8:]
+    # The footer alone is a file readFooter can check: the row groups' offsets are only read when they are decoded.
+    return readFooter(_PARQUET_MAGIC + footer)
+
+
+def _trustedFooter(projectId: str, tableName: str, metadata: "pq.FileMetaData | None", what: str) -> "pq.FileMetaData | None":
+    """The footer of a table this API wrote, after the decoded-size check; None for a table that is not."""
+    if metadata is None or not markerIsValid(metadata, projectId, tableName):
+        return None
+    limit = maxDecodedBytes()
+    if _overDecodedLimit(metadata, limit):
+        _logTooLarge(what, projectId, tableName, limit)
+        raise _tooLargeToOpen(limit)
+    return metadata
+
+
+def decodeStoredTable(projectId: str, tableName: str, data: bytes) -> "pa.Table":
+    """Decode a stored table: in this process when the API wrote it, else in the reader child.
+
+    Raises TableTooLargeError over STORED_TABLE_MAX_DECODED_BYTES, and whatever `readUntrustedTable` raises.
+    """
+    if _trustedFooter(projectId, tableName, readFooter(data), "Reading a table (table)") is not None:
+        return pq.read_table(pa.BufferReader(data))
+    return readUntrustedTable(projectId, tableName, data)
+
+
+def readStoredTablePage(projectId: str, tableName: str, offset: int, limit: int) -> tuple["pl.DataFrame", int]:
+    """One page of a stored table and its row count, for the data grid.
+
+    A table the API wrote is read as before: its footer and only the row groups holding the page, by ranged reads.
+    Any other table is downloaded and read by `readUntrustedPage`. Raises as `decodeStoredTable` does, and
+    StorageReadError when storage fails.
+    """
+    import polars as pl
+
+    from utils.projectStorage import openTableFile, readTableBytes
+
+    what = "Reading a table (page)"
+    with openTableFile(projectId, tableName) as tableFile:
+        metadata = _trustedFooter(projectId, tableName, readTailFooter(tableFile), what)
+        if metadata is not None:
+            with pq.ParquetFile(tableFile, pre_buffer=True, metadata=metadata) as parquet:
+                return pl.from_arrow(_readPage(parquet, offset, limit)), metadata.num_rows
+    return readUntrustedPage(projectId, tableName, readTableBytes(projectId, tableName), offset, limit)
+
+
+def storedTableInfo(projectId: str, tableName: str, data: bytes) -> dict:
+    """Columns, shape and a one-row sample of a stored table, in the shape `readUntrustedInfo` returns.
+
+    A table the API wrote is read in this process; any other in the reader child. A table over
+    STORED_TABLE_MAX_DECODED_BYTES gets its shape and no sample either way.
+    """
+    metadata = readFooter(data)
+    if metadata is not None and markerIsValid(metadata, projectId, tableName):
+        return tableInfo(data, maxDecodedBytes())
+    return readUntrustedInfo(projectId, tableName, data)
+
+
+def tableReadException(error: BaseException) -> "CustomException | None":
+    """The answer for a refused stored-table read, or None for any other error.
+
+    Callers whose broad `except` turns errors into a generic 500 use it first, so a busy sandbox stays a 503 retry,
+    a table over the limit a 413, an unreadable table a 422, and a CustomException made below them stays as it was.
+    """
+    from utils.exceptionHandler import CustomException
+    from utils.sandboxSlots import BUSY_CODE, BUSY_MESSAGE
+
+    if isinstance(error, CustomException):
+        return error
+    if isinstance(error, SandboxBusyError):
+        return CustomException(error, statusCode=503, uiMessage=BUSY_MESSAGE, errorCode=BUSY_CODE)
+    if isinstance(error, TableTooLargeError):
+        return CustomException(error, statusCode=413, uiMessage=str(error), errorCode=TOO_LARGE_CODE)
+    if isinstance(error, TableUnreadableError):
+        return CustomException(error, statusCode=422, uiMessage=str(error), errorCode=UNREADABLE_CODE)
+    return None

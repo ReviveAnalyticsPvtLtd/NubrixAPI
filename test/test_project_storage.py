@@ -14,7 +14,7 @@ import polars as pl
 import pyarrow.parquet as pq
 import pytest
 
-from test.privateStorageFixtures import SERVICE_KEY, FakePrivateStorage
+from test.privateStorageFixtures import SERVICE_KEY, FakePrivateStorage, markedParquet
 from utils import projectStorage
 
 PROJECT = "11111111-2222-4333-8444-555555555555"
@@ -175,7 +175,7 @@ def test_readTablePageSpansARowGroupBoundary(storage):
 
 
 def test_readTablePageReadsOnlyTheFooterAndTheRowGroupsItNeeds(storage):
-    body = _wideParquet()
+    body = markedParquet(_wideParquet(), PROJECT, "sales")
     storage.put(PROJECT, "sales.parquet", body)
 
     projectStorage.readTablePage(PROJECT, "sales", offset=0, limit=10)
@@ -187,7 +187,7 @@ def test_readTablePageReadsOnlyTheFooterAndTheRowGroupsItNeeds(storage):
 
 
 def test_readTablePageSendsTheServiceKeyOnEveryRequestAndUsesNoSignedUrl(storage):
-    storage.put(PROJECT, "sales.parquet", _parquet())
+    storage.put(PROJECT, "sales.parquet", markedParquet(_parquet(), PROJECT, "sales"))
 
     projectStorage.readTablePage(PROJECT, "sales", offset=0, limit=1)
 
@@ -292,7 +292,7 @@ def test_aFailedReadNamesTheFileButNeverTheKey(storage):
 
 
 def test_readTablePageTakesTheSizeFromHeadWhenItCan(storage):
-    storage.put(PROJECT, "sales.parquet", _parquet(10))
+    storage.put(PROJECT, "sales.parquet", markedParquet(_parquet(10), PROJECT, "sales"))
 
     projectStorage.readTablePage(PROJECT, "sales", offset=2, limit=2)
 
@@ -301,7 +301,7 @@ def test_readTablePageTakesTheSizeFromHeadWhenItCan(storage):
 
 
 def test_readTablePageFallsBackToARangeWithoutContentLength(storage):
-    storage.put(PROJECT, "sales.parquet", _parquet(10))
+    storage.put(PROJECT, "sales.parquet", markedParquet(_parquet(10), PROJECT, "sales"))
     storage.omitContentLength = True
 
     frame, totalRows = projectStorage.readTablePage(PROJECT, "sales", offset=2, limit=2)
@@ -312,7 +312,7 @@ def test_readTablePageFallsBackToARangeWithoutContentLength(storage):
 
 
 def test_readTablePageAsksForUncompressedBytes(storage):
-    storage.put(PROJECT, "sales.parquet", _parquet(10))
+    storage.put(PROJECT, "sales.parquet", markedParquet(_parquet(10), PROJECT, "sales"))
     storage.compressUnlessIdentity = True
 
     frame, _ = projectStorage.readTablePage(PROJECT, "sales", offset=2, limit=2)
@@ -339,7 +339,7 @@ def test_aRangeAnswerWithoutTheTotalSizeIsAnError(storage):
 
 
 def test_readTablePageStopsDecodingOnceThePageIsCovered(storage, monkeypatch):
-    storage.put(PROJECT, "loaded.parquet", _oneRowGroupParquet())
+    storage.put(PROJECT, "loaded.parquet", markedParquet(_oneRowGroupParquet(), PROJECT, "loaded"))
     decoded = _countDecodedBatches(monkeypatch)
 
     frame, totalRows = projectStorage.readTablePage(PROJECT, "loaded", offset=10, limit=5)
@@ -350,7 +350,7 @@ def test_readTablePageStopsDecodingOnceThePageIsCovered(storage, monkeypatch):
 
 
 def test_readTablePageReleasesEachBatchBeforeThePage(storage, monkeypatch):
-    storage.put(PROJECT, "loaded.parquet", _oneRowGroupParquet())
+    storage.put(PROJECT, "loaded.parquet", markedParquet(_oneRowGroupParquet(), PROJECT, "loaded"))
     realBatches = pq.ParquetFile.iter_batches
     decoded, aliveAtEachYield = [], []
 
@@ -370,7 +370,7 @@ def test_readTablePageReleasesEachBatchBeforeThePage(storage, monkeypatch):
 
 
 def test_readTablePageAcrossABatchBoundaryOfOneRowGroup(storage):
-    body = _oneRowGroupParquet()
+    body = markedParquet(_oneRowGroupParquet(), PROJECT, "loaded")
     storage.put(PROJECT, "loaded.parquet", body)
 
     frame, _ = projectStorage.readTablePage(PROJECT, "loaded", offset=8190, limit=5)

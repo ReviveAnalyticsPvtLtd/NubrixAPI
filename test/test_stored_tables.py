@@ -1111,3 +1111,662 @@ def test_sandboxErrorsPropagateUnchanged(monkeypatch, error):
         with pytest.raises(type(error)) as caught:
             call()
         assert caught.value is error
+
+
+# ---- The choke point: every API decode of a stored table ----
+
+import asyncio  # noqa: E402
+import hashlib  # noqa: E402
+import pickle  # noqa: E402
+import re  # noqa: E402
+import types  # noqa: E402
+from concurrent.futures import ThreadPoolExecutor  # noqa: E402
+from pathlib import Path  # noqa: E402
+from unittest.mock import MagicMock  # noqa: E402
+
+from fastapi import HTTPException  # noqa: E402
+
+from test.privateStorageFixtures import SERVICE_KEY, FakePrivateStorage  # noqa: E402
+from utils.exceptionHandler import CustomException  # noqa: E402
+from utils.sandboxSlots import BUSY_CODE, BUSY_MESSAGE  # noqa: E402
+
+REPOSITORY = Path(__file__).resolve().parent.parent
+TOO_LARGE_COPY = "This table is too large to open (over 2 GiB)."
+READER = "table_reader_launcher.py"
+
+
+@pytest.fixture
+def storage(monkeypatch):
+    fake = FakePrivateStorage()
+    monkeypatch.setenv("SUPABASE_URL", fake.url)
+    monkeypatch.setenv("SUPABASE_KEY", SERVICE_KEY)
+    yield fake
+    fake.close()
+
+
+def _refuseReader(monkeypatch):
+    def refuse(*_args, **_kwargs):
+        raise AssertionError("went to the reader")
+
+    for name in ("readUntrustedTable", "readUntrustedPage", "readUntrustedInfo"):
+        monkeypatch.setattr(storedTables, name, refuse)
+
+
+def _spyReader(monkeypatch) -> tuple[list, dict]:
+    """Record what reaches the reader and answer with a sentinel per call."""
+    calls = []
+    answers = {"table": pa.table({"sentinel": [1]}), "page": ("page", 7), "info": {"sentinel": True}}
+
+    def recorder(kind):
+        def record(projectId, tableName, data, *rest):
+            calls.append((kind, projectId, tableName, bytes(data), rest))
+            return answers[kind]
+
+        return record
+
+    monkeypatch.setattr(storedTables, "readUntrustedTable", recorder("table"))
+    monkeypatch.setattr(storedTables, "readUntrustedPage", recorder("page"))
+    monkeypatch.setattr(storedTables, "readUntrustedInfo", recorder("info"))
+    return calls, answers
+
+
+def _polars(df: pd.DataFrame):
+    import polars as pl
+
+    return pl.from_pandas(df)
+
+
+def test_markedTableDecodesInProcess(monkeypatch, storage, noChild):
+    df = _honestFrame(30)
+    data = writeStoredTable(df, PROJECT_ID, "orders")
+    _refuseReader(monkeypatch)
+
+    table = storedTables.decodeStoredTable(PROJECT_ID, "orders", data)
+    assert table.equals(pq.read_table(io.BytesIO(data)), check_metadata=True)
+    assert storedTables.storedTableInfo(PROJECT_ID, "orders", data) == _expectedInfo(data)
+
+    storage.put(PROJECT_ID, "orders.parquet", data)
+    page, totalRows = storedTables.readStoredTablePage(PROJECT_ID, "orders", 5, 10)
+    assert totalRows == 30
+    assert page.to_dicts() == _polars(df).slice(5, 10).to_dicts()
+    reads = [r for r in storage.requests if r["method"] == "GET"]
+    assert reads and all(r["range"] for r in reads)  # footer and row groups only, as the data grid read before
+
+
+def test_unmarkedTableGoesToTheReader(monkeypatch, storage):
+    calls, answers = _spyReader(monkeypatch)
+    cases = {
+        "unmarked": _runOutput(_frame()),
+        "anotherTablesMarker": writeStoredTable(_frame(), PROJECT_ID, "other"),
+        "anotherProjectsMarker": writeStoredTable(_frame(), "p2", "orders"),
+        "forgedMarker": _runOutput(_frame(), {MARKER_KEY: b"0" * 64}),
+        "notParquet": b"not a parquet file at all",
+    }
+    for case, data in cases.items():
+        calls.clear()
+        assert storedTables.decodeStoredTable(PROJECT_ID, "orders", data) is answers["table"], case
+        assert storedTables.storedTableInfo(PROJECT_ID, "orders", data) is answers["info"], case
+        storage.put(PROJECT_ID, "orders.parquet", data)
+        assert storedTables.readStoredTablePage(PROJECT_ID, "orders", 3, 4) == answers["page"], case
+        assert calls == [
+            ("table", PROJECT_ID, "orders", data, ()),
+            ("info", PROJECT_ID, "orders", data, ()),
+            ("page", PROJECT_ID, "orders", data, (3, 4)),
+        ], case
+
+
+def test_markedTableWithAFooterOverOneMiBGoesToTheReader(monkeypatch, storage):
+    wide = pa.table({f"c{i}": pa.array([1], pa.int8()) for i in range(20_000)})
+    data = writeStoredTable(wide, PROJECT_ID, "orders")
+    assert int.from_bytes(data[-8:-4], "little") > storedTables.MAX_INPROCESS_FOOTER_BYTES
+    calls, _ = _spyReader(monkeypatch)
+    storedTables.decodeStoredTable(PROJECT_ID, "orders", data)
+    storedTables.storedTableInfo(PROJECT_ID, "orders", data)
+    storage.put(PROJECT_ID, "orders.parquet", data)
+    storedTables.readStoredTablePage(PROJECT_ID, "orders", 0, 1)
+    assert [call[0] for call in calls] == ["table", "info", "page"]
+
+
+def test_oversizedMarkedTableIsRefusedBeforeDecoding(monkeypatch, storage, noChild):
+    data = writeStoredTable(pd.DataFrame({"a": np.arange(10_000, dtype="int64")}), PROJECT_ID, "orders")
+    storage.put(PROJECT_ID, "orders.parquet", data)
+    monkeypatch.setenv("STORED_TABLE_MAX_DECODED_BYTES", "1024")
+    _refuseReader(monkeypatch)
+
+    def refuse(*_args, **_kwargs):
+        raise AssertionError("decoded a table over the limit")
+
+    monkeypatch.setattr(pq, "read_table", refuse)
+    monkeypatch.setattr(pq.ParquetFile, "iter_batches", refuse)
+    monkeypatch.setattr(pq.ParquetFile, "read", refuse)
+    with pytest.raises(TableTooLargeError):
+        storedTables.decodeStoredTable(PROJECT_ID, "orders", data)
+    with pytest.raises(TableTooLargeError):
+        storedTables.readStoredTablePage(PROJECT_ID, "orders", 0, 10)
+    info = storedTables.storedTableInfo(PROJECT_ID, "orders", data)
+    assert info == {"columns": [["a", "int64"]], "rows": 10_000, "cols": 1, "sample": None, "sampleFailed": True}
+
+
+def test_normaliseOffIgnoresMarkers(monkeypatch, storage):
+    data = writeStoredTable(_frame(), PROJECT_ID, "orders")
+    storage.put(PROJECT_ID, "orders.parquet", data)
+    monkeypatch.setenv("STORED_TABLE_NORMALISE", "0")
+    calls, _ = _spyReader(monkeypatch)
+    storedTables.decodeStoredTable(PROJECT_ID, "orders", data)
+    storedTables.storedTableInfo(PROJECT_ID, "orders", data)
+    storedTables.readStoredTablePage(PROJECT_ID, "orders", 0, 1)
+    assert [call[0] for call in calls] == ["table", "info", "page"]
+
+
+def test_tailFooterReadsOnlyAFooterItMayParse(storage):
+    from utils import projectStorage
+
+    small = writeStoredTable(_frame(), PROJECT_ID, "orders")
+    storage.put(PROJECT_ID, "orders.parquet", small)
+    with projectStorage.openTableFile(PROJECT_ID, "orders") as tableFile:
+        metadata = storedTables.readTailFooter(tableFile)
+    assert markerIsValid(metadata, PROJECT_ID, "orders")
+
+    wide = pa.table({f"c{i}": pa.array([1], pa.int8()) for i in range(20_000)})
+    big = writeStoredTable(wide, PROJECT_ID, "wide")
+    storage.put(PROJECT_ID, "wide.parquet", big)
+    storage.requests.clear()
+    with projectStorage.openTableFile(PROJECT_ID, "wide") as tableFile:
+        assert storedTables.readTailFooter(tableFile) is None
+    ranges = [r["range"] for r in storage.requests if r["method"] == "GET"]
+    assert sum(int(end) - int(start) + 1 for start, end in (r.split("=")[1].split("-") for r in ranges)) <= 64 * 1024
+
+    doctored = bytearray(small)
+    doctored[-8:-4] = len(small).to_bytes(4, "little")
+    for name, body in (("short", b"PAR1"), ("junk", b"x" * 100), ("doctored", bytes(doctored))):
+        storage.put(PROJECT_ID, f"{name}.parquet", body)
+        with projectStorage.openTableFile(PROJECT_ID, name) as tableFile:
+            assert storedTables.readTailFooter(tableFile) is None, name
+
+
+def test_redisParquetFallbackUsesTheChokePoint(monkeypatch):
+    from utils import initMethods
+
+    blob = _runOutput(_frame())
+    monkeypatch.setattr(initMethods, "_read_redis_bytes", lambda _key: blob)
+    monkeypatch.setattr(initMethods, "_store_to_redis", lambda *_args: None)
+    seen = []
+
+    def choke(projectId, tableName, data):
+        seen.append((projectId, tableName, data))
+        return pa.Table.from_pandas(_frame(), preserve_index=False)
+
+    def refuse(*_args, **_kwargs):
+        raise AssertionError("decoded around the choke point")
+
+    monkeypatch.setattr(initMethods, "decodeStoredTable", choke)
+    monkeypatch.setattr(pq, "read_table", refuse)
+    initMethods.invalidate_data_cache()
+    try:
+        assert initMethods._fetch_data_from_redis(f"{PROJECT_ID}::orders", PROJECT_ID, "orders").num_rows == 3
+        pd.testing.assert_frame_equal(initMethods.fetch_data(PROJECT_ID, "orders"), _frame())
+        assert seen == [(PROJECT_ID, "orders", blob)] * 2
+
+        initMethods.invalidate_data_cache()
+        monkeypatch.setattr(initMethods, "decodeStoredTable", _raiser(SandboxBusyError))
+        with pytest.raises(SandboxBusyError):
+            initMethods.fetch_data(PROJECT_ID, "orders")
+
+        # Arrow IPC the API wrote itself is still read directly.
+        sink = pa.BufferOutputStream()
+        with pa.ipc.new_stream(sink, pa.table({"a": [1, 2]}).schema) as writer:
+            writer.write_table(pa.table({"a": [1, 2]}))
+        monkeypatch.setattr(initMethods, "_read_redis_bytes", lambda _key: sink.getvalue().to_pybytes())
+        monkeypatch.setattr(initMethods, "decodeStoredTable", refuse)
+        assert initMethods._fetch_data_from_redis(f"{PROJECT_ID}::orders", PROJECT_ID, "orders").num_rows == 2
+    finally:
+        initMethods.invalidate_data_cache()
+
+
+def test_coldReadUsesTheChokePoint(monkeypatch):
+    from utils import initMethods
+
+    blob = _runOutput(_frame())
+    monkeypatch.setattr(initMethods, "_fetch_data_from_redis", lambda *_args: None)
+    monkeypatch.setattr(initMethods, "_store_to_redis", lambda *_args: None)
+    monkeypatch.setattr(initMethods, "readTableBytes", lambda projectId, tableName: blob)
+    seen = []
+    monkeypatch.setattr(initMethods, "decodeStoredTable", lambda *args: seen.append(args) or pa.table({"a": [1]}))
+    initMethods.invalidate_data_cache()
+    try:
+        assert initMethods.fetch_data_pl(PROJECT_ID, "orders").height == 1
+    finally:
+        initMethods.invalidate_data_cache()
+    assert seen == [(PROJECT_ID, "orders", blob)]
+
+
+def test_servingARunsTablesNeverDecodesThem(monkeypatch, storage, tmp_path):
+    """A run holds a slot while its tables are served, so serving only moves bytes: a reader would need a slot too."""
+    from utils import initMethods
+
+    def refuse(*_args, **_kwargs):
+        raise AssertionError("decoded while serving a run")
+
+    for name in ("decodeStoredTable", "readStoredTablePage", "storedTableInfo", "readUntrustedTable", "readUntrustedPage", "readUntrustedInfo"):
+        monkeypatch.setattr(storedTables, name, refuse, raising=False)
+    monkeypatch.setattr(initMethods, "decodeStoredTable", refuse, raising=False)
+    monkeypatch.setattr(sandboxRunner, "runTrustedSandbox", refuse)
+    monkeypatch.setattr(initMethods, "_store_file_in_redis", lambda *_args: None)
+    data = _runOutput(_frame())
+    storage.put(PROJECT_ID, "orders.parquet", data)
+
+    monkeypatch.setattr(initMethods, "_read_redis_bytes", lambda _key: None)
+    with open(initMethods.spool_table(PROJECT_ID, "orders", str(tmp_path / "0")), "rb") as spooled:
+        assert spooled.read() == data
+    monkeypatch.setattr(initMethods, "_read_redis_bytes", lambda _key: data)
+    with open(initMethods.spool_table(PROJECT_ID, "orders", str(tmp_path / "1")), "rb") as spooled:
+        assert spooled.read() == data
+
+
+# ---- Each site's answer to a refusal ----
+
+REFUSALS = [
+    pytest.param(lambda: SandboxBusyError(), 503, BUSY_CODE, BUSY_MESSAGE, id="busy"),
+    pytest.param(lambda: TableTooLargeError(TOO_LARGE_COPY), 413, "TABLE_TOO_LARGE", TOO_LARGE_COPY, id="tooLarge"),
+    pytest.param(lambda: storedTables.TableUnreadableError(READ_FAILED), 422, "TABLE_UNREADABLE", READ_FAILED, id="unreadable"),
+]
+
+
+def _raiser(make):
+    def raiseIt(*_args, **_kwargs):
+        raise make()
+
+    return raiseIt
+
+
+def _assertAnswer(exception, status, code, message):
+    assert isinstance(exception, CustomException), repr(exception)
+    assert (exception.statusCode, exception.errorCode, exception.uiMessage) == (status, code, message)
+
+
+@pytest.mark.parametrize("make, status, code, message", REFUSALS)
+def test_tableReadExceptionMapsEachRefusal(make, status, code, message):
+    _assertAnswer(storedTables.tableReadException(make()), status, code, message)
+    existing = CustomException(ValueError("x"), statusCode=409, uiMessage="taken")
+    assert storedTables.tableReadException(existing) is existing
+    busyAnswer = CustomException(ValueError("x"), statusCode=503, uiMessage=BUSY_MESSAGE, errorCode=BUSY_CODE)
+    assert storedTables.tableReadException(busyAnswer) is busyAnswer
+    assert storedTables.tableReadException(RuntimeError("other")) is None
+    assert storedTables.tableReadException(ValueError("other")) is None
+
+
+@pytest.mark.parametrize("make, status, code, message", REFUSALS)
+def test_dataGridAnswersEachRefusal(monkeypatch, make, status, code, message):
+    from api.routers import manager
+
+    monkeypatch.setattr(manager, "readStoredTablePage", _raiser(make), raising=False)
+    monkeypatch.setattr(manager, "readTablePage", _raiser(make), raising=False)
+    monkeypatch.setattr(manager, "requireProjectOwner", lambda *_args: None)
+    with pytest.raises(HTTPException) as caught:
+        asyncio.run(manager.viewTable(PROJECT_ID, "orders", page=1, pageSize=2, user=MagicMock(userId="user_1")))
+    assert caught.value.status_code == status
+    assert (caught.value.detail.get("errorCode"), caught.value.detail["message"]) == (code, message)
+
+
+@pytest.mark.parametrize("make, status, code, message", REFUSALS)
+def test_getAllColumnsAnswersEachRefusal(monkeypatch, make, status, code, message):
+    from api.services import dashboardService as dashboardModule
+
+    monkeypatch.setattr(dashboardModule, "listProjectFiles", lambda *_args: [{"name": "orders.parquet"}, {"name": "items.parquet"}])
+    monkeypatch.setattr(dashboardModule, "readTableBytes", lambda *_args: _runOutput(_frame()))
+    monkeypatch.setattr(dashboardModule, "decodeStoredTable", _raiser(make), raising=False)
+    monkeypatch.setattr(storedTables, "readUntrustedTable", _raiser(make))
+    with pytest.raises(CustomException) as caught:
+        dashboardModule.dashboardService.getAllColumns(PROJECT_ID)
+    _assertAnswer(caught.value, status, code, message)
+
+
+def _infoReturns(monkeypatch, outcome):
+    from api.services import managementService as managementModule
+
+    monkeypatch.setattr(managementModule, "readTableBytes", lambda *_args: b"bytes")
+    monkeypatch.setattr(managementModule, "storedTableInfo", outcome if callable(outcome) else (lambda *_args: outcome), raising=False)
+    return managementModule.managementService
+
+
+@pytest.mark.parametrize(
+    "make",
+    [lambda: TableTooLargeError(TOO_LARGE_COPY), lambda: storedTables.TableUnreadableError(READ_FAILED), lambda: RuntimeError("No sandbox uid is free.")],
+    ids=["tooLarge", "unreadable", "sandboxError"],
+)
+def test_attributeInfoKeepsItsFallbackForATableItCannotRead(monkeypatch, make):
+    service = _infoReturns(monkeypatch, _raiser(make))
+    assert service._attributeInfoFunc(PROJECT_ID, "orders") == ("DATAFRAME NAME: orders\n(Metadata read failed)\n", None)
+
+
+def test_attributeInfoReRaisesBusy(monkeypatch):
+    service = _infoReturns(monkeypatch, _raiser(SandboxBusyError))
+    with pytest.raises(SandboxBusyError):
+        service._attributeInfoFunc(PROJECT_ID, "orders")
+
+
+@pytest.mark.parametrize(
+    "info, sampleLine",
+    [
+        ({"sample": "   a\n0  1", "sampleFailed": False}, "SAMPLE ROW:\n   a\n0  1\n"),
+        ({"sample": None, "sampleFailed": False}, "SAMPLE ROW: (no rows)\n"),
+        ({"sample": None, "sampleFailed": True}, "SAMPLE ROW: (failed to load)\n"),
+    ],
+    ids=["sample", "noRows", "sampleFailed"],
+)
+def test_attributeInfoKeepsItsFormat(monkeypatch, info, sampleLine):
+    service = _infoReturns(monkeypatch, {"columns": [["a", "int64"], ["b", "string"]], "rows": 4, "cols": 2, **info})
+    text, shape = service._attributeInfoFunc(PROJECT_ID, "orders")
+    assert text == "DATAFRAME NAME: orders\n- a (int64)\n- b (string)\nSHAPE: (4, 2)\n" + sampleLine
+    assert shape == [4, 2]
+
+
+def test_metadataGenerationAnswersBusyWithoutAskingTheModel(monkeypatch):
+    from api.services import managementService as managementModule
+
+    service = _infoReturns(monkeypatch, _raiser(SandboxBusyError))
+    model = MagicMock()
+    model.getMetadataChain.side_effect = AssertionError("asked the model")
+    monkeypatch.setattr(service, "metadataGenerator", model)
+    monkeypatch.setattr(managementModule, "listProjectFiles", lambda *_args: [{"name": "orders.parquet", "metadata": {"lastModified": "2026-11-01T00:00:00Z"}}])
+    for call in (
+        lambda: service._generateMetadata(PROJECT_ID, tableNames=["orders"]),
+        lambda: service.generateMetadataForTables(PROJECT_ID, ["orders"]),
+        lambda: service.generateMetadata(PROJECT_ID),
+    ):
+        with pytest.raises(CustomException) as caught:
+            call()
+        _assertAnswer(caught.value, 503, BUSY_CODE, BUSY_MESSAGE)
+
+
+@pytest.mark.parametrize("make, status, code, message", REFUSALS)
+def test_profilingReportAnswersEachRefusal(monkeypatch, make, status, code, message):
+    from api.services import managementService as managementModule
+
+    error = make()
+    copy = pickle.loads(pickle.dumps(error))  # it comes back from a process pool this way
+    assert (type(copy), str(copy)) == (type(error), str(error))
+    service = managementModule.managementService
+    generator = MagicMock()
+    generator.getAllTables.return_value = ["orders"]
+    generator.getProfilingReport.side_effect = _raiser(lambda: copy)
+    monkeypatch.setattr(service, "reportGenerator", generator)
+    monkeypatch.setattr(managementModule, "ProcessPoolExecutor", ThreadPoolExecutor)
+    with pytest.raises(CustomException) as caught:
+        service.generateReport(PROJECT_ID)
+    _assertAnswer(caught.value, status, code, message)
+
+
+def test_profilingRefusalComesBackFromARealProcessPool(monkeypatch, storage):
+    from api.services import managementService as managementModule
+    from nubrix.components.reportGenerator import ReportGenerator
+
+    storage.putJson(PROJECT_ID, "metadata.json", {"orders": {}})
+    storage.put(PROJECT_ID, "orders.parquet", writeStoredTable(pd.DataFrame({"a": np.arange(1_000_000, dtype="int64")}), PROJECT_ID, "orders"))
+    monkeypatch.setenv("STORED_TABLE_MAX_DECODED_BYTES", "1048576")
+    service = managementModule.managementService
+    monkeypatch.setattr(service, "reportGenerator", ReportGenerator())
+    with pytest.raises(CustomException) as caught:
+        service.generateReport(PROJECT_ID)
+    _assertAnswer(caught.value, 413, "TABLE_TOO_LARGE", "This table is too large to open (over 1 MiB).")
+
+
+def test_profilingDecodesThroughTheChokePoint(monkeypatch):
+    from nubrix.components import reportGenerator as reportGeneratorModule
+
+    seen = []
+    monkeypatch.setattr(reportGeneratorModule, "readTableBytes", lambda *_args: b"bytes")
+    monkeypatch.setattr(reportGeneratorModule, "decodeStoredTable", lambda *args: seen.append(args) or pa.table({"a": [1, 2]}), raising=False)
+
+    class Report:
+        def __init__(self, frame, title):
+            seen.append(len(frame.index))
+
+        def to_html(self):
+            return (
+                '<button id="tab-overview-reproduction"></button><div id="tab-pane-overview-reproduction"></div>'
+                '<p class="text-body-secondary text-end"></p><footer></footer><main>report</main>'
+            )
+
+    monkeypatch.setattr(reportGeneratorModule, "ProfileReport", Report)
+    generator = reportGeneratorModule.ReportGenerator()
+    assert "report" in generator.getProfilingReport(PROJECT_ID, "orders")
+    assert seen == [(PROJECT_ID, "orders", b"bytes"), 2]
+
+
+def _panelChart(projectId=PROJECT_ID):
+    return types.SimpleNamespace(
+        projectId=projectId, dataSource="orders", chartType="bar", xAxis="a", yAxis="b", aggregationMetric="sum",
+        index=None, columns=None, values=None, selectedColumns=None, mapType=None, isFilterApplied=False, filters=None,
+        zipCodeColumn=None,
+    )
+
+
+@pytest.mark.parametrize("sizeClass", ["small", "large"])
+@pytest.mark.parametrize("make, status, code, message", REFUSALS)
+def test_panelChartAnswersEachRefusal(monkeypatch, sizeClass, make, status, code, message):
+    from api.services import reportingService as reportingModule
+    from utils import initMethods
+
+    service = object.__new__(reportingModule.ReportingService)
+    bucket = MagicMock()
+    bucket.list.return_value = [{"name": "orders.parquet"}]
+    service.client = MagicMock()
+    service.client.storage.from_.return_value = bucket
+    monkeypatch.setattr(initMethods, "classify_table_size", lambda *_args: {"size_class": sizeClass})
+    monkeypatch.setattr(initMethods, "_load_table", _raiser(make))
+    with pytest.raises(CustomException) as caught:
+        asyncio.run(service.generatePanelChart(_panelChart()))
+    _assertAnswer(caught.value, status, code, message)
+
+
+# ---- A run's output is normalised once, at preview ----
+
+
+def _executorWithRun(monkeypatch, parquetBytes: bytes):
+    from nubrix.components import transformationExecutor as executorModule
+
+    preview = json.dumps([{"row": 1}]).encode()
+    monkeypatch.setattr(executorModule, "runSandbox", lambda *_args, **_kwargs: ("", "", 0, parquetBytes, preview, None))
+    executor = object.__new__(executorModule.TransformationExecutor)
+    executor.timeoutSeconds = 5
+    bucket = MagicMock()
+    executor.client = MagicMock()
+    executor.client.storage.from_.return_value = bucket
+    executor._redis_client = MagicMock()
+    return executorModule, executor, bucket
+
+
+def test_previewCachesNormalisedBytes(monkeypatch):
+    from api.services.transformationService import TransformationService
+
+    df = _honestFrame(5)
+    # A run can copy another table's marker into its output; normalising replaces it with this table's.
+    raw = _runOutput(df, {MARKER_KEY: tableMarker(PROJECT_ID, "sales")})
+    _, executor, bucket = _executorWithRun(monkeypatch, raw)
+
+    rows, out = executor.executeAndPreview(PROJECT_ID, "code", "summary")
+    assert rows == [{"row": 1}]
+    assert out != raw
+    assert markerIsValid(_footer(out), PROJECT_ID, "summary")
+    assert not markerIsValid(_footer(out), PROJECT_ID, "sales")
+    pd.testing.assert_frame_equal(pd.read_parquet(io.BytesIO(out)), df)
+
+    service = object.__new__(TransformationService)
+    service._executor = executor
+    cached = {}
+    redisFake = MagicMock()
+    redisFake.set.side_effect = lambda name, value, ex: cached.__setitem__(name, value)
+    service._redis_client = lambda: redisFake
+    message = {"message_id": "m1", "role": "assistant", "python_code": "code", "artifact": {"code": "graph"}}
+    service._ensure_transformation = lambda **_kwargs: {"transformation_name": "summary", "messages": [message]}
+    service._validate_transformation_table_name = lambda **_kwargs: None
+    service._save_messages_to_db = lambda **_kwargs: None
+    assert asyncio.run(service.approveMessage(PROJECT_ID, "t1", "m1")) == {"data": [{"row": 1}]}
+    (preview,) = cached.values()
+    assert markerIsValid(_footer(preview), PROJECT_ID, "summary")
+
+    service._claim_table_name = lambda *_args: (True, None)
+    service._write_claimed_table(PROJECT_ID, "t1", "summary", preview)
+    uploaded = bucket.upload.call_args.kwargs["file"]
+    assert uploaded == preview
+    # Storage's eTag of the upload is the MD5 of these same bytes, so the table file record still matches it.
+    assert TransformationService._holds_written_content({"eTag": f'"{hashlib.md5(uploaded).hexdigest()}"'}, preview)
+
+
+@pytest.mark.parametrize(
+    "error, status, code, message",
+    [
+        (ValueError(SAVE_FAILED), 400, None, SAVE_FAILED),
+        (ValueError("The transformation's result is too large to save (over 2 GiB)."), 400, None, "The transformation's result is too large to save (over 2 GiB)."),
+        (SandboxBusyError(), 503, BUSY_CODE, BUSY_MESSAGE),
+    ],
+    ids=["unreadable", "tooLarge", "busy"],
+)
+def test_previewAnswersTheNormalisersRefusals(monkeypatch, error, status, code, message):
+    executorModule, executor, _ = _executorWithRun(monkeypatch, _runOutput(_frame()))
+    monkeypatch.setattr(executorModule, "normaliseRunOutput", _raiser(lambda: error), raising=False)
+    monkeypatch.setattr(storedTables, "normaliseRunOutput", _raiser(lambda: error))
+    with pytest.raises(CustomException) as caught:
+        executor.executeAndPreview(PROJECT_ID, "code", "summary")
+    _assertAnswer(caught.value, status, code, message)
+
+
+def test_validationRunIsNotNormalised(monkeypatch):
+    executorModule, executor, _ = _executorWithRun(monkeypatch, _runOutput(_frame()))
+    refuse = _raiser(lambda: AssertionError("normalised a validation run"))
+    monkeypatch.setattr(executorModule, "normaliseRunOutput", refuse, raising=False)
+    monkeypatch.setattr(storedTables, "normaliseRunOutput", refuse)
+    executor._execute_code(PROJECT_ID, "code")
+
+
+# ---- An honest table the API did not mark still opens everywhere ----
+
+
+def _uploadStyleTable() -> bytes:
+    """Written the way the CSV loader writes a table, as every table stored before marking was."""
+    from api.services.dataLoadService import DataLoadService
+
+    df = pd.DataFrame(
+        {
+            "id": [1, 2, 3, 4, 5],
+            "amount": [1.5, None, 3.25, 4.0, 5.5],
+            "region": ["north", None, "south", "east", "₹"],
+            "when": pd.date_range("2026-01-01", periods=5, freq="D"),
+            "flag": [True, False, True, True, False],
+        }
+    )
+    sink = io.BytesIO()
+    DataLoadService._sanitizeDfForParquet(df).to_parquet(sink, compression="snappy")
+    return sink.getvalue()
+
+
+def _todaysAttributeInfo(name: str, data: bytes) -> str:
+    """What managementService._attributeInfoFunc wrote before the choke point."""
+    parquet = pq.ParquetFile(io.BytesIO(data))
+    text = f"DATAFRAME NAME: {name}\n"
+    for field in parquet.schema_arrow:
+        text += f"- {field.name} ({field.type})\n"
+    text += f"SHAPE: ({parquet.metadata.num_rows}, {parquet.metadata.num_columns})\n"
+    sample = next(parquet.iter_batches(batch_size=1), None)
+    return text + ("SAMPLE ROW: (no rows)\n" if sample is None else "SAMPLE ROW:\n" + str(sample.to_pandas().to_string()) + "\n")
+
+
+def test_unmarkedHonestTableStillOpensEverywhere(monkeypatch, storage):
+    """Through the real reader child: as a run uid under a root parent on Linux, as this user on Windows."""
+    import polars as pl
+
+    from api.routers import manager
+    from api.services import dashboardService as dashboardModule
+    from api.services import managementService as managementModule
+    from utils import initMethods
+
+    body = _uploadStyleTable()
+    assert not markerIsValid(_footer(body), PROJECT_ID, "sales")
+    storage.put(PROJECT_ID, "sales.parquet", body)
+    readerRuns, runUids = [], []
+    realRun, realClaim = sandboxRunner.runTrustedSandbox, sandboxRunner._claimRun
+
+    def countingRun(launcherName, *args, **kwargs):
+        readerRuns.append(launcherName)
+        return realRun(launcherName, *args, **kwargs)
+
+    def recordingClaim():
+        claimed = realClaim()
+        runUids.append(claimed[0])
+        return claimed
+
+    monkeypatch.setattr(sandboxRunner, "runTrustedSandbox", countingRun)
+    monkeypatch.setattr(sandboxRunner, "_claimRun", recordingClaim)
+    monkeypatch.setattr(manager, "requireProjectOwner", lambda *_args: None)
+
+    def viewTable():
+        response = asyncio.run(manager.viewTable(PROJECT_ID, "sales", page=2, pageSize=2, user=MagicMock(userId="user_1")))
+        return json.loads(response.body)
+
+    grid = viewTable()
+    with monkeypatch.context() as today:
+        todaysPage = lambda p, t, offset, limit: (pl.read_parquet(io.BytesIO(body)).slice(offset, limit), 5)  # noqa: E731
+        today.setattr(manager, "readStoredTablePage", todaysPage, raising=False)
+        today.setattr(manager, "readTablePage", todaysPage, raising=False)
+        assert grid == viewTable()
+
+    columnTypes = dashboardModule.dashboardService._getDataTypes(PROJECT_ID, "sales")
+    with monkeypatch.context() as today:
+        today.setattr(dashboardModule, "decodeStoredTable", lambda p, t, data: types.SimpleNamespace(to_pandas=lambda: pd.read_parquet(io.BytesIO(data))), raising=False)
+        assert columnTypes == dashboardModule.dashboardService._getDataTypes(PROJECT_ID, "sales")
+
+    info, shape = managementModule.managementService._attributeInfoFunc(PROJECT_ID, "sales")
+    assert (info, shape) == (_todaysAttributeInfo("sales", body), [5, 5])
+
+    monkeypatch.setattr(initMethods, "_fetch_data_from_redis", lambda *_args: None)
+    monkeypatch.setattr(initMethods, "_store_to_redis", lambda *_args: None)
+    initMethods.invalidate_data_cache()
+    try:
+        pd.testing.assert_frame_equal(initMethods.fetch_data(PROJECT_ID, "sales"), pq.read_table(io.BytesIO(body)).to_pandas())
+    finally:
+        initMethods.invalidate_data_cache()
+
+    assert readerRuns == [READER] * 4
+    if os.name == "posix" and os.geteuid() == 0:
+        assert len(runUids) == 4 and None not in runUids
+
+
+# ---- Nothing decodes a stored table around the choke point ----
+
+# A Parquet decode in any spelling pandas, polars and pyarrow offer.
+_DECODE = re.compile(r"read_parquet|scan_parquet|\bread_table\b|ParquetFile|ParquetDataset|iter_batches|read_row_groups?\b|read_metadata|read_schema|read_pandas")
+# Parent-side files where a decode is allowed, and the lines (None = the whole file).
+_DECODERS = {
+    # The choke point and the bounded decoders it shares with the reader child.
+    "utils/storedTables.py": None,
+    # sandboxRunner's child-side readTable: a run decodes the tables it was served, under its own limits.
+    "utils/sandboxRunner.py": {"return pq.read_table(path)"},
+}
+# Every *_launcher.py runs in a sandbox child under the run limits: transform_launcher reads back its own output for
+# the preview, normalise_launcher and table_reader_launcher are the normaliser and the reader.
+_CHILD_SIDE = re.compile(r"utils/[a-z_]+_launcher\.py")
+
+
+def _decodeLines():
+    for folder in ("api", "nubrix", "utils"):
+        for path in sorted((REPOSITORY / folder).rglob("*.py")):
+            relative = path.relative_to(REPOSITORY).as_posix()
+            for number, line in enumerate(path.read_text(encoding="utf-8").splitlines(), start=1):
+                if _DECODE.search(line):
+                    yield relative, number, line.strip()
+
+
+def test_noOtherStoredTableDecodeRemains():
+    for spelling in ("pd.read_parquet(io.BytesIO(readTableBytes(p, t)))", "pq.read_table(io.BytesIO(x))", "pq.ParquetFile(file_like)",
+                     "pl.scan_parquet(url)", "pl.read_parquet(buffer)", "pf.iter_batches(batch_size=1)", "pq.read_metadata(f)"):
+        assert _DECODE.search(spelling), spelling
+    assert not _DECODE.search("pq.write_table(table, sink)")
+    offenders = []
+    for relative, number, line in _decodeLines():
+        if _CHILD_SIDE.fullmatch(relative):
+            continue
+        if relative in _DECODERS and (_DECODERS[relative] is None or line in _DECODERS[relative]):
+            continue
+        offenders.append(f"{relative}:{number}: {line}")
+    assert offenders == []

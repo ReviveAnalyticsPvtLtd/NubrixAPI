@@ -17,6 +17,7 @@ from utils.codeExecutor import replManager, _remove_code_fences
 from utils.sandboxSlots import BUSY_CODE, BUSY_MESSAGE, isBusy
 from sqlalchemy import URL, create_engine
 from utils.projectStorage import readJson, readTableBytes
+from utils.storedTables import decodeStoredTable, tableReadException
 from utils.logger import logger
 from api.commons import client
 from api.models import (
@@ -106,7 +107,7 @@ class DashboardService:
         Returns:
             list[dict]: List of dictionaries containing column metadata.
         """
-        df = pd.read_parquet(io.BytesIO(readTableBytes(projectId, tableName)))
+        df = decodeStoredTable(projectId, tableName, readTableBytes(projectId, tableName)).to_pandas()
         numericals = ["int64", "float64", "float32", "int32"]
         categoricals = ["bool", "category", "object", "string"]
         datetimeTypes = ["datetime64[ns]", "datetime64[ns, tz]"]
@@ -443,7 +444,7 @@ class DashboardService:
             results = {x: y for x, y in zip(dataTables, results)}
             return results
         except Exception as e:
-            exception  = CustomException(e)
+            exception = tableReadException(e) or CustomException(e)
             logger.error(exception)
             raise exception
         

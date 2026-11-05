@@ -31,6 +31,7 @@ import time
 from collections import OrderedDict
 from utils.logger import logger
 from utils.projectStorage import downloadTable, objectUrl, readTableBytes
+from utils.storedTables import decodeStoredTable
 from typing import Callable, Iterable
 
 try:
@@ -239,7 +240,7 @@ def _fetch_data_from_supabase(projectId: str, tableName: str) -> "pa.Table":
     """Cold-path reader that pulls the full unfiltered table for caching."""
     if pq is None:
         raise RuntimeError("pyarrow is required.")
-    return pq.read_table(io.BytesIO(readTableBytes(projectId, tableName)))
+    return decodeStoredTable(projectId, tableName, readTableBytes(projectId, tableName))
 
 
 def _apply_filters_in_arrow_if_possible(table: "pa.Table", tableName: str, filters: list) -> "pa.Table":
@@ -322,18 +323,19 @@ def _read_redis_bytes(redis_key: str) -> bytes | None:
         return None
 
 
-def _fetch_data_from_redis(redis_key: str) -> "pa.Table | None":
+def _fetch_data_from_redis(redis_key: str, projectId: str, tableName: str) -> "pa.Table | None":
+    """The cached table, or None. Its refusals (busy, too large, unreadable) raise rather than read storage again."""
     blob = _read_redis_bytes(redis_key)
     if not blob:
         return None
+    if blob[:4] == b"PAR1":
+        # The stored file as `spool_table` cached it, so it is decoded as the stored file is.
+        return decodeStoredTable(projectId, tableName, blob)
     try:
-        # Arrow IPC = ~2× smaller than parquet bytes and ~10× faster to deserialize.
+        # Arrow IPC that `_store_to_redis` wrote: ~2× smaller than parquet bytes and ~10× faster to deserialize.
         return pa.ipc.open_stream(pa.BufferReader(blob)).read_all()
     except Exception:
-        try:
-            return pq.read_table(pa.BufferReader(blob))
-        except Exception:
-            return None
+        return None
 
 
 def _store_to_redis(redis_key: str, table: "pa.Table") -> None:
@@ -378,7 +380,7 @@ def _load_table(projectId: str, tableName: str) -> "pa.Table":
             table = _TABLE_SOURCE(tableName)
         else:
             redis_key = f"{projectId}::{tableName}"
-            table = _fetch_data_from_redis(redis_key)
+            table = _fetch_data_from_redis(redis_key, projectId, tableName)
             if table is None:
                 # Cold path: scan without pushdown so the cached table is always the
                 # complete dataset. Filter translation + pushdown live in

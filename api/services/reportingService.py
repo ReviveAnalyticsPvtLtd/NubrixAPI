@@ -16,6 +16,7 @@ from nubrix.workflows.parallelReportingToolWorkflow import buildParallelReportin
 from api.services.credits.creditTrackingCallback import CreditTrackingCallback
 from api.commons import updateProjectModifiedAt
 from utils.exceptionHandler import CustomException
+from utils.storedTables import tableReadException
 from concurrent.futures import ThreadPoolExecutor
 from utils.initMethods import fetch_data, scan_data
 from utils.projectStorage import authHeaders, objectUrl
@@ -823,7 +824,7 @@ class ReportingService:
         except CustomException:
             raise
         except Exception as e:
-            exception = CustomException(e)
+            exception = tableReadException(e) or CustomException(e)
             logger.error(exception)
             raise exception
 
