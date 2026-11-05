@@ -319,10 +319,10 @@ def test_refresh_stores_a_marked_table():
 
 
 def test_refresh_refuses_a_table_over_the_size_limit_with_413():
-    big = pd.DataFrame({"id": range(10_000)})
+    big = pd.DataFrame({"id": range(400_000)})
 
-    with mock.patch.dict(os.environ, {"STORED_TABLE_MAX_DECODED_BYTES": "1024"}), pytest.raises(CustomException) as caught:
+    with mock.patch.dict(os.environ, {"STORED_TABLE_MAX_DECODED_BYTES": str(1024 * 1024)}), pytest.raises(CustomException) as caught:
         _refresh(big)
 
     assert (caught.value.statusCode, caught.value.errorCode) == (413, "TABLE_TOO_LARGE")
-    assert caught.value.uiMessage == "This table is too large to load (over 0 MiB)."
+    assert caught.value.uiMessage == "This table is too large to load (over 1 MiB)."

@@ -533,7 +533,7 @@ class DashboardService:
                 results = {connection.get("table"): result for connection, result in zip(connections, results)}
             for result in results:
                 # A folder rather than an open temporary file, which other writers cannot reopen on every platform.
-                with tempfile.TemporaryDirectory() as folder:
+                with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as folder:
                     path = os.path.join(folder, "table.parquet")
                     writeStoredTableToPath(results[result], projectId, result, path)
                     _ = self.client.storage.from_("AnalyticsHub").upload(

@@ -140,9 +140,26 @@ def test_oversizedUploadIsRefusedWith413(loader, monkeypatch):
     loader._releaseTableName.assert_not_called()
 
 
+def test_excelWithAnOversizedSecondSheetGives413AndKeepsTheFirstTable(loader, monkeypatch):
+    monkeypatch.setenv("STORED_TABLE_MAX_DECODED_BYTES", str(1024 * 1024))
+    sheets = {"Q1": pd.DataFrame({"amount": [1, 2]}), "Q2": pd.DataFrame({"amount": np.arange(400_000, dtype="int64")})}
+
+    with (
+        mock.patch("api.services.dataLoadService.pd.read_excel", return_value=sheets),
+        pytest.raises(CustomException) as caught,
+    ):
+        asyncio.run(loader.loadExcelData(PROJECT, [_upload(b"x", "book.xlsx")]))
+
+    assert (caught.value.statusCode, caught.value.errorCode) == (413, "TABLE_TOO_LARGE")
+    assert caught.value.uiMessage == "This table is too large to load (over 1 MiB)."
+    assert list(loader.bucket.uploads) == [f"{PROJECT}/book_Q1.parquet"]
+    loader._restoreClaims.assert_called_once_with(PROJECT, "book_Q2", CLAIMS)
+    loader.metadata.assert_not_called()
+
+
 def test_oversizedImportIsRefusedWith413(loader, monkeypatch):
-    monkeypatch.setenv("STORED_TABLE_MAX_DECODED_BYTES", "1024")
-    big = pd.DataFrame({"a": np.arange(10_000, dtype="int64")})
+    monkeypatch.setenv("STORED_TABLE_MAX_DECODED_BYTES", str(1024 * 1024))
+    big = pd.DataFrame({"a": np.arange(400_000, dtype="int64")})
     with (
         mock.patch("api.services.dataLoadService.URL"),
         mock.patch("api.services.dataLoadService.create_engine"),
@@ -152,7 +169,7 @@ def test_oversizedImportIsRefusedWith413(loader, monkeypatch):
         loader.loadMySql(_connection("orders"))
 
     assert (caught.value.statusCode, caught.value.errorCode) == (413, "TABLE_TOO_LARGE")
-    assert caught.value.uiMessage == "This table is too large to load (over 0 MiB)."
+    assert caught.value.uiMessage == "This table is too large to load (over 1 MiB)."
     assert "bytes decoded" not in caught.value.uiMessage
     assert loader.bucket.uploads == {}
 

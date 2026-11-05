@@ -251,13 +251,13 @@ class _Warnings:
 
 
 @pytest.fixture
-def warnings(monkeypatch):
+def warningLog(monkeypatch):
     recorder = _Warnings()
     monkeypatch.setattr(storedTables, "logger", recorder)
     return recorder
 
 
-def test_missingKeyMarksNothingAndNeverRaises(monkeypatch, warnings):
+def test_missingKeyMarksNothingAndNeverRaises(monkeypatch, warningLog):
     valid = _footer(writeStoredTable(_frame(), "p1", "orders"))
     for setter in (lambda: monkeypatch.delenv("SUPABASE_KEY"), lambda: monkeypatch.setenv("SUPABASE_KEY", "")):
         setter()
@@ -275,12 +275,12 @@ def test_missingKeyMarksNothingAndNeverRaises(monkeypatch, warnings):
         assert pd.read_parquet(io.BytesIO(keyless)).equals(_frame())
 
 
-def test_missingKeyWarnsOnce(monkeypatch, warnings):
+def test_missingKeyWarnsOnce(monkeypatch, warningLog):
     monkeypatch.delenv("SUPABASE_KEY")
     storedTables._missingKeyWarned = False
     for _ in range(5):
         tableMarker("p", "t")
-    assert len([m for m in warnings.messages if "SUPABASE_KEY" in m]) == 1
+    assert len([m for m in warningLog.messages if "SUPABASE_KEY" in m]) == 1
 
 
 TRUSTED_ECHO = "trusted_echo_launcher.py"
@@ -552,7 +552,7 @@ def test_normaliseOffReturnsTheInputUnchanged(monkeypatch, noChild):
     assert storedTables.normaliseRunOutput("p1", "orders", data) is data
 
 
-def test_normaliserWithoutAKeyWritesNoMarker(monkeypatch, warnings):
+def test_normaliserWithoutAKeyWritesNoMarker(monkeypatch, warningLog):
     data = _runOutput(_frame(), {MARKER_KEY: tableMarker("p1", "orders")})
     monkeypatch.delenv("SUPABASE_KEY")
     out = storedTables.normaliseRunOutput("p1", "orders", data)
@@ -762,7 +762,7 @@ OUT_OF_MEMORY = "The run was stopped: the server ran out of memory."
         (IsADirectoryError(21, "Is a directory"), "unreadable"),
     ],
 )
-def test_readerMapsEveryChildOutcome(monkeypatch, warnings, outcome, expected):
+def test_readerMapsEveryChildOutcome(monkeypatch, warningLog, outcome, expected):
     _fakeRun(monkeypatch, outcome)
     for name, call in (
         ("table", lambda: storedTables.readUntrustedTable("p1", "t", b"x")),
@@ -793,7 +793,7 @@ def test_readerMapsEveryChildOutcome(monkeypatch, warnings, outcome, expected):
         (IsADirectoryError(21, "Is a directory"), SAVE_FAILED),
     ],
 )
-def test_normaliserMapsEveryChildOutcome(monkeypatch, warnings, outcome, expected):
+def test_normaliserMapsEveryChildOutcome(monkeypatch, warningLog, outcome, expected):
     _fakeRun(monkeypatch, outcome)
     with pytest.raises(ValueError) as caught:
         storedTables.normaliseRunOutput("p1", "t", b"x")
@@ -801,13 +801,13 @@ def test_normaliserMapsEveryChildOutcome(monkeypatch, warnings, outcome, expecte
     assert str(caught.value) == expected
 
 
-def test_failureLogsTheChildsStderrTail(monkeypatch, warnings):
+def test_failureLogsTheChildsStderrTail(monkeypatch, warningLog):
     _fakeRun(monkeypatch, _result(returncode=1, resultBytes=None, stderr="x" * 10_000 + "the real reason"))
     with pytest.raises(storedTables.TableUnreadableError) as unreadable:
         storedTables.readUntrustedTable("p1", "t", b"x")
     with pytest.raises(ValueError) as unsaved:
         storedTables.normaliseRunOutput("p1", "t", b"x")
-    logged = [m for m in warnings.messages if "the real reason" in m]
+    logged = [m for m in warningLog.messages if "the real reason" in m]
     assert len(logged) == 2
     assert all(len(m) < 5000 for m in logged)
     assert "real reason" not in str(unreadable.value) + str(unsaved.value)
@@ -924,7 +924,7 @@ def test_honestTablePassesUnderTheSameLimit(smallRunMemory):
 
 
 @separateUids
-def test_normaliserStopsAnExpandingFile(smallRunMemory, expandingFile, warnings):
+def test_normaliserStopsAnExpandingFile(smallRunMemory, expandingFile, warningLog):
     import time
 
     _resetPeak()
@@ -936,13 +936,13 @@ def test_normaliserStopsAnExpandingFile(smallRunMemory, expandingFile, warnings)
     grew = _peakMib() - before
     print(f"normaliser: {elapsed:.1f} s, parent VmHWM grew {grew:.1f} MiB")
     assert str(caught.value) == SAVE_FAILED
-    assert _failedOnALargeAllocation(warnings.messages[-1])
+    assert _failedOnALargeAllocation(warningLog.messages[-1])
     assert grew < 64
     assert elapsed < EXPANDING_SECONDS
 
 
 @separateUids
-def test_readerStopsAnExpandingFile(smallRunMemory, expandingFile, warnings):
+def test_readerStopsAnExpandingFile(smallRunMemory, expandingFile, warningLog):
     import time
 
     for name, call in (
@@ -962,7 +962,7 @@ def test_readerStopsAnExpandingFile(smallRunMemory, expandingFile, warnings):
             assert result["sample"] is None and result["sampleFailed"] is True, result
         else:
             assert isinstance(result, storedTables.TableUnreadableError) and str(result) == READ_FAILED
-            assert _failedOnALargeAllocation(warnings.messages[-1])
+            assert _failedOnALargeAllocation(warningLog.messages[-1])
         assert elapsed < EXPANDING_SECONDS
 
 
@@ -1044,7 +1044,7 @@ def test_readerDecodesNestedDictionaries():
     ],
     ids=["listOfDictionary", "structOfDictionary", "dictionary"],
 )
-def test_parentRefusesAnAnswerHoldingADictionary(monkeypatch, warnings, table):
+def test_parentRefusesAnAnswerHoldingADictionary(monkeypatch, warningLog, table):
     sink = io.BytesIO()
     with pa.ipc.new_stream(sink, table.schema) as writer:
         writer.write_table(table)
@@ -1095,7 +1095,7 @@ def test_infoAnswerHasItsOwnCapAndATruncatedSample(monkeypatch):
     assert answered <= cap
 
 
-def test_tooLargeExitCodeIsNoRuntimesOwn(monkeypatch, warnings):
+def test_tooLargeExitCodeIsNoRuntimesOwn(monkeypatch, warningLog):
     assert storedTables.EXIT_TOO_LARGE not in (0, 1, 2, 3, 120, 126, 127)
     _fakeRun(monkeypatch, _result(returncode=3, resultBytes=None))  # MSVC abort()
     with pytest.raises(storedTables.TableUnreadableError):
@@ -1117,7 +1117,7 @@ def test_tooLargeExitCodeIsNoRuntimesOwn(monkeypatch, warnings):
     ],
     ids=["readerResultCap", "readerExitCode", "normaliserResultCap", "normaliserExitCode", "inProcessTable", "inProcessPage"],
 )
-def test_everyTooLargeBranchLogsOneLine(monkeypatch, warnings, outcome, call, limit):
+def test_everyTooLargeBranchLogsOneLine(monkeypatch, warningLog, outcome, call, limit):
     _fakeRun(monkeypatch, outcome)
     data = b"x"
     if call.startswith("inProcess"):
@@ -1131,8 +1131,8 @@ def test_everyTooLargeBranchLogsOneLine(monkeypatch, warnings, outcome, call, li
             storedTables.readUntrustedPage("p1", "orders", data, 0, 10)
         else:
             storedTables.normaliseRunOutput("p1", "orders", data)
-    assert len(warnings.messages) == 1, warnings.messages
-    assert "'orders'" in warnings.messages[0] and limit in warnings.messages[0]
+    assert len(warningLog.messages) == 1, warningLog.messages
+    assert "'orders'" in warningLog.messages[0] and limit in warningLog.messages[0]
 
 
 @pytest.mark.parametrize("error", [RuntimeError("No sandbox uid is free."), RuntimeError("Could not clear the sandbox run's uid."), TypeError("bad request")])

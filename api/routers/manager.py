@@ -574,8 +574,11 @@ async def viewTable(
     """
     Read a parquet table from Supabase storage and return paginated rows.
 
-    Only the footer and the row groups holding the page are fetched, so a
-    10M-row table costs one row group, not the whole file.
+    A table the API wrote carries a marker, so only its footer and the row
+    groups holding the page are fetched. An older, unmarked table is
+    downloaded whole and read by a bounded reader child, one run per page.
+    A table over the decoded-size limit is refused with 413 and an
+    unreadable one with 422.
     """
     await asyncio.to_thread(requireProjectOwner, projectId, user)
     try:

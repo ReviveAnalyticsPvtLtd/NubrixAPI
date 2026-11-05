@@ -149,7 +149,7 @@ class DataLoadService:
         uploading = False
         try:
             # A folder rather than an open temporary file, which other writers cannot reopen on every platform.
-            with tempfile.TemporaryDirectory() as folder:
+            with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as folder:
                 path = os.path.join(folder, "table.parquet")
                 writeParquet(path)
                 uploading = True
