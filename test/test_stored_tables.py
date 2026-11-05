@@ -28,6 +28,7 @@ def _cleanEnv(monkeypatch):
     monkeypatch.setenv("SUPABASE_KEY", "unit-test-key")
     monkeypatch.delenv("STORED_TABLE_NORMALISE", raising=False)
     monkeypatch.delenv("STORED_TABLE_MAX_DECODED_BYTES", raising=False)
+    monkeypatch.delenv("TABLE_READER_MEMORY_BYTES", raising=False)
     storedTables._missingKeyWarned = False
 
 
@@ -344,3 +345,582 @@ def test_unsafeTrustedResultIsNotATooLargeError(tmp_path):
     with pytest.raises(ValueError) as caught:  # a file the run's uid does not own
         sandboxRunner.readResult(str(result), 12345, 10)
     assert not isinstance(caught.value, sandboxRunner.ResultTooLargeError)
+
+
+# ---- The normaliser and the reader ----
+
+PROJECT_ID = "11111111-2222-4333-8444-555555555555"
+READER_MEMORY = 268435456
+SAVE_FAILED = "The transformation's result could not be read safely."
+READ_FAILED = "This table could not be read safely."
+
+
+def _runOutput(df: pd.DataFrame, metadata: dict | None = None) -> bytes:
+    """Bytes the way transform_launcher writes a pandas result."""
+    table = pa.Table.from_pandas(df, preserve_index=False)
+    if metadata:
+        table = table.replace_schema_metadata({**(table.schema.metadata or {}), **metadata})
+    sink = io.BytesIO()
+    pq.write_table(table, sink, compression="snappy")
+    return sink.getvalue()
+
+
+def _honestFrame(rows: int = 3) -> pd.DataFrame:
+    return pd.DataFrame(
+        {
+            "cat": pd.Categorical([("a", "b", "a")[i % 3] for i in range(rows)]),
+            "nullable": pd.array([None if i % 3 == 1 else i for i in range(rows)], dtype="Int64"),
+            "s": [None if i % 3 == 2 else f"v{i}" for i in range(rows)],
+            "f": np.arange(rows, dtype="float64") / 2,
+            "when": pd.date_range("2020-01-01", periods=rows, freq="h"),
+        }
+    )
+
+
+def _plain(df: pd.DataFrame) -> pd.DataFrame:
+    """An unmarked categorical comes back from the reader as plain strings."""
+    return df.assign(cat=df["cat"].astype(object))
+
+
+def _expectedPage(df: pd.DataFrame, offset: int, limit: int):
+    import polars as pl
+
+    return pl.from_pandas(_plain(df).iloc[offset : offset + limit].reset_index(drop=True))
+
+
+def _expectedInfo(data: bytes) -> dict:
+    """What managementService._attributeInfoFunc reads today, as the info dict."""
+    parquet = pq.ParquetFile(io.BytesIO(data))
+    sample = next(parquet.iter_batches(batch_size=1), None)
+    return {
+        "columns": [[field.name, str(field.type)] for field in parquet.schema_arrow],
+        "rows": parquet.metadata.num_rows,
+        "cols": parquet.metadata.num_columns,
+        "sample": None if sample is None else sample.to_pandas().to_string(),
+        "sampleFailed": False,
+    }
+
+
+def _grouped(df: pd.DataFrame, rows: int) -> bytes:
+    sink = io.BytesIO()
+    pq.write_table(pa.Table.from_pandas(df, preserve_index=False), sink, row_group_size=rows)
+    return sink.getvalue()
+
+
+@pytest.fixture
+def noChild(monkeypatch):
+    def refuse(*_args, **_kwargs):
+        raise AssertionError("started a child")
+
+    monkeypatch.setattr(sandboxRunner, "runTrustedSandbox", refuse)
+
+
+def test_normaliserRoundTripsAnHonestTable():
+    df = _honestFrame()
+    out = storedTables.normaliseRunOutput("p1", "orders", _runOutput(df))
+    back = pd.read_parquet(io.BytesIO(out))
+    pd.testing.assert_frame_equal(back, df)
+    assert str(back["nullable"].dtype) == "Int64"
+    assert str(back["cat"].dtype) == "category"
+    metadata = _footer(out)
+    assert markerIsValid(metadata, "p1", "orders")
+    assert set(metadata.metadata) <= {b"pandas", b"ARROW:schema", MARKER_KEY}
+    assert metadata.row_group(0).column(0).compression == "ZSTD"
+
+
+def test_normaliserRoundTripsAPolarsResult():
+    import polars as pl
+    from polars.testing import assert_frame_equal
+
+    frame = pl.DataFrame({"a": [1, None, 3], "b": ["x", "y", None]})
+    sink = io.BytesIO()
+    pq.write_table(frame.to_arrow(), sink, compression="snappy")
+    out = storedTables.normaliseRunOutput("p1", "orders", sink.getvalue())
+    assert_frame_equal(pl.read_parquet(io.BytesIO(out)), frame)
+    assert markerIsValid(_footer(out), "p1", "orders")
+
+
+def test_normaliserWritesInTheStoredTableLayout():
+    n = 2_500_000
+    data = _runOutput(pd.DataFrame({"a": np.random.default_rng(1).integers(0, 1 << 62, n)}))
+    metadata = _footer(storedTables.normaliseRunOutput("p1", "t", data))
+    assert metadata.num_rows == n
+    assert [metadata.row_group(i).num_rows for i in range(metadata.num_row_groups)] == [1_048_576, 1_048_576, 402_848]
+    assert metadata.row_group(0).column(0).compression == "ZSTD"
+
+
+def test_normaliserDropsACopiedMarker():
+    copied = tableMarker("p1", "other")
+    data = _runOutput(_frame(), {MARKER_KEY: copied, b"nubrix.other": b"1", b"extra": b"2"})
+    metadata = _footer(storedTables.normaliseRunOutput("p1", "orders", data))
+    assert metadata.metadata[MARKER_KEY] == tableMarker("p1", "orders")
+    assert not markerIsValid(metadata, "p1", "other")
+    assert [key for key in metadata.metadata if key.startswith(b"nubrix.")] == [MARKER_KEY]
+    assert b"extra" not in metadata.metadata
+
+
+def test_normaliserDropsFieldMetadata():
+    table = pa.Table.from_pandas(_frame(), preserve_index=False)
+    field = table.schema.field("a").with_metadata({MARKER_KEY: tableMarker("p1", "other")})
+    table = pa.Table.from_arrays(table.columns, schema=table.schema.set(0, field))
+    sink = io.BytesIO()
+    pq.write_table(table, sink)
+    assert pq.read_schema(io.BytesIO(sink.getvalue())).field("a").metadata  # the input really carries it
+    out = storedTables.normaliseRunOutput("p1", "orders", sink.getvalue())
+    assert all(not field.metadata for field in pq.read_schema(io.BytesIO(out)))
+
+
+@pytest.mark.parametrize(
+    "pandasEntry",
+    [
+        b"{bad",
+        b"[1, 2]",
+        json.dumps({"columns": [{"name": "missing", "field_name": "missing"}]}).encode(),
+        json.dumps({"columns": "a"}).encode(),
+        json.dumps({"columns": [{"name": "a", "field_name": "a"}], "pad": "x" * (64 * 1024)}).encode(),
+    ],
+    ids=["notJson", "notAnObject", "unknownColumn", "columnsNotAList", "over64KiB"],
+)
+def test_normaliserDropsAPandasEntryThatDoesNotFit(pandasEntry):
+    data = _runOutput(_frame(), {b"pandas": pandasEntry})
+    out = storedTables.normaliseRunOutput("p1", "orders", data)
+    assert b"pandas" not in _footer(out).metadata
+    assert pq.read_table(io.BytesIO(out)).to_pydict() == _frame().to_dict(orient="list")
+
+
+def test_normaliserKeepsAValidPandasEntryReserialised():
+    data = _runOutput(_honestFrame())
+    original = json.loads(_footer(data).metadata[b"pandas"])
+    kept = _footer(storedTables.normaliseRunOutput("p1", "orders", data)).metadata[b"pandas"]
+    assert json.loads(kept) == original
+
+
+def test_normaliserRefusesOverTheLimit(monkeypatch):
+    monkeypatch.setenv("STORED_TABLE_MAX_DECODED_BYTES", "1048576")
+    data = _runOutput(pd.DataFrame({"a": np.arange(1_000_000, dtype="int64")}))
+    with pytest.raises(ValueError) as caught:
+        storedTables.normaliseRunOutput("p1", "orders", data)
+    assert str(caught.value) == "The transformation's result is too large to save (over 1 MiB)."
+
+
+def test_normaliserFailureGivesTheCouldNotReadCopy():
+    for junk in (b"", b"not parquet at all", b"PAR1" + b"\0" * 64 + b"PAR1"):
+        with pytest.raises(ValueError) as caught:
+            storedTables.normaliseRunOutput("p1", "orders", junk)
+        assert str(caught.value) == SAVE_FAILED
+
+
+def test_normaliseOffReturnsTheInputUnchanged(monkeypatch, noChild):
+    monkeypatch.setenv("STORED_TABLE_NORMALISE", "0")
+    data = _runOutput(_frame(), {MARKER_KEY: b"copied"})
+    assert storedTables.normaliseRunOutput("p1", "orders", data) is data
+
+
+def test_normaliserWithoutAKeyWritesNoMarker(monkeypatch, warnings):
+    data = _runOutput(_frame(), {MARKER_KEY: tableMarker("p1", "orders")})
+    monkeypatch.delenv("SUPABASE_KEY")
+    out = storedTables.normaliseRunOutput("p1", "orders", data)
+    metadata = _footer(out)
+    assert MARKER_KEY not in metadata.metadata
+    assert not markerIsValid(metadata, "p1", "orders")
+    pd.testing.assert_frame_equal(pd.read_parquet(io.BytesIO(out)), _frame())
+
+
+@pytest.fixture
+def childSees(monkeypatch):
+    """Everything a child is started with: its environment and the payload on its stdin."""
+    seen = {"env": [], "payload": []}
+    realPopen = sandboxRunner.subprocess.Popen
+    realWait = sandboxRunner._waitForChild
+
+    def popen(*args, **kwargs):
+        seen["env"].append(dict(kwargs.get("env") or {}))
+        return realPopen(*args, **kwargs)
+
+    def wait(proc, payload, timeoutSeconds):
+        seen["payload"].append(payload)
+        return realWait(proc, payload, timeoutSeconds)
+
+    monkeypatch.setattr(sandboxRunner.subprocess, "Popen", popen)
+    monkeypatch.setattr(sandboxRunner, "_waitForChild", wait)
+    return seen
+
+
+def test_normaliserChildGetsTheMarkerButNotTheKey(childSees):
+    out = storedTables.normaliseRunOutput("p1", "orders", _runOutput(_frame()))
+    assert markerIsValid(_footer(out), "p1", "orders")
+    assert len(childSees["payload"]) == 1
+    # On a run uid the reaper is started too; the launcher is the one given PYTHONPATH.
+    assert len([env for env in childSees["env"] if "PYTHONPATH" in env]) == 1
+    request = json.loads(childSees["payload"][0])["request"]
+    assert request["marker"] == tableMarker("p1", "orders").decode("ascii")
+    for text in childSees["payload"] + [json.dumps(env) for env in childSees["env"]]:
+        assert "unit-test-key" not in text
+
+
+def test_readerChildGetsNoKey(childSees):
+    storedTables.readUntrustedTable("p1", "orders", _runOutput(_frame()))
+    assert len(childSees["payload"]) == 1
+    for text in childSees["payload"] + [json.dumps(env) for env in childSees["env"]]:
+        assert "unit-test-key" not in text
+
+
+def test_normaliserAndReaderUseTheirTimeoutsLimitsAndCaps(monkeypatch):
+    calls = []
+
+    def record(launcherName, projectId, inputBytes, request, timeoutSeconds, maxResultBytes, limits=None):
+        calls.append((launcherName, timeoutSeconds, maxResultBytes, limits))
+        raise SandboxBusyError()
+
+    monkeypatch.setattr(sandboxRunner, "runTrustedSandbox", record)
+    monkeypatch.setenv("TABLE_READER_MEMORY_BYTES", str(READER_MEMORY))
+    for call in (
+        lambda: storedTables.normaliseRunOutput("p1", "t", b"x"),
+        lambda: storedTables.readUntrustedTable("p1", "t", b"x"),
+        lambda: storedTables.readUntrustedPage("p1", "t", b"x", 0, 10),
+        lambda: storedTables.readUntrustedInfo("p1", "t", b"x"),
+    ):
+        with pytest.raises(SandboxBusyError):
+            call()
+    normalise, *readers = calls
+    assert normalise[:2] == ("normalise_launcher.py", 120)
+    assert normalise[2] > 0
+    assert normalise[3] is None
+    assert len(readers) == 3
+    for name, timeout, cap, limits in readers:
+        assert (name, timeout, cap) == ("table_reader_launcher.py", 60, 2147483648)
+        assert limits == sandboxRunner.currentRunLimits(maxProcessMemory=READER_MEMORY)
+    monkeypatch.setenv("STORED_TABLE_MAX_DECODED_BYTES", "0")
+    for call in (
+        lambda: storedTables.readUntrustedTable("p1", "t", b"x"),
+        lambda: storedTables.normaliseRunOutput("p1", "t", b"x"),
+    ):
+        with pytest.raises(SandboxBusyError):
+            call()
+    assert calls[-2][2] == sandboxRunner._MAX_RESULT_BYTES
+    assert calls[-1][2] > 0
+
+
+def test_busyIsNeverConverted(monkeypatch):
+    def busy(*_args):
+        raise SandboxBusyError()
+
+    monkeypatch.setattr(sandboxRunner, "acquireRunSlot", busy)
+    data = _runOutput(_frame())
+    for call in (
+        lambda: storedTables.normaliseRunOutput("p1", "t", data),
+        lambda: storedTables.readUntrustedTable("p1", "t", data),
+        lambda: storedTables.readUntrustedPage("p1", "t", data, 0, 10),
+        lambda: storedTables.readUntrustedInfo("p1", "t", data),
+    ):
+        with pytest.raises(SandboxBusyError):
+            call()
+
+
+def test_readerMemoryDefaultsTo4GiB(monkeypatch):
+    assert storedTables.readerMemoryBytes() == 4294967296
+    for raw in ("abc", "-1", ""):
+        monkeypatch.setenv("TABLE_READER_MEMORY_BYTES", raw)
+        assert storedTables.readerMemoryBytes() == 4294967296
+    monkeypatch.setenv("TABLE_READER_MEMORY_BYTES", "0")
+    assert storedTables.readerMemoryBytes() == 0
+
+
+def test_readerReturnsTablePageAndInfo():
+    from polars.testing import assert_frame_equal
+
+    df = _honestFrame(30)
+    data = _grouped(df, 7)
+    table = storedTables.readUntrustedTable("p1", "orders", data)
+    pd.testing.assert_frame_equal(table.to_pandas(), _plain(df))
+    assert str(table.to_pandas()["nullable"].dtype) == "Int64"
+    assert set(table.schema.metadata or {}) <= {b"pandas"}
+    for offset, limit in ((0, 5), (5, 10), (28, 10)):
+        page, totalRows = storedTables.readUntrustedPage("p1", "orders", data, offset, limit)
+        assert totalRows == 30
+        assert_frame_equal(page, _expectedPage(df, offset, limit))
+    page, totalRows = storedTables.readUntrustedPage("p1", "orders", data, 40, 5)
+    assert (page.height, page.columns, totalRows) == (0, list(df.columns), 30)
+    assert storedTables.readUntrustedInfo("p1", "orders", data) == _expectedInfo(data)
+
+
+def test_readerInfoForAnEmptyTableAndAFailedSample():
+    empty = io.BytesIO()
+    pq.write_table(pa.table({"a": pa.array([], pa.int64())}), empty)
+    info = storedTables.readUntrustedInfo("p1", "t", empty.getvalue())
+    assert info == {"columns": [["a", "int64"]], "rows": 0, "cols": 1, "sample": None, "sampleFailed": False}
+    broken = _runOutput(_frame(), {b"pandas": json.dumps({"index_columns": ["nowhere"], "columns": []}).encode()})
+    with pytest.raises(Exception):  # the sample really fails today
+        next(pq.ParquetFile(io.BytesIO(broken)).iter_batches(batch_size=1)).to_pandas()
+    info = storedTables.readUntrustedInfo("p1", "t", broken)
+    assert info == {"columns": [["a", "int64"], ["b", "string"]], "rows": 3, "cols": 2, "sample": None, "sampleFailed": True}
+
+
+def test_readerDecodesDictionariesAndStripsMetadata():
+    table = pa.table({"d": pa.array(["x", "y", "x"]).dictionary_encode(), "n": [1, 2, 3]})
+    table = table.replace_schema_metadata({MARKER_KEY: b"copied", b"extra": b"1"})
+    sink = io.BytesIO()
+    pq.write_table(table, sink)
+    assert pa.types.is_dictionary(pq.read_table(io.BytesIO(sink.getvalue())).schema.field("d").type)
+    out = storedTables.readUntrustedTable("p1", "t", sink.getvalue())
+    assert out.schema.field("d").type == pa.string()
+    assert out.column("d").to_pylist() == ["x", "y", "x"]
+    assert not out.schema.metadata
+    page, _ = storedTables.readUntrustedPage("p1", "t", sink.getvalue(), 0, 2)
+    assert page["d"].to_list() == ["x", "y"]
+
+
+def test_readerRefusesOverTheLimit(monkeypatch):
+    monkeypatch.setenv("STORED_TABLE_MAX_DECODED_BYTES", "1048576")
+    data = _runOutput(pd.DataFrame({"a": np.arange(1_000_000, dtype="int64")}))
+    for call in (
+        lambda: storedTables.readUntrustedTable("p1", "t", data),
+        lambda: storedTables.readUntrustedPage("p1", "t", data, 0, 10),
+    ):
+        with pytest.raises(TableTooLargeError) as caught:
+            call()
+        assert str(caught.value) == "This table is too large to open (over 1 MiB)."
+
+
+def test_readerFailureGivesTheUnreadableCopy():
+    for junk in (b"", b"not parquet at all", b"PAR1" + b"\0" * 64 + b"PAR1"):
+        for call in (
+            lambda: storedTables.readUntrustedTable("p1", "t", junk),
+            lambda: storedTables.readUntrustedPage("p1", "t", junk, 0, 10),
+            lambda: storedTables.readUntrustedInfo("p1", "t", junk),
+        ):
+            with pytest.raises(storedTables.TableUnreadableError) as caught:
+                call()
+            assert str(caught.value) == READ_FAILED
+
+
+def _fakeRun(monkeypatch, outcome):
+    def run(*_args, **_kwargs):
+        if isinstance(outcome, BaseException):
+            raise outcome
+        return outcome
+
+    monkeypatch.setattr(sandboxRunner, "runTrustedSandbox", run)
+
+
+def _result(returncode=0, resultBytes=b"", stopped=None, stderr="child said: too large"):
+    return sandboxRunner.SandboxResult("", stderr, returncode, resultBytes, None, stopped)
+
+
+OUT_OF_MEMORY = "The run was stopped: the server ran out of memory."
+
+
+@pytest.mark.parametrize(
+    "outcome, expected",
+    [
+        (sandboxRunner.ResultTooLargeError("too large"), "too large"),
+        (_result(returncode=3, resultBytes=None), "too large"),
+        (_result(returncode=3, resultBytes=None, stopped=OUT_OF_MEMORY), "unreadable"),
+        (_result(returncode=1, resultBytes=None), "unreadable"),
+        (_result(returncode=-9, resultBytes=None, stopped=OUT_OF_MEMORY), "unreadable"),
+        (_result(returncode=0, resultBytes=None), "unreadable"),
+        (_result(returncode=0, resultBytes=b"not ipc or json"), "unreadable"),
+        (_result(returncode=0, resultBytes=b'{"columns": "x"}'), "unreadable"),
+        (ValueError("Sandbox result is not a regular file."), "unreadable"),
+        (IsADirectoryError(21, "Is a directory"), "unreadable"),
+    ],
+)
+def test_readerMapsEveryChildOutcome(monkeypatch, warnings, outcome, expected):
+    _fakeRun(monkeypatch, outcome)
+    for call in (
+        lambda: storedTables.readUntrustedTable("p1", "t", b"x"),
+        lambda: storedTables.readUntrustedPage("p1", "t", b"x", 0, 1),
+        lambda: storedTables.readUntrustedInfo("p1", "t", b"x"),
+    ):
+        with pytest.raises((TableTooLargeError, storedTables.TableUnreadableError)) as caught:
+            call()
+        if expected == "too large":
+            assert type(caught.value) is TableTooLargeError
+            assert str(caught.value) == "This table is too large to open (over 2 GiB)."
+        else:
+            assert type(caught.value) is storedTables.TableUnreadableError
+            assert str(caught.value) == READ_FAILED
+
+
+@pytest.mark.parametrize(
+    "outcome, expected",
+    [
+        (sandboxRunner.ResultTooLargeError("too large"), "The transformation's result is too large to save (over 512 MiB)."),
+        (_result(returncode=3, resultBytes=None), "The transformation's result is too large to save (over 2 GiB)."),
+        (_result(returncode=3, resultBytes=None, stopped="Execution timed out after 120 seconds."), SAVE_FAILED),
+        (_result(returncode=1, resultBytes=None), SAVE_FAILED),
+        (_result(returncode=0, resultBytes=None), SAVE_FAILED),
+        (ValueError("Sandbox result is not a regular file."), SAVE_FAILED),
+        (IsADirectoryError(21, "Is a directory"), SAVE_FAILED),
+    ],
+)
+def test_normaliserMapsEveryChildOutcome(monkeypatch, warnings, outcome, expected):
+    _fakeRun(monkeypatch, outcome)
+    with pytest.raises(ValueError) as caught:
+        storedTables.normaliseRunOutput("p1", "t", b"x")
+    assert type(caught.value) is ValueError
+    assert str(caught.value) == expected
+
+
+def test_failureLogsTheChildsStderrTail(monkeypatch, warnings):
+    _fakeRun(monkeypatch, _result(returncode=1, resultBytes=None, stderr="x" * 10_000 + "the real reason"))
+    with pytest.raises(storedTables.TableUnreadableError) as unreadable:
+        storedTables.readUntrustedTable("p1", "t", b"x")
+    with pytest.raises(ValueError) as unsaved:
+        storedTables.normaliseRunOutput("p1", "t", b"x")
+    logged = [m for m in warnings.messages if "the real reason" in m]
+    assert len(logged) == 2
+    assert all(len(m) < 5000 for m in logged)
+    assert "real reason" not in str(unreadable.value) + str(unsaved.value)
+
+
+def test_readerRevertDecodesInThisProcess(monkeypatch, noChild):
+    from polars.testing import assert_frame_equal
+
+    monkeypatch.setenv("TABLE_READER_MEMORY_BYTES", "0")
+    df = _honestFrame(30)
+    data = _grouped(df, 7)
+    table = storedTables.readUntrustedTable("p1", "t", data)
+    assert table.equals(pq.read_table(io.BytesIO(data)), check_metadata=True)
+    page, totalRows = storedTables.readUntrustedPage("p1", "t", data, 5, 10)
+    assert totalRows == 30
+    import polars as pl
+
+    assert page.schema["cat"] == pl.Categorical  # decoded here exactly as today
+    assert_frame_equal(page.with_columns(pl.col("cat").cast(pl.String)), _expectedPage(df, 5, 10))
+    assert storedTables.readUntrustedInfo("p1", "t", data) == _expectedInfo(data)
+    # The decoded-size limit stays on its own switch.
+    monkeypatch.setenv("STORED_TABLE_MAX_DECODED_BYTES", "1048576")
+    big = _runOutput(pd.DataFrame({"a": np.arange(1_000_000, dtype="int64")}))
+    for call in (
+        lambda: storedTables.readUntrustedTable("p1", "t", big),
+        lambda: storedTables.readUntrustedPage("p1", "t", big, 0, 10),
+    ):
+        with pytest.raises(TableTooLargeError) as caught:
+            call()
+        assert str(caught.value) == "This table is too large to open (over 1 MiB)."
+
+
+# ---- Under a 256 MiB process limit, with run uids ----
+
+_EXPANDING_SCRIPT = (
+    "import sys, pyarrow as pa, pyarrow.parquet as pq\n"
+    "n = 512 * 1024 * 1024 // 8\n"
+    'pq.write_table(pa.table({"c0": pa.repeat(pa.scalar(0, pa.int64()), n)}), sys.argv[1], compression="zstd",'
+    " use_dictionary=False, data_page_size=1 << 30, row_group_size=n)\n"
+)
+EXPANDING_SECONDS = 30
+
+
+@pytest.fixture(scope="module")
+def expandingFile(tmp_path_factory):
+    """One int64 column whose single 512 MiB page of zeros compresses to a few KiB.
+
+    Written by a separate process, so this one never holds the decoded column.
+    """
+    import subprocess
+    import sys
+
+    path = tmp_path_factory.mktemp("expanding") / "expanding.parquet"
+    subprocess.run([sys.executable, "-c", _EXPANDING_SCRIPT, str(path)], check=True, timeout=300)
+    data = path.read_bytes()
+    metadata = _footer(data)
+    column = metadata.row_group(0).column(0)
+    assert metadata.num_row_groups == 1 and column.total_uncompressed_size > 512 * (1 << 20)
+    assert len(data) < 4 * (1 << 20)
+    return data
+
+
+@pytest.fixture
+def smallRunMemory(monkeypatch):
+    monkeypatch.setenv("SANDBOX_MAX_PROCESS_MEMORY_BYTES", str(READER_MEMORY))
+    monkeypatch.setenv("TABLE_READER_MEMORY_BYTES", str(READER_MEMORY))
+
+
+def _peakMib() -> float:
+    with open("/proc/self/status") as status:
+        for line in status:
+            if line.startswith("VmHWM"):
+                return int(line.split()[1]) / 1024
+    raise AssertionError("no VmHWM")
+
+
+def _currentMib() -> float:
+    with open("/proc/self/status") as status:
+        for line in status:
+            if line.startswith("VmRSS"):
+                return int(line.split()[1]) / 1024
+    raise AssertionError("no VmRSS")
+
+
+def _resetPeak() -> None:
+    """Start this process's high-water mark again from its current size, so growth is measured, not hidden by an old peak."""
+    with open("/proc/self/clear_refs", "w") as clear:
+        clear.write("5")
+    assert _peakMib() - _currentMib() < 16
+
+
+def _failedOnALargeAllocation(logged: str) -> bool:
+    """The child got as far as decoding the page, not stopped on a small allocation such as an import's."""
+    import re
+
+    sizes = [int(size) for size in re.findall(r"malloc of size (\d+) failed", logged)]
+    return bool(sizes) and max(sizes) >= 64 * (1 << 20)
+
+
+@separateUids
+def test_honestTablePassesUnderTheSameLimit(smallRunMemory):
+    from polars.testing import assert_frame_equal
+
+    df = _honestFrame(30_000)
+    out = storedTables.normaliseRunOutput(PROJECT_ID, "orders", _runOutput(df))
+    pd.testing.assert_frame_equal(pd.read_parquet(io.BytesIO(out)), df)
+    assert markerIsValid(_footer(out), PROJECT_ID, "orders")
+    pd.testing.assert_frame_equal(storedTables.readUntrustedTable(PROJECT_ID, "orders", out).to_pandas(), _plain(df))
+    page, totalRows = storedTables.readUntrustedPage(PROJECT_ID, "orders", out, 100, 50)
+    assert totalRows == 30_000
+    assert_frame_equal(page, _expectedPage(df, 100, 50))
+    assert storedTables.readUntrustedInfo(PROJECT_ID, "orders", out) == _expectedInfo(out)
+
+
+@separateUids
+def test_normaliserStopsAnExpandingFile(smallRunMemory, expandingFile, warnings):
+    import time
+
+    _resetPeak()
+    before = _peakMib()
+    started = time.monotonic()
+    with pytest.raises(ValueError) as caught:
+        storedTables.normaliseRunOutput(PROJECT_ID, "orders", expandingFile)
+    elapsed = time.monotonic() - started
+    grew = _peakMib() - before
+    print(f"normaliser: {elapsed:.1f} s, parent VmHWM grew {grew:.1f} MiB")
+    assert str(caught.value) == SAVE_FAILED
+    assert _failedOnALargeAllocation(warnings.messages[-1])
+    assert grew < 64
+    assert elapsed < EXPANDING_SECONDS
+
+
+@separateUids
+def test_readerStopsAnExpandingFile(smallRunMemory, expandingFile, warnings):
+    import time
+
+    for name, call in (
+        ("table", lambda: storedTables.readUntrustedTable(PROJECT_ID, "orders", expandingFile)),
+        ("page", lambda: storedTables.readUntrustedPage(PROJECT_ID, "orders", expandingFile, 0, 1)),
+        ("info", lambda: storedTables.readUntrustedInfo(PROJECT_ID, "orders", expandingFile)),
+    ):
+        started = time.monotonic()
+        try:
+            result = call()
+        except storedTables.TableUnreadableError as error:
+            result = error
+        elapsed = time.monotonic() - started
+        print(f"reader {name}: {elapsed:.1f} s")
+        if name == "info":
+            # The shape comes from the footer; only the sample needs the page.
+            assert result["sample"] is None and result["sampleFailed"] is True, result
+        else:
+            assert isinstance(result, storedTables.TableUnreadableError) and str(result) == READ_FAILED
+            assert _failedOnALargeAllocation(warnings.messages[-1])
+        assert elapsed < EXPANDING_SECONDS

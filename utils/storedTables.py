@@ -1,14 +1,20 @@
-"""Stored Parquet tables: the marker, the bounded footer check and the API's writer.
+"""Stored Parquet tables: the marker, the bounded footer check, the API's writer, and reads in a limited child.
 
 Why: the API only decodes a stored table in its own process when the table
 carries a marker that only this API can write for that project and table, and
 only after its footer has been read within a fixed size. Anything else is read
-elsewhere. Every function that inspects a file returns None/False rather than
-raising, so a bad file can never break the request path.
+elsewhere. The footer and marker checks return None/False rather than raising,
+so a bad file can never break the request path.
+
+A run's output is rewritten by `normaliseRunOutput` in a limited child before it
+can be stored, and an unmarked table is decoded by the `readUntrusted*`
+functions in a limited child too: a Parquet file can decode to far more memory
+than its size, so neither is decoded in the API's own process.
 """
 
 import hmac
 import io
+import json
 import os
 from hashlib import sha256
 
@@ -17,14 +23,34 @@ import pyarrow as pa
 import pyarrow.parquet as pq
 
 from utils.logger import logger
-from utils.sandboxLimits import _readBool, _readInt
+from utils.sandboxLimits import _formatBytes, _readBool, _readInt, currentRunLimits
+from utils.sandboxSlots import SandboxBusyError
 
 MARKER_KEY = b"nubrix.stored-table"
 MAX_INPROCESS_FOOTER_BYTES = 1 << 20
 _MAX_FOOTER_CONTAINER = 100_000
 _DEFAULT_MAX_DECODED_BYTES = 2147483648
+_DEFAULT_READER_MEMORY_BYTES = 4294967296
 _MARKER_DOMAIN = b"nubrix stored-table marker v1"
 _PARQUET_MAGIC = b"PAR1"
+# How every stored table is written: by the API's writers and by the normaliser.
+WRITE_SETTINGS = {"compression": "zstd", "data_page_size": 1 << 20}
+ROW_GROUP_ROWS = 1_048_576
+# A child's own refusal of a table over the decoded-size limit. Python itself exits 1 for an uncaught error, and a
+# limit that ends the child gives a signal, so only the launcher's own size check exits with this.
+EXIT_TOO_LARGE = 3
+NORMALISE_BATCH_ROWS = 65536
+_MAX_PANDAS_METADATA_BYTES = 64 * 1024
+# Carries a page's row count from the reader child; the parent removes it.
+PAGE_ROWS_KEY = b"nubrix.reader.total-rows"
+_NORMALISE_LAUNCHER = "normalise_launcher.py"
+_READER_LAUNCHER = "table_reader_launcher.py"
+_NORMALISE_TIMEOUT_SECONDS = 120
+_READER_TIMEOUT_SECONDS = 60
+_STDERR_TAIL_CHARS = 2000
+_INFO_KEYS = {"columns", "rows", "cols", "sample", "sampleFailed"}
+_SAVE_FAILED = "The transformation's result could not be read safely."
+_READ_FAILED = "This table could not be read safely."
 
 _missingKeyWarned = False
 
@@ -131,11 +157,249 @@ def writeStoredTable(table: "pa.Table | pd.DataFrame", projectId: str, tableName
         metadata[MARKER_KEY] = marker
     table = table.replace_schema_metadata(metadata)
     sink = io.BytesIO()
-    pq.write_table(
-        table,
-        sink,
-        compression="zstd",
-        data_page_size=1 << 20,
-        row_group_size=1_048_576,
-    )
+    pq.write_table(table, sink, **WRITE_SETTINGS, row_group_size=ROW_GROUP_ROWS)
     return sink.getvalue()
+
+
+def readerMemoryBytes() -> int:
+    """Memory (RLIMIT_DATA) of the child that reads an unmarked table. 0 decodes in this process instead."""
+    return _readInt("TABLE_READER_MEMORY_BYTES", _DEFAULT_READER_MEMORY_BYTES)
+
+
+def trustedPandasMetadata(schema: "pa.Schema") -> bytes | None:
+    """The schema's pandas entry, re-serialised, or None when it is not one an honest table would carry.
+
+    It is kept only as a JSON object of at most 64 KiB whose columns all name fields of this schema. It lets
+    nullable dtypes such as Int64 read back as they were written.
+    """
+    try:
+        raw = (schema.metadata or {}).get(b"pandas")
+        if raw is None or len(raw) > _MAX_PANDAS_METADATA_BYTES:
+            return None
+        parsed = json.loads(raw)
+        if not isinstance(parsed, dict) or not isinstance(parsed.get("columns"), list):
+            return None
+        names = set(schema.names)
+        for column in parsed["columns"]:
+            name = column.get("field_name", column.get("name")) if isinstance(column, dict) else None
+            if not isinstance(name, str) or name not in names:
+                return None
+        return json.dumps(parsed).encode()
+    except Exception:
+        return None
+
+
+def _tooLargeToOpen(limit: int) -> TableTooLargeError:
+    return TableTooLargeError(f"This table is too large to open (over {_formatBytes(limit)}).")
+
+
+def _source(data: "bytes | str"):
+    """A path is opened by pyarrow; bytes are read from memory."""
+    return pa.BufferReader(data) if isinstance(data, (bytes, bytearray, memoryview)) else data
+
+
+def _withinDecodedLimit(metadata: "pq.FileMetaData", rowGroups, limit: int) -> bool:
+    """Whether these row groups are at most `limit` bytes encoded and uncompressed (0 means no limit)."""
+    if not limit:
+        return True
+    total = sum(metadata.row_group(group).column(column).total_uncompressed_size for group in rowGroups for column in range(metadata.num_columns))
+    return total <= limit
+
+
+def decodeTable(data: "bytes | str", limit: int) -> "pa.Table":
+    """Decode a whole table after the decoded-size check on its footer."""
+    with pq.ParquetFile(_source(data)) as parquet:
+        metadata = parquet.metadata
+    if not _withinDecodedLimit(metadata, range(metadata.num_row_groups), limit):
+        raise _tooLargeToOpen(limit)
+    return pq.read_table(_source(data))
+
+
+def decodePage(data: "bytes | str", offset: int, limit: int, maxDecoded: int) -> tuple["pa.Table", int]:
+    """Decode the rows `offset` to `offset + limit` and return them with the table's row count.
+
+    Only the row groups holding the page are checked against `maxDecoded` and decoded, as the data grid reads them.
+    """
+    from utils.projectStorage import _pageBatches
+
+    with pq.ParquetFile(_source(data)) as parquet:
+        metadata = parquet.metadata
+        rowGroups, firstRow, nextRow = [], offset, 0
+        for index in range(metadata.num_row_groups):
+            groupRows = metadata.row_group(index).num_rows
+            if nextRow < offset + limit and nextRow + groupRows > offset:
+                if not rowGroups:
+                    firstRow = nextRow
+                rowGroups.append(index)
+            nextRow += groupRows
+        if not _withinDecodedLimit(metadata, rowGroups, maxDecoded):
+            raise _tooLargeToOpen(maxDecoded)
+        batches = _pageBatches(parquet, rowGroups, firstRow, offset, limit)
+        return pa.Table.from_batches(batches, schema=parquet.schema_arrow), metadata.num_rows
+
+
+def tableInfo(data: "bytes | str", maxDecoded: int) -> dict:
+    """Columns, shape and a one-row sample, as metadata generation reads them.
+
+    The shape comes from the footer. The sample decodes the start of the first row group, so it is skipped and
+    marked failed when that row group is over `maxDecoded`, as it is when it can't be read.
+    """
+    with pq.ParquetFile(_source(data)) as parquet:
+        metadata = parquet.metadata
+        info = {
+            "columns": [[field.name, str(field.type)] for field in parquet.schema_arrow],
+            "rows": int(metadata.num_rows),
+            "cols": int(metadata.num_columns),
+            "sample": None,
+            "sampleFailed": False,
+        }
+        if not _withinDecodedLimit(metadata, range(min(1, metadata.num_row_groups)), maxDecoded):
+            info["sampleFailed"] = True
+            return info
+        try:
+            sample = next(parquet.iter_batches(batch_size=1), None)
+            if sample is not None:
+                info["sample"] = sample.to_pandas().to_string()
+        except Exception:
+            info["sampleFailed"] = True
+        return info
+
+
+def _logChildFailure(what: str, projectId: str, tableName: str, result=None, error: BaseException | None = None) -> None:
+    """Keep what the child said for us. It never reaches the user's copy."""
+    if result is not None:
+        detail = f"exit {result.returncode}, stopped {result.stopped!r}, stderr: {result.stderr[-_STDERR_TAIL_CHARS:]}"
+    else:
+        detail = f"{type(error).__name__}: {str(error)[-_STDERR_TAIL_CHARS:]}"
+    logger.warning(f"{what} failed for table {tableName!r} in project {projectId}: {detail}")
+
+
+def normaliseRunOutput(projectId: str, tableName: str, parquetBytes: bytes) -> bytes:
+    """Rewrite a run's Parquet output in a limited child, with this table's marker and no metadata from the input.
+
+    The child streams the input and refuses it once its decoded batches pass STORED_TABLE_MAX_DECODED_BYTES, so a
+    file built to expand never reaches this process. Only the marker value is passed, never the key behind it.
+    Raises SandboxBusyError unchanged; any other failure is a ValueError carrying the user's copy.
+    With STORED_TABLE_NORMALISE=0 the bytes are returned as they are.
+    """
+    if not normaliseEnabled():
+        return parquetBytes
+    from utils import sandboxRunner
+
+    limit = maxDecodedBytes()
+    # The output is stored as it comes back, so it gets the cap the run's own output had.
+    cap = sandboxRunner._MAX_RESULT_BYTES
+    request = {"marker": tableMarker(projectId, tableName).decode("ascii"), "maxDecodedBytes": limit}
+    what = "Normalising a run's output"
+    try:
+        result = sandboxRunner.runTrustedSandbox(_NORMALISE_LAUNCHER, projectId, parquetBytes, request, _NORMALISE_TIMEOUT_SECONDS, cap)
+    except SandboxBusyError:
+        raise
+    except sandboxRunner.ResultTooLargeError as error:
+        _logChildFailure(what, projectId, tableName, error=error)
+        raise ValueError(f"The transformation's result is too large to save (over {_formatBytes(cap)}).") from error
+    except (ValueError, OSError) as error:
+        _logChildFailure(what, projectId, tableName, error=error)
+        raise ValueError(_SAVE_FAILED) from error
+    if result.returncode == EXIT_TOO_LARGE and not result.stopped and limit:
+        raise ValueError(f"The transformation's result is too large to save (over {_formatBytes(limit)}).")
+    if result.returncode != 0 or result.stopped or result.resultBytes is None:
+        _logChildFailure(what, projectId, tableName, result=result)
+        raise ValueError(_SAVE_FAILED)
+    return result.resultBytes
+
+
+def _readInChild(projectId: str, tableName: str, data: bytes, request: dict) -> bytes:
+    """Run the reader child on `data` and return its answer, mapping every failure to the user's copy."""
+    from utils import sandboxRunner
+
+    limit = maxDecodedBytes()
+    cap = limit or sandboxRunner._MAX_RESULT_BYTES
+    limits = currentRunLimits(maxProcessMemory=readerMemoryBytes())
+    what = f"Reading a table ({request['op']})"
+    try:
+        result = sandboxRunner.runTrustedSandbox(
+            _READER_LAUNCHER, projectId, data, {**request, "maxDecodedBytes": limit}, _READER_TIMEOUT_SECONDS, cap, limits=limits
+        )
+    except SandboxBusyError:
+        raise
+    except sandboxRunner.ResultTooLargeError as error:
+        raise _tooLargeToOpen(cap) from error
+    except (ValueError, OSError) as error:
+        _logChildFailure(what, projectId, tableName, error=error)
+        raise TableUnreadableError(_READ_FAILED) from error
+    if result.returncode == EXIT_TOO_LARGE and not result.stopped and limit:
+        raise _tooLargeToOpen(limit)
+    if result.returncode != 0 or result.stopped or result.resultBytes is None:
+        _logChildFailure(what, projectId, tableName, result=result)
+        raise TableUnreadableError(_READ_FAILED)
+    return result.resultBytes
+
+
+def _ipcTable(projectId: str, tableName: str, answer: bytes) -> "pa.Table":
+    try:
+        return pa.ipc.open_stream(pa.BufferReader(answer)).read_all()
+    except Exception as error:
+        _logChildFailure("Reading a table's answer", projectId, tableName, error=error)
+        raise TableUnreadableError(_READ_FAILED) from error
+
+
+def readUntrustedTable(projectId: str, tableName: str, data: bytes) -> "pa.Table":
+    """Decode a whole table that may not be the API's own, in a child limited to TABLE_READER_MEMORY_BYTES.
+
+    Dictionary columns come back decoded and the schema keeps only a valid pandas entry. Raises SandboxBusyError
+    unchanged, TableTooLargeError over STORED_TABLE_MAX_DECODED_BYTES and TableUnreadableError for anything else.
+    With TABLE_READER_MEMORY_BYTES=0 the table is decoded in this process as before, after the same size check.
+    """
+    if not readerMemoryBytes():
+        return decodeTable(data, maxDecodedBytes())
+    return _ipcTable(projectId, tableName, _readInChild(projectId, tableName, data, {"op": "table"}))
+
+
+def readUntrustedPage(projectId: str, tableName: str, data: bytes, offset: int, limit: int) -> tuple["pl.DataFrame", int]:
+    """One page of a table that may not be the API's own, and the table's row count, read as `readUntrustedTable` is."""
+    import polars as pl
+
+    if not readerMemoryBytes():
+        table, totalRows = decodePage(data, offset, limit, maxDecodedBytes())
+        return pl.from_arrow(table), totalRows
+    answer = _readInChild(projectId, tableName, data, {"op": "page", "offset": int(offset), "limit": int(limit)})
+    table = _ipcTable(projectId, tableName, answer)
+    metadata = dict(table.schema.metadata or {})
+    rows = metadata.pop(PAGE_ROWS_KEY, b"")
+    if not rows.isdigit():
+        _logChildFailure("Reading a table's page", projectId, tableName, error=ValueError("no row count"))
+        raise TableUnreadableError(_READ_FAILED)
+    return pl.from_arrow(table.replace_schema_metadata(metadata or None)), int(rows)
+
+
+def _isInfo(info) -> bool:
+    """Whether the child's answer has exactly the shape `tableInfo` builds."""
+    return (
+        isinstance(info, dict)
+        and set(info) == _INFO_KEYS
+        and isinstance(info["columns"], list)
+        and all(isinstance(pair, list) and len(pair) == 2 and all(isinstance(part, str) for part in pair) for pair in info["columns"])
+        and all(type(info[key]) is int and info[key] >= 0 for key in ("rows", "cols"))
+        and (info["sample"] is None or isinstance(info["sample"], str))
+        and isinstance(info["sampleFailed"], bool)
+    )
+
+
+def readUntrustedInfo(projectId: str, tableName: str, data: bytes) -> dict:
+    """Columns, shape and a one-row sample of a table that may not be the API's own, read as `readUntrustedTable` is.
+
+    Returns {"columns": [[name, type], ...], "rows", "cols", "sample": str | None, "sampleFailed": bool}: a sample of
+    None is a table with no rows, unless sampleFailed says it could not be read.
+    """
+    if not readerMemoryBytes():
+        return tableInfo(data, maxDecodedBytes())
+    answer = _readInChild(projectId, tableName, data, {"op": "info"})
+    try:
+        info = json.loads(answer)
+    except Exception:  # Malformed or too deeply nested.
+        info = None
+    if not _isInfo(info):
+        _logChildFailure("Reading a table's info", projectId, tableName, error=ValueError("malformed answer"))
+        raise TableUnreadableError(_READ_FAILED)
+    return info
