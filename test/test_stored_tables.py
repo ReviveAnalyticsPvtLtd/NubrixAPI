@@ -1076,16 +1076,25 @@ def test_tooLargeExitCodeIsNoRuntimesOwn(monkeypatch, warnings):
         (_result(returncode=storedTables.EXIT_TOO_LARGE, resultBytes=None), "table", "2147483648"),
         (sandboxRunner.ResultTooLargeError("big"), "normalise", str(512 * 1024 * 1024)),
         (_result(returncode=storedTables.EXIT_TOO_LARGE, resultBytes=None), "normalise", "2147483648"),
+        (AssertionError("started a child"), "inProcessTable", "1048576"),
+        (AssertionError("started a child"), "inProcessPage", "1048576"),
     ],
-    ids=["readerResultCap", "readerExitCode", "normaliserResultCap", "normaliserExitCode"],
+    ids=["readerResultCap", "readerExitCode", "normaliserResultCap", "normaliserExitCode", "inProcessTable", "inProcessPage"],
 )
 def test_everyTooLargeBranchLogsOneLine(monkeypatch, warnings, outcome, call, limit):
     _fakeRun(monkeypatch, outcome)
+    data = b"x"
+    if call.startswith("inProcess"):
+        monkeypatch.setenv("TABLE_READER_MEMORY_BYTES", "0")
+        monkeypatch.setenv("STORED_TABLE_MAX_DECODED_BYTES", limit)
+        data = _rowGroups()
     with pytest.raises(ValueError):
-        if call == "table":
-            storedTables.readUntrustedTable("p1", "orders", b"x")
+        if call in ("table", "inProcessTable"):
+            storedTables.readUntrustedTable("p1", "orders", data)
+        elif call == "inProcessPage":
+            storedTables.readUntrustedPage("p1", "orders", data, 0, 10)
         else:
-            storedTables.normaliseRunOutput("p1", "orders", b"x")
+            storedTables.normaliseRunOutput("p1", "orders", data)
     assert len(warnings.messages) == 1, warnings.messages
     assert "'orders'" in warnings.messages[0] and limit in warnings.messages[0]
 

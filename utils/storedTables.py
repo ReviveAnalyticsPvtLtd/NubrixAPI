@@ -315,8 +315,9 @@ def normaliseRunOutput(projectId: str, tableName: str, parquetBytes: bytes) -> b
 
     The child streams the input and refuses it once its decoded batches pass STORED_TABLE_MAX_DECODED_BYTES, so a
     file built to expand never reaches this process. Only the marker value is passed, never the key behind it.
-    Raises SandboxBusyError unchanged; any other failure is a ValueError carrying the user's copy.
-    With STORED_TABLE_NORMALISE=0 the bytes are returned as they are.
+    A failure of the child or its answer is a ValueError carrying the user's copy. SandboxBusyError and errors of the
+    sandbox itself (no free uid, a uid that could not be cleared, a TypeError) propagate unchanged, as they do for
+    code runs. With STORED_TABLE_NORMALISE=0 the bytes are returned as they are.
     """
     if not normaliseEnabled():
         return parquetBytes
@@ -391,6 +392,16 @@ def _ipcTable(projectId: str, tableName: str, answer: bytes) -> "pa.Table":
         raise TableUnreadableError(_READ_FAILED) from error
 
 
+def _inProcess(what: str, projectId: str, tableName: str, decode):
+    """Decode in this process (TABLE_READER_MEMORY_BYTES=0), logging a refusal over the decoded-size limit as the child path does."""
+    limit = maxDecodedBytes()
+    try:
+        return decode(limit)
+    except TableTooLargeError:
+        _logTooLarge(what, projectId, tableName, limit)
+        raise
+
+
 def readUntrustedTable(projectId: str, tableName: str, data: bytes) -> "pa.Table":
     """Decode a whole table that may not be the API's own, in a child limited to TABLE_READER_MEMORY_BYTES.
 
@@ -401,7 +412,7 @@ def readUntrustedTable(projectId: str, tableName: str, data: bytes) -> "pa.Table
     this process as before, after the same size check.
     """
     if not readerMemoryBytes():
-        return decodeTable(data, maxDecodedBytes())
+        return _inProcess("Reading a table (table)", projectId, tableName, lambda limit: decodeTable(data, limit))
     return _ipcTable(projectId, tableName, _readInChild(projectId, tableName, data, {"op": "table"}))
 
 
@@ -414,7 +425,7 @@ def readUntrustedPage(projectId: str, tableName: str, data: bytes, offset: int, 
     import polars as pl
 
     if not readerMemoryBytes():
-        table, totalRows = decodePage(data, offset, limit, maxDecodedBytes())
+        table, totalRows = _inProcess("Reading a table (page)", projectId, tableName, lambda maxDecoded: decodePage(data, offset, limit, maxDecoded))
         return pl.from_arrow(table), totalRows
     answer = _readInChild(projectId, tableName, data, {"op": "page", "offset": int(offset), "limit": int(limit)})
     table = _ipcTable(projectId, tableName, answer)
