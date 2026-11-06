@@ -206,7 +206,7 @@ class ReportingService:
             return lf.group_by(x).agg(expr.alias(y)).collect()
 
         single_table = tablesUsed if not isinstance(tablesUsed, list) else None
-        use_lazy = _use_lazy(single_table) and not hasFilters and chartType != "pivot"
+        use_lazy = _use_lazy(single_table) and not hasFilters and chartType not in ("pivot", "geoMap")
 
         if use_lazy:
             import polars as pl
@@ -424,9 +424,11 @@ class ReportingService:
                     geocode_cache[value] = None
                 return geocode_cache[value]
 
-            for _, row in finalResult.iterrows():
+            label_values = finalResult.get("label")
+            for row_index, (_, row) in enumerate(finalResult.iterrows()):
                 lat = None
                 lon = None
+                location_label = ""
 
                 if xAxis in finalResult.columns and yAxis in finalResult.columns:
                     latEx = row[xAxis]
@@ -445,12 +447,24 @@ class ReportingService:
                             if pd.notna(latC) and pd.notna(lonC):
                                 lat = latC
                                 lon = lonC
+                                location_label = g.strip()
 
                 if lat is not None and lon is not None:
+                    # Read the original column value since iterrows can coerce integers to floats.
+                    label_value = label_values.iloc[row_index] if isinstance(label_values, pd.Series) else None
+                    label = ""
+                    if pd.api.types.is_scalar(label_value) and pd.notna(label_value):
+                        is_numeric_zero = (
+                            pd.api.types.is_number(label_value)
+                            and not pd.api.types.is_bool(label_value)
+                            and label_value == 0
+                        )
+                        label = "0" if is_numeric_zero else str(label_value).strip()
                     points.append({
                         "id": "".join(random.choice(string.ascii_letters + string.digits) for i in range(16)),
                         "lat": lat,
-                        "long": lon
+                        "long": lon,
+                        "label": label or location_label or f"{lat}, {lon}",
                     })
 
             response = {
@@ -636,8 +650,9 @@ class ReportingService:
             
             for widget, originalQuery in zip(responses, uniqueQueries):
                 widgetId = str(uuid.uuid4())
-                chartType = widget.get("finalOutput", {}).get("chartType")
-                data = widget.get("finalOutput", {}).get("data")
+                chart_output = widget.get("finalOutput", {})
+                chartType = chart_output.get("chartType")
+                data = chart_output.get("data")
                 if chartType == "card":
                     if isinstance(data, (int, float)):
                         data = float(f"{data:.2f}")
@@ -654,18 +669,21 @@ class ReportingService:
                         "generatedCode": widget.get("generatedCode")
                     })
                 else:
-                    newWidgets.append({
+                    dashboard_widget = {
                         "id": widgetId,
                         "chartType": chartType,
-                        "title": widget.get("finalOutput", {}).get("title"),
-                        "label": widget.get("finalOutput", {}).get("label"),
-                        "xLabels": widget.get("finalOutput", {}).get("xLabels"),
-                        "yLabels": widget.get("finalOutput", {}).get("yLabels"),
+                        "title": chart_output.get("title"),
+                        "label": chart_output.get("label"),
+                        "xLabels": chart_output.get("xLabels"),
+                        "yLabels": chart_output.get("yLabels"),
                         "data": data,
                         "query": originalQuery,
                         "layout": {"x": 0, "y": 0, "w": 6, "h": 10},
                         "generatedCode": widget.get("generatedCode")
-                    })
+                    }
+                    if chartType in ("geoMap", "geo-map") and "map" in chart_output:
+                        dashboard_widget["map"] = chart_output["map"]
+                    newWidgets.append(dashboard_widget)
             
             allWidgets = existingWidgets + newWidgets
             cards = [w for w in allWidgets if w.get("chartType") == "card"]

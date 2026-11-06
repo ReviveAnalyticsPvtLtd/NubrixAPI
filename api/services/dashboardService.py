@@ -19,6 +19,7 @@ from sqlalchemy import URL, create_engine
 from utils.projectStorage import readJson, readTableBytes
 from utils.storedTables import decodeStoredTable, tableReadException, tableWriteException, writeStoredTableToPath
 from utils.logger import logger
+from utils.mapPointLabels import ensureScatterMapPointLabels
 from api.commons import client
 from api.models import (
     DeleteDashboardElement,
@@ -279,6 +280,10 @@ class DashboardService:
                     _ = self.client.storage.from_("AnalyticsHub").upload(path = f"{details.projectId}/dashboardConfig.json", file = buffer.getvalue(), file_options = {"upsert": "true"})    
             else:
                 raise ValueError("Filters and Refresh cannot be implemented simultaneously.")
+            widgets = pageInfo.get("widgets")
+            if isinstance(widgets, list):
+                for widget in widgets:
+                    ensureScatterMapPointLabels(widget)
             return pageInfo
         except Exception as e:
             if isBusy(e):
