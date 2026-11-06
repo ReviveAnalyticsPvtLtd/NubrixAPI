@@ -386,7 +386,7 @@ def test_unsafeTrustedResultIsNotATooLargeError(tmp_path):
 # ---- The normaliser and the reader ----
 
 PROJECT_ID = "11111111-2222-4333-8444-555555555555"
-READER_MEMORY = 268435456
+READER_MEMORY = 536870912
 SAVE_FAILED = "The transformation's result could not be read safely."
 READ_FAILED = "This table could not be read safely."
 
@@ -841,7 +841,7 @@ def test_readerRevertDecodesInThisProcess(monkeypatch, noChild):
         assert str(caught.value) == "This table is too large to open (over 1 MiB)."
 
 
-# ---- Under a 256 MiB process limit, with run uids ----
+# ---- Under a 512 MiB process limit, with run uids ----
 # These need a file that is small on disk and decodes past that limit.
 
 _EXPANDING_SCRIPT = (
@@ -855,7 +855,7 @@ EXPANDING_SECONDS = 30
 
 @pytest.fixture(scope="module")
 def expandingFile(tmp_path_factory):
-    """A small file that decodes past the 256 MiB process limit.
+    """A small file that decodes past the 512 MiB process limit.
 
     Written by a separate process, so this one never holds it decoded.
     """
