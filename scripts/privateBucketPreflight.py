@@ -50,7 +50,7 @@ def _checkPagedRead(projectId: str, tableName: str) -> dict:
         with openTableFile(projectId, tableName) as tableFile:
             footer = readTailFooter(tableFile)
         if footer is None:
-            raise StorageReadError(f"{tableName}.parquet has no readable footer")
+            raise StorageReadError(f"{tableName}.parquet footer not checked (unparsable or over 1 MiB)")
         return {"pagedReadRows": footer.num_rows}
     except Exception as e:
         return {"pagedReadRows": None, "pagedReadError": _errorText(e)}
