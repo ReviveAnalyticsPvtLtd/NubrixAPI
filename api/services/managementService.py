@@ -32,6 +32,8 @@ from api.services.subscriptions.paymentValidationService import (
 )
 from concurrent.futures import ProcessPoolExecutor
 from utils.projectStorage import readJson, readTableBytes
+from utils.sandboxSlots import isBusy
+from utils.storedTables import storedTableInfo, tableReadException
 from utils.logger import logger
 from urllib.request import urlopen
 from api.commons import client
@@ -458,30 +460,27 @@ class ManagementService:
 
         Returns:
             tuple: (attribute info string, deterministic [num_rows, num_cols] shape).
-        """
-        import pyarrow.parquet as pq
-        import io
 
+        Raises:
+            SandboxBusyError: When the table's reader could not get a run slot; that is a retry, not a failed read.
+        """
         try:
-            file_like = io.BytesIO(readTableBytes(projectId, dataframeName))
-            pf = pq.ParquetFile(file_like)
-            schema = pf.schema_arrow
-            num_rows = pf.metadata.num_rows
-            num_cols = pf.metadata.num_columns
+            info = storedTableInfo(projectId, dataframeName, readTableBytes(projectId, dataframeName))
+            num_rows, num_cols = info["rows"], info["cols"]
             attributeInfo = f'DATAFRAME NAME: {dataframeName}\n'
-            for field in schema:
-                attributeInfo += f'- {field.name} ({field.type})\n'
+            for name, dataType in info["columns"]:
+                attributeInfo += f'- {name} ({dataType})\n'
             attributeInfo += f'SHAPE: ({num_rows}, {num_cols})\n'
-            try:
-                sample = next(pf.iter_batches(batch_size=1), None)
-                if sample is None:
-                    attributeInfo += 'SAMPLE ROW: (no rows)\n'
-                else:
-                    attributeInfo += 'SAMPLE ROW:\n' + str(sample.to_pandas().to_string()) + '\n'
-            except Exception:
+            if info["sampleFailed"]:
                 attributeInfo += 'SAMPLE ROW: (failed to load)\n'
+            elif info["sample"] is None:
+                attributeInfo += 'SAMPLE ROW: (no rows)\n'
+            else:
+                attributeInfo += 'SAMPLE ROW:\n' + info["sample"] + '\n'
             return attributeInfo, [int(num_rows), int(num_cols)]
         except Exception as e:
+            if isBusy(e):
+                raise
             logger.error(f"Failed to generate attribute info for {dataframeName} under project {projectId}: {e}")
             return f"DATAFRAME NAME: {dataframeName}\n(Metadata read failed)\n", None
 
@@ -580,8 +579,9 @@ class ManagementService:
                     metadata[tableName]["shape"] = tableShapes[tableName]
             return metadata
         except Exception as e:
-            logger.error(CustomException(e))
-            raise CustomException(e)
+            exception = tableReadException(e) or CustomException(e)
+            logger.error(exception)
+            raise exception
 
     def generateMetadataForTables(self, projectId: str, tableNames: list[str], userId: str | None = None) -> dict:
         """
@@ -638,8 +638,9 @@ class ManagementService:
             # Return only the newly generated entries
             return {name: newMetadata[name] for name in tableNames if name in newMetadata}
         except Exception as e:
-            logger.error(CustomException(e))
-            raise CustomException(e)
+            exception = tableReadException(e) or CustomException(e)
+            logger.error(exception)
+            raise exception
         
     def _generateRawInsights(self, projectId: str, userId: str | None = None) -> list:
         """
@@ -831,7 +832,7 @@ class ManagementService:
             updateProjectModifiedAt(projectId)
             return jsonData
         except Exception as e:
-            exception = CustomException(e)
+            exception = tableReadException(e) or CustomException(e)
             logger.error(exception)
             raise exception   
 
@@ -1056,7 +1057,7 @@ class ManagementService:
                 _ = self.client.storage.from_("AnalyticsHub").upload(path = f"{projectId}/generatedReport.json", file = buffer.getvalue(), file_options = {"upsert": "true"})  
             updateProjectModifiedAt(projectId)
         except Exception as e:
-            exception = CustomException(e)
+            exception = tableReadException(e) or CustomException(e)
             logger.error(exception)
             raise exception   
         

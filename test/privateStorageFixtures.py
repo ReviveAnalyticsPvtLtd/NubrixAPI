@@ -6,14 +6,37 @@ object answers 400 with a JSON 404 body and the public route is dead.
 
 import gzip
 import http.server
+import io
 import json
 import threading
 from urllib.parse import unquote, urlsplit
 
 SERVICE_KEY = "test-service-key"
+
 _OBJECT_PREFIX = "/storage/v1/object/"
 _NOT_FOUND = {"statusCode": "404", "error": "not_found", "message": "Object not found"}
 _NO_BUCKET = {"statusCode": "404", "error": "Bucket not found", "message": "Bucket not found"}
+
+
+def markedParquet(body: bytes, projectId: str, tableName: str) -> bytes:
+    """`body` rewritten with the table's marker, keeping its row groups and compression.
+
+    The API decodes only a marked table in its own process, so a test of how that read goes needs one. Call it with
+    SUPABASE_KEY set to the key the read will see.
+    """
+    import pyarrow.parquet as pq
+
+    from utils.storedTables import MARKER_KEY, tableMarker
+
+    source = pq.ParquetFile(io.BytesIO(body))
+    metadata = source.metadata
+    table = source.read()
+    table = table.replace_schema_metadata({**(table.schema.metadata or {}), MARKER_KEY: tableMarker(projectId, tableName)})
+    groupRows = metadata.row_group(0).num_rows if metadata.num_row_groups else None
+    compression = metadata.row_group(0).column(0).compression.lower() if metadata.num_row_groups else "snappy"
+    sink = io.BytesIO()
+    pq.write_table(table, sink, row_group_size=groupRows or None, compression=compression)
+    return sink.getvalue()
 
 
 class FakePrivateStorage:

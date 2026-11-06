@@ -20,6 +20,8 @@ from fastapi import Form, UploadFile
 from sqlalchemy import URL, create_engine
 from utils.projectStorage import readJson
 from utils.logger import logger
+from utils.sandboxSlots import isBusy
+from utils.storedTables import tableWriteException, writeStoredTableToPath
 from api.commons import client
 from typing import Annotated
 from time import sleep
@@ -125,10 +127,19 @@ class DataLoadService:
         claims = self._releaseTableName(projectId, tableName)
         return [{**claim, "file_before_release": fileBeforeRelease} for claim in claims]
 
+    @staticmethod
+    def _logMetadataFailure(kind: str, tableNames: list[str], error: Exception) -> None:
+        """The tables are stored, so a failed metadata step is only logged; a busy sandbox is a warning, not a fault."""
+        if isBusy(error):
+            logger.warning(f"Metadata generation for {kind} load of {tableNames} skipped: the sandbox is busy; regenerate it later.")
+        else:
+            logger.error(f"Metadata generation failed for {kind} load of {tableNames}: {error}")
+
     def _writeTable(self, projectId: str, tableName: str, claims: list[dict], writeParquet) -> None:
         """Write a load's table under a name it accepted, then release the name again.
 
-        writeParquet(path) produces the file. If it fails, nothing was written, so the claims are given back
+        writeParquet(path) produces the file, through `writeStoredTableToPath` so it carries the table's marker and
+        is refused over the size limit (a 413 TABLE_TOO_LARGE). If it fails, nothing was written, so the claims are given back
         while the file is unchanged (see _restoreClaims, which also covers no file and no record) and a
         transformation's table keeps its owner. A failed upload may still have landed, so after one the
         claims stay released. After the write the name is released again and the table's caches are cleared,
@@ -137,17 +148,24 @@ class DataLoadService:
         """
         uploading = False
         try:
-            with tempfile.NamedTemporaryFile(delete=True, suffix=".parquet") as temp:
-                writeParquet(temp.name)
+            # A folder rather than an open temporary file, which other writers cannot reopen on every platform.
+            with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as folder:
+                path = os.path.join(folder, "table.parquet")
+                writeParquet(path)
                 uploading = True
                 self.client.storage.from_("AnalyticsHub").upload(
-                    file=temp.name,
+                    file=path,
                     path=f"{projectId}/{tableName}.parquet",
                     file_options={"upsert": "true"}
                 )
-        except Exception:
+        except Exception as error:
             if not uploading:
                 self._restoreClaims(projectId, tableName, claims)
+                # The writer's refusal for size becomes the user's 413; the internal text stays in the log.
+                refusal = tableWriteException(error)
+                if refusal is not None:
+                    logger.warning(f"Refused to store table {tableName!r} in project {projectId}: {error}")
+                    raise refusal from error
             raise
         releaseError = None
         for pause in (*RELEASE_RETRY_PAUSES, None):
@@ -238,7 +256,7 @@ class DataLoadService:
                 claims = self._acceptTableName(projectId, sanitizedName)
                 self._writeTable(
                     projectId, sanitizedName, claims,
-                    lambda path: self._sanitizeDfForParquet(self._readCsvUpload(fileBytes)).to_parquet(path, compression="snappy"),
+                    lambda path: writeStoredTableToPath(self._sanitizeDfForParquet(self._readCsvUpload(fileBytes)), projectId, sanitizedName, path),
                 )
                 loadedTableNames.append(sanitizedName)
             updateProjectModifiedAt(projectId)
@@ -250,7 +268,7 @@ class DataLoadService:
                         projectId=projectId, tableNames=loadedTableNames, userId=userId
                     )
                 except Exception as metaErr:
-                    logger.error(f"Metadata generation failed for CSV load: {metaErr}")
+                    self._logMetadataFailure("CSV", loadedTableNames, metaErr)
             return newMetadata
         except CustomException:
             raise
@@ -298,7 +316,7 @@ class DataLoadService:
                     claims = self._acceptTableName(projectId, tableName)
                     self._writeTable(
                         projectId, tableName, claims,
-                        lambda path: self._sanitizeDfForParquet(sheetData).to_parquet(path, compression="snappy"),
+                        lambda path: writeStoredTableToPath(self._sanitizeDfForParquet(sheetData), projectId, tableName, path),
                     )
                     loadedTableNames.append(tableName)
             updateProjectModifiedAt(projectId)
@@ -309,7 +327,7 @@ class DataLoadService:
                         projectId=projectId, tableNames=loadedTableNames, userId=userId
                     )
                 except Exception as metaErr:
-                    logger.error(f"Metadata generation failed for Excel load: {metaErr}")
+                    self._logMetadataFailure("Excel", loadedTableNames, metaErr)
             return newMetadata
         except CustomException:
             raise
@@ -441,7 +459,7 @@ class DataLoadService:
                         tableName = f"{baseName}_table{idx}"
                         self._writeTable(
                             projectId, tableName, acceptedClaims.pop(tableName),
-                            lambda path: self._sanitizeDfForParquet(entry["df"]).to_parquet(path, compression="snappy"),
+                            lambda path: writeStoredTableToPath(self._sanitizeDfForParquet(entry["df"]), projectId, tableName, path),
                         )
                         loadedTableNames.append(tableName)
                 except Exception:
@@ -459,7 +477,7 @@ class DataLoadService:
                         projectId=projectId, tableNames=loadedTableNames, userId=userId
                     )
                 except Exception as metaErr:
-                    logger.error(f"Metadata generation failed for PDF load: {metaErr}")
+                    self._logMetadataFailure("PDF", loadedTableNames, metaErr)
             return newMetadata
         except CustomException:
             raise
@@ -498,7 +516,7 @@ class DataLoadService:
             claims = self._acceptTableName(connection.projectId, sanitizedTable)
             self._writeTable(
                 connection.projectId, sanitizedTable, claims,
-                lambda path: pd.read_sql(f"SELECT * FROM {connection.table}", engine).to_parquet(path, compression="snappy"),
+                lambda path: writeStoredTableToPath(pd.read_sql(f"SELECT * FROM {connection.table}", engine), connection.projectId, sanitizedTable, path),
             )
             updateProjectModifiedAt(connection.projectId)
             newMetadata = {}
@@ -507,7 +525,7 @@ class DataLoadService:
                     projectId=connection.projectId, tableNames=[sanitizedTable], userId=userId
                 )
             except Exception as metaErr:
-                logger.error(f"Metadata generation failed for MySQL load: {metaErr}")
+                self._logMetadataFailure("MySQL", [sanitizedTable], metaErr)
             return newMetadata
         except CustomException:
             raise
@@ -548,7 +566,7 @@ class DataLoadService:
             claims = self._acceptTableName(connection.projectId, sanitizedTable)
             self._writeTable(
                 connection.projectId, sanitizedTable, claims,
-                lambda path: pd.read_sql(f"SELECT * FROM {connection.table}", engine).to_parquet(path, compression="snappy"),
+                lambda path: writeStoredTableToPath(pd.read_sql(f"SELECT * FROM {connection.table}", engine), connection.projectId, sanitizedTable, path),
             )
             updateProjectModifiedAt(connection.projectId)
             newMetadata = {}
@@ -557,7 +575,7 @@ class DataLoadService:
                     projectId=connection.projectId, tableNames=[sanitizedTable], userId=userId
                 )
             except Exception as metaErr:
-                logger.error(f"Metadata generation failed for PostgreSQL load: {metaErr}")
+                self._logMetadataFailure("PostgreSQL", [sanitizedTable], metaErr)
             return newMetadata
         except CustomException:
             raise
@@ -589,7 +607,7 @@ class DataLoadService:
                 records = list(mongoClient[connection.db][connection.collection].find())
                 for record in records:
                     record.pop("_id", None)
-                pd.DataFrame(records).to_parquet(path, compression="snappy")
+                writeStoredTableToPath(pd.DataFrame(records), connection.projectId, sanitizedCollection, path)
 
             claims = self._acceptTableName(connection.projectId, sanitizedCollection)
             self._writeTable(connection.projectId, sanitizedCollection, claims, writeCollection)
@@ -600,7 +618,7 @@ class DataLoadService:
                     projectId=connection.projectId, tableNames=[sanitizedCollection], userId=userId
                 )
             except Exception as metaErr:
-                logger.error(f"Metadata generation failed for MongoDB load: {metaErr}")
+                self._logMetadataFailure("MongoDB", [sanitizedCollection], metaErr)
             return newMetadata
         except CustomException:
             raise

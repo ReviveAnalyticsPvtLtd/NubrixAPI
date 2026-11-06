@@ -1042,7 +1042,7 @@ def _load(project, tableName, beforeWrite=None, kind="mongo", parquetError=None,
     with (
         mock.patch.object(managementService, "client", project),
         mock.patch.object(managementService, "generateMetadataForTables", side_effect=_register(project)),
-        mock.patch("pandas.DataFrame.to_parquet", side_effect=parquetError),
+        mock.patch("api.services.dataLoadService.writeStoredTableToPath", side_effect=parquetError),
     ):
         _loadVia(kind, service, tableName, pdfTables)
 

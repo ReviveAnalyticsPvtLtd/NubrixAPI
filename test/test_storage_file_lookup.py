@@ -9,6 +9,7 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest import mock
 
+import pandas as pd
 import pytest
 
 from api.models import CreateDataBlend, CreatePage, GenerateChartsInParallel, GetFieldsFromSources, PanelChartDetails, SaveQuery
@@ -19,7 +20,7 @@ from api.services.reportingService import ReportingService
 from api.services.transformationService import TransformationService
 from api.services.utilityService import UtilityService
 from nubrix.components.insightContextBuilder import InsightContextBuilder
-from test.storageListingFixtures import FILE_URL, PROJECT_ID, fakeClient, largeFolder
+from test.storageListingFixtures import FILE_URL, PROJECT_ID, FakeBucket, fakeClient, largeFolder
 from utils.exceptionHandler import CustomException
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
@@ -134,7 +135,7 @@ def test_shapes_update_metadata_stored_past_the_first_names():
 def test_refresh_pulls_connections_stored_past_the_first_names():
     bucket = largeFolder({"connections.json": {"first": {"table": "orders"}}})
     service = _service(DashboardService, bucket)
-    service._pullData = mock.Mock(return_value=SimpleNamespace(to_parquet=lambda *_args, **_kwargs: None, index=[1], columns=[1]))
+    service._pullData = mock.Mock(return_value=pd.DataFrame({"id": [1]}))
     service._updateMetadataShapes = mock.Mock()
 
     with _storedDashboard(bucket):
@@ -285,3 +286,43 @@ def test_no_project_folder_listing_stops_at_the_default_page():
                         uncapped.append(f"{path.relative_to(REPO_ROOT)}:{node.lineno}")
 
     assert uncapped == []
+
+
+class _KeepingBucket(FakeBucket):
+    """Keeps the bytes of every table upload, because the temporary file is gone once the upload returns."""
+
+    def upload(self, path, file, file_options=None):
+        if path.endswith(".parquet"):
+            with open(file, "rb") as stored:
+                file = stored.read()
+        self.uploads[path.rsplit("/", 1)[1]] = file
+
+
+def _refresh(frame):
+    bucket = _KeepingBucket({"connections.json": {"first": {"table": "orders"}}})
+    service = _service(DashboardService, bucket)
+    service._pullData = mock.Mock(return_value=frame)
+    service._updateMetadataShapes = mock.Mock()
+    with _storedDashboard(bucket):
+        service.pullDataInParallel(PROJECT_ID)
+    return bucket
+
+
+def test_refresh_stores_a_marked_table():
+    from utils.storedTables import markerIsValid, readFooter
+
+    with mock.patch.dict(os.environ, {"SUPABASE_KEY": "unit-test-key"}):
+        bucket = _refresh(pd.DataFrame({"id": [1, 2]}))
+        metadata = readFooter(bucket.uploads["orders.parquet"])
+        assert metadata is not None
+        assert markerIsValid(metadata, PROJECT_ID, "orders")
+
+
+def test_refresh_refuses_a_table_over_the_size_limit_with_413():
+    big = pd.DataFrame({"id": range(400_000)})
+
+    with mock.patch.dict(os.environ, {"STORED_TABLE_MAX_DECODED_BYTES": str(1024 * 1024)}), pytest.raises(CustomException) as caught:
+        _refresh(big)
+
+    assert (caught.value.statusCode, caught.value.errorCode) == (413, "TABLE_TOO_LARGE")
+    assert caught.value.uiMessage == "This table is too large to load (over 1 MiB)."

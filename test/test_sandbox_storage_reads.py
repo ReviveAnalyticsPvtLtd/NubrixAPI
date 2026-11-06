@@ -470,7 +470,7 @@ def test_apiReadsAParquetFileFromRedis(monkeypatch):
     pl.DataFrame({"amount": [7, 8]}).write_parquet(buffer)
     monkeypatch.setattr(initMethods, "_read_redis_bytes", lambda _key: buffer.getvalue())
 
-    assert initMethods._fetch_data_from_redis("key").num_rows == 2
+    assert initMethods._fetch_data_from_redis(f"{PROJECT}::sales", PROJECT, "sales").num_rows == 2
 
 
 def test_applyLeavesTheTableOutOfRedis(monkeypatch):

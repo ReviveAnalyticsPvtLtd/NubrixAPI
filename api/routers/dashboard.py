@@ -156,7 +156,7 @@ async def getAllColumns(projectId: str, user: UserContext = Depends(requireProdu
     """
     await asyncio.to_thread(requireProjectOwner, projectId, user)
     try:
-        results = dashboardService.getAllColumns(projectId = projectId)
+        results = await asyncio.to_thread(dashboardService.getAllColumns, projectId = projectId)
         return ORJSONResponse(status_code = 200, content = {"status": "SUCCESS", "details": results})
     except CustomException as e:
         raiseHttpException(e)

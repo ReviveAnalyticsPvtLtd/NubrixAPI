@@ -26,7 +26,7 @@ run from a live one.
         work/         this run's own: cwd, HOME, TMPDIR and the result file
 """
 
-__all__ = ["runSandbox", "sweepOrphanedRuns", "serveTables", "readResult", "enterSandbox", "SandboxResult"]
+__all__ = ["runSandbox", "runTrustedSandbox", "sweepOrphanedRuns", "serveTables", "readResult", "ResultTooLargeError", "enterSandbox", "SandboxResult"]
 
 
 import base64
@@ -45,7 +45,8 @@ import subprocess
 import sys
 import tempfile
 import threading
-from typing import IO, NamedTuple
+from dataclasses import dataclass
+from typing import IO, Callable, NamedTuple
 
 from utils.initMethods import spool_table, use_table_source
 from utils.logger import logger
@@ -88,6 +89,33 @@ _INHERITED_ENV = (
 )
 # Passed through only when the thread cap is off; with a cap they are set to it.
 _THREAD_TUNING_ENV = ("POLARS_MAX_THREADS", "OPENBLAS_NUM_THREADS")
+
+
+# The launchers runTrustedSandbox will start, by name, each with its script relative to the repo root. A name
+# not in this table is refused, so no caller can point a run at another script.
+_TRUSTED_LAUNCHERS: dict[str, str] = {
+    "normalise_launcher.py": "utils/normalise_launcher.py",
+    "table_reader_launcher.py": "utils/table_reader_launcher.py",
+}
+_TRUSTED_RESULT_NAME = "result"
+_TRUSTED_INPUT_NAME = "input"
+_INPUT_FILE_MODE = 0o640
+
+
+@dataclass(frozen=True)
+class _RunKind:
+    """What differs between a run of generated code and a trusted run: where the child writes and what it is given."""
+
+    resultName: str = "result.parquet"
+    resultCap: int | None = None
+    previewName: str | None = "preview.json"
+    servesTables: bool = True
+    script: str | None = None
+    payload: dict | None = None
+
+
+class ResultTooLargeError(ValueError):
+    """A file the child wrote is over the cap given to `readResult`. Any other ValueError from it means the file is unsafe."""
 
 
 class SandboxResult(NamedTuple):
@@ -292,7 +320,18 @@ def serveTables(projectId: str, requests, replies, tablesFolder: str, runEnded: 
             return
 
 
-def _startChild(launcherName: str, runUid: int | None, workFolder: str, childEnd: socket.socket, stdout: IO[bytes], stderr: IO[bytes], limits: RunLimits) -> subprocess.Popen:
+def _refuseTables(projectId: str, requests, replies, tablesFolder: str, runEnded: threading.Event) -> None:
+    """Answer every table request with a refusal: a trusted run is handed its bytes and reads nothing else."""
+    while not runEnded.is_set():
+        try:
+            if not requests.readline(_MAX_REQUEST_BYTES):
+                return
+            replies.write(json.dumps({"error": "This run has no table access."}).encode("utf-8") + b"\n")
+        except OSError:
+            return
+
+
+def _startChild(launcherName: str, runUid: int | None, workFolder: str, childEnd: socket.socket, stdout: IO[bytes], stderr: IO[bytes], limits: RunLimits, script: str | None = None) -> subprocess.Popen:
     """Start the launcher. Its output goes to files, so nothing a process holds open can block the parent."""
     env = {k: os.environ[k] for k in _INHERITED_ENV if k in os.environ}
     env["PYTHONPATH"] = os.pathsep.join(filter(None, (_ROOT, env.get("PYTHONPATH"))))
@@ -308,7 +347,7 @@ def _startChild(launcherName: str, runUid: int | None, workFolder: str, childEnd
     if os.name == "posix":
         options["pass_fds"] = (childEnd.fileno(),)
     return subprocess.Popen(
-        [sys.executable, "-s", os.path.join(_ROOT, "utils", launcherName)],
+        [sys.executable, "-s", script or os.path.join(_ROOT, "utils", launcherName)],
         stdin=subprocess.PIPE,
         stdout=stdout,
         stderr=stderr,
@@ -342,7 +381,7 @@ def readResult(path: str, runUid: int | None, maxBytes: int | None = None) -> by
         if not stat.S_ISREG(info.st_mode) or (runUid is not None and info.st_uid != runUid):
             raise ValueError("Sandbox result is not a regular file.")
         if info.st_size > maxBytes:
-            raise ValueError(f"Sandbox result is too large: {info.st_size} bytes.")
+            raise ResultTooLargeError(f"Sandbox result is too large: {info.st_size} bytes.")
         return result.read(maxBytes)
 
 
@@ -408,10 +447,10 @@ def _stopReason(returncode: int, watchdogReason: str | None, timeoutNote: str, l
     return None
 
 
-def _runChild(launcherName: str, projectId: str, code: str, timeoutSeconds: int | None, withResult: bool, runUid: int | None, runFolder: str, tablesFolder: str, workFolder: str, limits: RunLimits) -> SandboxResult:
-    """Start the launcher, serve its table reads and collect what it produced."""
-    resultPath = os.path.join(workFolder, "result.parquet")
-    previewPath = os.path.join(workFolder, "preview.json")
+def _runChild(launcherName: str, projectId: str, code: str, timeoutSeconds: int | None, withResult: bool, runUid: int | None, runFolder: str, tablesFolder: str, workFolder: str, limits: RunLimits, kind: _RunKind = _RunKind()) -> SandboxResult:
+    """Start the launcher, serve its table reads (a trusted run is refused them) and collect what it produced."""
+    resultPath = os.path.join(workFolder, kind.resultName)
+    previewPath = os.path.join(workFolder, kind.previewName) if kind.previewName else None
     parentEnd, childEnd = socket.socketpair()
     runEnded = threading.Event()
     with (
@@ -422,16 +461,17 @@ def _runChild(launcherName: str, projectId: str, code: str, timeoutSeconds: int 
         tempfile.TemporaryFile(dir=runFolder) as stderr,
     ):
         with childEnd:
-            proc = _startChild(launcherName, runUid, workFolder, childEnd, stdout, stderr, limits)
+            proc = _startChild(launcherName, runUid, workFolder, childEnd, stdout, stderr, limits, kind.script)
             _giveRunPriority(proc, runUid, limits)
             payload = json.dumps({
                 "projectId": projectId,
                 "code": code,
                 "result_path": resultPath,
-                "preview_path": previewPath,
+                **({"preview_path": previewPath} if previewPath else {}),
+                **(kind.payload or {}),
                 "channel": {**_channelFor(proc, childEnd), "tablesFolder": tablesFolder, "parentPid": os.getpid(), "limits": limits.toChannel()},
             })
-        server = threading.Thread(target=serveTables, args=(projectId, requests, replies, tablesFolder, runEnded), daemon=True)
+        server = threading.Thread(target=serveTables if kind.servesTables else _refuseTables, args=(projectId, requests, replies, tablesFolder, runEnded), daemon=True)
         server.start()
         watchdog = None
         try:
@@ -447,18 +487,15 @@ def _runChild(launcherName: str, projectId: str, code: str, timeoutSeconds: int 
             server.join()
         resultBytes = previewBytes = None
         if withResult and proc.returncode == 0:
-            resultBytes = readResult(resultPath, runUid)
-            previewBytes = readResult(previewPath, runUid, _MAX_PREVIEW_BYTES)
+            resultBytes = readResult(resultPath, runUid, kind.resultCap)
+            previewBytes = readResult(previewPath, runUid, _MAX_PREVIEW_BYTES) if previewPath else None
         stopped = _stopReason(proc.returncode, watchdog.reason if watchdog else None, timeoutNote, limits)
         stopNote = f"\n{stopped}\n" if stopped and stopped not in timeoutNote else ""
         return SandboxResult(_readOutput(stdout), _readOutput(stderr) + timeoutNote + stopNote, proc.returncode, resultBytes, previewBytes, stopped)
 
 
-def runSandbox(launcherName: str, projectId: str, code: str, timeoutSeconds: int | None, withResult: bool = False) -> SandboxResult:
-    """Run generated code in a launcher subprocess, serving its table reads from this process.
-
-    Only a launcher that writes a result sets `withResult`: the file is the child's, so it isn't read otherwise.
-    """
+def _inFreshRun(prepare: Callable[[int | None, str], None], run: Callable[[int | None, str, str, str, RunLimits], SandboxResult]) -> SandboxResult:
+    """Take a slot and a uid, give the run its folders and call `run`. `prepare` runs once the folders exist, before any child."""
     limits = currentRunLimits()
     # The slot comes first, so a run that waits holds no uid and no folder.
     slot = acquireRunSlot(os.environ.get("SANDBOX_RUN_ROOT"), limits.maxConcurrentRuns, limits.slotWaitSeconds)
@@ -473,7 +510,8 @@ def runSandbox(launcherName: str, projectId: str, code: str, timeoutSeconds: int
             tablesFolder, workFolder = _prepareFolders(runUid, runFolder)
             uidIsClear = False
             try:
-                return _runChild(launcherName, projectId, code, timeoutSeconds, withResult, runUid, runFolder, tablesFolder, workFolder, limits)
+                prepare(runUid, tablesFolder)
+                return run(runUid, runFolder, tablesFolder, workFolder, limits)
             finally:
                 uidIsClear = _clearUid(runUid, runFolder)
         finally:
@@ -482,6 +520,68 @@ def runSandbox(launcherName: str, projectId: str, code: str, timeoutSeconds: int
                 os.close(lock)
     finally:
         releaseRunSlot(slot)
+
+
+def runSandbox(launcherName: str, projectId: str, code: str, timeoutSeconds: int | None, withResult: bool = False) -> SandboxResult:
+    """Run generated code in a launcher subprocess, serving its table reads from this process.
+
+    Only a launcher that writes a result sets `withResult`: the file is the child's, so it isn't read otherwise.
+    """
+    return _inFreshRun(
+        lambda runUid, tablesFolder: None,
+        lambda runUid, runFolder, tablesFolder, workFolder, limits: _runChild(launcherName, projectId, code, timeoutSeconds, withResult, runUid, runFolder, tablesFolder, workFolder, limits),
+    )
+
+
+def _writeInput(tablesFolder: str, inputBytes: bytes, runUid: int | None) -> str:
+    """Write the run's input where it can read it and nothing else can change it. Returns its path.
+
+    The folder is root's and closed to the run, so the file is created new (never through a link), owned by root
+    with the run's group, and only then opened to that group: it is never readable by anyone else.
+    """
+    path = os.path.join(tablesFolder, _TRUSTED_INPUT_NAME)
+    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_BINARY", 0)
+    fd = os.open(path, flags, 0o600)
+    with os.fdopen(fd, "wb") as target:
+        if runUid is not None:
+            os.fchown(fd, os.geteuid(), runUid)
+            os.fchmod(fd, _INPUT_FILE_MODE)
+        target.write(inputBytes)
+    return path
+
+
+def runTrustedSandbox(launcherName: str, projectId: str, inputBytes: bytes, request: dict, timeoutSeconds: int, maxResultBytes: int, limits: RunLimits | None = None) -> SandboxResult:
+    """Run one of our own launchers on bytes this process hands it, under every limit a code run has.
+
+    The run is given no table access and no secret: `request` is the only thing besides the input that reaches it,
+    so it must hold no credential. The launcher must call `enterSandbox` before it reads the input. Its answer is
+    the file `work/result`, read through `readResult` up to `maxResultBytes`; a larger one raises ResultTooLargeError.
+    The slot cap and the slot wait come from the environment (`currentRunLimits()`), not from `limits`.
+    `request` must be a JSON-serialisable dict and `maxResultBytes` positive; both are checked before a slot is taken.
+    Raises SandboxBusyError when no slot is free, as `runSandbox` does.
+    """
+    if not isinstance(request, dict):
+        raise TypeError("A trusted run's request must be a dict.")
+    json.dumps(request)  # Raises TypeError or ValueError for anything the child could not be sent.
+    if maxResultBytes <= 0:
+        raise ValueError("A trusted run needs a positive result cap.")
+    script = _TRUSTED_LAUNCHERS.get(launcherName)
+    if script is None:
+        raise ValueError(f"{launcherName!r} is not a trusted launcher.")
+    inputPath: list[str] = []
+
+    def runIt(runUid, runFolder, tablesFolder, workFolder, runLimits):
+        kind = _RunKind(
+            resultName=_TRUSTED_RESULT_NAME,
+            resultCap=maxResultBytes,
+            previewName=None,
+            servesTables=False,
+            script=os.path.join(_ROOT, *script.split("/")),
+            payload={"input_path": inputPath[0], "request": request},
+        )
+        return _runChild(launcherName, projectId, "", timeoutSeconds, True, runUid, runFolder, tablesFolder, workFolder, limits or runLimits, kind)
+
+    return _inFreshRun(lambda runUid, tablesFolder: inputPath.append(_writeInput(tablesFolder, inputBytes, runUid)), runIt)
 
 
 def _withinHardLimit(wanted: int, hard: int) -> int:

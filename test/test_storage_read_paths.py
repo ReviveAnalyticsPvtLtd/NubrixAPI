@@ -29,7 +29,7 @@ from api.services import transformationService as transformationModule
 from api.services import utilityService as utilityModule
 from nubrix.components.insightContextBuilder import InsightContextBuilder
 from nubrix.components import reportGenerator as reportGeneratorModule
-from test.privateStorageFixtures import SERVICE_KEY, FakePrivateStorage
+from test.privateStorageFixtures import SERVICE_KEY, FakePrivateStorage, markedParquet
 from utils import initMethods
 from utils.exceptionHandler import CustomException
 
@@ -528,7 +528,7 @@ def test_reportGeneratorProfilesAStoredTable(storage, monkeypatch):
 @pytest.fixture
 def coldDataCache(monkeypatch):
     initMethods.invalidate_data_cache()
-    monkeypatch.setattr(initMethods, "_fetch_data_from_redis", lambda _key: None)
+    monkeypatch.setattr(initMethods, "_fetch_data_from_redis", lambda *_args: None)
     monkeypatch.setattr(initMethods, "_store_to_redis", lambda *_args: None)
     yield
     initMethods.invalidate_data_cache()
@@ -584,7 +584,7 @@ def test_viewTableReadsNoMoreThanItNeeds(storage):
     frame = {f"c{i}": [str(j) for j in range(2000)] for i in range(3)}
     buffer = io.BytesIO()
     pl.DataFrame(frame).write_parquet(buffer, row_group_size=200)
-    storage.put(PROJECT, "sales.parquet", buffer.getvalue())
+    storage.put(PROJECT, "sales.parquet", markedParquet(buffer.getvalue(), PROJECT, "sales"))
 
     _viewTable(page=1, pageSize=10)
 
