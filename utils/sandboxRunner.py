@@ -50,6 +50,10 @@ from typing import IO, NamedTuple
 from utils.initMethods import spool_table, use_table_source
 from utils.logger import logger
 from utils.sandbox_reaper import _SHARED_TEMP_FOLDERS
+from utils.sandboxLimits import RunLimits, currentRunLimits
+from utils.sandboxSeccomp import installFilter
+from utils.sandboxSlots import SLOTS_FOLDER, acquireRunSlot, releaseRunSlot
+from utils.sandboxWatchdog import RunWatchdog
 
 # Below 65536, the range a user namespace normally maps. The same number of uids above
 # the range are spare: a reaper's real uid is its run's uid plus _RUN_UID_COUNT. No run
@@ -66,21 +70,24 @@ _MAX_OUTPUT_BYTES = 64 * 1024 * 1024
 _MAX_RESULT_BYTES = 512 * 1024 * 1024
 _MAX_PREVIEW_BYTES = 4 * 1024 * 1024
 _MAX_SPOOL_BYTES = 8 * 1024 * 1024 * 1024
-# Limits every process of a run shares. Threads count, so leave room for Polars, Arrow, BLAS and OpenMP.
-_MAX_RUN_PROCESSES = 1024
 _MAX_RUN_OPEN_FILES = 4096
-_MAX_CHILD_FILE_BYTES = 4 * 1024 * 1024 * 1024
+_CPU_HARD_LIMIT_GRACE_SECONDS = 10
 _CLEAR_UID_TIMEOUT_SECONDS = 30
 _MAX_REAPER_ERROR_BYTES = 1024
 _PR_SET_PDEATHSIG = 1
+# Linux numbers, because Windows has neither name.
+_SIGXCPU = 24
+_SIGKILL = 9
 _PR_SET_NO_NEW_PRIVS = 38
+_THREAD_VARIABLES = ("POLARS_MAX_THREADS", "OMP_NUM_THREADS", "OPENBLAS_NUM_THREADS", "MKL_NUM_THREADS", "NUMEXPR_MAX_THREADS")
 _ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 # Generated code can read its whole environment, so never add a secret here.
 _INHERITED_ENV = (
     "PATH", "PYTHONPATH", "LANG", "LC_ALL", "TZ", "SYSTEMROOT",
-    "POLARS_MAX_THREADS", "OPENBLAS_NUM_THREADS",
     "DF_CACHE_MAX_BYTES", "DF_CACHE_MAX_ENTRIES",
 )
+# Passed through only when the thread cap is off; with a cap they are set to it.
+_THREAD_TUNING_ENV = ("POLARS_MAX_THREADS", "OPENBLAS_NUM_THREADS")
 
 
 class SandboxResult(NamedTuple):
@@ -89,6 +96,7 @@ class SandboxResult(NamedTuple):
     returncode: int
     resultBytes: bytes | None
     previewBytes: bytes | None = None
+    stopped: str | None = None
 
 
 def _lockRun(runFolder: str) -> int | None:
@@ -219,6 +227,8 @@ def _removeRun(runFolder: str, uidIsClear: bool) -> None:
 
 def _sweepRun(runRoot: str, name: str) -> None:
     """Clear one folder of the run root, unless a live worker holds it."""
+    if name == SLOTS_FOLDER:  # The run slots, not a run.
+        return
     runUid = name.removeprefix("sandbox-")
     if not runUid.isdigit() or not _FIRST_RUN_UID <= int(runUid) < _FIRST_RUN_UID + _RUN_UID_COUNT:
         logger.warning(f"Sandbox sweep left {name!r}, which is not a run folder.")
@@ -282,10 +292,15 @@ def serveTables(projectId: str, requests, replies, tablesFolder: str, runEnded: 
             return
 
 
-def _startChild(launcherName: str, runUid: int | None, workFolder: str, childEnd: socket.socket, stdout: IO[bytes], stderr: IO[bytes]) -> subprocess.Popen:
+def _startChild(launcherName: str, runUid: int | None, workFolder: str, childEnd: socket.socket, stdout: IO[bytes], stderr: IO[bytes], limits: RunLimits) -> subprocess.Popen:
     """Start the launcher. Its output goes to files, so nothing a process holds open can block the parent."""
     env = {k: os.environ[k] for k in _INHERITED_ENV if k in os.environ}
     env["PYTHONPATH"] = os.pathsep.join(filter(None, (_ROOT, env.get("PYTHONPATH"))))
+    if limits.threads > 0:
+        # Each library sizes its pool when it loads, so the cap has to be in the environment before the child starts.
+        env.update(dict.fromkeys(_THREAD_VARIABLES, str(limits.threads)))
+    else:
+        env.update({k: os.environ[k] for k in _THREAD_TUNING_ENV if k in os.environ})
     env.update(HOME=workFolder, TMPDIR=workFolder, USER="sandbox", LOGNAME="sandbox")
     options: dict = {}
     if runUid is not None:
@@ -354,7 +369,46 @@ def _readOutput(output: IO[bytes]) -> str:
     return printed.decode("utf-8", "replace")
 
 
-def _runChild(launcherName: str, projectId: str, code: str, timeoutSeconds: int | None, withResult: bool, runUid: int | None, runFolder: str, tablesFolder: str, workFolder: str) -> SandboxResult:
+def _watchRun(proc: subprocess.Popen, runUid: int | None, workFolder: str, limits: RunLimits) -> RunWatchdog | None:
+    """Start the watchdog for a run uid. A development run under the parent's own uid has none, nor has a run whose watched limits are all off."""
+    if runUid is None or not (limits.maxRunMemory or limits.oomScoreAdj or limits.maxDiskBytes or limits.maxFiles):
+        return None
+    watchdog = RunWatchdog(runUid, workFolder, limits, lambda reason: proc.kill())
+    watchdog.start()
+    return watchdog
+
+
+def _writeOomAdjustment(pid: int, value: int) -> None:
+    with open(f"/proc/{pid}/oom_score_adj", "w") as target:
+        target.write(str(value))
+
+
+def _giveRunPriority(proc: subprocess.Popen, runUid: int | None, limits: RunLimits) -> None:
+    """Set the run's OOM adjustment from the parent, before any generated code exists, so the watchdog can judge every process. A failed write ends the run."""
+    if runUid is None or not limits.oomScoreAdj:
+        return
+    try:
+        _writeOomAdjustment(proc.pid, limits.oomScoreAdj)
+    except OSError:
+        proc.kill()
+        proc.wait()
+        raise
+
+
+def _stopReason(returncode: int, watchdogReason: str | None, timeoutNote: str, limits: RunLimits) -> str | None:
+    """Why a limit ended the run, if one did. The watchdog's reason counts only if the run did not end well anyway."""
+    if watchdogReason and returncode != 0:
+        return watchdogReason
+    if timeoutNote:
+        return timeoutNote.strip()
+    if returncode == -_SIGXCPU:
+        return f"The run was stopped: it used more than {limits.maxCpuSeconds} CPU-seconds."
+    if returncode == -_SIGKILL:
+        return "The run was stopped: the server ran out of memory."
+    return None
+
+
+def _runChild(launcherName: str, projectId: str, code: str, timeoutSeconds: int | None, withResult: bool, runUid: int | None, runFolder: str, tablesFolder: str, workFolder: str, limits: RunLimits) -> SandboxResult:
     """Start the launcher, serve its table reads and collect what it produced."""
     resultPath = os.path.join(workFolder, "result.parquet")
     previewPath = os.path.join(workFolder, "preview.json")
@@ -368,19 +422,24 @@ def _runChild(launcherName: str, projectId: str, code: str, timeoutSeconds: int 
         tempfile.TemporaryFile(dir=runFolder) as stderr,
     ):
         with childEnd:
-            proc = _startChild(launcherName, runUid, workFolder, childEnd, stdout, stderr)
+            proc = _startChild(launcherName, runUid, workFolder, childEnd, stdout, stderr, limits)
+            _giveRunPriority(proc, runUid, limits)
             payload = json.dumps({
                 "projectId": projectId,
                 "code": code,
                 "result_path": resultPath,
                 "preview_path": previewPath,
-                "channel": {**_channelFor(proc, childEnd), "tablesFolder": tablesFolder, "parentPid": os.getpid()},
+                "channel": {**_channelFor(proc, childEnd), "tablesFolder": tablesFolder, "parentPid": os.getpid(), "limits": limits.toChannel()},
             })
         server = threading.Thread(target=serveTables, args=(projectId, requests, replies, tablesFolder, runEnded), daemon=True)
         server.start()
+        watchdog = None
         try:
+            watchdog = _watchRun(proc, runUid, workFolder, limits)
             timeoutNote = _waitForChild(proc, payload, timeoutSeconds)
         finally:
+            if watchdog is not None:
+                watchdog.stop()
             # Out of the child's reach: nothing it wrote to the socket can stop this or block it.
             runEnded.set()
             with contextlib.suppress(OSError):
@@ -390,7 +449,9 @@ def _runChild(launcherName: str, projectId: str, code: str, timeoutSeconds: int 
         if withResult and proc.returncode == 0:
             resultBytes = readResult(resultPath, runUid)
             previewBytes = readResult(previewPath, runUid, _MAX_PREVIEW_BYTES)
-        return SandboxResult(_readOutput(stdout), _readOutput(stderr) + timeoutNote, proc.returncode, resultBytes, previewBytes)
+        stopped = _stopReason(proc.returncode, watchdog.reason if watchdog else None, timeoutNote, limits)
+        stopNote = f"\n{stopped}\n" if stopped and stopped not in timeoutNote else ""
+        return SandboxResult(_readOutput(stdout), _readOutput(stderr) + timeoutNote + stopNote, proc.returncode, resultBytes, previewBytes, stopped)
 
 
 def runSandbox(launcherName: str, projectId: str, code: str, timeoutSeconds: int | None, withResult: bool = False) -> SandboxResult:
@@ -398,23 +459,29 @@ def runSandbox(launcherName: str, projectId: str, code: str, timeoutSeconds: int
 
     Only a launcher that writes a result sets `withResult`: the file is the child's, so it isn't read otherwise.
     """
-    runUid, runFolder, lock = _claimRun()
-    uidIsClear = False
+    limits = currentRunLimits()
+    # The slot comes first, so a run that waits holds no uid and no folder.
+    slot = acquireRunSlot(os.environ.get("SANDBOX_RUN_ROOT"), limits.maxConcurrentRuns, limits.slotWaitSeconds)
     try:
-        # A worker that died mid-run can leave a process holding this uid, so nothing is handed over until it's gone.
-        uidIsClear = _clearUid(runUid, runFolder)
-        if not uidIsClear:
-            raise RuntimeError("Could not clear the sandbox run's uid.")
-        tablesFolder, workFolder = _prepareFolders(runUid, runFolder)
+        runUid, runFolder, lock = _claimRun()
         uidIsClear = False
         try:
-            return _runChild(launcherName, projectId, code, timeoutSeconds, withResult, runUid, runFolder, tablesFolder, workFolder)
-        finally:
+            # A worker that died mid-run can leave a process holding this uid, so nothing is handed over until it's gone.
             uidIsClear = _clearUid(runUid, runFolder)
+            if not uidIsClear:
+                raise RuntimeError("Could not clear the sandbox run's uid.")
+            tablesFolder, workFolder = _prepareFolders(runUid, runFolder)
+            uidIsClear = False
+            try:
+                return _runChild(launcherName, projectId, code, timeoutSeconds, withResult, runUid, runFolder, tablesFolder, workFolder, limits)
+            finally:
+                uidIsClear = _clearUid(runUid, runFolder)
+        finally:
+            _removeRun(runFolder, uidIsClear)
+            if lock is not None:
+                os.close(lock)
     finally:
-        _removeRun(runFolder, uidIsClear)
-        if lock is not None:
-            os.close(lock)
+        releaseRunSlot(slot)
 
 
 def _withinHardLimit(wanted: int, hard: int) -> int:
@@ -437,14 +504,34 @@ def _lockDownChild(channel: dict) -> None:
             raise OSError(ctypes.get_errno(), "prctl failed")
     if os.getppid() != channel["parentPid"]:  # The worker died before the signal was set.
         sys.exit(1)
-    for limit, value in (
-        (resource.RLIMIT_NPROC, _MAX_RUN_PROCESSES),
-        (resource.RLIMIT_FSIZE, _MAX_CHILD_FILE_BYTES),
-        (resource.RLIMIT_CORE, 0),
-        (resource.RLIMIT_NOFILE, _MAX_RUN_OPEN_FILES),
-    ):
-        value = _withinHardLimit(value, resource.getrlimit(limit)[1])
-        resource.setrlimit(limit, (value, value))
+    limits = RunLimits.fromChannel(channel["limits"])
+    if limits.oomScoreAdj:
+        # Make this run the OOM killer's first pick. A failed write must stop the run, as a failed prctl does.
+        fd = os.open("/proc/self/oom_score_adj", os.O_WRONLY)
+        try:
+            os.write(fd, str(limits.oomScoreAdj).encode("ascii"))
+        except OSError as error:
+            raise OSError(error.errno, "could not set the memory priority") from error
+        finally:
+            os.close(fd)
+    # Limits every process of a run shares. Threads count towards the process limit.
+    wanted = [
+        (resource.RLIMIT_NPROC, limits.maxProcesses, limits.maxProcesses),
+        (resource.RLIMIT_FSIZE, limits.maxFileBytes, limits.maxFileBytes),
+        (resource.RLIMIT_CORE, 0, 0),
+        (resource.RLIMIT_NOFILE, _MAX_RUN_OPEN_FILES, _MAX_RUN_OPEN_FILES),
+        (resource.RLIMIT_DATA, limits.maxProcessMemory, limits.maxProcessMemory),
+        (resource.RLIMIT_CPU, limits.maxCpuSeconds, limits.maxCpuSeconds + _CPU_HARD_LIMIT_GRACE_SECONDS),
+    ]
+    for limit, soft, hard in wanted:
+        # Zero turns a limit off, except for core files, which are always off.
+        if limit != resource.RLIMIT_CORE and soft == 0:
+            continue
+        ceiling = resource.getrlimit(limit)[1]
+        resource.setrlimit(limit, (_withinHardLimit(soft, ceiling), _withinHardLimit(hard, ceiling)))
+    if limits.blockNetwork:
+        # Last step: refuses non-local sockets and uncounted shared memory. A failure stops the run.
+        installFilter()
 
 
 def _connectTableChannel(channel: dict) -> None:
@@ -475,7 +562,17 @@ def _connectTableChannel(channel: dict) -> None:
     use_table_source(readTable)
 
 
+def _capArrowThreads(limits: RunLimits) -> None:
+    """Child side: Arrow's pools are sized from the machine, not the environment, so cap them here."""
+    if limits.threads > 0:
+        import pyarrow as pa
+
+        pa.set_cpu_count(limits.threads)
+        pa.set_io_thread_count(limits.threads)
+
+
 def enterSandbox(channel: dict) -> None:
     """Child side: every launcher calls this once, before it runs generated code."""
     _lockDownChild(channel)
+    _capArrowThreads(RunLimits.fromChannel(channel["limits"]))
     _connectTableChannel(channel)

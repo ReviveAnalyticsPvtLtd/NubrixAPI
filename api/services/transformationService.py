@@ -16,6 +16,7 @@ from api.models import TransformationAgentResponse
 from api.commons import client, tableFileState, updateProjectModifiedAt
 from utils.projectStorage import authHeaders, objectUrl, readJson
 from utils.logger import logger
+from utils.sandboxSlots import BUSY_MESSAGE, isBusy
 from typing import TYPE_CHECKING
 import redis
 import httpx
@@ -638,7 +639,7 @@ class TransformationService:
             yield self._sse("done", self._buildMessagePayload(projectId, transformationId, assistantMessageId, userMessageId))
         except Exception as e:
             logger.error(f"Transformation stream failed after user message {userMessageId}: {e}")
-            fallback = "I could not generate a transformation because the request failed. Please try again."
+            fallback = BUSY_MESSAGE if isBusy(e) else "I could not generate a transformation because the request failed. Please try again."
             assistantMessageId = str(uuid.uuid4())
             try:
                 messages = self._get_messages_from_db(projectId=projectId, transformationId=transformationId)

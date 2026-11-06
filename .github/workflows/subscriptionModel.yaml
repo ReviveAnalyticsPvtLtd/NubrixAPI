@@ -40,7 +40,7 @@ jobs:
         run: |
           docker run --rm nubrix-sandbox bash -c '
             set -o pipefail
-            uv run --group dev pytest test/test_sandbox_storage_reads.py -q -rs | tee /tmp/sandbox-tests.txt
+            uv run --group dev pytest test/test_sandbox_storage_reads.py test/test_sandbox_run_limits.py test/test_sandbox_seccomp.py -q -rs | tee /tmp/sandbox-tests.txt
             status=$?
             if grep -q "only a root parent" /tmp/sandbox-tests.txt; then echo "Separate-uid tests were skipped"; exit 1; fi
             exit $status
