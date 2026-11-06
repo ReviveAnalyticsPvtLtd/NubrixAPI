@@ -390,7 +390,8 @@ def _readInChild(projectId: str, tableName: str, data: bytes, request: dict) -> 
 
     limit = maxDecodedBytes()
     isInfo = request["op"] == "info"
-    cap = MAX_INFO_ANSWER_BYTES if isInfo else limit or sandboxRunner._MAX_RESULT_BYTES
+    # With the decoded-size limit off, the answer is bounded by what the child can hold, never below the default limit.
+    cap = MAX_INFO_ANSWER_BYTES if isInfo else limit or max(readerMemoryBytes(), _DEFAULT_MAX_DECODED_BYTES)
     limits = currentRunLimits(maxProcessMemory=readerMemoryBytes())
     what = f"Reading a table ({request['op']})"
     try:

@@ -627,14 +627,15 @@ def test_normaliserAndReaderUseTheirTimeoutsLimitsAndCaps(monkeypatch):
     for (name, timeout, cap, limits), expectedCap in zip(readers, (2147483648, 2147483648, 4 * 1024 * 1024)):
         assert (name, timeout, cap) == ("table_reader_launcher.py", 60, expectedCap)
         assert limits == sandboxRunner.currentRunLimits(maxProcessMemory=READER_MEMORY)
+    # With the decoded-size limit off, a table answer is never capped below what it was with the limit on.
     monkeypatch.setenv("STORED_TABLE_MAX_DECODED_BYTES", "0")
-    for call in (
-        lambda: storedTables.readUntrustedTable("p1", "t", b"x"),
-        lambda: storedTables.normaliseRunOutput("p1", "t", b"x"),
-    ):
+    for readerMemory, expectedCap in ((READER_MEMORY, 2147483648), (8 * 1024**3, 8 * 1024**3)):
+        monkeypatch.setenv("TABLE_READER_MEMORY_BYTES", str(readerMemory))
         with pytest.raises(SandboxBusyError):
-            call()
-    assert calls[-2][2] == sandboxRunner._MAX_RESULT_BYTES
+            storedTables.readUntrustedTable("p1", "t", b"x")
+        assert calls[-1][2] == expectedCap
+    with pytest.raises(SandboxBusyError):
+        storedTables.normaliseRunOutput("p1", "t", b"x")
     assert calls[-1][2] > 0
 
 
