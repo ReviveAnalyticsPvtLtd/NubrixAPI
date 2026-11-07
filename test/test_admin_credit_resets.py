@@ -7,7 +7,7 @@ test_admin_credit_reset_postgres.py.
 import json
 import sqlite3
 import uuid
-from datetime import timedelta
+from datetime import datetime, timedelta
 from unittest.mock import patch
 
 import pytest
@@ -180,7 +180,24 @@ def test_reset_keeps_paid_dates_and_future_invoice(resets):
     assert rows(path, 'SELECT * FROM "Invoices" ORDER BY id') == invoicesBefore
 
 
-def test_old_admission_cannot_drain_reset_allocation(resets):
+@pytest.fixture
+def fixedCreditClock():
+    """Keep ManualCreditRepository's own datetime.now() on the tests' fixed NOW.
+
+    The repository reads the real clock before it enters the (fixed-clock) SQL
+    transaction, so a NOW-seeded monthly period would otherwise go due once the
+    real date passes its end.
+    """
+    class FixedDatetime(datetime):
+        @classmethod
+        def now(cls, tz=None):
+            return NOW if tz is None else NOW.astimezone(tz)
+
+    with patch("api.services.credits.manualCreditRepository.datetime", FixedDatetime):
+        yield
+
+
+def test_old_admission_cannot_drain_reset_allocation(resets, fixedCreditClock):
     _, repository, path = resets
     activateMonthly(resets)
     from api.services.credits.manualCreditRepository import ManualCreditRepository
@@ -193,7 +210,7 @@ def test_old_admission_cannot_drain_reset_allocation(resets):
     assert after["remaining_tokens"] == 10000 and after["used_tokens"] == 0
 
 
-def test_next_read_and_admission_keep_reset_allocation(resets):
+def test_next_read_and_admission_keep_reset_allocation(resets, fixedCreditClock):
     _, repository, path = resets
     activateMonthly(resets)
     _, target = reset(resets)

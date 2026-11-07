@@ -12,8 +12,9 @@ that child, so it can write both files itself and exit before the launcher
 does, and neither has to obey the launcher's limits. So the parent only moves a
 result's bytes, because a file can decode to far more than the parent can hold,
 whatever its footer says, and it keeps a preview as rows.
-No hard timeout/SIGKILL is enforced by default; set TRANSFORMATION_TIMEOUT_SECONDS
-env var to re-enable one.
+A run ends after 300 seconds by default (TRANSFORMATION_TIMEOUT_SECONDS=0 turns the
+timeout off), and the sandbox's memory, CPU, disk and process limits apply to it
+(see utils/sandboxLimits.py).
 """
 
 __version__ = "1.1.0"
@@ -23,7 +24,9 @@ __all__ = ["TransformationExecutor"]
 
 from utils.exceptionHandler import CustomException
 from utils.initMethods import fetch_data, fetch_data_pl, scan_data, serializer
+from utils.sandboxLimits import defaultTimeoutSeconds
 from utils.sandboxRunner import runSandbox
+from utils.sandboxSlots import BUSY_CODE, BUSY_MESSAGE, SandboxBusyError
 from api.commons import client
 from utils.logger import logger
 import multiprocessing as mp
@@ -115,10 +118,9 @@ class TransformationExecutor:
     Uses subprocess isolation (close_fds=True) to avoid fork+Redis deadlocks.
     """
     def __init__(self, timeoutSeconds: int | None = None):
-        """Initialize the executor. timeoutSeconds=0/None means no hard timeout."""
+        """Initialize the executor. timeoutSeconds=0 means no hard timeout; None uses the 300 second default."""
         if timeoutSeconds is None:
-            env_val = os.environ.get("TRANSFORMATION_TIMEOUT_SECONDS", "0")
-            timeoutSeconds = int(env_val) if env_val else 0
+            timeoutSeconds = defaultTimeoutSeconds("TRANSFORMATION_TIMEOUT_SECONDS")
         self.timeoutSeconds = timeoutSeconds
         self.client = client
 
@@ -134,11 +136,17 @@ class TransformationExecutor:
 
     def _execute_code(self, projectId: str, pythonCode: str) -> None:
         """Execute generated code and raise if it fails. A validation run, so nothing it wrote is kept."""
-        self._run_transformation(projectId, pythonCode)
+        try:
+            self._run_transformation(projectId, pythonCode)
+        except SandboxBusyError as e:
+            raise self._busy(e)
 
     def _run_transformation(self, projectId: str, pythonCode: str) -> tuple[list[dict], bytes]:
         """Run transformation code and return the preview rows and the parquet bytes of `final_df`."""
-        _, stderr, rc, parquetBytes, previewBytes = runSandbox("transform_launcher.py", projectId, pythonCode, self.timeoutSeconds, withResult=True)
+        _, stderr, rc, parquetBytes, previewBytes, stopped = runSandbox("transform_launcher.py", projectId, pythonCode, self.timeoutSeconds, withResult=True)
+        if stopped:
+            logger.warning(f"Transformation run for project {projectId} was stopped: {stopped} stderr tail: {(stderr or '')[-2000:]}")
+            raise ValueError(stopped)
         if rc != 0:
             raise ValueError(stderr.strip() or "Transformation execution failed.")
         if not parquetBytes:
@@ -169,9 +177,18 @@ class TransformationExecutor:
             raise ValueError("Transformation produced no readable preview.")
         return rows
 
+    def _busy(self, error: SandboxBusyError) -> CustomException:
+        """Every run slot stayed taken: tell the caller to retry."""
+        exception = CustomException(error, statusCode=503, uiMessage=BUSY_MESSAGE, errorCode=BUSY_CODE)
+        logger.error(exception)
+        return exception
+
     def executeInspection(self, projectId: str, pythonCode: str) -> str:
         """Execute inspection code in the sandbox and return stdout + stderr."""
-        stdout, stderr, rc, *_ = runSandbox("inspect_launcher.py", projectId, pythonCode, self.timeoutSeconds)
+        try:
+            stdout, stderr, rc, *_ = runSandbox("inspect_launcher.py", projectId, pythonCode, self.timeoutSeconds)
+        except SandboxBusyError as e:
+            raise self._busy(e)
         if rc != 0:
             errors = stderr or f"Inspection exited with code {rc} and wrote no error output."
             return f"Stdout:\n{stdout}\nStderr/Errors:\n{errors}"
@@ -182,6 +199,8 @@ class TransformationExecutor:
         try:
             self._validate_table_name(tableName)
             return self._run_transformation(projectId, pythonCode)
+        except SandboxBusyError as e:
+            raise self._busy(e)
         except Exception as e:
             exception = CustomException(e, statusCode=400, uiMessage=str(e))
             logger.error(exception)

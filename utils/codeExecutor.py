@@ -2,8 +2,11 @@
 codeExecutor.py — sandboxed subprocess code execution with per-project concurrency lock.
 
 Runs LLM-generated code in an isolated subprocess with stdout/stderr capture.
-Uses a Redis Sorted Set (ZSET) soft concurrency gate per projectId; no hard
-CPU/memory caps (RLIMIT_AS crashes polars import).
+Uses a Redis Sorted Set (ZSET) soft concurrency gate per projectId. Each run
+also gets the sandbox's limits (utils/sandboxLimits.py): a 300 second default
+timeout, caps on threads, processes, memory, CPU, disk and files, and a
+container-wide cap on how many runs go at once. RLIMIT_AS is not used because it
+counts address space that polars reserves without using.
 """
 
 __all__ = ["replManager", "REPLManager", "_remove_code_fences"]
@@ -15,7 +18,9 @@ import uuid
 import re
 from api.services.credits.creditService import creditService
 from utils.logger import logger
+from utils.sandboxLimits import currentRunLimits, defaultTimeoutSeconds
 from utils.sandboxRunner import runSandbox
+from utils.sandboxSlots import SandboxBusyError
 
 
 def _remove_code_fences(code: str) -> str:
@@ -33,8 +38,7 @@ class REPLManager:
 
     def __init__(self, timeoutSeconds: int | None = None, maxConcurrentPerProject: int = 50):
         if timeoutSeconds is None:
-            env_val = os.environ.get("CODE_EXEC_TIMEOUT_SECONDS", "0")
-            timeoutSeconds = int(env_val) if env_val else None
+            timeoutSeconds = defaultTimeoutSeconds("CODE_EXEC_TIMEOUT_SECONDS")
         self.timeoutSeconds = timeoutSeconds
         self.maxConcurrentPerProject = maxConcurrentPerProject
 
@@ -50,15 +54,17 @@ class REPLManager:
         sem_key = f"semaphore:{projectId}"
         slot_id = str(uuid.uuid4())
 
+        # An entry may wait for a run slot as well as run, so it isn't stale before both are over.
+        staleSeconds = self.timeoutSeconds + 60 + currentRunLimits().slotWaitSeconds
         acquired = False
         start_time = time.time()
         while time.time() - start_time < 30.0:
             try:
-                r.zremrangebyscore(sem_key, 0, time.time() - (self.timeoutSeconds + 60))
+                r.zremrangebyscore(sem_key, 0, time.time() - staleSeconds)
                 count = r.zcard(sem_key)
                 if count < self.maxConcurrentPerProject:
                     r.zadd(sem_key, {slot_id: time.time()})
-                    r.expire(sem_key, self.timeoutSeconds + 60)
+                    r.expire(sem_key, int(staleSeconds))
                     acquired = True
                     break
             except Exception as e:
@@ -74,8 +80,12 @@ class REPLManager:
         stdout = ""
         stderr = ""
         returnCode = None
+        stopped = None
         try:
-            stdout, stderr, returnCode, *_ = runSandbox("sandbox_launcher.py", projectId, codeString, self.timeoutSeconds)
+            stdout, stderr, returnCode, _, _, stopped = runSandbox("sandbox_launcher.py", projectId, codeString, self.timeoutSeconds)
+        except SandboxBusyError:
+            # Not output: callers must not treat a full sandbox as a code failure. The semaphore entry is released below.
+            raise
         except Exception as e:
             stderr = f"Error during subprocess execution: {e}\n"
         finally:
@@ -85,6 +95,12 @@ class REPLManager:
                 except Exception as e:
                     logger.warning(f"Failed to release semaphore for project {projectId}: {e}")
 
+        if stopped:
+            # Tell the caller why the run ended, after whatever it printed. The sentence on the end keeps a stopped
+            # run's output from parsing as a result, even when the output already holds it.
+            if not stdout.strip():
+                return stopped
+            return stdout + "\n" + stopped
         # Callers accept any valid JSON as the result, so a failed run's partial stdout must not reach them.
         if returnCode:
             return stderr or f"Code execution exited with code {returnCode} and wrote no error output."

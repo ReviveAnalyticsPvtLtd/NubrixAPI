@@ -5,12 +5,13 @@ from unittest import mock
 
 from nubrix.components import transformationExecutor as executorModule
 from utils import codeExecutor as codeExecutorModule
+from utils.sandboxRunner import SandboxResult
 
 
 def _inspect(stdout, stderr, returnCode):
     executor = object.__new__(executorModule.TransformationExecutor)
     executor.timeoutSeconds = 0
-    with mock.patch.object(executorModule, "runSandbox", return_value=(stdout, stderr, returnCode, None)):
+    with mock.patch.object(executorModule, "runSandbox", return_value=SandboxResult(stdout, stderr, returnCode, None)):
         return executor.executeInspection("project_1", "print(1)")
 
 
@@ -70,7 +71,7 @@ def _run(popenResult):
 
 
 def _finished(stdout, stderr, returnCode):
-    return {"return_value": (stdout, stderr, returnCode, None)}
+    return {"return_value": SandboxResult(stdout, stderr, returnCode, None)}
 
 
 def _isJson(text):

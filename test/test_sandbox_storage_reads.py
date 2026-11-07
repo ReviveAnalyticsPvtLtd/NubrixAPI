@@ -35,6 +35,7 @@ from nubrix.components import transformationExecutor
 from nubrix.components.transformationExecutor import TransformationExecutor
 from test.privateStorageFixtures import SERVICE_KEY, FakePrivateStorage
 from utils import codeExecutor, initMethods, projectStorage, sandbox_reaper, sandboxRunner, transform_launcher
+from utils.sandboxLimits import currentRunLimits
 
 PROJECT = "11111111-2222-4333-8444-555555555555"
 OTHER_PROJECT = "99999999-8888-4777-8666-555555555555"
@@ -744,7 +745,7 @@ def test_childPathHasNoEmptyEntry(tmp_path, monkeypatch):
     started = MagicMock()
     monkeypatch.setattr(subprocess, "Popen", started)
 
-    sandboxRunner._startChild("inspect_launcher.py", None, str(tmp_path), MagicMock(fileno=lambda: 3), None, None)
+    sandboxRunner._startChild("inspect_launcher.py", None, str(tmp_path), MagicMock(fileno=lambda: 3), None, None, currentRunLimits())
 
     assert "" not in started.call_args.kwargs["env"]["PYTHONPATH"].split(os.pathsep)
 
@@ -1878,8 +1879,8 @@ def test_sandboxHasHardLimits(runInSandbox):
 
     limits = json.loads(runInSandbox(code).strip())
 
-    assert limits["RLIMIT_NPROC"] == [sandboxRunner._MAX_RUN_PROCESSES] * 2
-    assert limits["RLIMIT_FSIZE"] == [sandboxRunner._MAX_CHILD_FILE_BYTES] * 2
+    assert limits["RLIMIT_NPROC"] == [currentRunLimits().maxProcesses] * 2
+    assert limits["RLIMIT_FSIZE"] == [currentRunLimits().maxFileBytes] * 2
     assert limits["RLIMIT_CORE"] == [0, 0]
     assert limits["RLIMIT_NOFILE"] == [sandboxRunner._MAX_RUN_OPEN_FILES] * 2
 
@@ -1888,7 +1889,7 @@ def test_sandboxHasHardLimits(runInSandbox):
 def test_sandboxCantRaiseItsLimits(runInSandbox):
     code = (
         'resource = pd.io.common.os.sys.modules["resource"]\n'
-        f'resource.setrlimit(resource.RLIMIT_NPROC, ({sandboxRunner._MAX_RUN_PROCESSES + 1},) * 2)\n'
+        f'resource.setrlimit(resource.RLIMIT_NPROC, ({currentRunLimits().maxProcesses + 1},) * 2)\n'
         'outcome = "raised"'
     )
 
@@ -1900,7 +1901,7 @@ def test_sandboxCantWriteAFilePastTheLimit(runInSandbox):
     code = (
         'os = pd.io.common.os\n'
         'fd = os.open("big", os.O_CREAT | os.O_WRONLY)\n'
-        f'os.lseek(fd, {sandboxRunner._MAX_CHILD_FILE_BYTES}, os.SEEK_SET)\n'
+        f'os.lseek(fd, {currentRunLimits().maxFileBytes}, os.SEEK_SET)\n'
         'outcome = os.write(fd, b"x")'
     )
 
