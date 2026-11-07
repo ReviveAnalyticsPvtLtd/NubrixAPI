@@ -12,9 +12,8 @@ __all__ = ["ReportGenerator"]
 
 from ydata_profiling import ProfileReport
 from utils.projectStorage import readJson, readTableBytes
+from utils.storedTables import decodeStoredTable
 from bs4 import BeautifulSoup
-import pandas as pd
-import io
 
 class ReportGenerator:
     """
@@ -51,7 +50,7 @@ class ReportGenerator:
         Returns:
             str: The cleaned HTML profiling report as a string.
         """
-        df = pd.read_parquet(io.BytesIO(readTableBytes(projectId, tableName)))
+        df = decodeStoredTable(projectId, tableName, readTableBytes(projectId, tableName)).to_pandas()
         htmlText = ProfileReport(df, title = f"Report for: {tableName}").to_html()
         soup = BeautifulSoup(htmlText, 'html.parser')
         soup.find("button", id = "tab-overview-reproduction").decompose()

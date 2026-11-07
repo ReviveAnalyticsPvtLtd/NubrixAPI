@@ -10,7 +10,7 @@ __all__ = ["router"]
 
 
 from utils.exceptionHandler import CustomException, raiseHttpException
-from utils.projectStorage import readTablePage
+from utils.storedTables import readStoredTablePage, tableReadException
 import asyncio
 from fastapi import APIRouter, Depends, Form, Request, Query
 from api.services.managementService import managementService
@@ -254,7 +254,7 @@ async def generateMetadata(projectId: str, user: UserContext = Depends(requireCr
     """
     await asyncio.to_thread(requireProjectOwner, projectId, user)
     try:
-        jsonData = managementService.generateMetadata(projectId=projectId, userId=user.userId)
+        jsonData = await asyncio.to_thread(managementService.generateMetadata, projectId=projectId, userId=user.userId)
         return ORJSONResponse(status_code = 200, content = {"status": "SUCCESS", "metadata": jsonData})
     except CustomException as e:
         raiseHttpException(e)
@@ -452,7 +452,7 @@ async def generateReport(projectId: str, user: UserContext = Depends(requireTria
     """
     await asyncio.to_thread(requireProjectOwner, projectId, user)
     try:
-        reports = managementService.generateReport(projectId = projectId)
+        reports = await asyncio.to_thread(managementService.generateReport, projectId = projectId)
         return ORJSONResponse(status_code = 200, content = {"status": "SUCCESS", "reportHtmlContent": reports})
     except CustomException as e:
         raiseHttpException(e)
@@ -574,13 +574,16 @@ async def viewTable(
     """
     Read a parquet table from Supabase storage and return paginated rows.
 
-    Only the footer and the row groups holding the page are fetched, so a
-    10M-row table costs one row group, not the whole file.
+    A table the API wrote carries a marker, so only its footer and the row
+    groups holding the page are fetched. An older, unmarked table is
+    downloaded whole and read by a bounded reader child, one run per page.
+    A table over the decoded-size limit is refused with 413 and an
+    unreadable one with 422.
     """
     await asyncio.to_thread(requireProjectOwner, projectId, user)
     try:
         def _read_page() -> dict:
-            frame, totalRows = readTablePage(projectId, tableName, offset=(page - 1) * pageSize, limit=pageSize)
+            frame, totalRows = readStoredTablePage(projectId, tableName, offset=(page - 1) * pageSize, limit=pageSize)
             rows = frame.to_dicts()
             from utils.initMethods import serializer
             import json as _json
@@ -600,5 +603,5 @@ async def viewTable(
     except CustomException as e:
         raiseHttpException(e)
     except Exception as e:
-        exc = CustomException(e, statusCode=500, uiMessage=f"Failed to read table: {e}")
+        exc = tableReadException(e) or CustomException(e, statusCode=500, uiMessage=f"Failed to read table: {e}")
         raiseHttpException(exc)

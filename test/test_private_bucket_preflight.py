@@ -189,3 +189,27 @@ def test_resultCarriesNoStoredContentOrCredential(storage, monkeypatch):
     assert "customer secret" not in text
     assert SERVICE_KEY not in text
     assert ANON_KEY not in text
+
+
+def test_theRowCountComesFromTheFooterWithoutDownloadingOrDecoding(storage, monkeypatch):
+    import pyarrow.parquet as pq
+
+    from utils import sandboxRunner, storedTables
+
+    buffer = io.BytesIO()
+    pl.DataFrame({"amount": list(range(50_000))}).write_parquet(buffer, row_group_size=10_000)
+    storage.put(PROJECT, "big.parquet", buffer.getvalue())
+    refuse = lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("decoded"))  # noqa: E731
+    monkeypatch.setattr(sandboxRunner, "runTrustedSandbox", refuse)
+    monkeypatch.setattr(storedTables, "readUntrustedPage", refuse)
+    monkeypatch.setattr(storedTables, "readTableBytes", refuse, raising=False)
+    monkeypatch.setattr(pq, "read_table", refuse)
+    monkeypatch.setattr(pq.ParquetFile, "iter_batches", refuse)
+    storage.requests.clear()
+
+    result = preflight.runPreflight(PROJECT, "big")
+
+    assert result["pagedReadRows"] == 50_000
+    tableReads = [r for r in storage.requests if r["path"].endswith("/big.parquet") and "/public/" not in r["path"]]
+    assert {r["method"] for r in tableReads} <= {"GET", "HEAD"}
+    assert all(r["range"] for r in tableReads if r["method"] == "GET")

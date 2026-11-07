@@ -17,6 +17,7 @@ from utils.codeExecutor import replManager, _remove_code_fences
 from utils.sandboxSlots import BUSY_CODE, BUSY_MESSAGE, isBusy
 from sqlalchemy import URL, create_engine
 from utils.projectStorage import readJson, readTableBytes
+from utils.storedTables import decodeStoredTable, tableReadException, tableWriteException, writeStoredTableToPath
 from utils.logger import logger
 from utils.mapPointLabels import ensureScatterMapPointLabels
 from api.commons import client
@@ -107,7 +108,7 @@ class DashboardService:
         Returns:
             list[dict]: List of dictionaries containing column metadata.
         """
-        df = pd.read_parquet(io.BytesIO(readTableBytes(projectId, tableName)))
+        df = decodeStoredTable(projectId, tableName, readTableBytes(projectId, tableName)).to_pandas()
         numericals = ["int64", "float64", "float32", "int32"]
         categoricals = ["bool", "category", "object", "string"]
         datetimeTypes = ["datetime64[ns]", "datetime64[ns, tz]"]
@@ -448,7 +449,7 @@ class DashboardService:
             results = {x: y for x, y in zip(dataTables, results)}
             return results
         except Exception as e:
-            exception  = CustomException(e)
+            exception = tableReadException(e) or CustomException(e)
             logger.error(exception)
             raise exception
         
@@ -536,14 +537,15 @@ class DashboardService:
                 results = [x.result() for x in futures]
                 results = {connection.get("table"): result for connection, result in zip(connections, results)}
             for result in results:
-                with tempfile.NamedTemporaryFile(delete = True, suffix = ".parquet") as temp:
-                    results[result].to_parquet(temp.name, compression = "snappy")
+                # A folder rather than an open temporary file, which other writers cannot reopen on every platform.
+                with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as folder:
+                    path = os.path.join(folder, "table.parquet")
+                    writeStoredTableToPath(results[result], projectId, result, path)
                     _ = self.client.storage.from_("AnalyticsHub").upload(
-                        file = temp.name,
+                        file = path,
                         path = f"{projectId}/{result + '.parquet'}",
                         file_options = {"upsert": "true"}
                     )
-                temp.close()
             # Deterministically refresh row/column counts in metadata.json so
             # they never drift from the just-refreshed parquet files.
             shapes = {name: [int(len(df.index)), int(len(df.columns))] for name, df in results.items()}
@@ -557,7 +559,8 @@ class DashboardService:
             updateProjectModifiedAt(projectId)
             return {"status": "SUCCESS"}
         except Exception as e:
-            exception  = CustomException(e)
+            # A table over the size limit is refused with its own 413; any other failure stays a generic 500.
+            exception = tableWriteException(e) or CustomException(e)
             logger.error(exception)
             raise exception
     

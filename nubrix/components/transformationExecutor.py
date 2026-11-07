@@ -27,6 +27,7 @@ from utils.initMethods import fetch_data, fetch_data_pl, scan_data, serializer
 from utils.sandboxLimits import defaultTimeoutSeconds
 from utils.sandboxRunner import runSandbox
 from utils.sandboxSlots import BUSY_CODE, BUSY_MESSAGE, SandboxBusyError
+from utils.storedTables import normaliseRunOutput
 from api.commons import client
 from utils.logger import logger
 import multiprocessing as mp
@@ -195,10 +196,15 @@ class TransformationExecutor:
         return stdout if stdout else "Inspection executed successfully with no output."
 
     def executeAndPreview(self, projectId: str, pythonCode: str, tableName: str) -> tuple[list[dict], bytes]:
-        """Execute code and return preview rows plus parquet bytes. The parquet is never decoded here."""
+        """Execute code and return preview rows plus the parquet bytes to store. The parquet is never decoded here.
+
+        The run's output is rewritten by the normaliser for `tableName` before anything caches or stores it, so a
+        refusal there answers as a stopped run does.
+        """
         try:
             self._validate_table_name(tableName)
-            return self._run_transformation(projectId, pythonCode)
+            previewRows, parquetBytes = self._run_transformation(projectId, pythonCode)
+            return previewRows, normaliseRunOutput(projectId, tableName, parquetBytes)
         except SandboxBusyError as e:
             raise self._busy(e)
         except Exception as e:

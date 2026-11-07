@@ -8,7 +8,7 @@ hold no credentials, so it reads SUPABASE_URL and SUPABASE_KEY at call time and
 must not import api.commons.
 """
 
-__all__ = ["StorageReadError", "objectUrl", "authHeaders", "readBytes", "readJson", "readTableBytes", "downloadTable", "readTablePage"]
+__all__ = ["StorageReadError", "objectUrl", "authHeaders", "readBytes", "readJson", "readTableBytes", "downloadTable", "openTableFile", "readTablePage"]
 
 
 import httpx
@@ -18,12 +18,12 @@ import os
 import re
 import ssl
 import threading
+from contextlib import contextmanager
 from urllib.parse import quote
 
 _BUCKET = "AnalyticsHub"
 _READ_TIMEOUT_SECONDS = 60
 _DOWNLOAD_CHUNK_BYTES = 1024 * 1024
-_PAGE_BATCH_ROWS = 8192
 _UNSAFE_PATH_SEGMENT = re.compile(r"[/\\%\x00-\x1f]")
 _SSL_CONTEXT: ssl.SSLContext | None = None
 
@@ -163,43 +163,21 @@ class _TableFile(io.RawIOBase):
         return content
 
 
-def _pageBatches(parquet, rowGroups: list, firstRow: int, offset: int, limit: int) -> list:
-    """Decode only up to the end of the page. pandas writes a million rows as one row group."""
-    batches, batchStart = [], firstRow
-    for batch in parquet.iter_batches(batch_size=_PAGE_BATCH_ROWS, row_groups=rowGroups):
-        batchEnd = batchStart + batch.num_rows
-        if batchEnd > offset:
-            start = max(offset, batchStart)
-            batches.append(batch.slice(start - batchStart, offset + limit - start))
-        batchStart = batchEnd
-        if batchStart >= offset + limit:
-            break
-    return batches
+@contextmanager
+def openTableFile(projectId: str, tableName: str):
+    """A seekable view of a table's stored file, read by authenticated range requests.
 
-
-def readTablePage(projectId: str, tableName: str, offset: int, limit: int) -> tuple:
-    """Return `(rows, totalRows)` for one page, reading only the footer and the row groups it touches.
-
-    `pl.scan_parquet` can't do this on a private bucket. Polars drops
+    Polars' own lazy reader can't do this on a private bucket. It drops
     `storage_options` on HTTP URLs, so it can't send the service key, and a
     signed URL makes storage read the whole object on Polars' HEAD request.
     """
-    import polars as pl
-    import pyarrow as pa
-    import pyarrow.parquet as pq
-
     headers = {**authHeaders(), "Accept-Encoding": "identity"}
     with httpx.Client(headers=headers, timeout=_READ_TIMEOUT_SECONDS, verify=_sslContext()) as client:
-        tableFile = _TableFile(client, objectUrl(projectId, f"{tableName}.parquet"))
-        with pq.ParquetFile(tableFile, pre_buffer=True) as parquet:
-            metadata = parquet.metadata
-            rowGroups, firstRow, nextRow = [], offset, 0
-            for index in range(metadata.num_row_groups):
-                groupRows = metadata.row_group(index).num_rows
-                if nextRow < offset + limit and nextRow + groupRows > offset:
-                    if not rowGroups:
-                        firstRow = nextRow
-                    rowGroups.append(index)
-                nextRow += groupRows
-            batches = _pageBatches(parquet, rowGroups, firstRow, offset, limit)
-            return pl.from_arrow(pa.Table.from_batches(batches, schema=parquet.schema_arrow)), metadata.num_rows
+        yield _TableFile(client, objectUrl(projectId, f"{tableName}.parquet"))
+
+
+def readTablePage(projectId: str, tableName: str, offset: int, limit: int) -> tuple:
+    """Return `(rows, totalRows)` for one page. See `storedTables.readStoredTablePage`, which decodes it."""
+    from utils.storedTables import readStoredTablePage
+
+    return readStoredTablePage(projectId, tableName, offset, limit)

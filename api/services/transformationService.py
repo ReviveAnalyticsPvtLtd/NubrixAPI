@@ -76,8 +76,11 @@ class TransformationService:
         return objectUrl(projectId, "metadata.json")
 
     def _preview_cache_key(self, projectId: str, transformationId: str, messageId: str, tableName: str) -> str:
-        """Return the Redis preview cache key."""
-        return f"{projectId}::transformation_preview::{transformationId}::{messageId}::{tableName}"
+        """Return the Redis preview cache key.
+
+        The v2 segment keeps a preview cached before run outputs were normalised from being applied now.
+        """
+        return f"{projectId}::transformation_preview::v2::{transformationId}::{messageId}::{tableName}"
 
     def _sanitizeTableName(self, name: str) -> str:
         """Sanitize a string into a valid table name."""
