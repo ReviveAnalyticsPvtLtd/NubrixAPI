@@ -338,6 +338,28 @@ def test_honestWorkloadFinishesUnderDefaultLimits(storage):
     assert threads <= 32
 
 
+@separateUids
+def test_chartWhoseRunTakesEightSecondsStillDrawsItsChart(storage, monkeypatch):
+    """A big table's hand-off and a fresh child can take several seconds, so 7 cut honest charts short."""
+    from nubrix.workflows import reportingToolWorkflow
+    from utils import codeExecutor
+
+    monkeypatch.setattr(reportingToolWorkflow, "buildLlmChain", lambda name, prompt: MagicMock())
+    monkeypatch.setattr(reportingToolWorkflow, "QueryRephaser", MagicMock())
+    monkeypatch.setattr(codeExecutor.creditService, "_redis", lambda: MagicMock(zcard=lambda _key: 0))
+    code = (
+        "import datetime, json\n"
+        "end = datetime.datetime.now() + datetime.timedelta(seconds=8)\n"
+        "while datetime.datetime.now() < end:\n"
+        "    pass\n"
+        'print(json.dumps({"chartType": "bar", "data": []}))\n'
+    )
+
+    state = reportingToolWorkflow.ReportingToolWorkflow()._runInPythonSandbox({"generatedCode": code, "projectId": PROJECT})
+
+    assert json.loads(state["codeOutput"])["chartType"] == "bar", state["codeOutput"]
+
+
 # The watchdog: measuring a run and stopping it when it passes a limit.
 
 @pytest.mark.skipif(os.name != "posix", reason="sparse files and block counts are posix")
