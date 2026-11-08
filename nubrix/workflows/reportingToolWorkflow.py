@@ -48,7 +48,8 @@ class ReportingToolWorkflow:
         self.queryRephraseChain = QueryRephaser().getQueryRephraserChain()
         self.codeGeneratorChain = buildLlmChain("CODEGENERATOR", "codeGeneratorAgentPrompt")
         self.codeDebuggerChain = buildLlmChain("CODEDEBUGGER", "codeDebuggerAgentPrompt")
-        self.replManager = REPLManager(timeoutSeconds=7)
+        # The same limit as a dashboard widget's run: a big table's hand-off and a fresh child can take 5 to 7 seconds.
+        self.replManager = REPLManager(timeoutSeconds=35)
 
     def _rephraseQuery(self, state: State):
         """
