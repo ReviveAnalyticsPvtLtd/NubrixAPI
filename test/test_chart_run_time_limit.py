@@ -1,8 +1,8 @@
 """A prompt chart's generated code gets the same time as a dashboard widget's.
 
-Each run receives its tables from the parent and starts a fresh child, which on
-production takes about 5 to 7 seconds for a chart over a million-row table. At
-7 seconds those charts failed now and then with "Execution timed out".
+Each run receives its tables from the parent and starts a fresh child. For a
+chart over a large table that alone can take several seconds, so at 7 seconds
+honest charts failed now and then with "Execution timed out".
 """
 
 import importlib

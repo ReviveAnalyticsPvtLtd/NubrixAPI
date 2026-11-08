@@ -340,7 +340,7 @@ def test_honestWorkloadFinishesUnderDefaultLimits(storage):
 
 @separateUids
 def test_chartWhoseRunTakesEightSecondsStillDrawsItsChart(storage, monkeypatch):
-    """A big table's hand-off and a fresh child took 5 to 7 seconds on production, so 7 cut honest charts short."""
+    """A big table's hand-off and a fresh child can take several seconds, so 7 cut honest charts short."""
     from nubrix.workflows import reportingToolWorkflow
     from utils import codeExecutor
 
