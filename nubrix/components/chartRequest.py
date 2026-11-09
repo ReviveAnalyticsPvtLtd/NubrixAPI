@@ -210,7 +210,7 @@ def decodeGeneratedCode(text: str | None) -> ChartRequest | None:
         return None
     try:
         parsed = json.loads(text)
-    except ValueError:
+    except (ValueError, RecursionError):
         return None
     if not isinstance(parsed, dict) or GENERATED_CODE_MARKER not in parsed:
         return None

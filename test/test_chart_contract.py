@@ -131,3 +131,36 @@ def test_scatterWithTextYIsReported():
     chart = copy.deepcopy(GOLDEN["scatter"])
     chart["data"]["datasets"][0]["data"] = [{"x": 1, "y": "2"}]
     assert contractErrors(chart) != []
+
+
+def pivotChart(*keys):
+    return {"chartType": "pivot", "title": "t", "data": {key: {"r": 1} for key in keys}}
+
+
+def test_pivotKeysTheClientReadsAreAccepted():
+    assert contractErrors(pivotChart("Q1", "('A', 'B')", "('C', 'D')")) == []
+
+
+@pytest.mark.parametrize(
+    "key",
+    ["('Kids (Boys)', '2024')", "('', '2024')", "('Q1', '')", "('A', 'B'"],
+)
+def test_pivotKeyTheClientWouldMisreadIsReported(key):
+    errors = contractErrors(pivotChart(key))
+    assert any("misread" in error for error in errors)
+
+
+def test_pivotKeysOfDifferentDepthAreReported():
+    errors = contractErrors(pivotChart("('A', 'B')", "('A', 'B', 'C')"))
+    assert any("same depth" in error for error in errors)
+
+
+@pytest.mark.parametrize("bad", [float("nan"), float("inf"), object(), {1: 2}, [float("nan")]])
+def test_tableCellMustBeJsonSafe(bad):
+    chart = {"chartType": "table", "title": "t", "columns": ["a"], "data": [{"a": bad}]}
+    assert any("JSON-safe" in error for error in contractErrors(chart))
+
+
+def test_tableCellsOfNestedSafeValuesAreAccepted():
+    chart = {"chartType": "table", "title": "t", "columns": ["a"], "data": [{"a": {"k": [1, "x", None, True]}}]}
+    assert contractErrors(chart) == []

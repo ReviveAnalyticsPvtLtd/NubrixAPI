@@ -188,3 +188,8 @@ def test_markedButInvalidRequestRaises():
 def test_chartRequestTextGivesEmptyProvenance():
     text = encodeGeneratedCode(makeRequest("bar"))
     assert extractProvenance(text) == extractProvenance("")
+
+
+def test_decodeDeeplyNestedJsonDoesNotRaiseRecursionError():
+    text = "{" + '"a":{' * 100000 + "}" * 100001
+    assert decodeGeneratedCode(text) is None

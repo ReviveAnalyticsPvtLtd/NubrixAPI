@@ -70,12 +70,12 @@ def test_seriesLongFormFillsMissingCellsWithNull():
     }
 
 
-def test_seriesDuplicatePairRaisesWhenStrict():
+@pytest.mark.parametrize("lenient", [False, True])
+def test_seriesDuplicatePairRaises(lenient):
     request = makeRequest("bar", {"x": "month", "y": "n", "series": "grp"})
     table = pa.table({"month": ["Jan", "Jan"], "grp": ["a", "a"], "n": [1, 2]})
     with pytest.raises(ChartBuildError, match="GROUP BY"):
-        buildChart(request, table)
-    assert build(request, table, lenient=True)["data"]["datasets"] == [{"label": "a", "data": [2]}]
+        buildChart(request, table, lenient=lenient)
 
 
 def test_radarHasNoAxisLabels():
@@ -95,12 +95,12 @@ def test_pieUsesOneDataset(chartType):
     }
 
 
-def test_categoryValueColumnMustBeNumeric():
+@pytest.mark.parametrize("lenient", [False, True])
+def test_categoryValueColumnMustBeNumeric(lenient):
     request = makeRequest("bar", {"x": "a", "y": "b"})
     table = pa.table({"a": ["x"], "b": ["not a number"]})
     with pytest.raises(ChartBuildError, match="numeric"):
-        buildChart(request, table)
-    assert build(request, table, lenient=True)["data"]["datasets"][0]["data"] == [None]
+        buildChart(request, table, lenient=lenient)
 
 
 def test_missingColumnRaisesWithTheColumnNames():
@@ -149,14 +149,13 @@ def test_bubblePointsCarryR():
     [pa.array(["a", "b"]), pa.array([datetime.date(2024, 1, 1)] * 2)],
     ids=["text", "date"],
 )
-def test_pointsWithNonNumericColumnRaiseWhenStrict(chartType, xColumn):
+@pytest.mark.parametrize("lenient", [False, True])
+def test_pointsWithNonNumericColumnRaise(chartType, xColumn, lenient):
     encoding = {"x": "x", "y": "y", **({"r": "r"} if chartType == "bubble" else {})}
     request = makeRequest(chartType, encoding)
     table = pa.table({"x": xColumn, "y": [1, 2], "r": [1, 2]})
     with pytest.raises(ChartBuildError, match="line or bar chart"):
-        buildChart(request, table)
-    # Lenient mode drops the points that cannot be drawn.
-    assert build(request, table, lenient=True)["data"]["datasets"] == []
+        buildChart(request, table, lenient=lenient)
 
 
 @pytest.mark.parametrize("lenient", [False, True])
@@ -207,7 +206,7 @@ def test_cardTwoRowsRaisesEvenWhenLenient(lenient):
 def test_cardEmptyGivesZero():
     request = makeRequest("card", {"value": "n"})
     chart = build(request, pa.table({"n": pa.array([], pa.int64())}))
-    assert chart == {"chartType": "card", "title": "t", "label": "", "data": 0}
+    assert chart == {"chartType": "card", "title": "t", "label": "N", "data": 0}
 
 
 def test_cardNullAndNaNGiveZero():
@@ -300,9 +299,9 @@ def test_geoMapUsesLabelAndIdColumns():
     ]
 
 
-def test_geoMapTextCoordinatesAreDropped():
+def test_geoMapNonFiniteCoordinatesAreDroppedButKeepTheTitle():
     request = makeRequest("geoMap", {"lat": "a", "long": "b"})
-    chart = build(request, pa.table({"a": ["x"], "b": ["y"]}))
+    chart = build(request, pa.table({"a": [float("nan")], "b": [float("inf")]}))
     assert chart["map"]["data"]["points"] == []
     assert chart["title"] == "t"
 
@@ -431,7 +430,10 @@ def test_emptyResultGivesEmptyChartOfEachType(chartType):
     request = makeRequest(chartType, EMPTY_ENCODINGS[chartType], xLabel="X axis", yLabel="Y axis")
     table = pa.table({name: pa.array([], pa.float64()) for name in "abc"})
     chart = build(request, table)
-    assert chart == emptyChart(chartType, "t", "X axis", "Y axis")
+    expected = emptyChart(chartType, "t", "X axis", "Y axis")
+    if chartType == "card":
+        expected["label"] = "A"
+    assert chart == expected
 
 
 def test_emptyChartShapes():
@@ -460,3 +462,80 @@ def test_geoMapOutputAlwaysCarriesATitle():
     empty = buildChart(request, pa.table({"a": pa.array([], pa.int64()), "b": pa.array([], pa.int64())}))
     assert full["title"] == "t"
     assert empty["title"] == "t"
+
+
+@pytest.mark.parametrize("lenient", [False, True])
+def test_pivotKeysSurviveTheClientParsers(lenient):
+    request = makeRequest("pivot", {"rows": ["r"], "columns": ["a", "b"], "value": "n"})
+    table = pa.table(
+        {
+            "r": ["Kids (Boys)", None, ""],
+            "a": ["Kids (Boys)", "", None],
+            "b": ["2024", "Q1", ""],
+            "n": [1, 2, 3],
+        }
+    )
+    chart = build(request, table, lenient=lenient)
+    assert chart["data"] == {
+        "('Kids （Boys）', '2024')": {"Kids （Boys）": 1, "—": None},
+        "('—', 'Q1')": {"Kids （Boys）": None, "—": 2},
+        "('—', '—')": {"Kids （Boys）": None, "—": 3},
+    }
+
+
+def test_pivotSingleLevelKeysAreCleanedToo():
+    request = makeRequest("pivot", {"rows": ["r"], "columns": ["c"], "value": "n"})
+    table = pa.table({"r": ["a (b)"], "c": [None], "n": [1]})
+    assert build(request, table)["data"] == {"—": {"a （b）": 1}}
+
+
+def test_cardBooleanBecomesLowercaseText():
+    request = makeRequest("card", {"value": "ok"})
+    assert build(request, pa.table({"ok": [True]}))["data"] == "true"
+    assert build(request, pa.table({"ok": [False]}))["data"] == "false"
+
+
+@pytest.mark.parametrize("lenient", [False, True])
+def test_cardListValueRaises(lenient):
+    request = makeRequest("card", {"value": "v"})
+    with pytest.raises(ChartBuildError, match="single number or text"):
+        buildChart(request, pa.table({"v": [[1, 2]]}), lenient=lenient)
+
+
+def test_emptyCardKeepsItsLabel():
+    request = makeRequest("card", {"value": "total_revenue"})
+    empty = pa.table({"total_revenue": pa.array([], pa.int64())})
+    assert build(request, empty)["label"] == "Total Revenue"
+    labelled = makeRequest("card", {"value": "n", "label": "Orders"})
+    assert build(labelled, pa.table({"n": pa.array([], pa.int64())}))["label"] == "Orders"
+
+
+def test_geoMapStrictRejectsNonNumericCoordinateColumns():
+    request = makeRequest("geoMap", {"lat": "a", "long": "b"})
+    with pytest.raises(ChartBuildError, match="CAST"):
+        buildChart(request, pa.table({"a": ["1"], "b": [2]}))
+
+
+def test_wholeNumberFloatLabelsPrintWithoutDecimals():
+    request = makeRequest("bar", {"x": "x", "y": "y"})
+    table = pa.table({"x": [10.0, 2.5, 3], "y": [1, 2, 3]})
+    assert build(request, table)["data"]["labels"] == ["10", "2.5", "3"]
+
+
+def test_integerValuedDecimalActsLikeAnInt():
+    request = makeRequest("table", {})
+    kind = pa.decimal128(38, 0)
+    table = pa.table({"small": pa.array([Decimal(5)], kind), "big": pa.array([Decimal(2**53 + 1)], kind)})
+    row = build(request, table)["data"][0]
+    assert row == {"small": 5, "big": "9007199254740993"}
+    assert isinstance(row["small"], int)
+    card = makeRequest("card", {"value": "big"})
+    assert build(card, table.select(["big"]))["data"] == "9007199254740993"
+
+
+def test_lenientTruncatedWithinCapSaysDataIsIncomplete(caplog):
+    request = makeRequest("bar", {"x": "x", "y": "y"})
+    with caplog.at_level(logging.WARNING):
+        buildChart(request, pa.table({"x": ["a"], "y": [1]}), truncated=True, lenient=True)
+    assert "incomplete" in caplog.text
+    assert "keeping the first" not in caplog.text

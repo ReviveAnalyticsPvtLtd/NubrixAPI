@@ -11,6 +11,7 @@ __author__ = "Rohit Mishra"
 __all__ = ["contractErrors"]
 
 import math
+import re
 
 CATEGORY_AXIS_TYPES = ("bar", "line", "area", "histogram")
 SINGLE_DATASET_TYPES = ("pie", "doughnut", "polarArea")
@@ -26,6 +27,19 @@ def _isNumber(value: object) -> bool:
 
 def _isNumberOrNull(value: object) -> bool:
     return value is None or _isNumber(value)
+
+
+def _isJsonSafe(value: object) -> bool:
+    """True for str, bool, None, int, finite float, or lists and dicts of those."""
+    if value is None or isinstance(value, (str, bool, int)):
+        return True
+    if isinstance(value, float):
+        return math.isfinite(value)
+    if isinstance(value, list):
+        return all(_isJsonSafe(item) for item in value)
+    if isinstance(value, dict):
+        return all(isinstance(key, str) and _isJsonSafe(item) for key, item in value.items())
+    return False
 
 
 def _isStrList(value: object) -> bool:
@@ -109,6 +123,19 @@ def _checkTable(chart: dict, errors: list[str]) -> None:
             errors.append(f"data[{index}] must be an object")
         elif list(row) != columns:
             errors.append(f"data[{index}] keys must equal columns, in the same order")
+        elif not _isJsonSafe(row):
+            errors.append(f"data[{index}] must hold only JSON-safe values")
+
+
+def _pivotLevels(key: str) -> list[str] | None:
+    """The levels the client reads from a tuple-text column key; None when it misreads the key."""
+    tupleMatch = re.search(r"\(([^)]+)\)", key)
+    if not tupleMatch or tupleMatch.group(0) != key:
+        return None
+    levels = re.findall(r"'([^']+)'", tupleMatch.group(1))
+    if not levels or tupleMatch.group(1) != ", ".join(f"'{level}'" for level in levels):
+        return None
+    return levels
 
 
 def _checkPivot(chart: dict, errors: list[str]) -> None:
@@ -116,6 +143,16 @@ def _checkPivot(chart: dict, errors: list[str]) -> None:
     if not isinstance(data, dict):
         errors.append("data must be an object")
         return
+    depths = set()
+    for columnKey in data:
+        if columnKey.startswith("("):
+            levels = _pivotLevels(columnKey)
+            if levels is None:
+                errors.append(f"data['{columnKey}'] is a column key the client would misread")
+            else:
+                depths.add(len(levels))
+    if len(depths) > 1:
+        errors.append("multi-level pivot column keys must all have the same depth")
     for columnKey, column in data.items():
         if not isinstance(column, dict):
             errors.append(f"data['{columnKey}'] must be an object keyed by row")
