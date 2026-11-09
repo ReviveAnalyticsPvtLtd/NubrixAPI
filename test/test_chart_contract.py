@@ -103,10 +103,28 @@ def test_geoMapWithNonStringTitleIsReported():
     assert contractErrors(chart) != []
 
 
-def test_scatterWithTextXPasses():
+def test_scatterWithTextXIsReported():
     chart = copy.deepcopy(GOLDEN["scatter"])
-    chart["data"]["datasets"][0]["data"] = [{"x": "SP", "y": 2.5}, {"x": "RJ", "y": 1}]
-    assert contractErrors(chart) == []
+    chart["data"]["datasets"][0]["data"] = [{"x": "SP", "y": 2.5}]
+    assert contractErrors(chart) != []
+
+
+@pytest.mark.parametrize("bad", [float("nan"), float("inf"), float("-inf")])
+@pytest.mark.parametrize(
+    "chartType, change",
+    [
+        ("bar", lambda c, v: c["data"]["datasets"][0].update(data=[v])),
+        ("scatter", lambda c, v: c["data"]["datasets"][0]["data"][0].update(y=v)),
+        ("bubble", lambda c, v: c["data"]["datasets"][0]["data"][0].update(r=v)),
+        ("card", lambda c, v: c.update(data=v)),
+        ("pivot", lambda c, v: c["data"]["('L1', 'L2')"].update(r1=v)),
+        ("geoMap", lambda c, v: c["map"]["data"]["points"][0].update(lat=v)),
+    ],
+)
+def test_nonFiniteNumbersAreReported(chartType, change, bad):
+    chart = copy.deepcopy(GOLDEN[chartType])
+    change(chart, bad)
+    assert contractErrors(chart) != []
 
 
 def test_scatterWithTextYIsReported():

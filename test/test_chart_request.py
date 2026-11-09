@@ -173,6 +173,13 @@ def test_wrongVersionRaises():
         decodeGeneratedCode(text)
 
 
+@pytest.mark.parametrize("version", ["1.0", "true"])
+def test_onlyTheIntegerOneIsAVersion(version):
+    text = encodeGeneratedCode(makeRequest("bar")).replace('"nubrixChart":1', '"nubrixChart":' + version)
+    with pytest.raises(ValueError):
+        decodeGeneratedCode(text)
+
+
 def test_markedButInvalidRequestRaises():
     with pytest.raises(ValueError):
         decodeGeneratedCode('{"nubrixChart":1,"chartType":"bar"}')

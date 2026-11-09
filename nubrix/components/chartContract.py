@@ -10,14 +10,18 @@ __version__ = "1.0.0"
 __author__ = "Rohit Mishra"
 __all__ = ["contractErrors"]
 
+import math
+
 CATEGORY_AXIS_TYPES = ("bar", "line", "area", "histogram")
 SINGLE_DATASET_TYPES = ("pie", "doughnut", "polarArea")
 POINT_KEYS = {"scatter": ("x", "y"), "bubble": ("x", "y", "r")}
 
 
 def _isNumber(value: object) -> bool:
-    """True for int and float, not bool."""
-    return isinstance(value, (int, float)) and not isinstance(value, bool)
+    """True for a finite int or float (not bool, NaN or infinity)."""
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return False
+    return math.isfinite(value)
 
 
 def _isNumberOrNull(value: object) -> bool:
@@ -60,8 +64,6 @@ def _checkCategoryData(chart: dict, errors: list[str]) -> None:
 
 def _checkPointData(chart: dict, errors: list[str]) -> None:
     keys = POINT_KEYS[chart["chartType"]]
-    # A scatter over a category column (for example a state) has text for x.
-    numericKeys = tuple(key for key in keys if key != "x")
     data = chart.get("data")
     datasets = data.get("datasets") if isinstance(data, dict) else None
     if not isinstance(datasets, list):
@@ -81,10 +83,8 @@ def _checkPointData(chart: dict, errors: list[str]) -> None:
             where = f"datasets[{index}].data[{pointIndex}]"
             if not isinstance(point, dict) or set(point) != set(keys):
                 errors.append(f"{where} must have exactly the keys {list(keys)}")
-            elif not all(_isNumber(point[key]) for key in numericKeys):
-                errors.append(f"{where} {list(numericKeys)} must be numbers")
-            elif not (_isNumber(point["x"]) or isinstance(point["x"], str)):
-                errors.append(f"{where}.x must be a number or a string")
+            elif not all(_isNumber(point[key]) for key in keys):
+                errors.append(f"{where} values must be finite numbers")
 
 
 def _checkCard(chart: dict, errors: list[str]) -> None:

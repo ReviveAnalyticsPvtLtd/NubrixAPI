@@ -215,6 +215,6 @@ def decodeGeneratedCode(text: str | None) -> ChartRequest | None:
     if not isinstance(parsed, dict) or GENERATED_CODE_MARKER not in parsed:
         return None
     version = parsed.pop(GENERATED_CODE_MARKER)
-    if isinstance(version, bool) or version != GENERATED_CODE_VERSION:
+    if type(version) is not int or version != GENERATED_CODE_VERSION:
         raise ValueError(f"Unsupported chart request version: {version!r}")
     return ChartRequest.model_validate(parsed)
