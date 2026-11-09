@@ -21,6 +21,7 @@ __version__ = "1.0.0"
 __author__ = "Rohit Mishra"
 __all__ = ["CheckedSql", "SqlCheckError", "checkSql"]
 
+import string
 from dataclasses import dataclass
 from typing import Iterable
 
@@ -47,9 +48,6 @@ _FORBIDDEN_NAMES = frozenset(
         "load_extension",
     }
 )
-# Harmless as scalars (`range(3)` is a list, `unnest` explodes a list), but a
-# table function when used as a source. Sources are refused structurally.
-_TABLE_ONLY_NAMES = frozenset({"range", "generate_series", "unnest"})
 
 _DENIED_NODE_NAMES = (
     "Command",
@@ -114,8 +112,21 @@ class CheckedSql:
     tables: tuple[str, ...]
 
 
+_ASCII_FOLD = str.maketrans(string.ascii_uppercase, string.ascii_lowercase)
+
+
+def _foldName(name: str) -> str:
+    """Fold a name exactly as DuckDB does: ASCII letters only.
+
+    str.casefold() would also fold characters such as U+017F or U+212A onto
+    ASCII letters, so a CTE the check sees as a different spelling could
+    resolve to a system view or file in DuckDB.
+    """
+    return str(name).translate(_ASCII_FOLD)
+
+
 def _isForbiddenFunction(name: str) -> bool:
-    lowered = name.lower()
+    lowered = _foldName(name)
     return lowered in _FORBIDDEN_NAMES or lowered.startswith(_FORBIDDEN_PREFIXES)
 
 
@@ -165,7 +176,7 @@ class _Checker:
         recursive = bool(withNode.args.get("recursive"))
         scope = ctes
         for cte in withNode.expressions:
-            name = str(cte.alias_or_name).casefold()
+            name = _foldName(cte.alias_or_name)
             inner = scope | {name} if recursive else scope
             self._checkNode(cte, inner)
             for child in cte.iter_expressions():
@@ -230,7 +241,7 @@ class _Checker:
                     "can read a file and is not allowed. " + _ALLOWED_SOURCES
                 )
 
-        key = name.casefold()
+        key = _foldName(name)
         if key in ctes:
             return
         canonical = self.activeByKey.get(key)
@@ -291,7 +302,7 @@ def checkSql(sql: str, activeTables: Iterable[str]) -> CheckedSql:
     """
     activeByKey: dict[str, str] = {}
     for name in activeTables:
-        activeByKey.setdefault(str(name).casefold(), str(name))
+        activeByKey.setdefault(_foldName(name), str(name))
 
     text = sql.strip() if isinstance(sql, str) else ""
     while text.endswith(";"):

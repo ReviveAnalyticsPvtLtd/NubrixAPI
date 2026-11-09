@@ -243,3 +243,35 @@ def test_parseErrorKeepsOnlyItsFirstLine():
     with pytest.raises(SqlCheckError) as info:
         checkSql("SELECT * FROM (", ACTIVE)
     assert "\n" not in str(info.value)
+
+
+@pytest.mark.parametrize(
+    "cte, source",
+    [
+        ("duckdb_tableſ", "duckdb_tables"),
+        ("ſqlite_master", "sqlite_master"),
+        ("pg_claſſ", "pg_class"),
+        ("straße", "strasse"),
+        ("Kelvin_k", "kelvin_k"),
+        ("dir/probe_ſecret.csv", "dir/probe_secret.csv"),
+    ],
+)
+def test_unicodeLookalikeCteDoesNotHideARealSource(cte, source):
+    with pytest.raises(SqlCheckError):
+        checkSql(f'WITH "{cte}" AS (SELECT 1 AS a) SELECT * FROM "{source}"', ["orders"])
+
+
+@pytest.mark.parametrize(
+    "active, used",
+    [("ſales.csv", "sales.csv"), ("sales.csv", "ſales.csv"), ("strasse", "straße"), ("kelvin", "Kelvin")],
+)
+def test_unicodeFoldingDoesNotMatchActiveTables(active, used):
+    with pytest.raises(SqlCheckError):
+        checkSql(f'SELECT * FROM "{used}"', [active])
+
+
+def test_nonAsciiActiveTableFoldsAsciiLettersOnly():
+    assert checkSql('SELECT * FROM "ÄRGER"', ["Ärger"]).tables == ("Ärger",)
+    assert checkSql('SELECT * FROM "Ärger"', ["Ärger"]).tables == ("Ärger",)
+    with pytest.raises(SqlCheckError):
+        checkSql('SELECT * FROM "ärger"', ["Ärger"])
