@@ -1,5 +1,7 @@
 """Unit tests for run payloads, the SQL run kind and the per-project slot (the child and the sandbox are stubbed)."""
 
+import io
+import threading
 from unittest.mock import MagicMock
 
 import pytest
@@ -139,3 +141,36 @@ def test_runSqlReleasesTheSemaphore(monkeypatch):
     with pytest.raises(RuntimeError):
         manager.runSql({}, "p1")
     assert redis.zrem.call_count == 2
+
+
+def _tablePathAsking(monkeypatch, tmp_path, reply: bytes):
+    """`tablePath` wired to a parent that answers with `reply`; returns what the child sent."""
+    requests, replies = io.BytesIO(), io.BytesIO(reply)
+    lock = threading.Lock()
+
+    def ask(tableName):
+        return sandboxRunner._askForPath(requests, replies, lock, str(tmp_path), tableName)
+
+    monkeypatch.setattr(sandboxRunner, "_pathSource", [ask])
+    return requests
+
+
+def test_tablePathReturnsTheSpooledFilesPath(monkeypatch, tmp_path):
+    requests = _tablePathAsking(monkeypatch, tmp_path, b'{"file": "0.parquet"}\n')
+
+    assert sandboxRunner.tablePath("sales") == str(tmp_path / "0.parquet")
+    assert requests.getvalue() == b'"sales"\n'
+
+
+def test_tablePathRaisesTheParentsErrorReply(monkeypatch, tmp_path):
+    _tablePathAsking(monkeypatch, tmp_path, b'{"error": "Could not read table \'sales\'."}\n')
+
+    with pytest.raises(RuntimeError, match="Could not read table 'sales'"):
+        sandboxRunner.tablePath("sales")
+
+
+def test_tablePathRefusesToRunOutsideASandbox(monkeypatch):
+    monkeypatch.setattr(sandboxRunner, "_pathSource", [None])
+
+    with pytest.raises(RuntimeError, match="only available inside a sandbox"):
+        sandboxRunner.tablePath("sales")

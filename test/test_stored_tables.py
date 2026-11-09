@@ -1876,12 +1876,15 @@ _DECODERS = {
     "utils/storedTables.py": None,
     # sandboxRunner's child-side readTable: a run decodes the tables it was served, under its own limits.
     "utils/sandboxRunner.py": {"return pq.read_table(path)"},
+    # Only the type annotations of the shared filter use the module; it decodes nothing.
+    "utils/runFilters.py": {"import pyarrow.dataset as ds"},
 }
 # The launchers that decode run in a sandbox child under the run limits: transform_launcher reads back its own output for
 # the preview, normalise_launcher and table_reader_launcher are the normaliser and the reader. inspect_launcher and
 # sandbox_launcher decode nothing themselves (they read tables only through sandboxRunner's channel), so they are not
-# listed: a decode added to either one must be reviewed and named here.
-_CHILD_SIDE = {"utils/transform_launcher.py", "utils/normalise_launcher.py", "utils/table_reader_launcher.py"}
+# listed: a decode added to either one must be reviewed and named here. sql_launcher opens a table's spooled Parquet
+# file as a dataset for DuckDB, in the child, under the run limits.
+_CHILD_SIDE = {"utils/transform_launcher.py", "utils/normalise_launcher.py", "utils/table_reader_launcher.py", "utils/sql_launcher.py"}
 
 
 def _decodeLines():
