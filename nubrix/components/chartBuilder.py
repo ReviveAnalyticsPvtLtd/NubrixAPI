@@ -29,6 +29,7 @@ from nubrix.components.chartRequest import (
 logger = logging.getLogger(__name__)
 
 MAX_EXACT_INT = 2**53
+EMPTY_LEVEL = "\u2014"
 AXIS_TYPES = ("bar", "line", "area", "histogram")
 POINT_TYPES = ("scatter", "bubble")
 SINGLE_DATASET_TYPES = ("pie", "doughnut", "polarArea")
@@ -90,7 +91,9 @@ def _number(value: object) -> int | float | None:
     if isinstance(value, bool) or not isinstance(value, (int, float, Decimal)):
         return None
     if isinstance(value, Decimal):
-        value = float(value)
+        if not value.is_finite():
+            return None
+        value = int(value) if value == value.to_integral_value() else float(value)
     if isinstance(value, float):
         return value if math.isfinite(value) else None
     return value if abs(value) <= MAX_EXACT_INT else float(value)
@@ -102,15 +105,29 @@ def _text(value: object) -> str:
         return ""
     if isinstance(value, str):
         return value
+    if isinstance(value, float) and value.is_integer():
+        return str(int(value))
     if hasattr(value, "isoformat"):
         return value.isoformat()
     return str(value)
+
+
+def _levelText(value: object) -> str:
+    """
+    A pivot key level the client's parsers read back unchanged: its regexes
+    cannot hold an apostrophe, a parenthesis or an empty level.
+    """
+    text = _text(value)
+    text = text.replace("'", APOSTROPHE).replace("(", "\uff08").replace(")", "\uff09")
+    return text or EMPTY_LEVEL
 
 
 def _cell(value: object):
     """A JSON-safe table or card value; integers above 2**53 become text."""
     if value is None or isinstance(value, (str, bool)):
         return value
+    if isinstance(value, Decimal) and value.is_finite() and value == value.to_integral_value():
+        value = int(value)
     if isinstance(value, (float, Decimal)):
         return _number(value)
     if isinstance(value, int):
@@ -126,12 +143,16 @@ def _cell(value: object):
     return str(value)
 
 
-def _column(table: pa.Table, name: str) -> list:
+def _checkColumn(table: pa.Table, name: str) -> None:
     if table.column_names.count(name) != 1:
         raise ChartBuildError(
             f"The query result has no single column '{name}'; its columns are {table.column_names}. "
             "Use the exact output column names in the encoding."
         )
+
+
+def _column(table: pa.Table, name: str) -> list:
+    _checkColumn(table, name)
     return table.column(name).to_pylist()
 
 
@@ -153,7 +174,10 @@ def _checkLabelCount(request: ChartRequest, count: int, truncated: bool, lenient
     else:
         problem = f"query returned more rows than a {request.chartType} chart can use"
     if lenient:
-        logger.warning("The %s; keeping the first %d labels", problem, LABEL_CAP)
+        if count > LABEL_CAP:
+            logger.warning("The %s; keeping the first %d labels", problem, LABEL_CAP)
+        else:
+            logger.warning("The %s; the data is incomplete", problem)
         return
     raise ChartBuildError(
         f"The {problem} (limit {LABEL_CAP}). Aggregate further, and add ORDER BY and LIMIT {LABEL_CAP}."
@@ -176,8 +200,7 @@ def _buildCategory(request: ChartRequest, table: pa.Table, truncated: bool, leni
     encoding = request.encoding
     labelColumn = encoding.x or encoding.label
     valueColumns = encoding.y or [encoding.value]
-    if not lenient:
-        _requireNumeric(table, valueColumns, "Return a numeric value column, aggregated with SUM, AVG or COUNT.")
+    _requireNumeric(table, valueColumns, "Return a numeric value column, aggregated with SUM, AVG or COUNT.")
     rawLabels = [_text(value) for value in _column(table, labelColumn)]
     valueLists = [[_number(value) for value in _column(table, name)] for name in valueColumns]
 
@@ -201,7 +224,7 @@ def _buildCategory(request: ChartRequest, table: pa.Table, truncated: bool, leni
             if index >= LABEL_CAP:
                 continue
             column = cells.setdefault(name, {})
-            if index in column and not lenient:
+            if index in column:
                 raise ChartBuildError(
                     f"The query has more than one row for x '{label}' and series '{name}'. "
                     "Aggregate with GROUP BY so each pair appears once."
@@ -219,18 +242,17 @@ def _buildCategory(request: ChartRequest, table: pa.Table, truncated: bool, leni
     return chart
 
 
-def _buildPoints(request: ChartRequest, table: pa.Table, lenient: bool) -> dict:
+def _buildPoints(request: ChartRequest, table: pa.Table) -> dict:
     encoding = request.encoding
     roles = [("x", encoding.x), ("y", encoding.y[0])]
     if request.chartType == "bubble":
         roles.append(("r", encoding.r))
-    if not lenient:
-        _requireNumeric(
-            table,
-            [name for _, name in roles],
-            f"A {request.chartType} chart needs numeric columns for x, y and r; "
-            "for a text or date x use a line or bar chart instead.",
-        )
+    _requireNumeric(
+        table,
+        [name for _, name in roles],
+        f"A {request.chartType} chart needs numeric columns for x, y and r; "
+        "for a text or date x use a line or bar chart instead.",
+    )
     values = [[_number(value) for value in _column(table, name)] for _, name in roles]
     seriesNames = [_text(v) for v in _column(table, encoding.series)] if encoding.series else None
     datasets: dict[str, list[dict]] = {}
@@ -249,6 +271,10 @@ def _buildPoints(request: ChartRequest, table: pa.Table, lenient: bool) -> dict:
     }
 
 
+def _cardLabel(request: ChartRequest) -> str:
+    return request.encoding.label or readableLabel(request.encoding.value)
+
+
 def _buildCard(request: ChartRequest, table: pa.Table) -> dict:
     if table.num_rows > 1:
         raise ChartBuildError(
@@ -256,11 +282,16 @@ def _buildCard(request: ChartRequest, table: pa.Table) -> dict:
             "Aggregate to a single row, or add LIMIT 1."
         )
     column = request.encoding.value
-    value = _cell(_column(table, column)[0])
+    raw = _column(table, column)[0]
+    if isinstance(raw, (list, tuple, dict)):
+        raise ChartBuildError(
+            f"Column '{column}' holds a list or struct, which a card cannot show. Return a single number or text."
+        )
+    value = "true" if raw is True else "false" if raw is False else _cell(raw)
     return {
         "chartType": "card",
         "title": request.title,
-        "label": request.encoding.label or readableLabel(column),
+        "label": _cardLabel(request),
         "data": 0 if value is None else value,
     }
 
@@ -276,21 +307,20 @@ def _pivotKey(levels: tuple[str, ...]) -> str:
     """One level is plain text; several are the tuple text the client parses."""
     if len(levels) == 1:
         return levels[0]
-    quoted = ", ".join("'" + level.replace("'", APOSTROPHE) + "'" for level in levels)
+    quoted = ", ".join(f"'{level}'" for level in levels)
     return f"({quoted})"
 
 
-def _buildPivot(request: ChartRequest, table: pa.Table, truncated: bool, lenient: bool) -> dict:
+def _buildPivot(request: ChartRequest, table: pa.Table, truncated: bool) -> dict:
     encoding = request.encoding
     if truncated:
         raise ChartBuildError(
             "The pivot query returned more rows than a pivot can use, so its totals would be wrong. "
             "Aggregate further so fewer (row, column) pairs are returned."
         )
-    if not lenient:
-        _requireNumeric(table, [encoding.value], "Return a numeric value column, aggregated with SUM, AVG or COUNT.")
-    rowLevels = zip(*[[_text(v) for v in _column(table, name)] for name in encoding.rows])
-    columnLevels = zip(*[[_text(v) for v in _column(table, name)] for name in encoding.columns])
+    _requireNumeric(table, [encoding.value], "Return a numeric value column, aggregated with SUM, AVG or COUNT.")
+    rowLevels = zip(*[[_levelText(v) for v in _column(table, name)] for name in encoding.rows])
+    columnLevels = zip(*[[_levelText(v) for v in _column(table, name)] for name in encoding.columns])
     rowKeys: dict[str, None] = {}
     cells: dict[str, dict[str, int | float | None]] = {}
     for rowLevel, columnLevel, value in zip(rowLevels, columnLevels, _column(table, encoding.value)):
@@ -312,6 +342,7 @@ def _buildPivot(request: ChartRequest, table: pa.Table, truncated: bool, lenient
 
 def _buildGeoMap(request: ChartRequest, table: pa.Table) -> dict:
     encoding = request.encoding
+    _requireNumeric(table, [encoding.lat, encoding.long], "Use CAST(... AS DOUBLE) for the coordinates.")
     lats, longs = _column(table, encoding.lat), _column(table, encoding.long)
     labels = _column(table, encoding.label) if encoding.label else [None] * table.num_rows
     ids = _column(table, encoding.id) if encoding.id else [None] * table.num_rows
@@ -343,8 +374,10 @@ def buildChart(request: ChartRequest, table: pa.Table, truncated: bool = False, 
         request (ChartRequest): The chart the model asked for.
         table (pa.Table): The query result.
         truncated (bool): The launcher cut the result at its row cap.
-        lenient (bool): For old stored charts: a category chart keeps its first
-            LABEL_CAP labels instead of raising, and non-numbers become null.
+        lenient (bool): For re-runs of saved chart requests, where no model is
+            left to repair them: a category chart keeps its first LABEL_CAP
+            labels instead of raising when it has too many labels or the rows
+            were truncated. Nothing else is relaxed.
 
     Returns:
         dict: One of the chart shapes the client reads.
@@ -354,19 +387,22 @@ def buildChart(request: ChartRequest, table: pa.Table, truncated: bool = False, 
     """
     chartType = request.chartType
     for name in [*requiredColumns(request), *(request.encoding.columns or [])]:
-        _column(table, name)
+        _checkColumn(table, name)
     if table.num_rows == 0:
         if chartType in AXIS_TYPES or chartType in POINT_TYPES:
             return emptyChart(chartType, request.title, *_axisLabels(request))
-        return emptyChart(chartType, request.title)
+        chart = emptyChart(chartType, request.title)
+        if chartType == "card":
+            chart["label"] = _cardLabel(request)
+        return chart
     if chartType in CATEGORY_TYPES:
         return _buildCategory(request, table, truncated, lenient)
     if chartType in POINT_TYPES:
-        return _buildPoints(request, table, lenient)
+        return _buildPoints(request, table)
     if chartType == "card":
         return _buildCard(request, table)
     if chartType == "table":
         return _buildTable(request, table)
     if chartType == "pivot":
-        return _buildPivot(request, table, truncated, lenient)
+        return _buildPivot(request, table, truncated)
     return _buildGeoMap(request, table)
