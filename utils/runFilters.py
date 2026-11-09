@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import datetime
 import decimal
+import zoneinfo
 
 import pyarrow as pa
 import pyarrow.compute as pc
@@ -40,10 +41,23 @@ def _isDate(dataType: pa.DataType) -> bool:
     return pa.types.is_date32(dataType) or pa.types.is_date64(dataType)
 
 
+def _zone(tz: str) -> datetime.tzinfo:
+    if tz.upper() in ("UTC", "Z"):
+        return datetime.timezone.utc
+    try:
+        return zoneinfo.ZoneInfo(tz)
+    except (zoneinfo.ZoneInfoNotFoundError, ValueError):
+        # A fixed offset such as "+05:30".
+        sign = -1 if tz.startswith("-") else 1
+        hours, _, minutes = tz.lstrip("+-").partition(":")
+        return datetime.timezone(sign * datetime.timedelta(hours=int(hours), minutes=int(minutes or 0)))
+
+
 def _parseTimestamp(value, unit: str, tz: str | None) -> pa.Scalar:
     """Datetime text (``YYYY-MM-DD[ T]HH:MM:SS``, optional ``Z`` / offset) to a timestamp scalar.
 
-    Text without an offset is read as UTC for a timezone-aware column and as wall-clock time otherwise.
+    Text without an offset is read in the column's own timezone (wall-clock time for a naive column), as
+    pandas did. Text with an offset keeps it.
     """
     if isinstance(value, str):
         moment = datetime.datetime.fromisoformat(value.strip())
@@ -55,7 +69,7 @@ def _parseTimestamp(value, unit: str, tz: str | None) -> pa.Scalar:
         return pa.scalar(value).cast(pa.timestamp(unit, tz=tz), safe=True)
     if tz is not None:
         if moment.tzinfo is None:
-            moment = moment.replace(tzinfo=datetime.timezone.utc)
+            moment = moment.replace(tzinfo=_zone(tz))
     elif moment.tzinfo is not None:
         moment = moment.astimezone(datetime.timezone.utc).replace(tzinfo=None)
     return pa.scalar(moment, type=pa.timestamp(unit, tz=tz))
@@ -95,6 +109,9 @@ def _comparable(field: pc.Expression, dataType: pa.DataType) -> tuple[pc.Express
     """The column expression and the type values are cast to (dates compare as midnight timestamps)."""
     if pa.types.is_dictionary(dataType):
         return _comparable(field.cast(dataType.value_type), dataType.value_type)
+    if hasattr(pa.types, "is_string_view") and pa.types.is_string_view(dataType):
+        # pyarrow 20 has no compute kernels for string_view.
+        return field.cast(pa.string()), pa.string()
     if _isDate(dataType):
         return field.cast(pa.timestamp("us")), pa.timestamp("us")
     return field, dataType
@@ -127,8 +144,16 @@ def _conditionExpressions(column: str, dataType: pa.DataType, condition) -> list
         members = [item for item in members if item is not None]
         if not members:
             return [_matchNothing()]
-        valueSet = pa.array([item.as_py() for item in members], type=members[0].type)
-        return [pc.is_in(field, value_set=valueSet)]
+        # One is_in per scalar type, OR-ed: the result never depends on member order or on mixed types
+        # (e.g. 1.5 beside 2 on an integer column).
+        byType: dict[pa.DataType, list] = {}
+        for item in members:
+            byType.setdefault(item.type, []).append(item.as_py())
+        expression = None
+        for memberType, values in byType.items():
+            one = pc.is_in(field, value_set=pa.array(values, type=memberType))
+            expression = one if expression is None else expression | one
+        return [expression]
 
     scalar = _castScalar(condition, valueType)
     return [_matchNothing() if scalar is None else pc.equal(field, scalar)]
@@ -160,7 +185,15 @@ def filterExpression(tableName: str, schema: pa.Schema, filters: list | None) ->
 
 def applyFilters(table: pa.Table, tableName: str, filters: list | None) -> pa.Table:
     expression = filterExpression(tableName, table.schema, filters)
-    return table if expression is None else table.filter(expression)
+    if expression is None:
+        return table
+    viewColumns = [
+        i for i, field in enumerate(table.schema) if hasattr(pa.types, "is_string_view") and pa.types.is_string_view(field.type)
+    ]
+    # pyarrow 20 can neither filter nor take string_view columns, so they come back as plain string.
+    for i in viewColumns:
+        table = table.set_column(i, table.schema.field(i).name, table.column(i).cast(pa.string()))
+    return table.filter(expression)
 
 
 def filterDataset(dataset: ds.Dataset, tableName: str, filters: list | None) -> ds.Dataset:
