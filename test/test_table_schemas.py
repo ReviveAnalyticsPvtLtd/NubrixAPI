@@ -247,7 +247,6 @@ def test_dropsMakeNoScan(redisFake, reader):
 
 def test_skipUnreadableLeavesOutATableThatFailsAndKeepsTheRest(redisFake, reader):
     warnings = []
-    real = tableSchemas.storedTableSchema
 
     def decode(projectId, tableName, **kwargs):
         if tableName == "legacy":
@@ -260,7 +259,6 @@ def test_skipUnreadableLeavesOutATableThatFailsAndKeepsTheRest(redisFake, reader
     assert list(result) == ["sales", "costs"]
     assert any("ValueError" in message for message in warnings)
     assert not any("Secret Corp" in message for message in warnings)
-    assert real is not None
 
 
 def test_unreadableTableStillRaisesByDefault(reader):
