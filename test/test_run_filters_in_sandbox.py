@@ -4,9 +4,11 @@ Each test runs real sandbox children: the filters travel in the run's stdin, `sa
 `use_run_filters`, and the data functions narrow every table they load.
 """
 
+import copy
 import io
 import json
-import os
+import string
+from pathlib import Path
 from unittest.mock import MagicMock
 
 import polars as pl
@@ -15,8 +17,10 @@ import yaml
 
 from test.privateStorageFixtures import SERVICE_KEY, FakePrivateStorage
 from test.test_sandbox_storage_reads import PROJECT
+from api.models import GetData
 from utils import codeExecutor
 
+TEMPLATES_FILE = Path(__file__).resolve().parent.parent / "codeTemplates.yaml"
 SALES = {"state": ["SP", "RJ", "SP", "MG"], "amount": [1, 2, 3, 4]}
 SP_ROWS = 2
 
@@ -37,6 +41,11 @@ def salesStorage(monkeypatch):
     monkeypatch.setattr(codeExecutor.creditService, "_redis", lambda: MagicMock(zcard=lambda _key: 0))
     yield fake
     fake.close()
+
+
+def loadTemplates():
+    with open(TEMPLATES_FILE, encoding="utf-8") as templatesFile:
+        return yaml.safe_load(templatesFile)
 
 
 def runCode(code, filters=None):
@@ -96,8 +105,7 @@ def test_aFilterOnAnotherTableLeavesThisOneAlone(salesStorage):
 
 def test_panelTemplateWidgetIsFilteredThroughRunInput(salesStorage):
     """The saved panel widget loads its table with fetch_data, so the run's filters narrow it."""
-    templates = yaml.safe_load(open(os.path.join(os.getcwd(), "codeTemplates.yaml"), encoding="utf-8"))
-    import string
+    templates = loadTemplates()
 
     code = string.Template(templates["panelChartWithoutBlend"]).substitute(
         projectId=PROJECT, chartType="bar", xAxis="state", yAxis="amount", aggregationMetric="sum",
@@ -115,9 +123,7 @@ def test_panelTemplateWidgetIsFilteredThroughRunInput(salesStorage):
 
 def test_panelBlendTemplateWidgetIsFilteredThroughRunInput(salesStorage):
     """The blend template loads every table with fetch_data, so the run's filters narrow each one before the merge."""
-    import string
-
-    templates = yaml.safe_load(open(os.path.join(os.getcwd(), "codeTemplates.yaml"), encoding="utf-8"))
+    templates = loadTemplates()
     code = string.Template(templates["panelChartWithBlend"]).substitute(
         projectId=PROJECT, chartType="bar", xAxis="zone", yAxis="amount", aggregationMetric="sum",
         dataSourceName="blend", tablesUsed=["sales", "regions"], joinTypes=["inner"], blendOn=["state"],
@@ -131,3 +137,68 @@ def test_panelBlendTemplateWidgetIsFilteredThroughRunInput(salesStorage):
     filtered = json.loads(runCode(code, [{"state": "SP"}]))
     assert filtered["data"]["labels"] == ["south"]
     assert filtered["data"]["datasets"][0]["data"] == [4]
+
+
+def panelWithoutBlendCode():
+    """The unmodified saved panel template, as the chart builder renders it for a bar chart over `sales`."""
+    return string.Template(loadTemplates()["panelChartWithoutBlend"]).substitute(
+        projectId=PROJECT, chartType="bar", xAxis="state", yAxis="amount", aggregationMetric="sum",
+        dataSourceName="sales", tablesUsed="sales", index=None, columns=None, values=None,
+        selectedColumns=None, mapType="", isFilterApplied=False, filters=None, geoCodeColumn="None",
+    )
+
+
+LAZY_BAR = (
+    "import json\n"
+    f'n = scan_data("{PROJECT}", "sales").collect().height\n'
+    'print(json.dumps({"chartType": "bar", "title": "rows", "xLabels": "x", "yLabels": "y", '
+    '"data": {"labels": ["rows"], "datasets": [{"label": "rows", "data": [n]}]}}))'
+)
+SAVED_BAR = {"labels": ["rows"], "datasets": [{"label": "rows", "data": [999]}]}
+
+
+def savedWidgets():
+    return [
+        {"id": "lazy", "chartType": "bar", "title": "rows", "data": SAVED_BAR, "layout": {"x": 0}, "generatedCode": LAZY_BAR},
+        {"id": "panel", "chartType": "bar", "title": "t", "data": SAVED_BAR, "layout": {"x": 1}, "generatedCode": panelWithoutBlendCode()},
+        {"id": "broken", "chartType": "table", "title": "t", "data": [{"a": 1}], "layout": {"x": 2},
+         "generatedCode": "raise RuntimeError('boom')"},
+    ]
+
+
+@pytest.fixture
+def dashboardService(salesStorage, monkeypatch):
+    """The real DashboardService and real sandbox children; only the project's config storage is stubbed."""
+    from api.services import dashboardService as module
+
+    store = {"pg": {"name": "n", "widgets": savedWidgets()}}
+    monkeypatch.setattr(module, "readJson", lambda projectId, name: copy.deepcopy(store))
+    service = module.DashboardService.__new__(module.DashboardService)
+    service.client = MagicMock()
+    return service
+
+
+def test_getDataFilterRerunsSavedWidgetsThroughRealSandboxChildren(dashboardService):
+    page = dashboardService.getData(GetData(projectId=PROJECT, page="pg", filters=[{"sales.state": "SP"}]))
+
+    lazy, panel, broken = page["widgets"]
+    assert lazy["data"]["datasets"][0]["data"] == [SP_ROWS]
+    assert panel["data"]["labels"] == ["SP"]
+    assert panel["data"]["datasets"][0]["data"] == [4]
+    assert broken["chartType"] == "table" and broken["data"] == []
+    assert [w["id"] for w in page["widgets"]] == ["lazy", "panel", "broken"]
+    assert [w["generatedCode"] for w in page["widgets"]] == [w["generatedCode"] for w in savedWidgets()]
+    dashboardService.client.storage.from_.assert_not_called()
+
+
+def test_getDataRefreshSavesSucceededWidgetsAndKeepsTheFailedOne(dashboardService):
+    page = dashboardService.getData(GetData(projectId=PROJECT, page="pg", refresh=True))
+
+    upload = dashboardService.client.storage.from_.return_value.upload
+    saved = json.loads(upload.call_args.kwargs["file"].decode("utf-8"))["pg"]["widgets"]
+    assert [w["id"] for w in saved] == ["lazy", "panel", "broken"]
+    assert [w["generatedCode"] for w in saved] == [w["generatedCode"] for w in savedWidgets()]
+    assert saved[0]["data"]["datasets"][0]["data"] == [4]
+    assert sorted(saved[1]["data"]["labels"]) == ["MG", "RJ", "SP"]
+    assert saved[2]["data"] == [{"a": 1}]
+    assert [w["data"] for w in page["widgets"]] == [w["data"] for w in saved]
