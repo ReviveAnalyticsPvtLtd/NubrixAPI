@@ -299,3 +299,102 @@ def test_compareCharts_theGreedyFallbackStopsAtItsBudget(monkeypatch):
     assert compareCharts(a, b) == "differ"
     assert state["calls"] <= 500 + n
     assert state["calls"] >= 500
+
+
+# --- names are not data: dataset labels of a single series and table column names ---
+
+
+def _bar(label, values, labels=("n", "s")):
+    return {"chartType": "bar", "data": {"labels": list(labels), "datasets": [{"label": label, "data": list(values)}]}}
+
+
+def test_compareCharts_singleDatasetLabelIsIgnored():
+    assert compareCharts(_bar("Revenue", [1, 2]), _bar("Total Revenue", [1, 2])) == "match"
+    assert compareCharts(_bar("Revenue", [1, 2]), _bar("Total Revenue", [1, 3])) == "differ"
+
+
+def test_compareCharts_singleScatterDatasetLabelIsIgnored():
+    def scatter(label, y):
+        return {"chartType": "scatter", "data": {"datasets": [{"label": label, "data": [{"x": 1, "y": y}]}]}}
+
+    assert compareCharts(scatter("a", 2), scatter("b", 2)) == "match"
+    assert compareCharts(scatter("a", 2), scatter("b", 3)) == "differ"
+
+
+def test_compareCharts_oneDatasetAgainstTwoDiffers():
+    two = _bar("a", [1, 2])
+    two["data"]["datasets"].append({"label": "b", "data": [3, 4]})
+    assert compareCharts(_bar("a", [1, 2]), two) == "differ"
+
+
+def _two(labelA, labelB, a=(1, 2), b=(3, 4)):
+    return {
+        "chartType": "bar",
+        "data": {"labels": ["n", "s"], "datasets": [{"label": labelA, "data": list(a)}, {"label": labelB, "data": list(b)}]},
+    }
+
+
+def test_compareCharts_twoDatasetsStillPairByLabel():
+    swapped = _two("y", "x", a=(3, 4), b=(1, 2))
+    assert compareCharts(_two("x", "y"), swapped) == "match"
+    assert compareCharts(_two("x", "y"), _two("x", "z")) == "differ"
+    assert compareCharts(_two("x", "y"), _two("y", "x")) == "differ"
+
+
+def test_compareCharts_titleAxisLabelsAndCardLabelDoNotCount():
+    other = _bar("v", [1, 2])
+    other.update({"title": "T2", "xLabels": "X2", "yLabels": "Y2"})
+    base = _bar("v", [1, 2])
+    base.update({"title": "T1", "xLabels": "X1", "yLabels": "Y1"})
+    assert compareCharts(base, other) == "match"
+    assert compareCharts({"chartType": "card", "label": "a", "data": 1}, {"chartType": "card", "label": "b", "data": 1}) == "match"
+
+
+def _table(columns, rows):
+    return {"chartType": "table", "columns": columns, "data": [dict(zip(columns, r)) for r in rows]}
+
+
+def test_compareCharts_e2eTableWithRenamedColumnAndFloatNoise():
+    py = _table(["product", "category", "total_revenue"], [["A", "x", 236045.58000000002], ["B", "y", 5.5]])
+    sql = _table(["product", "category", "revenue"], [["A", "x", 236045.58], ["B", "y", 5.5]])
+    assert compareCharts(py, sql) == "match"
+
+
+def test_compareCharts_tableRenamedReorderedColumnsAndRows():
+    a = _table(["id", "name", "amt"], [[1, "p", 1.5], [2, "q", 2.5], [3, "r", 3.5]])
+    b = _table(["value", "who", "n"], [[3.5, "r", 3], [1.5, "p", 1], [2.5, "q", 2]])
+    assert compareCharts(a, b) == "match"
+
+
+def test_compareCharts_tableRenamedColumnWithDifferentValuesDiffers():
+    a = _table(["id", "amt"], [[1, 1.5], [2, 2.5]])
+    assert compareCharts(a, _table(["id", "total"], [[1, 1.5], [2, 9.5]])) == "differ"
+    assert compareCharts(a, _table(["id", "total", "extra"], [[1, 1.5, 0], [2, 2.5, 0]])) == "differ"
+
+
+def test_compareCharts_tableRowsMustStayTogetherUnderTheMapping():
+    a = _table(["a", "b"], [[1, "x"], [2, "y"]])
+    assert compareCharts(a, _table(["c", "d"], [["x", 2], ["y", 1]])) == "differ"
+
+
+def test_compareCharts_tableTiedColumnSignaturesGiveTheCorrectResult():
+    a = _table(["p", "q", "r"], [[1, 1, "a"], [2, 2, "b"]])
+    assert compareCharts(a, _table(["x", "y", "z"], [["a", 1, 1], ["b", 2, 2]])) == "match"
+    # same column multisets, rows pair them differently
+    c = _table(["p", "q"], [[1, 2], [2, 1]])
+    assert compareCharts(c, _table(["x", "y"], [[2, 1], [1, 2]])) == "match"
+    d = _table(["p", "q"], [[1, 1], [2, 2]])
+    assert compareCharts(d, _table(["x", "y"], [[1, 2], [2, 1]])) == "differ"
+
+
+def test_compareCharts_tableTenTiedColumnsFinishFast():
+    import time
+
+    cols = [f"a{i}" for i in range(10)]
+    rows = [[r] * 10 for r in range(50)]
+    a = _table(cols, rows)
+    b = _table([f"b{i}" for i in range(10)], rows)
+    start = time.monotonic()
+    verdict = compareCharts(a, b)
+    assert time.monotonic() - start < 1
+    assert verdict in ("match", "differ")

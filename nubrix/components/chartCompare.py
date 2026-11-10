@@ -6,6 +6,7 @@ Both charts are the `finalOutput` of a successful run.
 
 __all__ = ["compareCharts"]
 
+import itertools
 import math
 import re
 from typing import Any, Literal
@@ -15,6 +16,9 @@ _MIDNIGHT = re.compile(r"[ T]00:00:00$")
 _WHOLE = re.compile(r"[+-]?\d+$")
 # Calls of `_same` that the greedy fallback may make in one comparison; past it the answer is "differ".
 _GREEDY_BUDGET = 200_000
+# Column matching for tables: columns sharing one signature are tried in permutations, within these bounds.
+_MAX_TIED_COLUMNS = 8
+_MAX_COLUMN_MAPPINGS = 720
 
 
 class _BudgetExhausted(Exception):
@@ -162,10 +166,16 @@ def _datasets(chart: dict) -> list:
 
 
 def _pairDatasets(a: dict, b: dict, sameData) -> bool:
-    """Datasets are matched by label, in any order; `sameData(datasetA, datasetB)` says whether two carry the same data."""
+    """
+    Datasets are matched by label, in any order; `sameData(datasetA, datasetB)` says whether two carry the same data.
+
+    With exactly one dataset on each side the label is only the model's wording of the measure, so it is ignored.
+    """
     datasetsA, datasetsB = _datasets(a), _datasets(b)
     if len(datasetsA) != len(datasetsB):
         return False
+    if len(datasetsA) == 1:
+        return sameData(datasetsA[0], datasetsB[0])
     byLabel: dict[str, list[dict]] = {}
     for dataset in datasetsB:
         byLabel.setdefault(_text(dataset.get("label")), []).append(dataset)
@@ -206,8 +216,70 @@ def _sameScatter(a: dict, b: dict, relTol: float, budget: list) -> bool:
     return _pairDatasets(a, b, lambda x, y: _sameMultiset(x.get("data") or [], y.get("data") or [], relTol, budget))
 
 
+def _columns(chart: dict) -> list:
+    """Column names in first-seen order: the declared `columns`, then any key a row adds."""
+    names: dict = {}
+    for name in chart.get("columns") or []:
+        names.setdefault(name, None)
+    for row in chart.get("data") or []:
+        if isinstance(row, dict):
+            for name in row:
+                names.setdefault(name, None)
+    return list(names)
+
+
+def _signature(rows: list, column: Any) -> tuple:
+    return tuple(sorted(_key(row.get(column)) for row in rows))
+
+
+def _columnMappings(colsA: list, colsB: list, rowsA: list, rowsB: list):
+    """
+    Yields mappings (a list of B columns, one per A column) that pair columns with equal value signatures.
+
+    Columns with a unique signature pair directly; a group of columns sharing a signature is permuted. A group of more
+    than `_MAX_TIED_COLUMNS` or more than `_MAX_COLUMN_MAPPINGS` mappings in all yields nothing further.
+    """
+    groupsA: dict = {}
+    groupsB: dict = {}
+    for col in colsA:
+        groupsA.setdefault(_signature(rowsA, col), []).append(col)
+    for col in colsB:
+        groupsB.setdefault(_signature(rowsB, col), []).append(col)
+    if groupsA.keys() != groupsB.keys() or any(len(groupsA[s]) != len(groupsB[s]) for s in groupsA):
+        return
+    signatures = list(groupsA)
+    if any(len(groupsA[s]) > _MAX_TIED_COLUMNS for s in signatures):
+        return
+    choices = [list(itertools.permutations(groupsB[s])) for s in signatures]
+    for picked in itertools.islice(itertools.product(*choices), _MAX_COLUMN_MAPPINGS):
+        target = {}
+        for s, perm in zip(signatures, picked):
+            target.update(zip(groupsA[s], perm))
+        yield [target[col] for col in colsA]
+
+
 def _sameTable(a: dict, b: dict, relTol: float, budget: list) -> bool:
-    return _sameMultiset(a.get("data") or [], b.get("data") or [], relTol, budget)
+    """
+    Rows as a multiset. Columns are matched by their values, not their names.
+
+    Same column names: the rows compare as dicts, as before. Otherwise the column count must agree and columns pair by
+    the multiset of their values; each candidate pairing is checked with the multiset of whole rows. Past the bounds on
+    tied columns and mappings the comparison falls back to names, which cannot match differently named columns.
+    """
+    rowsA, rowsB = a.get("data") or [], b.get("data") or []
+    colsA, colsB = _columns(a), _columns(b)
+    if len(colsA) != len(colsB):
+        return False
+    if set(colsA) == set(colsB):
+        return _sameMultiset(rowsA, rowsB, relTol, budget)
+    if len(rowsA) != len(rowsB):
+        return False
+    tuplesA = [tuple(row.get(c) for c in colsA) for row in rowsA]
+    for mapping in _columnMappings(colsA, colsB, rowsA, rowsB):
+        tuplesB = [tuple(row.get(c) for c in mapping) for row in rowsB]
+        if _sameMultiset(tuplesA, tuplesB, relTol, budget):
+            return True
+    return False
 
 
 def _points(chart: dict) -> set | None:
@@ -232,10 +304,10 @@ def compareCharts(a: dict, b: dict, relTol: float = 1e-6) -> Literal["match", "d
     Returns:
         Literal["match", "differ"]: "match" when the chart type is the same and:
             - category charts: each dataset agrees as a mapping label -> value, so the order of labels does not count;
-              datasets pair by label in any order; a duplicate label falls back to ordered lists;
-            - scatter and bubble: datasets agree by label, points as a multiset;
+              datasets pair by label in any order (one dataset per side ignores its label); a duplicate label falls back to ordered lists;
+            - scatter and bubble: datasets agree by label (a single dataset on each side ignores its label), points as a multiset;
             - card: the value agrees;
-            - table: rows agree as a multiset, in any order;
+            - table: rows agree as a multiset, in any order, with columns matched by their values, not their names;
             - pivot: every key and value agrees;
             - geoMap: the set of (lat, long, label) agrees to 6 decimals.
         Missing values (None, NaN) agree with each other. Two integral numbers agree only when equal, other numbers
