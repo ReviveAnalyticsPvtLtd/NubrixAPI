@@ -81,25 +81,39 @@ def _readRequest(text: str) -> ChartRequest:
     """The chart request in a model reply: the first JSON object that validates.
 
     The reply may hold reasoning text before the JSON (the chain only strips the think tags) or a code fence around it,
-    so each '{' is tried as the start of an object. Raises the ValidationError of the first object found, or the one for
-    invalid JSON when the reply holds no object.
+    so each '{' is tried as the start of an object. When none validates, the error raised is the one for the object
+    most likely to be the request: the last one with a `chartType` key, else the longest. When a '{' that did not
+    decode starts a longer stretch than that object, with no `chartType` object after it, the reply was cut off or is
+    not JSON, and the error is the invalid-JSON one for that stretch.
     """
     decoder = json.JSONDecoder()
-    firstError: ValidationError | None = None
+    decoded: list[tuple[int, int, dict]] = []
+    undecoded: list[int] = []
+    errors: dict[int, ValidationError] = {}
     position = text.find("{")
     while position != -1:
         try:
-            parsed, _ = decoder.raw_decode(text, position)
+            parsed, end = decoder.raw_decode(text, position)
         except ValueError:
-            parsed = None
-        if isinstance(parsed, dict):
-            try:
-                return ChartRequest.model_validate(parsed)
-            except ValidationError as error:
-                firstError = firstError or error
+            undecoded.append(position)
+        else:
+            if isinstance(parsed, dict):
+                try:
+                    return ChartRequest.model_validate(parsed)
+                except ValidationError as error:
+                    decoded.append((position, end, parsed))
+                    errors[position] = error
         position = text.find("{", position + 1)
-    if firstError is not None:
-        raise firstError
+    withType = [item for item in decoded if "chartType" in item[2]]
+    best = withType[-1] if withType else max(decoded, key=lambda item: item[1] - item[0], default=None)
+    span = best[1] - best[0] if best else 0
+    after = best[0] if withType else -1
+    for cut in undecoded:
+        if len(text) - cut > span and cut > after:
+            # Invalid JSON, for the stretch that could not be read.
+            return ChartRequest.model_validate_json(text[cut:].strip())
+    if best:
+        raise errors[best[0]]
     return ChartRequest.model_validate_json(text.strip())
 
 
@@ -244,7 +258,6 @@ class SqlChartWorkflow:
         except Exception as error:
             # The sandbox or the result reader broke. That says nothing about the request, so nothing is repaired,
             # and the user's answer and the log carry fixed text; the log keeps the exception's class.
-            logger.warning(f"Chart run failed unexpectedly: {type(error).__name__}")
             failure = ChartFailure("run", _UNEXPECTED_MESSAGE, logMessage=_UNEXPECTED_MESSAGE)
             failure.__cause__ = error
             return {"chart": None, "failure": {"stage": "run", "message": _UNEXPECTED_MESSAGE, "error": failure, "repairable": False}}

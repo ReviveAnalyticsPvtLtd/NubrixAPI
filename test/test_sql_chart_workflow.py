@@ -308,7 +308,9 @@ def test_unexpectedRunErrorEndsAsAnErrorWithoutRepair(harness, error):
     records = harness.failureRecords()
     assert len(records) == 1
     assert records[0]["stage"] == "run" and records[0]["errorClass"] == type(error).__name__
-    assert "Secret Corp" not in harness.logs[0] and "uid" not in harness.logs[0]
+    assert records[0]["error"] == "The chart query could not be run."
+    assert len(harness.logs) == 1
+    assert not any("Secret Corp" in line or "uid" in line for line in harness.logs)
 
 
 def test_lastValidRequestSurvivesInvalidRepairs(harness):
@@ -355,3 +357,42 @@ def test_busyGroundingEndsAsBusyWithoutAModelCall(harness, kind):
     records = harness.failureRecords()
     assert len(records) == 1 and records[0]["stage"] == "busy" and records[0]["chartType"] is None
     assert records[0]["errorClass"] == type(error).__name__
+
+
+def _errorsOf(reply):
+    from pydantic import ValidationError
+
+    with pytest.raises(ValidationError) as caught:
+        module._readRequest(reply)
+    return [(item["type"], item["loc"]) for item in caught.value.errors()]
+
+
+def test_invalidRequestReportsTheRequestsOwnError():
+    reply = 'Plan {"step": 1} then {"chartType": "bar", "title": "T", "sql": "S"}'
+    assert _errorsOf(reply) == [("missing", ("encoding",))]
+
+
+def test_truncatedRequestAfterEmptyBracesIsInvalidJson():
+    assert _errorsOf("Use {} maybe.\n" + MODEL_TEXT[:-20]) == [("json_invalid", ())]
+
+
+def test_truncatedRequestAloneIsInvalidJson():
+    assert _errorsOf(MODEL_TEXT[:-20]) == [("json_invalid", ())]
+
+
+@pytest.mark.parametrize(
+    "reply",
+    [
+        'I could use {a} or {} here, or {"x": 1}.\n' + MODEL_TEXT,
+        '{"note": "draft"}\n' + MODEL_TEXT,
+        MODEL_TEXT + "\nHope this helps {smile}",
+        "[" + MODEL_TEXT + "]",
+    ],
+)
+def test_requestIsPickedOutOfSurroundingBraces(reply):
+    assert module._readRequest(reply).title == "Totals"
+
+
+def test_firstOfTwoValidRequestsIsTaken():
+    other = json.dumps({**REQUEST, "title": "Other"})
+    assert module._readRequest(MODEL_TEXT + "\n" + other).title == "Totals"
