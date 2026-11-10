@@ -162,19 +162,81 @@ def test_filtersAndRefreshTogetherStayAnError(monkeypatch):
         service.getData(GetData(projectId="p1", page="pg", filters=FILTERS, refresh=True))
 
 
+FAILURE_CARD = {"id": "F", "chartType": "card", "title": "Chart: q", "label": "Status", "xLabels": "Status",
+                "yLabels": "Value", "data": "Error/No data", "layout": {},
+                "generatedCode": "# Failed to generate code for: q\n# Error: x"}
+
+
+def _noType(widgetId="N", code=PYTHON) -> dict:
+    return {"id": widgetId, "title": "x", "data": "whatever", "layout": {"y": 2}, "generatedCode": code}
+
+
 @pytest.mark.parametrize("refresh", [False, True])
-def test_widgetWithoutChartTypeIsLeftAlone(monkeypatch, refresh):
-    failure = {"id": "F", "chartType": "card", "title": "Chart: q", "label": "Status", "xLabels": "Status",
-               "yLabels": "Value", "data": "Error/No data", "layout": {},
-               "generatedCode": "# Failed to generate code for: q\n# Error: x"}
-    noType = {"id": "N", "title": "x", "data": "whatever", "layout": {}, "generatedCode": "boom ("}
-    service, manager, renderer = _setup(monkeypatch, [failure, noType])
+def test_failureCardAndWidgetsWithoutCodeAreNotRun(monkeypatch, refresh):
+    noCode = {"id": "C", "title": "x", "data": "whatever", "layout": {}}
+    emptyCode = {"id": "E", "title": "x", "data": "whatever", "layout": {}, "generatedCode": "  "}
+    service, manager, renderer = _setup(monkeypatch, [FAILURE_CARD, noCode, emptyCode])
 
     page = service.getData(GetData(projectId="p1", page="pg", filters=None if refresh else FILTERS, refresh=refresh))
 
-    assert page["widgets"] == [failure, noType]
+    assert page["widgets"] == [FAILURE_CARD, noCode, emptyCode]
     manager.run.assert_not_called()
     renderer.assert_not_called()
+    service.client.storage.from_.assert_not_called()
+
+
+def test_noChartTypeWidgetWithCodeIsMergedUnderAFilter(monkeypatch):
+    saved = _noType()
+    service, manager, _ = _setup(monkeypatch, [saved])
+
+    widget = service.getData(GetData(projectId="p1", page="pg", filters=FILTERS))["widgets"][0]
+
+    assert manager.run.call_args.kwargs["filters"] == FILTERS
+    assert widget["data"] == "new" and widget["id"] == "N" and widget["layout"] == {"y": 2}
+    assert widget["generatedCode"] == PYTHON
+    service.client.storage.from_.assert_not_called()
+
+
+def test_noChartTypeWidgetWithCodeIsMergedAndSavedOnRefresh(monkeypatch):
+    saved = _noType()
+    service, _, _ = _setup(monkeypatch, [saved])
+
+    page = service.getData(GetData(projectId="p1", page="pg", refresh=True))
+
+    uploaded = _uploaded(service)["pg"]["widgets"][0]
+    assert uploaded["data"] == "new" and page["widgets"][0]["data"] == "new"
+    assert uploaded["id"] == "N" and uploaded["layout"] == {"y": 2} and uploaded["generatedCode"] == PYTHON
+
+
+def test_noChartTypeWidgetThatGainsAChartTypeKeepsIt(monkeypatch):
+    service, _, _ = _setup(monkeypatch, [_noType()],
+                           run=lambda code, projectId=None, filters=None: json.dumps({"chartType": "card", "data": 7}))
+
+    widget = service.getData(GetData(projectId="p1", page="pg", refresh=True))["widgets"][0]
+
+    assert widget["chartType"] == "card" and widget["data"] == 7
+    assert _uploaded(service)["pg"]["widgets"][0]["chartType"] == "card"
+
+
+def test_failedNoChartTypeWidgetIsUnchangedUnderAFilter(monkeypatch):
+    saved = _noType()
+    service, manager, _ = _setup(monkeypatch, [saved], run=lambda code, projectId=None, filters=None: "Traceback")
+
+    page = service.getData(GetData(projectId="p1", page="pg", filters=FILTERS))
+
+    assert page["widgets"] == [saved]
+    assert "chartType" not in page["widgets"][0]
+    manager.run.assert_called_once()
+
+
+def test_failedNoChartTypeWidgetIsUnchangedAndNotSavedOnRefresh(monkeypatch):
+    saved = _noType()
+    service, manager, _ = _setup(monkeypatch, [saved], run=lambda code, projectId=None, filters=None: "Traceback")
+
+    page = service.getData(GetData(projectId="p1", page="pg", refresh=True))
+
+    assert page["widgets"] == [saved]
+    manager.run.assert_called_once()
     service.client.storage.from_.assert_not_called()
 
 

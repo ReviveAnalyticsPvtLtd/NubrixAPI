@@ -118,10 +118,19 @@ class DashboardService:
 
     @staticmethod
     def _isRerunnable(widget: object) -> bool:
-        """A widget with no chart type, or the failure card of an automatic dashboard, has nothing to re-run."""
-        if not isinstance(widget, dict) or not widget.get("chartType"):
+        """
+        Whether a saved widget has code worth re-running.
+
+        A widget needs `generatedCode` that is a non-empty string and not the failure card of an automatic
+        dashboard. A missing `chartType` does not matter: such a widget (an automatic dashboard chart that
+        failed when it was created) is re-run too, so a refresh can recover it. A widget without code, and the
+        failure card, have nothing to re-run.
+        """
+        if not isinstance(widget, dict):
             return False
         code = widget.get("generatedCode")
+        if not widget.get("chartType") and not (isinstance(code, str) and code.strip()):
+            return False
         return not (isinstance(code, str) and code.lstrip().startswith(FAILED_CODE_PREFIX))
 
     @staticmethod
@@ -302,7 +311,7 @@ class DashboardService:
             elif (details.filters) and (not details.refresh):
                 widgets = pageInfo.get("widgets")
                 outcomes = self._rerunWidgets(widgets, details.filters, details.projectId)
-                pageInfo["widgets"] = [widget if succeeded else (self._emptiedWidget(widget) if self._isRerunnable(widget) else widget) for widget, succeeded in outcomes]
+                pageInfo["widgets"] = [widget if succeeded else (self._emptiedWidget(widget) if self._isRerunnable(widget) and widget.get("chartType") else widget) for widget, succeeded in outcomes]
             elif (not details.filters) and (details.refresh):
                 widgets = pageInfo.get("widgets")
                 outcomes = self._rerunWidgets(widgets, None, details.projectId)
