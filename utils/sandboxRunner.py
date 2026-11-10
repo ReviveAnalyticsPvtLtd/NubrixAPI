@@ -54,6 +54,7 @@ from utils.sandbox_reaper import _SHARED_TEMP_FOLDERS
 from utils.sandboxLimits import RunLimits, currentRunLimits
 from utils.sandboxSeccomp import installFilter
 from utils.sandboxSlots import SLOTS_FOLDER, acquireRunSlot, releaseRunSlot
+from utils.sandboxSlots import requireHeadroom as checkSlotHeadroom
 from utils.sandboxWatchdog import RunWatchdog
 
 # Below 65536, the range a user namespace normally maps. The same number of uids above
@@ -540,12 +541,15 @@ def runSandbox(launcherName: str, projectId: str, code: str, timeoutSeconds: int
     )
 
 
-def runSqlSandbox(projectId: str, request: dict, timeoutSeconds: int, slotWaitSeconds: float | None = None) -> SandboxResult:
+def runSqlSandbox(projectId: str, request: dict, timeoutSeconds: int, slotWaitSeconds: float | None = None, requireHeadroom: bool = False) -> SandboxResult:
     """Run one checked SQL query in `sql_launcher.py`, which writes an Arrow IPC file the parent reads up to the cap.
 
     The child asks for its tables over the table channel. `slotWaitSeconds` overrides the slot wait (0 tries once).
+    `requireHeadroom` (a shadow run) also refuses unless the sandbox has slots to spare, before any slot is taken.
     Raises SandboxBusyError when no slot is free and ResultTooLargeError when the result is over the cap.
     """
+    if requireHeadroom:
+        checkSlotHeadroom(os.environ.get("SANDBOX_RUN_ROOT"), currentRunLimits().maxConcurrentRuns)
     kind = _RunKind(resultName="result.arrow", resultCap=SQL_RESULT_CAP_BYTES, previewName=None, servesTables=True, payload={"request": request})
     return _inFreshRun(
         lambda runUid, tablesFolder: None,
