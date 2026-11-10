@@ -41,6 +41,7 @@ MAX_REPAIRS = 2
 RUN_TIMEOUT_SECONDS = 35
 _MODEL_LOG_MESSAGE = "The model reply is not a valid chart request."
 _TERMINAL_STAGES = ("timeout", "busy")
+_UNEXPECTED_MESSAGE = "The chart query could not be run."
 
 
 class OutputState(TypedDict, total=False):
@@ -61,7 +62,7 @@ class State(OutputState, total=False):
 
     chartRequest: dict | None
     chart: dict | None
-    # {stage, message, error}: `error` is the exception behind the failure, kept for the failure log.
+    # {stage, message, error, repairable?}: `error` is the exception behind the failure, kept for the failure log.
     failure: dict | None
     grounding: str
     tables: list[str]
@@ -208,6 +209,13 @@ class SqlChartWorkflow:
         except SandboxBusyError as error:
             # A full sandbox says nothing about the request, so the model is not asked to repair it.
             return {"chart": None, "failure": {"stage": "busy", "message": BUSY_MESSAGE, "error": error}}
+        except Exception as error:
+            # The sandbox or the result reader broke. That says nothing about the request, so nothing is repaired,
+            # and the user's answer and the log carry fixed text; the log keeps the exception's class.
+            logger.warning(f"Chart run failed unexpectedly: {type(error).__name__}")
+            failure = ChartFailure("run", _UNEXPECTED_MESSAGE, logMessage=_UNEXPECTED_MESSAGE)
+            failure.__cause__ = error
+            return {"chart": None, "failure": {"stage": "run", "message": _UNEXPECTED_MESSAGE, "error": failure, "repairable": False}}
         return {"chart": chart, "failure": None}
 
     def _next(self, state: State):
@@ -217,7 +225,7 @@ class SqlChartWorkflow:
         failure = state.get("failure")
         if failure is None:
             return "evaluate"
-        if failure["stage"] in _TERMINAL_STAGES or state.get("debugAttempts", 0) >= MAX_REPAIRS:
+        if failure["stage"] in _TERMINAL_STAGES or failure.get("repairable") is False or state.get("debugAttempts", 0) >= MAX_REPAIRS:
             return "format"
         return "repair"
 

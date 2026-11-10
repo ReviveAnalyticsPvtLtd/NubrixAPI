@@ -268,3 +268,18 @@ def test_modelFailureLogHasNoModelText(harness):
     harness.run()
     assert len(harness.logs) == 1
     assert "Secret Corp" not in harness.logs[0] and "nope" not in harness.logs[0]
+
+
+@pytest.mark.parametrize("error", [RuntimeError("No sandbox uid is free."), ValueError("unreadable result 'Secret Corp'")])
+def test_unexpectedRunErrorEndsAsAnErrorWithoutRepair(harness, error):
+    harness.render.side_effect = error
+    state = harness.run()
+    assert harness.render.call_count == 1
+    harness.repair.invoke.assert_not_called()
+    assert set(state["finalOutput"]) == {"error"}
+    assert "Secret Corp" not in json.dumps(state["finalOutput"])
+    assert state["debugAttempts"] == 0
+    records = harness.failureRecords()
+    assert len(records) == 1
+    assert records[0]["stage"] == "run" and records[0]["errorClass"] == type(error).__name__
+    assert "Secret Corp" not in harness.logs[0] and "uid" not in harness.logs[0]
