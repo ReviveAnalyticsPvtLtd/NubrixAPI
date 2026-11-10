@@ -355,3 +355,127 @@ def test_aBusySandboxWithACapOfTwoOrMoreDoesNotWarn(flock, tmp_path, warnings):
     requireHeadroom(str(tmp_path), 2)
     requireHeadroom(None, 1)  # no cap here: nothing to say
     assert warnings == []
+
+
+# The project-idle check against a Redis that keeps real sorted sets (fakeredis is not a dependency here).
+
+
+class ZsetRedis:
+    """The sorted-set commands the project semaphore uses, with Redis's semantics. `down` makes every command fail."""
+
+    def __init__(self, down: bool = False):
+        self.sets: dict[str, dict[str, float]] = {}
+        self.down = down
+
+    def _check(self):
+        if self.down:
+            raise ConnectionError("Redis is down")
+
+    def zadd(self, key, mapping):
+        self._check()
+        members = self.sets.setdefault(key, {})
+        added = sum(member not in members for member in mapping)
+        members.update({member: float(score) for member, score in mapping.items()})
+        return added
+
+    def zrem(self, key, *members):
+        self._check()
+        found = self.sets.get(key, {})
+        removed = sum(found.pop(member, None) is not None for member in members)
+        if key in self.sets and not found:
+            del self.sets[key]
+        return removed
+
+    def zcard(self, key):
+        self._check()
+        return len(self.sets.get(key, {}))
+
+    def zremrangebyscore(self, key, minimum, maximum):
+        self._check()
+        found = self.sets.get(key, {})
+        gone = [member for member, score in found.items() if float(minimum) <= score <= float(maximum)]
+        for member in gone:
+            del found[member]
+        if key in self.sets and not found:
+            del self.sets[key]
+        return len(gone)
+
+    def expire(self, key, seconds):
+        self._check()
+        return key in self.sets
+
+
+def _sqlSpy(monkeypatch, redis, key="semaphore:p1"):
+    calls = []
+
+    def run(**kwargs):
+        calls.append((kwargs, None if redis.down else redis.zcard(key)))
+        return OK
+
+    monkeypatch.setattr(codeExecutor, "runSqlSandbox", run)
+    return calls
+
+
+def test_aShadowOnAnIdleProjectRunsAndGivesItsEntryBack(monkeypatch):
+    redis = ZsetRedis()
+    manager = _manager(monkeypatch, redis)
+    calls = _sqlSpy(monkeypatch, redis)
+    assert manager.runSql({"sql": "x"}, "p1", waitForSlot=False) is OK
+    [(kwargs, entriesDuringTheRun)] = calls
+    assert kwargs["requireHeadroom"] is True and kwargs["slotWaitSeconds"] == 0
+    assert entriesDuringTheRun == 1
+    assert redis.zcard("semaphore:p1") == 0
+
+
+def test_aShadowOnABusyProjectIsRefusedAndLeavesTheOtherEntry(monkeypatch):
+    import time
+
+    redis = ZsetRedis()
+    redis.zadd("semaphore:p1", {"a-served-run": time.time()})
+    manager = _manager(monkeypatch, redis)
+    calls = _sqlSpy(monkeypatch, redis)
+    with pytest.raises(SandboxBusyError):
+        manager.runSql({"sql": "x"}, "p1", waitForSlot=False)
+    assert calls == []
+    assert redis.sets["semaphore:p1"].keys() == {"a-served-run"}
+    # A served run of the same project still runs beside it, as before.
+    assert manager.runSql({"sql": "x"}, "p1") is OK
+    assert calls[0][1] == 2 and "requireHeadroom" not in calls[0][0]
+    assert redis.sets["semaphore:p1"].keys() == {"a-served-run"}
+
+
+def test_aStaleEntryDoesNotKeepAProjectBusy(monkeypatch):
+    redis = ZsetRedis()
+    redis.zadd("semaphore:p1", {"a-run-that-died": 0.0})
+    manager = _manager(monkeypatch, redis)
+    calls = _sqlSpy(monkeypatch, redis)
+    assert manager.runSql({"sql": "x"}, "p1", waitForSlot=False) is OK
+    assert calls[0][1] == 1 and redis.zcard("semaphore:p1") == 0
+
+
+def test_aRunningShadowMakesASecondShadowOfTheProjectBusy(monkeypatch):
+    redis = ZsetRedis()
+    manager = _manager(monkeypatch, redis)
+    nested = []
+
+    def run(projectId, **kwargs):
+        if projectId == "p1":
+            with pytest.raises(SandboxBusyError):
+                manager.runSql({"sql": "y"}, "p1", waitForSlot=False)
+            nested.append(manager.runSql({"sql": "z"}, "p2", waitForSlot=False))  # another project is idle
+        return OK
+
+    monkeypatch.setattr(codeExecutor, "runSqlSandbox", run)
+    assert manager.runSql({"sql": "x"}, "p1", waitForSlot=False) is OK
+    assert nested == [OK]
+    assert redis.sets == {}
+
+
+def test_withRedisDownAShadowRunsAsAServedRunDoes(monkeypatch):
+    redis = ZsetRedis(down=True)
+    manager = _manager(monkeypatch, redis)
+    calls = _sqlSpy(monkeypatch, redis)
+    assert manager.runSql({"sql": "x"}, "p1", waitForSlot=False) is OK
+    assert manager.runSql({"sql": "x"}, "p1") is OK
+    assert len(calls) == 2
+    assert calls[0][0]["requireHeadroom"] is True and "requireHeadroom" not in calls[1][0]

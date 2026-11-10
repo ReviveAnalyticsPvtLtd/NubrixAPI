@@ -1021,3 +1021,75 @@ def test_aSandboxCapBelowTwoWarnsOnceAndDropsEveryShadowAsBusy(env, monkeypatch,
     assert [line for line in logged if line.startswith("chart_shadow_disabled")] == ['chart_shadow_disabled {"reason": "sandbox cap below 2"}']
     assert harness.failureRecords() == []
     assert env.free()
+
+
+
+# The shadow seam: the service, the real SQL workflow graph, real grounding and the real sandbox manager
+
+
+def _realSqlWorkflowBehindTheService(env, monkeypatch):
+    """Only the model chains, the stored-table read and the sandbox child are stubbed."""
+    import io
+
+    import pyarrow as pa
+
+    from test.test_shadow_headroom import ZsetRedis
+    from test.test_sql_chart_workflow import MODEL_TEXT
+    from utils import codeExecutor, sandboxRunner, tableSchemas
+
+    rephraser = MagicMock()
+    rephraser.invoke.return_value = {"rephrasedOutput": "plan", "doubt": None}
+    rephraserClass = MagicMock()
+    rephraserClass.return_value.getQueryRephraserChain.return_value = rephraser
+    generator = MagicMock()
+    generator.invoke.return_value = MODEL_TEXT
+    monkeypatch.setattr(sqlChartWorkflow, "QueryRephaser", rephraserClass)
+    monkeypatch.setattr(sqlChartWorkflow, "ParallelQueryRephaser", rephraserClass)
+    monkeypatch.setattr(sqlChartWorkflow, "buildLlmChain", lambda section, prompt, **kw: generator)
+    monkeypatch.setattr(rs, "buildSqlChartWorkflow", sqlChartWorkflow.buildSqlChartWorkflow)
+
+    schemaReads = []
+
+    def storedTableSchema(projectId, tableName, **kwargs):
+        schemaReads.append((projectId, tableName, kwargs))
+        return pa.schema([("a", pa.string()), ("b", pa.int64())])
+
+    monkeypatch.setattr(tableSchemas, "storedTableSchema", storedTableSchema)
+    monkeypatch.setattr(tableSchemas, "_client", lambda: (_ for _ in ()).throw(ConnectionError("no redis")))
+
+    rows = pa.table({"a": ["x"], "total": [3]})
+    sink = io.BytesIO()
+    with pa.ipc.new_file(sink, rows.schema) as writer:
+        writer.write_table(rows)
+    sandboxRuns = []
+
+    def runSqlSandbox(**kwargs):
+        sandboxRuns.append(kwargs)
+        return sandboxRunner.SandboxResult('{"ok": true, "truncated": false, "rows": 1}', "", 0, sink.getvalue(), None, None)
+
+    monkeypatch.setattr(codeExecutor, "runSqlSandbox", runSqlSandbox)
+    monkeypatch.setattr(codeExecutor.creditService, "_redis", lambda: ZsetRedis())
+    return schemaReads, sandboxRuns
+
+
+def test_shadowServiceRunReachesTheRealWorkflowWithHeadroom(env, monkeypatch):
+    schemaReads, sandboxRuns = _realSqlWorkflowBehindTheService(env, monkeypatch)
+    env.mode("shadow")
+    assert env.chart() == PY_RESPONSE
+    env.executor.wait()
+    (line,) = env.shadowLines()
+    assert line["sqlOk"] is True and line["contractErrors"] == 0 and "result" not in line
+    assert schemaReads == [("p1", "orders", {"leaveHeadroom": True})]
+    [run] = sandboxRuns
+    assert run["slotWaitSeconds"] == 0 and run["requireHeadroom"] is True
+    assert env.free()
+
+    # The same graph served (on mode) waits as before and asks for no headroom.
+    schemaReads.clear()
+    sandboxRuns.clear()
+    env.mode("on")
+    served = env.chart()
+    assert served["finalOutput"]["chartType"] == "bar"
+    assert schemaReads == [("p1", "orders", {})]
+    [run] = sandboxRuns
+    assert "requireHeadroom" not in run and "slotWaitSeconds" not in run
