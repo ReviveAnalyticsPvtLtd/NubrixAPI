@@ -1,5 +1,6 @@
 """Tests for how long a deleted table can stay in the data caches."""
 
+import time
 from unittest import mock
 
 import pyarrow as pa
@@ -158,3 +159,12 @@ def test_redisMetadataWinsOverThisWorkersOldSizeClass():
 
     assert result["rows_estimate"] == 10
     assert result["size_class"] == initMethods._classify_rows(10)
+
+
+def test_invalidateWithAProjectRunsTheRealSchemaDropAndFailsFastWithoutRedis():
+    messages = []
+    started = time.monotonic()
+    with mock.patch("utils.tableSchemas.logger.warning", side_effect=lambda message, *a, **k: messages.append(message)):
+        initMethods.invalidate_data_cache("project_1", "sales")
+    assert time.monotonic() - started < 1.0
+    assert any("Table schema cache drop failed" in message for message in messages)

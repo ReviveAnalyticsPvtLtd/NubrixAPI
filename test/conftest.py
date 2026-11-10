@@ -61,12 +61,16 @@ def _freshPaymentWorkerHeartbeat(request):
 
 
 @pytest.fixture(autouse=True)
-def _noSchemaCacheTraffic(request):
-    """`invalidate_data_cache` also drops cached schemas from Redis; no other test may wait on a Redis that isn't there."""
+def _schemaCacheFailsFast(request):
+    """No test may wait on a Redis that isn't there.
+
+    `invalidate_data_cache` and `tableSchemas` reach Redis through `utils.tableSchemas._client`; here it raises
+    ConnectionError at once, so the real swallow-and-warn path runs everywhere. test_table_schemas.py uses its own fakes.
+    """
     if request.node.fspath.basename == "test_table_schemas.py":
         yield
         return
     from unittest import mock
 
-    with mock.patch("utils.tableSchemas.dropSchemas"):
+    with mock.patch("utils.tableSchemas._client", side_effect=ConnectionError("no Redis in unit tests")):
         yield
