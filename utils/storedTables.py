@@ -27,7 +27,7 @@ import pyarrow.parquet as pq
 
 from utils.logger import logger
 from utils.sandboxLimits import _formatBytes, _readBool, _readInt, currentRunLimits
-from utils.sandboxSlots import SandboxBusyError
+from utils.sandboxSlots import SandboxBusyError, requireHeadroom
 
 MARKER_KEY = b"nubrix.stored-table"
 MAX_INPROCESS_FOOTER_BYTES = 1 << 20
@@ -646,6 +646,9 @@ def storedTableSchema(projectId: str, tableName: str, leaveHeadroom: bool = Fals
         metadata = _trustedFooter(projectId, tableName, readTailFooter(tableFile), "Reading a table (schema)")
     if metadata is not None:
         return plainSchema(metadata.schema.to_arrow_schema())
+    if leaveHeadroom and readerMemoryBytes():
+        # Refuse before downloading: the reader child would refuse the same way, but only after the whole object is here.
+        requireHeadroom(os.environ.get("SANDBOX_RUN_ROOT"), currentRunLimits().maxConcurrentRuns)
     data = readTableBytes(projectId, tableName)
     return readUntrustedSchema(projectId, tableName, data, leaveHeadroom) if leaveHeadroom else readUntrustedSchema(projectId, tableName, data)
 

@@ -286,6 +286,24 @@ def test_shadowSchemaReadOfAnUnmarkedTableWithTooFewFreeSlotsIsBusyAndStartsNoRe
     assert freeRunSlots(str(tmp_path), 4) == 4
 
 
+def test_shadowSchemaReadRefusedForHeadroomDownloadsNothing(readerRun, monkeypatch, tmp_path):
+    from utils import projectStorage
+
+    _unmarkedTableInStorage(monkeypatch)
+    downloads = []
+    monkeypatch.setattr(projectStorage, "readTableBytes", lambda p, t: downloads.append((p, t)) or b"x")
+    held = _hold(tmp_path, 4, 3)
+    try:
+        with pytest.raises(SandboxBusyError):
+            _readSchema(leaveHeadroom=True)
+        assert downloads == []
+        assert readerRun == []
+        assert _readSchema() == "schema"  # a served read with the same state downloads and reads as before
+        assert downloads == [("p1", "t")]
+    finally:
+        _release(held)
+
+
 def test_shadowSchemaReadWithRoomTakesItsSlotWithoutWaiting(readerRun, monkeypatch, tmp_path):
     _unmarkedTableInStorage(monkeypatch)
     waits = []
