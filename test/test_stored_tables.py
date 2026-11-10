@@ -1878,6 +1878,9 @@ _DECODERS = {
     "utils/sandboxRunner.py": {"return pq.read_table(path)"},
     # Only the type annotations of the shared filter use the module; it decodes nothing.
     "utils/runFilters.py": {"import pyarrow.dataset as ds"},
+    # The cached Arrow schema this process wrote to Redis: a schema message only, no table data. A miss reads the
+    # schema through storedTables.
+    "utils/tableSchemas.py": {"return pa.ipc.read_schema(pa.py_buffer(blob))"},
 }
 # The launchers that decode run in a sandbox child under the run limits: transform_launcher reads back its own output for
 # the preview, normalise_launcher and table_reader_launcher are the normaliser and the reader. inspect_launcher and
