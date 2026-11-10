@@ -9,6 +9,7 @@ The response keeps the keys of the Python chart workflows. Everything else stays
 
     START -> rephrase -> ground -> generate -> (evaluate | repair | format)
                   \\-> format (doubt)
+    ground -> format (a busy sandbox while reading table schemas)
     evaluate -> (format | repair)
     repair -> (evaluate | repair | format)
     format -> END
@@ -144,13 +145,21 @@ class SqlChartWorkflow:
 
     def _ground(self, state: State):
         tables = _activeTableNames(state["metadata"])
-        try:
-            schemas = tableSchemas(state["projectId"], tables)
-        except Exception as error:
-            # Types come back as UNKNOWN; the model can still write the query from names and samples.
-            logger.warning(f"Table schemas unavailable for grounding: {type(error).__name__}")
-            schemas = {}
-        return {"tables": tables, "grounding": groundingText(state["metadata"], schemas)}
+        schemas: dict = {}
+        for table in tables:
+            try:
+                schemas.update(tableSchemas(state["projectId"], [table]))
+            except SandboxBusyError as error:
+                # No model call is worth making when the sandbox that reads the tables is full.
+                return {"tables": tables, "failure": {"stage": "busy", "message": BUSY_MESSAGE, "error": error}}
+            except Exception as error:
+                # This table's types come back as UNKNOWN; the model can still use its name and samples.
+                logger.warning(f"Table schema unavailable for grounding: {type(error).__name__}")
+        return {"tables": tables, "grounding": groundingText(state["metadata"], schemas), "failure": None}
+
+    @staticmethod
+    def _afterGround(state: State):
+        return "format" if state.get("failure") else "generate"
 
     @staticmethod
     def _plan(state: State) -> str:
@@ -285,7 +294,7 @@ class SqlChartWorkflow:
         workflow.add_node("format", self._format)
         workflow.add_edge(START, "rephrase")
         workflow.add_conditional_edges("rephrase", self._afterRephrase, {"ground": "ground", "format": "format"})
-        workflow.add_edge("ground", "generate")
+        workflow.add_conditional_edges("ground", self._afterGround, {"generate": "generate", "format": "format"})
         route = {"evaluate": "evaluate", "repair": "repair", "format": "format"}
         for node in ("generate", "evaluate", "repair"):
             workflow.add_conditional_edges(node, self._next, route)

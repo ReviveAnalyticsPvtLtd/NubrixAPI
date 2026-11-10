@@ -3,6 +3,7 @@
 import json
 from unittest.mock import MagicMock
 
+import pyarrow as pa
 import pytest
 from langchain_core.callbacks import BaseCallbackHandler
 
@@ -57,8 +58,8 @@ class Harness:
         monkeypatch.setattr(chartFailureLog.logger, "warning", lambda message, *a, **k: self.logs.append(message))
         self.graph = module.buildSqlChartWorkflow(parallel=parallel)
 
-    def run(self, config=None):
-        return self.graph.invoke({"metadata": METADATA, "inputQuery": "Totals by a", "projectId": "p1"}, config=config)
+    def run(self, config=None, metadata=METADATA):
+        return self.graph.invoke({"metadata": metadata, "inputQuery": "Totals by a", "projectId": "p1"}, config=config)
 
     def failureRecords(self):
         return [json.loads(line[len("chart_failure "):]) for line in self.logs if line.startswith("chart_failure ")]
@@ -295,3 +296,34 @@ def test_lastValidRequestSurvivesInvalidRepairs(harness):
     second = harness.repair.invoke.call_args_list[1].args[0]
     assert json.loads(second["previous_request"])["sql"] == REQUEST["sql"]
     assert second["error"].startswith("The reply is not a valid chart request")
+
+
+TWO_TABLES = {"orders": {"columns": [{"name": "a"}]}, "legacy": {"columns": [{"name": "z"}]}}
+
+
+def test_groundingFallsBackPerTable(harness):
+    def read(projectId, names):
+        if names == ["legacy"]:
+            raise ValueError("This table could not be read safely.")
+        return {name: pa.schema([("a", pa.int64())]) for name in names}
+
+    harness.schemas.side_effect = read
+    state = harness.run(metadata=TWO_TABLES)
+    assert state["finalOutput"] == CHART
+    assert [call.args for call in harness.schemas.call_args_list] == [("p1", ["orders"]), ("p1", ["legacy"])]
+    grounding = harness.generator.invoke.call_args.args[0]["grounding"]
+    assert '"a" BIGINT' in grounding
+    assert '"z" UNKNOWN' in grounding
+
+
+def test_busyGroundingEndsAsBusyWithoutAModelCall(harness):
+    harness.schemas.side_effect = SandboxBusyError()
+    state = harness.run(metadata=TWO_TABLES)
+    harness.generator.invoke.assert_not_called()
+    harness.render.assert_not_called()
+    assert state["finalOutput"] == {"error": BUSY_MESSAGE}
+    assert state["codeOutput"] == json.dumps({"error": BUSY_MESSAGE})
+    assert harness.schemas.call_count == 1
+    records = harness.failureRecords()
+    assert len(records) == 1 and records[0]["stage"] == "busy" and records[0]["chartType"] is None
+    assert records[0]["errorClass"] == "SandboxBusyError"
