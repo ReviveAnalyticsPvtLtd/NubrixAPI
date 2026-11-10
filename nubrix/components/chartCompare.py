@@ -12,6 +12,7 @@ from typing import Any, Literal
 
 _ABS_TOL = 1e-12
 _MIDNIGHT = re.compile(r"[ T]00:00:00$")
+_WHOLE = re.compile(r"[+-]?\d+$")
 
 
 def _isNumber(value: Any) -> bool:
@@ -28,6 +29,8 @@ def _norm(value: Any) -> Any:
         return None
     if isinstance(value, str):
         text = _MIDNIGHT.sub("", value.strip())
+        if _WHOLE.match(text):
+            return int(text)
         try:
             number = float(text)
         except ValueError:
@@ -46,6 +49,8 @@ def _key(value: Any) -> tuple:
     if value is None:
         return (0, 0, "")
     if _isNumber(value):
+        if _isIntegral(value):
+            return (1, int(value), "")
         return (1, float(f"{value:.6g}"), "")
     return (2, 0, str(value))
 
@@ -69,8 +74,38 @@ def _same(a: Any, b: Any, relTol: float) -> bool:
 
 
 def _sameMultiset(a: list, b: list, relTol: float) -> bool:
-    """The same items in any order: both sides sorted by a normalised key, then compared pairwise."""
-    return len(a) == len(b) and all(_same(x, y, relTol) for x, y in zip(sorted(a, key=_key), sorted(b, key=_key)))
+    """The same items in any order: both sides sorted by a normalised key, then items that tie on the key are paired greedily."""
+    if len(a) != len(b):
+        return False
+    groupsA, groupsB = _groups(a), _groups(b)
+    if [k for k, _ in groupsA] != [k for k, _ in groupsB]:
+        # Rounded keys can differ for values that agree within the tolerance: fall back to one pool.
+        return _pairOff(sorted(a, key=_key), sorted(b, key=_key), relTol)
+    return all(_pairOff(x, y, relTol) for (_, x), (_, y) in zip(groupsA, groupsB))
+
+
+def _groups(items: list) -> list:
+    groups: list = []
+    for item in sorted(items, key=_key):
+        key = _key(item)
+        if groups and groups[-1][0] == key:
+            groups[-1][1].append(item)
+        else:
+            groups.append((key, [item]))
+    return groups
+
+
+def _pairOff(a: list, b: list, relTol: float) -> bool:
+    """Every item of `a` takes the first unused equal item of `b`."""
+    if len(a) != len(b):
+        return False
+    free = list(b)
+    for x in a:
+        index = next((i for i, y in enumerate(free) if _same(x, y, relTol)), None)
+        if index is None:
+            return False
+        free.pop(index)
+    return True
 
 
 def _text(value: Any) -> str:

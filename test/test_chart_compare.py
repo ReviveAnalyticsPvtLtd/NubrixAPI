@@ -200,3 +200,40 @@ def test_compareCharts_midnightDateLabelsEqualTheDate():
     assert compareCharts(bar("2024-01-01 00:00:00"), bar("2024-01-01")) == "match"
     assert compareCharts(bar("2024-01-01T00:00:00"), bar("2024-01-01")) == "match"
     assert compareCharts(bar("2024-01-01 10:00:00"), bar("2024-01-01")) == "differ"
+
+
+def test_compareCharts_wholeNumberTextKeepsFullPrecision():
+    big, near = "1234567890123456789", "1234567890123456788"
+    assert compareCharts({"chartType": "table", "data": [{"id": big}]}, {"chartType": "table", "data": [{"id": near}]}) == "differ"
+    assert compareCharts({"chartType": "table", "data": [{"id": big}]}, {"chartType": "table", "data": [{"id": big}]}) == "match"
+
+    def bar(label):
+        return {"chartType": "bar", "data": {"labels": [label], "datasets": [{"label": "n", "data": [1]}]}}
+
+    assert compareCharts(bar(big), bar(near)) == "differ"
+    assert compareCharts(bar(big), bar(big)) == "match"
+    assert compareCharts({"chartType": "card", "data": big}, {"chartType": "card", "data": near}) == "differ"
+    assert compareCharts({"chartType": "card", "data": "+5"}, {"chartType": "card", "data": 5}) == "match"
+
+
+def test_compareCharts_largeIntegersThatShareSixDigitsStillMatchInAnyOrder():
+    a = {"chartType": "table", "data": [{"id": 1000001, "v": 1}, {"id": 1000002, "v": 1}]}
+    b = {"chartType": "table", "data": [{"id": 1000002, "v": 1}, {"id": 1000001, "v": 1}]}
+    assert compareCharts(a, b) == "match"
+    assert compareCharts(_scatter([{"x": 1234567, "y": 1}, {"x": 1234568, "y": 1}]), _scatter([{"x": 1234568, "y": 1}, {"x": 1234567, "y": 1}])) == "match"
+
+
+def test_compareCharts_floatsThatTieAfterRoundingMatchInAnyOrder():
+    def table(*values):
+        return {"chartType": "table", "data": [{"v": v, "k": "a"} for v in values]}
+
+    assert compareCharts(table(1.0000004, 1.0000016), table(1.0000016, 1.0000004)) == "match"
+
+
+def test_compareCharts_aRealDifferenceInsideATieGroupDiffers():
+    a = {"chartType": "table", "data": [{"v": 1.0000004, "k": "a"}, {"v": 1.0000016, "k": "a"}]}
+    b = {"chartType": "table", "data": [{"v": 1.0000016, "k": "a"}, {"v": 1.000004, "k": "a"}]}
+    assert compareCharts(a, b) == "differ"
+    wholeA = {"chartType": "table", "data": [{"id": 1000001}, {"id": 1000002}]}
+    wholeB = {"chartType": "table", "data": [{"id": 1000002}, {"id": 1000003}]}
+    assert compareCharts(wholeA, wholeB) == "differ"
