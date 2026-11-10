@@ -32,6 +32,7 @@ class FakeRedis:
             self.store.pop(key, None)
 
     def scan_iter(self, match=None, **kwargs):
+        self.scanKwargs = kwargs
         prefix = match.rstrip("*")
         return [k for k in list(self.store) if k.startswith(prefix)]
 
@@ -160,3 +161,47 @@ def test_aSchemaCachedAfterForgetTableExpiresWithTheDataCache(redisFake, reader)
     reader.side_effect = lambda p, t: b"new-bytes"
     tableSchemas.tableSchemas("p1", ["sales"])
     assert reader.call_count == 2
+
+
+def test_aFailingRedisIsCalledOnceForTwentyTables(reader):
+    broken = mock.Mock()
+    broken.get.side_effect = ConnectionError("down")
+    broken.set.side_effect = ConnectionError("down")
+    names = [f"t{i}" for i in range(20)]
+    with mock.patch.object(
+        tableSchemas, "decodeStoredTable", side_effect=lambda p, t, data: SALES.empty_table()
+    ), mock.patch("utils.initMethods._redis_pool"), mock.patch("utils.initMethods.redis.Redis", return_value=broken):
+        result = tableSchemas.tableSchemas("p1", names)
+    assert list(result) == names
+    assert broken.get.call_count + broken.set.call_count == 1
+    assert reader.call_count == 20
+
+
+def test_aFailingSetStopsAllLaterRedisCallsInThatCall(reader):
+    broken = mock.Mock()
+    broken.get.return_value = None
+    broken.set.side_effect = ConnectionError("down")
+    names = [f"t{i}" for i in range(20)]
+    with mock.patch.object(
+        tableSchemas, "decodeStoredTable", side_effect=lambda p, t, data: SALES.empty_table()
+    ), mock.patch("utils.initMethods._redis_pool"), mock.patch("utils.initMethods.redis.Redis", return_value=broken):
+        tableSchemas.tableSchemas("p1", names)
+    assert broken.get.call_count == 1
+    assert broken.set.call_count == 1
+
+
+def test_theNextCallTriesRedisAgain(redisFake, reader):
+    broken = mock.Mock()
+    broken.get.side_effect = ConnectionError("down")
+    with mock.patch("utils.initMethods.redis.Redis", return_value=broken):
+        tableSchemas.tableSchemas("p1", ["sales"])
+    tableSchemas.tableSchemas("p1", ["sales"])
+    assert "p1::schema::sales" in redisFake.store
+
+
+def test_projectWideDropScansInBatches(redisFake, reader):
+    from utils.initMethods import invalidate_data_cache
+
+    tableSchemas.tableSchemas("p1", ["sales"])
+    invalidate_data_cache("p1")
+    assert redisFake.scanKwargs == {"count": 1000}

@@ -25,13 +25,8 @@ def _client():
 
 
 def _cached(client, key: str) -> pa.Schema | None:
-    if client is None:
-        return None
-    try:
-        blob = client.get(key)
-    except Exception as exc:
-        logger.warning(f"Table schema cache read failed: {type(exc).__name__}")
-        return None
+    """The cached schema, None on a miss or a corrupt value. Raises when Redis fails."""
+    blob = client.get(key)
     if not blob:
         return None
     try:
@@ -41,18 +36,18 @@ def _cached(client, key: str) -> pa.Schema | None:
 
 
 def _store(client, key: str, schema: pa.Schema) -> None:
-    if client is None:
-        return
-    try:
-        from utils import initMethods
+    """Cache a schema. Raises when Redis fails."""
+    from utils import initMethods
 
-        client.set(key, schema.serialize().to_pybytes(), ex=initMethods._REDIS_SMALL_TABLE_TTL_SECONDS)
-    except Exception as exc:
-        logger.warning(f"Table schema cache write failed: {type(exc).__name__}")
+    client.set(key, schema.serialize().to_pybytes(), ex=initMethods._REDIS_SMALL_TABLE_TTL_SECONDS)
 
 
 def tableSchemas(projectId: str, tableNames: Iterable[str]) -> dict[str, pa.Schema]:
-    """The Arrow schema of each named table: from Redis, else read from storage and cached."""
+    """The Arrow schema of each named table: from Redis, else read from storage and cached.
+
+    After the first Redis failure in a call, the rest of that call makes no Redis calls: a Redis that is down
+    would otherwise cost a connection timeout for every table.
+    """
     try:
         client = _client()
     except Exception as exc:
@@ -61,10 +56,21 @@ def tableSchemas(projectId: str, tableNames: Iterable[str]) -> dict[str, pa.Sche
     schemas: dict[str, pa.Schema] = {}
     for tableName in tableNames:
         key = schemaKey(projectId, tableName)
-        schema = _cached(client, key)
+        schema = None
+        if client is not None:
+            try:
+                schema = _cached(client, key)
+            except Exception as exc:
+                logger.warning(f"Table schema cache read failed: {type(exc).__name__}")
+                client = None
         if schema is None:
             schema = decodeStoredTable(projectId, tableName, readTableBytes(projectId, tableName)).schema
-            _store(client, key, schema)
+            if client is not None:
+                try:
+                    _store(client, key, schema)
+                except Exception as exc:
+                    logger.warning(f"Table schema cache write failed: {type(exc).__name__}")
+                    client = None
         schemas[tableName] = schema
     return schemas
 
@@ -76,7 +82,7 @@ def dropSchemas(projectId: str, tableName: str | None = None) -> None:
         if tableName is not None:
             client.delete(schemaKey(projectId, tableName))
             return
-        keys = list(client.scan_iter(match=schemaKey(projectId, "*")))
+        keys = list(client.scan_iter(match=schemaKey(projectId, "*"), count=1000))
         if keys:
             client.delete(*keys)
     except Exception as exc:
