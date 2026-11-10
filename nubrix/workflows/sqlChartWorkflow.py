@@ -18,7 +18,6 @@ The response keeps the keys of the Python chart workflows. Everything else stays
 __all__ = ["buildSqlChartWorkflow"]
 
 import json
-import re
 from typing import Any
 
 from langchain_core.runnables import RunnableConfig
@@ -78,22 +77,45 @@ def _activeTableNames(metadata: Any) -> list[str]:
     return [name for name, entry in metadata.items() if not (isinstance(entry, dict) and entry.get("isActive") is False)]
 
 
-def _cleanModelText(text: str) -> str:
-    """Drops <think> blocks and a surrounding code fence."""
-    text = re.sub(r"<think>.*?</think>", "", text, flags=re.DOTALL).replace("<think>", "").replace("</think>", "")
-    text = text.strip()
-    text = re.sub(r"^```[A-Za-z]*[ \t]*\n?", "", text)
-    text = re.sub(r"\n?[ \t]*```\s*$", "", text)
-    return text.strip()
+def _readRequest(text: str) -> ChartRequest:
+    """The chart request in a model reply: the first JSON object that validates.
+
+    The reply may hold reasoning text before the JSON (the chain only strips the think tags) or a code fence around it,
+    so each '{' is tried as the start of an object. Raises the ValidationError of the first object found, or the one for
+    invalid JSON when the reply holds no object.
+    """
+    decoder = json.JSONDecoder()
+    firstError: ValidationError | None = None
+    position = text.find("{")
+    while position != -1:
+        try:
+            parsed, _ = decoder.raw_decode(text, position)
+        except ValueError:
+            parsed = None
+        if isinstance(parsed, dict):
+            try:
+                return ChartRequest.model_validate(parsed)
+            except ValidationError as error:
+                firstError = firstError or error
+        position = text.find("{", position + 1)
+    if firstError is not None:
+        raise firstError
+    return ChartRequest.model_validate_json(text.strip())
 
 
 def _modelFailure(error: ValidationError) -> ChartFailure:
     """A stage-model failure whose message names the problems without echoing the reply."""
+    items = error.errors(include_url=False, include_input=False, include_context=False)
     problems = []
-    for item in error.errors(include_url=False, include_input=False, include_context=False):
+    for item in items:
         where = ".".join(str(part) for part in item["loc"])
         problems.append(f"{where}: {item['msg']}" if where else item["msg"])
-    failure = ChartFailure("model", "The reply is not a valid chart request: " + "; ".join(problems), logMessage=_MODEL_LOG_MESSAGE)
+    types = ", ".join(dict.fromkeys(item["type"] for item in items))
+    failure = ChartFailure(
+        "model",
+        "The reply is not a valid chart request: " + "; ".join(problems),
+        logMessage=f"{_MODEL_LOG_MESSAGE} Error types: {types}.",
+    )
     failure.__cause__ = error
     return failure
 
@@ -171,7 +193,7 @@ class SqlChartWorkflow:
     def _parse(text: str) -> dict:
         """The state update for a model reply: a valid request, or a stage-model failure."""
         try:
-            request = ChartRequest.model_validate_json(_cleanModelText(text))
+            request = _readRequest(text)
         except ValidationError as error:
             return {"rawText": text, "chartRequest": None, "chart": None, "failure": {"stage": "model", "message": "", "error": _modelFailure(error)}}
         valid = request.model_dump(exclude_none=True)

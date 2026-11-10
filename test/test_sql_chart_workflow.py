@@ -96,9 +96,8 @@ def test_evaluateGetsActiveTablesAndTheManager(harness):
     assert harness.generator.invoke.call_args.args[0]["question"] == "Totals by a"
 
 
-@pytest.mark.parametrize("parallel", [False, True])
-def test_doubtGivesResponse(monkeypatch, parallel):
-    harness = Harness(monkeypatch, parallel=parallel)
+def test_doubtGivesResponse(monkeypatch):
+    harness = Harness(monkeypatch)
     harness.rephraser.invoke.return_value = {"rephrasedOutput": None, "doubt": "Which year?"}
     state = harness.run()
     assert state["finalOutput"] == {"response": "Which year?"}
@@ -162,11 +161,37 @@ def test_noValidRequestKeepsTheRawModelText(harness):
     assert "third answer" not in harness.logs[0]
 
 
-def test_fencesAndThinkTokensAreCleaned(harness):
-    harness.generator.invoke.return_value = f"<think>hmm {{ not json</think>\n```json\n{MODEL_TEXT}\n```"
+@pytest.mark.parametrize(
+    "reply",
+    [
+        f"<think>I could group by {{a}} and use {{}} here.</think>\n```json\n{MODEL_TEXT}\n```",
+        f"Reasoning with a brace {{ and a note.\n{MODEL_TEXT}\nDone.",
+        f"```json\n{MODEL_TEXT}\n```",
+        MODEL_TEXT,
+    ],
+)
+def test_requestIsReadOutOfTheReply(harness, reply):
+    from langchain_core.messages import AIMessage
+
+    from utils.llm import cleanThinkTokens
+
+    # The chain hands the workflow text after cleanThinkTokens, which removes the tags and keeps the reasoning.
+    harness.generator.invoke.return_value = cleanThinkTokens(AIMessage(content=reply)).content
     state = harness.run()
     assert state["finalOutput"] == CHART
     assert state["debugAttempts"] == 0
+    harness.repair.invoke.assert_not_called()
+
+
+def test_modelFailureLogNamesTheErrorTypes(harness):
+    harness.generator.invoke.return_value = "no json here"
+    harness.repair.invoke.side_effect = ['{"chartType": "nope", "title": "Secret Corp"}', '{"extraKey": 1}']
+    harness.run()
+    assert len(harness.logs) == 1
+    error = harness.failureRecords()[0]["error"]
+    assert error.startswith("The model reply is not a valid chart request.")
+    assert "missing" in error and "extra_forbidden" in error
+    assert "extraKey" not in error and "Secret Corp" not in error and "nope" not in error
 
 
 def test_timeoutSkipsRepair(harness):
