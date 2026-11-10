@@ -485,7 +485,7 @@ def forget_table(projectId: str, tableName: str) -> None:
     Other workers drop their copy when it expires. This worker's copy goes first,
     then Redis, which raises if it fails so a caller that can retry the delete may stop.
     """
-    from utils.tableSchemas import schemaKey
+    from utils.tableSchemas import schemasKey
 
     _drop_local_cache(projectId, tableName)
     r = redis.Redis(connection_pool=_redis_pool())
@@ -493,5 +493,5 @@ def forget_table(projectId: str, tableName: str) -> None:
         f"{projectId}::{tableName}",
         f"{projectId}::metadata.json",
         f"{projectId}::metadata",
-        schemaKey(projectId, tableName),
     )
+    r.hdel(schemasKey(projectId), tableName)

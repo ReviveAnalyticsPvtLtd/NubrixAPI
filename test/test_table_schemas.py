@@ -7,34 +7,62 @@ from utils import tableSchemas
 
 
 class FakeRedis:
+    """Redis keys and hashes, each key with an expiry on a clock the test moves. Records every call."""
+
     def __init__(self):
         self.store = {}
         self.expiresAt = {}
         self.now = 0.0
-        self.setCalls = []
+        self.calls = []
 
-    def get(self, key):
+    def _live(self, key):
         if key in self.expiresAt and self.now >= self.expiresAt[key]:
             self.store.pop(key, None)
             del self.expiresAt[key]
         return self.store.get(key)
 
-    def set(self, key, value, *args, ex=None, **kwargs):
-        self.setCalls.append((key, args, dict(kwargs, ex=ex)))
-        self.store[key] = value
-        if ex is not None:
-            self.expiresAt[key] = self.now + ex
-        else:
-            self.expiresAt.pop(key, None)
+    def hmget(self, key, fields):
+        self.calls.append(("hmget", key, list(fields)))
+        found = self._live(key) or {}
+        return [found.get(field) for field in fields]
+
+    def hset(self, key, field, value):
+        self.calls.append(("hset", key, field))
+        self._live(key)
+        self.store.setdefault(key, {})[field] = value
+
+    def expire(self, key, seconds):
+        self.calls.append(("expire", key, seconds))
+        if self._live(key) is not None:
+            self.expiresAt[key] = self.now + seconds
+
+    def hdel(self, key, *fields):
+        self.calls.append(("hdel", key, *fields))
+        found = self._live(key) or {}
+        for field in fields:
+            found.pop(field, None)
+        if not found:
+            self.store.pop(key, None)
 
     def delete(self, *keys):
+        self.calls.append(("delete", *keys))
         for key in keys:
             self.store.pop(key, None)
 
-    def scan_iter(self, match=None, **kwargs):
-        self.scanKwargs = kwargs
-        prefix = match.rstrip("*")
-        return [k for k in list(self.store) if k.startswith(prefix)]
+    def scan_iter(self, *args, **kwargs):
+        self.calls.append(("scan",))
+        return []
+
+    def scan(self, *args, **kwargs):
+        self.calls.append(("scan",))
+        return 0, []
+
+    def keys(self, *args, **kwargs):
+        self.calls.append(("scan",))
+        return []
+
+    def callNames(self):
+        return [call[0] for call in self.calls]
 
 
 SALES = pa.schema([("id", pa.int64()), ("region", pa.string())])
@@ -44,8 +72,13 @@ COSTS = pa.schema([("id", pa.int32())])
 @pytest.fixture
 def redisFake():
     fake = FakeRedis()
-    with mock.patch("utils.initMethods._redis_pool"), mock.patch("utils.initMethods.redis.Redis", return_value=fake):
+    with mock.patch("utils.initMethods._redis_pool"), mock.patch("utils.initMethods.redis.Redis", return_value=fake), \
+            mock.patch.object(tableSchemas, "_now", side_effect=lambda: fake.now):
         yield fake
+
+
+def _cachedTables(fake, projectId):
+    return set(fake._live(f"{projectId}::schemas") or {})
 
 
 @pytest.fixture
@@ -61,15 +94,14 @@ def test_schemaCachedAndInvalidated(redisFake, reader):
     first = tableSchemas.tableSchemas("p1", ["sales"])
     assert first["sales"].equals(SALES)
     assert reader.call_count == 1
-    assert "p1::schema::sales" in redisFake.store
-    assert redisFake.setCalls[0][0] == "p1::schema::sales"
+    assert _cachedTables(redisFake, "p1") == {"sales"}
 
     second = tableSchemas.tableSchemas("p1", ["sales"])
     assert second["sales"].equals(SALES)
     assert reader.call_count == 1
 
     invalidate_data_cache("p1", "sales")
-    assert "p1::schema::sales" not in redisFake.store
+    assert _cachedTables(redisFake, "p1") == set()
     tableSchemas.tableSchemas("p1", ["sales"])
     assert reader.call_count == 2
 
@@ -79,8 +111,8 @@ def test_forgetTableAlsoDeletesTheSchemaKey(redisFake, reader):
 
     tableSchemas.tableSchemas("p1", ["sales", "costs"])
     forget_table("p1", "sales")
-    assert "p1::schema::sales" not in redisFake.store
-    assert "p1::schema::costs" in redisFake.store
+    assert _cachedTables(redisFake, "p1") == {"costs"}
+    assert ("hdel", "p1::schemas", "sales") in redisFake.calls
 
 
 def test_invalidateWholeProjectDropsItsSchemas(redisFake, reader):
@@ -89,7 +121,7 @@ def test_invalidateWholeProjectDropsItsSchemas(redisFake, reader):
     tableSchemas.tableSchemas("p1", ["sales", "costs"])
     tableSchemas.tableSchemas("p2", ["sales"])
     invalidate_data_cache("p1")
-    assert set(redisFake.store) == {"p2::schema::sales"}
+    assert set(redisFake.store) == {"p2::schemas"}
 
 
 def test_invalidateNeverRaisesWhenRedisIsDown():
@@ -106,15 +138,15 @@ def test_returnsOnlyTheNamedTables(redisFake, reader):
 
 def test_redisGetAndSetErrorsFallBackToReading(reader):
     broken = mock.Mock()
-    broken.get.side_effect = ConnectionError("down")
-    broken.set.side_effect = ConnectionError("down")
+    broken.hmget.side_effect = ConnectionError("down")
+    broken.hset.side_effect = ConnectionError("down")
     with mock.patch("utils.initMethods._redis_pool"), mock.patch("utils.initMethods.redis.Redis", return_value=broken):
         result = tableSchemas.tableSchemas("p1", ["sales"])
     assert result["sales"].equals(SALES)
 
 
 def test_redisSetErrorStillReturnsTheSchema(redisFake, reader):
-    redisFake.set = mock.Mock(side_effect=ConnectionError("down"))
+    redisFake.hset = mock.Mock(side_effect=ConnectionError("down"))
     result = tableSchemas.tableSchemas("p1", ["sales"])
     assert result["sales"].equals(SALES)
 
@@ -125,8 +157,12 @@ def test_poolErrorFallsBackToReading(reader):
     assert result["sales"].equals(SALES)
 
 
-def test_corruptCachedValueIsAMiss(redisFake, reader):
-    redisFake.store["p1::schema::sales"] = b"not a schema"
+@pytest.mark.parametrize(
+    "value", [b"not a schema", b"12:not a schema", b"x:" + SALES.serialize().to_pybytes(), b"", b":"],
+    ids=["noTime", "notASchema", "badTime", "empty", "onlySeparator"],
+)
+def test_corruptCachedValueIsAMiss(redisFake, reader, value):
+    redisFake.store["p1::schemas"] = {"sales": value}
     result = tableSchemas.tableSchemas("p1", ["sales"])
     assert result["sales"].equals(SALES)
     assert reader.call_count == 1
@@ -136,9 +172,8 @@ def test_schemaKeysUseTheTableDataCacheTtl(redisFake, reader):
     from utils import initMethods
 
     tableSchemas.tableSchemas("p1", ["sales"])
-    key, args, kwargs = redisFake.setCalls[0]
-    assert kwargs["ex"] == initMethods._REDIS_SMALL_TABLE_TTL_SECONDS
-    assert kwargs["ex"] >= initMethods._REDIS_MEDIUM_TABLE_TTL_SECONDS
+    assert redisFake.calls[-2:] == [("hset", "p1::schemas", "sales"), ("expire", "p1::schemas", initMethods._REDIS_SMALL_TABLE_TTL_SECONDS)]
+    assert initMethods._REDIS_SMALL_TABLE_TTL_SECONDS >= initMethods._REDIS_MEDIUM_TABLE_TTL_SECONDS
 
 
 def test_aSchemaCachedAfterForgetTableExpiresWithTheDataCache(redisFake, reader):
@@ -151,7 +186,7 @@ def test_aSchemaCachedAfterForgetTableExpiresWithTheDataCache(redisFake, reader)
 
     reader.side_effect = readThenTheWriterReplacesTheTable
     tableSchemas.tableSchemas("p1", ["sales"])
-    assert "p1::schema::sales" in redisFake.store  # the stale schema was cached after the delete
+    assert _cachedTables(redisFake, "p1") == {"sales"}  # the stale schema was cached after the delete
 
     redisFake.now += initMethods._REDIS_SMALL_TABLE_TTL_SECONDS
     reader.side_effect = lambda p, t, **k: SALES
@@ -161,44 +196,53 @@ def test_aSchemaCachedAfterForgetTableExpiresWithTheDataCache(redisFake, reader)
 
 def test_aFailingRedisIsCalledOnceForTwentyTables(reader):
     broken = mock.Mock()
-    broken.get.side_effect = ConnectionError("down")
-    broken.set.side_effect = ConnectionError("down")
+    broken.hmget.side_effect = ConnectionError("down")
+    broken.hset.side_effect = ConnectionError("down")
     names = [f"t{i}" for i in range(20)]
     reader.side_effect = lambda p, t, **k: SALES
     with mock.patch("utils.initMethods._redis_pool"), mock.patch("utils.initMethods.redis.Redis", return_value=broken):
         result = tableSchemas.tableSchemas("p1", names)
     assert list(result) == names
-    assert broken.get.call_count + broken.set.call_count == 1
+    assert broken.hmget.call_count + broken.hset.call_count + broken.expire.call_count == 1
     assert reader.call_count == 20
 
 
 def test_aFailingSetStopsAllLaterRedisCallsInThatCall(reader):
     broken = mock.Mock()
-    broken.get.return_value = None
-    broken.set.side_effect = ConnectionError("down")
     names = [f"t{i}" for i in range(20)]
+    broken.hmget.return_value = [None] * len(names)
+    broken.hset.side_effect = ConnectionError("down")
     reader.side_effect = lambda p, t, **k: SALES
     with mock.patch("utils.initMethods._redis_pool"), mock.patch("utils.initMethods.redis.Redis", return_value=broken):
         tableSchemas.tableSchemas("p1", names)
-    assert broken.get.call_count == 1
-    assert broken.set.call_count == 1
+    assert broken.hmget.call_count == 1
+    assert broken.hset.call_count == 1
+    assert broken.expire.call_count == 0
 
 
 def test_theNextCallTriesRedisAgain(redisFake, reader):
     broken = mock.Mock()
-    broken.get.side_effect = ConnectionError("down")
+    broken.hmget.side_effect = ConnectionError("down")
     with mock.patch("utils.initMethods.redis.Redis", return_value=broken):
         tableSchemas.tableSchemas("p1", ["sales"])
     tableSchemas.tableSchemas("p1", ["sales"])
-    assert "p1::schema::sales" in redisFake.store
+    assert _cachedTables(redisFake, "p1") == {"sales"}
 
 
-def test_projectWideDropScansInBatches(redisFake, reader):
-    from utils.initMethods import invalidate_data_cache
+def test_dropsMakeNoScan(redisFake, reader):
+    from utils.initMethods import forget_table, invalidate_data_cache
 
-    tableSchemas.tableSchemas("p1", ["sales"])
+    tableSchemas.tableSchemas("p1", ["sales", "costs"])
+    redisFake.calls.clear()
+    invalidate_data_cache("p1", "sales")
+    assert redisFake.calls == [("hdel", "p1::schemas", "sales")]
+    redisFake.calls.clear()
     invalidate_data_cache("p1")
-    assert redisFake.scanKwargs == {"count": 1000}
+    assert redisFake.calls == [("delete", "p1::schemas")]
+    redisFake.calls.clear()
+    forget_table("p1", "costs")
+    assert "scan" not in redisFake.callNames()
+    assert ("hdel", "p1::schemas", "costs") in redisFake.calls
 
 
 def test_skipUnreadableLeavesOutATableThatFailsAndKeepsTheRest(redisFake, reader):
@@ -221,7 +265,7 @@ def test_skipUnreadableLeavesOutATableThatFailsAndKeepsTheRest(redisFake, reader
 
 def test_unreadableTableStillRaisesByDefault(reader):
     reader.side_effect = ValueError("x")
-    with mock.patch("utils.initMethods._redis_pool"), mock.patch("utils.initMethods.redis.Redis", return_value=mock.Mock(get=lambda k: None)):
+    with mock.patch("utils.initMethods._redis_pool"), mock.patch("utils.initMethods.redis.Redis", return_value=mock.Mock(hmget=lambda k, f: [None] * len(f))):
         with pytest.raises(ValueError):
             tableSchemas.tableSchemas("p1", ["sales"])
 
@@ -241,8 +285,8 @@ def test_busyPropagatesEvenWhenSkippingUnreadable(redisFake, reader, busy):
 
 def test_aFailingRedisGetsOneAttemptWhileSkippingUnreadable(reader):
     broken = mock.Mock()
-    broken.get.side_effect = ConnectionError("down")
-    broken.set.side_effect = ConnectionError("down")
+    broken.hmget.side_effect = ConnectionError("down")
+    broken.hset.side_effect = ConnectionError("down")
     names = [f"t{i}" for i in range(20)]
 
     def decode(projectId, tableName, **kwargs):
@@ -254,7 +298,7 @@ def test_aFailingRedisGetsOneAttemptWhileSkippingUnreadable(reader):
     with mock.patch("utils.initMethods._redis_pool"), mock.patch("utils.initMethods.redis.Redis", return_value=broken):
         result = tableSchemas.tableSchemas("p1", names, skipUnreadable=True)
     assert len(result) == 19
-    assert broken.get.call_count + broken.set.call_count == 1
+    assert broken.hmget.call_count + broken.hset.call_count + broken.expire.call_count == 1
 
 
 def test_aMissReadsOnlyTheSchemaAndPassesHeadroomOnlyForAShadow(redisFake, reader):
@@ -263,3 +307,33 @@ def test_aMissReadsOnlyTheSchemaAndPassesHeadroomOnlyForAShadow(redisFake, reade
     tableSchemas.tableSchemas("p1", ["sales"])
     tableSchemas.tableSchemas("p2", ["sales"], leaveHeadroom=True)
     assert reader.call_args_list == [mock.call("p1", "sales"), mock.call("p2", "sales", leaveHeadroom=True)]
+
+
+def test_readsUseOneHmgetPerCall(redisFake, reader):
+    tableSchemas.tableSchemas("p1", ["sales", "costs"])
+    redisFake.calls.clear()
+    result = tableSchemas.tableSchemas("p1", ["sales", "costs"])
+    assert list(result) == ["sales", "costs"]
+    assert redisFake.calls == [("hmget", "p1::schemas", ["sales", "costs"])]
+    assert reader.call_count == 2
+
+
+def test_anEntryOlderThanTheTtlIsReReadEvenWhileTheHashLives(redisFake, reader):
+    from utils import initMethods
+
+    ttl = initMethods._REDIS_SMALL_TABLE_TTL_SECONDS
+    tableSchemas.tableSchemas("p1", ["sales"])  # written at 0
+    redisFake.now = ttl - 100
+    tableSchemas.tableSchemas("p1", ["costs"])  # written later, which renews the hash's own expiry
+    redisFake.now = ttl + 50
+    assert _cachedTables(redisFake, "p1") == {"sales", "costs"}  # the hash still holds the old entry
+    reader.reset_mock()
+    tableSchemas.tableSchemas("p1", ["sales", "costs"])
+    assert [call.args[1] for call in reader.call_args_list] == ["sales"]
+
+
+def test_aDropNeverRaisesWhenRedisFails(redisFake):
+    redisFake.hdel = mock.Mock(side_effect=ConnectionError("down"))
+    redisFake.delete = mock.Mock(side_effect=ConnectionError("down"))
+    tableSchemas.dropSchemas("p1", "sales")
+    tableSchemas.dropSchemas("p1")
