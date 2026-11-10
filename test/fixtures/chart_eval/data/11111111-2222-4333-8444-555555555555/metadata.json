@@ -1,0 +1,131 @@
+{
+  "orders": {
+    "description": "One row per order.",
+    "shape": [
+      36,
+      6
+    ],
+    "columns": [
+      {
+        "name": "order_id",
+        "type": "int64",
+        "description": "Order number."
+      },
+      {
+        "name": "order_date",
+        "type": "datetime64[ns]",
+        "description": "Day the order was placed."
+      },
+      {
+        "name": "region",
+        "type": "object",
+        "description": "Sales region."
+      },
+      {
+        "name": "product_id",
+        "type": "int64",
+        "description": "Product ordered; joins products.product_id."
+      },
+      {
+        "name": "quantity",
+        "type": "int64",
+        "description": "Units ordered."
+      },
+      {
+        "name": "revenue",
+        "type": "float64",
+        "description": "Order revenue."
+      }
+    ],
+    "sample_row": {
+      "order_id": 1,
+      "order_date": "2025-01-05",
+      "region": "North",
+      "product_id": 1,
+      "quantity": 1,
+      "revenue": 120.0
+    }
+  },
+  "products": {
+    "description": "One row per product.",
+    "shape": [
+      6,
+      4
+    ],
+    "columns": [
+      {
+        "name": "product_id",
+        "type": "int64",
+        "description": "Product number."
+      },
+      {
+        "name": "product_name",
+        "type": "object",
+        "description": "Product name."
+      },
+      {
+        "name": "category",
+        "type": "object",
+        "description": "Product category."
+      },
+      {
+        "name": "unit_price",
+        "type": "float64",
+        "description": "Price per unit."
+      }
+    ],
+    "sample_row": {
+      "product_id": 1,
+      "product_name": "Oak Desk",
+      "category": "Furniture",
+      "unit_price": 120.0
+    }
+  },
+  "stores": {
+    "description": "One row per store.",
+    "shape": [
+      3,
+      6
+    ],
+    "columns": [
+      {
+        "name": "store_id",
+        "type": "int64",
+        "description": "Store number."
+      },
+      {
+        "name": "store_name",
+        "type": "object",
+        "description": "Store name."
+      },
+      {
+        "name": "city",
+        "type": "object",
+        "description": "City."
+      },
+      {
+        "name": "latitude",
+        "type": "float64",
+        "description": "Latitude."
+      },
+      {
+        "name": "longitude",
+        "type": "float64",
+        "description": "Longitude."
+      },
+      {
+        "name": "employees",
+        "type": "int64",
+        "description": "Number of employees."
+      }
+    ],
+    "sample_row": {
+      "store_id": 1,
+      "store_name": "Harbor Store",
+      "city": "Northport",
+      "latitude": 40.5,
+      "longitude": -74.0,
+      "employees": 12
+    }
+  }
+}
