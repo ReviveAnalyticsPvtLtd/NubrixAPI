@@ -219,3 +219,65 @@ def test_runnerErrorExposesStageAndMessage():
     error = sqlRunner.ChartRunError("timeout", "slow")
 
     assert (error.stage, error.message, str(error)) == ("timeout", "slow", "slow")
+
+
+def _pivot():
+    return ChartRequest(
+        chartType="pivot",
+        title="Pivot",
+        sql="SELECT s, q, sum(n) AS n FROM sales GROUP BY s, q",
+        encoding={"rows": ["s"], "columns": ["q"], "value": "n"},
+    )
+
+
+def _duplicatePivotFailure():
+    table = pa.table({"s": ["Alice", "Alice"], "q": ["North", "North"], "n": [1, 2]})
+    return _failure(_Manager(_success(table)), _pivot())
+
+
+def test_buildFailureCarriesTheBuildersCauseAndLogMessage():
+    from nubrix.components.chartBuilder import ChartBuildError
+
+    failure = _duplicatePivotFailure()
+    assert failure.stage == "build"
+    assert "Alice" in failure.message and "Alice" in str(failure)  # repair still gets the full text
+    assert isinstance(failure.__cause__, ChartBuildError)
+    assert failure.logMessage == failure.__cause__.logMessage
+    assert "Alice" not in failure.logMessage
+
+
+def test_otherStagesHaveNoLogMessage():
+    failure = _failure(_Manager(_handled("run", "Out of Memory Error")), _bar())
+    assert getattr(failure, "logMessage", None) is None
+
+
+def test_duplicatePivotPairThroughTheEngineLogsNoLabel(monkeypatch):
+    from nubrix.components import chartFailureLog
+
+    lines = []
+    monkeypatch.setattr(chartFailureLog.logger, "warning", lambda message, *a, **k: lines.append(message))
+    failure = _duplicatePivotFailure()
+    chartFailureLog.logChartFailure(
+        stage=failure.stage, error=failure, traceId="t", projectId="p", chartType="pivot", repairs=0
+    )
+    record = json.loads(lines[0][len("chart_failure "):])
+    assert record["errorClass"] == "ChartBuildError"
+    assert record["stage"] == "build"
+    assert "Alice" not in lines[0] and "North" not in lines[0]
+
+
+def test_errorClassIsTheCausesClassForAnyWrappedError(monkeypatch):
+    from nubrix.components import chartFailureLog
+
+    lines = []
+    monkeypatch.setattr(chartFailureLog.logger, "warning", lambda message, *a, **k: lines.append(message))
+    try:
+        try:
+            raise KeyError("inner")
+        except KeyError as inner:
+            raise ChartFailure("run", "wrapped") from inner
+    except ChartFailure as failure:
+        chartFailureLog.logChartFailure(
+            stage="run", error=failure, traceId=None, projectId="p", chartType=None, repairs=0
+        )
+    assert json.loads(lines[0][len("chart_failure "):])["errorClass"] == "KeyError"

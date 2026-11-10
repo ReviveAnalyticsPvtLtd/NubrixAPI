@@ -49,6 +49,13 @@ def _redactor(tableNames: Iterable[str] | None):
     return replace
 
 
+def _classOf(error: BaseException | str) -> str:
+    """The exception's class name, or that of the error it wraps; "str" for a plain string."""
+    if isinstance(error, str):
+        return "str"
+    return type(error.__cause__ or error).__name__
+
+
 def _messageOf(error: BaseException | str) -> str:
     logMessage = getattr(error, "logMessage", None)
     return logMessage if isinstance(logMessage, str) else str(error)
@@ -72,14 +79,14 @@ def logChartFailure(
 ) -> None:
     """Log the stage, the error class, the redacted first line, and the ids needed to find the trace.
 
-    `errorClass` is the exception's class name, or "str" when the error is a plain string.
+    `errorClass` is the exception's class name (the wrapped error's, when it has a `__cause__`), or "str" for a plain string.
     `tableNames` are the project's tables: the only double-quoted text kept from the error.
     An error with a `logMessage` (a ChartBuildError) is logged through that data-free text.
     The cut to 300 characters comes after the redaction, so it never leaves half a literal.
     """
     record = {
         "stage": stage,
-        "errorClass": "str" if isinstance(error, str) else type(error).__name__,
+        "errorClass": _classOf(error),
         "error": _redactedFirstLine(error, tableNames),
         "traceId": traceId,
         "projectId": projectId,
