@@ -2292,7 +2292,8 @@ sqlQueryRephraserAgentPrompt: |
 
     ### **5. ORDER AND SIZE**
     - Say how the result is sorted: time ascending for trends, natural order for weekdays, months or bins, otherwise by the measure descending.
-    - Top or bottom N: say N. Category charts show at most 50 categories unless the user asks for more: keep the top 50 by the measure.
+    - Top or bottom N: say N. Category charts show at most 50 categories unless the user asks for more: keep the top 50 by the measure. With one dataset per category, the top N picks the categories and every period stays.
+    - A time axis is never cut to a number of periods: choose a coarser time bucket instead.
     - Tables: say which columns to show and how many rows (100 unless the user says otherwise).
 
     ### **6. RESULT COLUMNS**
@@ -2628,7 +2629,8 @@ parallelSqlQueryRephraserAgentPrompt: |
 
     ### **5. ORDER AND SIZE**
     - Say how the result is sorted: time ascending for trends, natural order for weekdays, months or bins, otherwise by the measure descending.
-    - Top or bottom N: say N. Category charts show at most 50 categories unless the user asks for more: keep the top 50 by the measure.
+    - Top or bottom N: say N. Category charts show at most 50 categories unless the user asks for more: keep the top 50 by the measure. With one dataset per category, the top N picks the categories and every period stays.
+    - A time axis is never cut to a number of periods: choose a coarser time bucket instead.
     - Tables: say which columns to show and how many rows (100 unless the user says otherwise).
 
     ### **6. RESULT COLUMNS**
@@ -2866,8 +2868,10 @@ sqlChartGeneratorPrompt: |
     - with a series column: ORDER BY x, then series.
     - tables: the order the user asked for, else the most meaningful measure or date descending.
 
-    Size:
-    - Category charts (bar, line, area, histogram, radar, pie, doughnut, polarArea) show at most 50 categories unless the user asks for more: keep the top 50 by the measure with ORDER BY ... DESC LIMIT 50. pie, doughnut and polarArea read best with 10 slices or fewer. A time axis may have more points (up to 500), so pick a bucket (day, week, month) that suits the period.
+    Size (LIMIT counts rows, not categories):
+    - Never put LIMIT on a time axis, on a long-form query (one with a series column) or on a pivot: it silently drops periods or series.
+    - A time axis is never cut: pick a bucket (day, week, month, quarter, year) that gives at most 500 periods for the range asked about.
+    - Category charts (bar, line, area, histogram, radar, pie, doughnut, polarArea) show at most 50 categories unless the user asks for more. Without a series, keep the top 50 with ORDER BY the measure DESC LIMIT 50. With a series, or for a top N of the series values, rank them in a CTE and filter on it: WITH top_x AS (SELECT x FROM ... GROUP BY x ORDER BY SUM(m) DESC, x LIMIT 50) ... WHERE x IN (SELECT x FROM top_x).
     - card: exactly one row. Aggregate without GROUP BY, or ORDER BY ... LIMIT 1 for "the top ..." questions.
     - table: LIMIT 100 unless the user asks for a number (at most 1000). Do not aggregate unless the user asks.
     - scatter and bubble: at most 5000 points. geoMap: at most 2000 points. pivot: at most 10000 long-form rows.
@@ -2936,11 +2940,11 @@ sqlChartGeneratorPrompt: |
     Answer:
     {{"chartType": "bar", "title": "Top 10 Electronics Products by Units Sold, 2024", "xLabel": "Product", "yLabel": "Units sold", "sql": "SELECT p.\"product_name\" AS product, SUM(oi.\"quantity\") AS units_sold FROM \"order_items\" AS oi JOIN \"products\" AS p ON p.\"product_id\" = oi.\"product_id\" JOIN \"orders\" AS o ON o.\"order_id\" = oi.\"order_id\" WHERE p.\"category\" ILIKE 'electronics' AND o.\"order_date\" >= DATE '2024-01-01' AND o.\"order_date\" < DATE '2025-01-01' GROUP BY ALL ORDER BY units_sold DESC, product LIMIT 10", "encoding": {{"x": "product", "y": ["units_sold"]}}}}
 
-    ### Example 2: line with a series column (long form)
-    Question: Monthly revenue in 2024, online vs in-store
-    Plan: Line chart, one line per channel. From "orders" dated in 2024, sum total_amount per month (YYYY-MM label) and channel; sort by month, then channel. Result columns: month, channel, revenue.
+    ### Example 2: line with a series column (long form) and a top-N cut
+    Question: Monthly revenue in 2024 for our top 3 product categories
+    Plan: Line chart, one line per category. Join "order_items" to "orders" and "products"; keep 2024 orders; pick the 3 categories with the most revenue in 2024; sum quantity times unit_price per month (YYYY-MM label) and category for those 3; sort by month, then category. Result columns: month, category, revenue.
     Answer:
-    {{"chartType": "line", "title": "Monthly Revenue by Channel, 2024", "xLabel": "Month", "yLabel": "Revenue", "sql": "SELECT strftime(date_trunc('month', \"order_date\"), '%Y-%m') AS month, \"channel\" AS channel, SUM(\"total_amount\") AS revenue FROM \"orders\" WHERE \"order_date\" >= DATE '2024-01-01' AND \"order_date\" < DATE '2025-01-01' GROUP BY ALL ORDER BY month, channel", "encoding": {{"x": "month", "y": ["revenue"], "series": "channel"}}}}
+    {{"chartType": "line", "title": "Monthly Revenue of the Top 3 Categories, 2024", "xLabel": "Month", "yLabel": "Revenue", "sql": "WITH sales AS (SELECT date_trunc('month', o.\"order_date\") AS month_start, p.\"category\" AS category, oi.\"quantity\" * oi.\"unit_price\" AS revenue FROM \"order_items\" AS oi JOIN \"orders\" AS o ON o.\"order_id\" = oi.\"order_id\" JOIN \"products\" AS p ON p.\"product_id\" = oi.\"product_id\" WHERE o.\"order_date\" >= DATE '2024-01-01' AND o.\"order_date\" < DATE '2025-01-01'), top_categories AS (SELECT category FROM sales GROUP BY category ORDER BY SUM(revenue) DESC, category LIMIT 3) SELECT strftime(month_start, '%Y-%m') AS month, category, round(SUM(revenue), 2) AS revenue FROM sales WHERE category IN (SELECT category FROM top_categories) GROUP BY ALL ORDER BY month, category", "encoding": {{"x": "month", "y": ["revenue"], "series": "category"}}}}
 
     ### Example 3: area with a running total
     Question: How did revenue build up over 2024?
@@ -3039,7 +3043,7 @@ sqlChartRepairPrompt: |
     - Binder errors (a column, table or function not found, no function matching the argument types, a column that "must appear in the GROUP BY clause"): use the exact names and types under "Project tables", double-quote them, prefix them with the right table alias, convert types with TRY_CAST, use GROUP BY ALL, and use only the DuckDB functions named in the rules. A "Candidate bindings" hint names the real columns closest to the wrong one.
     - Conversion or run errors (could not convert a string, out of range, division by zero): use TRY_CAST, try_strptime with the layout of the sample value, and NULLIF around divisors.
     - Chart build errors:
-      - too many labels for the chart: aggregate to fewer categories, or keep the top 50 by the measure with ORDER BY ... DESC LIMIT 50 (for a time axis, use a larger bucket such as week or month);
+      - too many labels for the chart: for a time axis use a larger bucket (week, month); otherwise keep the top 50 categories as the size rules say (LIMIT 50 only without a series, else a ranked CTE);
       - a card got more than one row: aggregate to exactly one row, or ORDER BY ... LIMIT 1;
       - more than one row for an x and series pair, or for a pivot row and column: GROUP BY all of those columns so each pair appears once;
       - a value column is not numeric: aggregate a numeric column, or TRY_CAST it AS DOUBLE;
@@ -3125,8 +3129,10 @@ sqlChartRepairPrompt: |
     - with a series column: ORDER BY x, then series.
     - tables: the order the user asked for, else the most meaningful measure or date descending.
 
-    Size:
-    - Category charts (bar, line, area, histogram, radar, pie, doughnut, polarArea) show at most 50 categories unless the user asks for more: keep the top 50 by the measure with ORDER BY ... DESC LIMIT 50. pie, doughnut and polarArea read best with 10 slices or fewer. A time axis may have more points (up to 500), so pick a bucket (day, week, month) that suits the period.
+    Size (LIMIT counts rows, not categories):
+    - Never put LIMIT on a time axis, on a long-form query (one with a series column) or on a pivot: it silently drops periods or series.
+    - A time axis is never cut: pick a bucket (day, week, month, quarter, year) that gives at most 500 periods for the range asked about.
+    - Category charts (bar, line, area, histogram, radar, pie, doughnut, polarArea) show at most 50 categories unless the user asks for more. Without a series, keep the top 50 with ORDER BY the measure DESC LIMIT 50. With a series, or for a top N of the series values, rank them in a CTE and filter on it: WITH top_x AS (SELECT x FROM ... GROUP BY x ORDER BY SUM(m) DESC, x LIMIT 50) ... WHERE x IN (SELECT x FROM top_x).
     - card: exactly one row. Aggregate without GROUP BY, or ORDER BY ... LIMIT 1 for "the top ..." questions.
     - table: LIMIT 100 unless the user asks for a number (at most 1000). Do not aggregate unless the user asks.
     - scatter and bubble: at most 5000 points. geoMap: at most 2000 points. pivot: at most 10000 long-form rows.

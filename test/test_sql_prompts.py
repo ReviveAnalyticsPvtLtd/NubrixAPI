@@ -14,6 +14,7 @@ from decimal import Decimal
 import duckdb
 import pyarrow as pa
 import pytest
+import sqlglot
 from langchain_core.language_models.fake_chat_models import FakeListChatModel
 from langchain_core.output_parsers import StrOutputParser
 from langchain_core.prompts import PromptTemplate
@@ -21,7 +22,7 @@ from langchain_core.runnables import RunnableBinding
 
 from nubrix.components.chartBuilder import buildChart
 from nubrix.components.chartContract import contractErrors
-from nubrix.components.chartRequest import CHART_TYPES, ChartRequest, requiredColumns
+from nubrix.components.chartRequest import CATEGORY_TYPES, CHART_TYPES, ChartRequest, requiredColumns
 from nubrix.components.sqlCheck import checkSql
 from nubrix.components.sqlGrounding import groundingText
 from nubrix.utils import readYaml
@@ -192,7 +193,10 @@ EXAMPLE_METADATA = {
 
 
 def _exampleTables() -> dict[str, pa.Table]:
-    """A few deterministic rows per table, enough for every example to return a non-empty result."""
+    """Deterministic invented rows: an order every day of 2024 (plus some in 2023), 12 products in 5 categories.
+
+    Dense enough that a LIMIT on a time axis or a long-form query would visibly cut data.
+    """
     stores = {
         "store_id": [1, 2, 3],
         "store_name": ["Riverside", "Hilltop", "Harbour"],
@@ -202,38 +206,44 @@ def _exampleTables() -> dict[str, pa.Table]:
         "floor_area_sqm": [850.0, 1200.0, 640.0],
     }
     customers = {
-        "customer_id": [1, 2, 3, 4],
-        "full_name": ["Maya Lin", "Tom Reed", "Ana Ruiz", "Li Wei"],
-        "segment": ["Consumer", "Corporate", "Consumer", "Small Business"],
-        "city": ["Springfield", "Lakeside", "Springfield", "Hillview"],
-        "signup_date": [datetime.date(2023, 1, 5), datetime.date(2023, 6, 1), datetime.date(2024, 2, 9), datetime.date(2024, 4, 20)],
+        "customer_id": [1, 2, 3, 4, 5, 6],
+        "full_name": ["Maya Lin", "Tom Reed", "Ana Ruiz", "Li Wei", "Sam Cole", "Ivy Park"],
+        "segment": ["Consumer", "Corporate", "Consumer", "Small Business", "Corporate", "Consumer"],
+        "city": ["Springfield", "Lakeside", "Springfield", "Hillview", "Lakeside", "Brookfield"],
+        "signup_date": [datetime.date(2023, 1, 5) + datetime.timedelta(days=61 * n) for n in range(6)],
     }
     products = {
-        "product_id": [1, 2, 3, 4, 5],
-        "product_name": ["Desk Lamp", "Headphones", "Garden Hose", "Puzzle", "Smart Speaker"],
-        "category": ["Home & Garden", "Electronics", "Home & Garden", "Toys", "Electronics"],
-        "list_price": [59.95, 89.0, 24.5, 15.0, 129.0],
+        "product_id": list(range(1, 13)),
+        "product_name": [
+            "Desk Lamp", "Headphones", "Garden Hose", "Puzzle", "Smart Speaker", "Football",
+            "Novel", "Plant Pot", "Tablet", "Board Game", "Yoga Mat", "Cookbook",
+        ],
+        "category": [
+            "Home & Garden", "Electronics", "Home & Garden", "Toys", "Electronics", "Sports",
+            "Books", "Home & Garden", "Electronics", "Toys", "Sports", "Books",
+        ],
+        "list_price": [59.95, 89.0, 24.5, 15.0, 129.0, 22.0, 12.5, 18.0, 249.0, 35.0, 28.0, 21.0],
     }
+    days = [datetime.date(2023, month, day) for month in range(1, 13) for day in (5, 20)]
+    days += [datetime.date(2024, 1, 1) + datetime.timedelta(days=n) for n in range(366)]
     orders: dict[str, list] = {name: [] for name in EXAMPLE_SCHEMAS["orders"].names}
     items: dict[str, list] = {name: [] for name in EXAMPLE_SCHEMAS["order_items"].names}
-    channels = ["Online", "In-Store"]
-    statuses = ["Delivered", "Shipped", "Cancelled", "Delivered"]
-    for number in range(1, 31):
-        year = 2023 if number <= 6 else 2024
-        month = (number % 12) + 1
-        productA, productB = (number % 5) + 1, ((number + 2) % 5) + 1
-        quantityA, quantityB = (number % 3) + 1, 1
-        amount = quantityA * products["list_price"][productA - 1] + quantityB * products["list_price"][productB - 1]
+    statuses = ["Delivered", "Shipped", "Cancelled", "Delivered", "Returned"]
+    for number, day in enumerate(days):
+        lines = [((number * 5) % 12 + 1, number % 3 + 1)]
+        if number % 2 == 0:
+            lines.append(((number * 7 + 3) % 12 + 1, 1))
+        amount = sum(quantity * products["list_price"][product - 1] for product, quantity in lines)
         discount = 5.0 if number % 4 == 0 else 0.0
         orders["order_id"].append(1000 + number)
-        orders["customer_id"].append((number % 4) + 1)
-        orders["store_id"].append((number % 3) + 1)
-        orders["order_date"].append(datetime.date(year, month, (number % 27) + 1))
-        orders["channel"].append(channels[number % 2])
-        orders["status"].append(statuses[number % 4])
+        orders["customer_id"].append(number % 6 + 1)
+        orders["store_id"].append(number % 3 + 1)
+        orders["order_date"].append(day)
+        orders["channel"].append("In-Store" if number % 3 == 0 else "Online")
+        orders["status"].append(statuses[number % 5])
         orders["total_amount"].append(Decimal(f"{amount - discount:.2f}"))
         orders["discount_amount"].append(discount)
-        for product, quantity in ((productA, quantityA), (productB, quantityB)):
+        for product, quantity in lines:
             items["order_id"].append(1000 + number)
             items["product_id"].append(product)
             items["quantity"].append(quantity)
@@ -259,6 +269,27 @@ def _formatted(key: str) -> str:
 def _answers(text: str) -> list[dict]:
     """Every worked-example answer: a line that is a JSON object starting with "chartType"."""
     return [json.loads(line) for line in re.findall(r'^(\{"chartType".*\})\s*$', text, flags=re.MULTILINE)]
+
+
+def _examples() -> list[ChartRequest]:
+    return [ChartRequest.model_validate(answer) for answer in _answers(_formatted("sqlChartGeneratorPrompt"))]
+
+
+def _example(chartType: str) -> ChartRequest:
+    (request,) = [request for request in _examples() if request.chartType == chartType]
+    return request
+
+
+def _query(sql: str, tables: dict[str, pa.Table]) -> list[tuple]:
+    connection = duckdb.connect()
+    for name, table in tables.items():
+        connection.register(name, table)
+    return connection.execute(sql).fetchall()
+
+
+def _hasOuterLimit(sql: str) -> bool:
+    """LIMIT on the statement itself (a LIMIT inside a CTE or subquery does not count)."""
+    return sqlglot.parse_one(sql, read="duckdb").args.get("limit") is not None
 
 
 def _runExample(request: ChartRequest, tables: dict[str, pa.Table]) -> dict:
@@ -316,6 +347,57 @@ def test_examplesAreValidChartRequests():
     assert repairAnswers
     for answer in repairAnswers:
         _runExample(ChartRequest.model_validate(answer), tables)
+
+
+MONTHS_2024 = [f"2024-{month:02d}" for month in range(1, 13)]
+CATEGORY_REVENUE_2024 = (
+    'SELECT p."category" AS category, SUM(oi."quantity" * oi."unit_price") AS revenue FROM "order_items" AS oi '
+    'JOIN "products" AS p ON p."product_id" = oi."product_id" JOIN "orders" AS o ON o."order_id" = oi."order_id" '
+    "WHERE o.\"order_date\" >= DATE '2024-01-01' AND o.\"order_date\" < DATE '2025-01-01' GROUP BY ALL"
+)
+
+
+def test_limitCutsATimeAxisSoNoTimeAxisOrLongFormExampleUsesIt():
+    tables = _exampleTables()
+    # A size rule applied as LIMIT on a daily axis keeps the first 50 days and drops the rest without an error.
+    daily = ChartRequest(
+        chartType="line",
+        title="Orders per Day",
+        sql="SELECT strftime(\"order_date\", '%Y-%m-%d') AS day, COUNT(*) AS order_count FROM \"orders\" "
+        "WHERE \"order_date\" >= DATE '2024-01-01' GROUP BY ALL ORDER BY day LIMIT 50",
+        encoding={"x": "day", "y": ["order_count"]},
+    )
+    assert _runExample(daily, tables)["data"]["labels"][-1] == "2024-02-19"
+
+    for request in _examples():
+        if request.chartType in ("line", "area", "pivot") or (request.chartType in CATEGORY_TYPES and request.encoding.series):
+            assert not _hasOuterLimit(request.sql), request.chartType
+
+
+def test_topCategoriesOfALongFormChartKeepEveryMonth():
+    tables = _exampleTables()
+    line = _example("line")
+    assert line.encoding.series
+
+    chart = _runExample(line, tables)
+
+    top = [row[0] for row in _query(f"SELECT category FROM ({CATEGORY_REVENUE_2024}) ORDER BY revenue DESC, category LIMIT 3", tables)]
+    assert chart["data"]["labels"] == MONTHS_2024
+    assert sorted(dataset["label"] for dataset in chart["data"]["datasets"]) == sorted(top)
+    assert all(value is not None for dataset in chart["data"]["datasets"] for value in dataset["data"])
+
+    # The old shape: every category, cut to 50 rows. Five categories over twelve months is 60 rows, so the
+    # last months lose some or all of their series.
+    allCategories = (
+        "SELECT strftime(date_trunc('month', o.\"order_date\"), '%Y-%m') AS month, p.\"category\" AS category, "
+        'SUM(oi."quantity" * oi."unit_price") AS revenue FROM "order_items" AS oi '
+        'JOIN "products" AS p ON p."product_id" = oi."product_id" JOIN "orders" AS o ON o."order_id" = oi."order_id" '
+        "WHERE o.\"order_date\" >= DATE '2024-01-01' AND o.\"order_date\" < DATE '2025-01-01' "
+        "GROUP BY ALL ORDER BY month, category"
+    )
+    assert len(_query(allCategories, tables)) == 60
+    cut = _runExample(line.model_copy(update={"sql": allCategories + " LIMIT 50"}), tables)
+    assert cut["data"]["labels"][-1] != "2024-12" or any(None in dataset["data"] for dataset in cut["data"]["datasets"])
 
 
 @pytest.mark.parametrize("key", ["sqlChartGeneratorPrompt", "sqlChartRepairPrompt"])
