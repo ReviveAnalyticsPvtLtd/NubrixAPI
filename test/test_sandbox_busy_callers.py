@@ -1,7 +1,6 @@
 """A busy sandbox is a retry-later answer, never a code failure: reports and dashboards must not debug or empty on it."""
 
 import json
-from concurrent.futures import ThreadPoolExecutor
 from unittest.mock import MagicMock
 
 import pytest
@@ -56,7 +55,6 @@ def _dashboard(monkeypatch, widgetRun):
     page = {"widgets": [{"id": "w1", "generatedCode": "x = 1", "chartType": "card", "data": 5},
                         {"id": "w2", "generatedCode": "x = 2", "chartType": "card", "data": 6}]}
     monkeypatch.setattr(module, "readJson", lambda projectId, name: {"pg": json.loads(json.dumps(page))})
-    monkeypatch.setattr(module, "ProcessPoolExecutor", ThreadPoolExecutor)
     manager = MagicMock()
     manager.run.side_effect = widgetRun
     monkeypatch.setattr(module, "replManager", manager)
@@ -69,7 +67,7 @@ def _dashboard(monkeypatch, widgetRun):
 def test_dashboardWithABusyWidgetIsA503AndSavesNothing(monkeypatch, filters, refresh):
     from api.models import GetData
 
-    def run(code, projectId=None):
+    def run(code, projectId=None, filters=None):
         if "x = 2" in code:
             raise SandboxBusyError()
         return json.dumps({"data": 1})
@@ -87,7 +85,7 @@ def test_dashboardWithABusyWidgetIsA503AndSavesNothing(monkeypatch, filters, ref
 def test_dashboardRefreshStillSavesWhenNothingIsBusy(monkeypatch):
     from api.models import GetData
 
-    module, service = _dashboard(monkeypatch, lambda code, projectId=None: json.dumps({"data": 1}))
+    module, service = _dashboard(monkeypatch, lambda code, projectId=None, filters=None: json.dumps({"data": 1}))
 
     service.getData(GetData(projectId="p1", page="pg", refresh=True))
 

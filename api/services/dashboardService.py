@@ -9,7 +9,7 @@ __author__ = "Rauhan Ahmed Siddiqui"
 __all__ = ["dashboardService"] 
 
 
-from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor
+from concurrent.futures import ThreadPoolExecutor
 from api.commons import updateProjectModifiedAt
 from utils.exceptionHandler import CustomException
 from utils.storageListing import listProjectFiles
@@ -21,6 +21,10 @@ from utils.storedTables import decodeStoredTable, tableReadException, tableWrite
 from utils.logger import logger
 from utils.mapPointLabels import ensureScatterMapPointLabels
 from api.commons import client
+from api.services.reportingService import ReportingService
+from nubrix.components.chartBuilder import emptyChart
+from nubrix.components.chartEngine import renderChartRequest
+from nubrix.components.chartRequest import decodeGeneratedCode
 from api.models import (
     DeleteDashboardElement,
     ExportToDashboard,
@@ -32,20 +36,13 @@ import pandas as pd
 import tempfile
 import uuid
 import json
-import ast
 import os
 import io
 import re
 
-class _FetchDataFilterTransformer(ast.NodeTransformer):
-    def __init__(self, filters: list):
-        self.filters = filters
+_CHART_KEYS = ("chartType", "title", "xLabels", "yLabels", "label", "data", "map", "columns")
+FAILED_CODE_PREFIX = "# Failed to generate code"
 
-    def visit_Call(self, node):
-        if isinstance(node.func, ast.Name) and node.func.id == "fetch_data":
-            filters_node = ast.parse(repr(self.filters)).body[0].value
-            node.args.append(filters_node)
-        return self.generic_visit(node)
 
 class DashboardService:
     """
@@ -62,40 +59,88 @@ class DashboardService:
         self.client = client
 
     @staticmethod
-    def _addCodeFences(code: str):
-        """Add code fences to a string."""
-        return "```python\n" + code.strip() + "\n```"
-
-    @staticmethod
-    def _applyFilterToAWidget(widget: dict, filters: list, codeExecutor: callable, projectId: str) -> dict:
+    def _rerunWidget(widget: dict, filters: list | None, projectId: str, activeTables: frozenset[str]) -> tuple[dict, bool]:
         """
-        Apply filters to a widget's generated code and update its data accordingly.
+        Re-run one saved widget in its own form and return a copy with the new chart data.
+
+        A ChartRequest runs through the SQL path with lenient limits. Anything else is the old Python, run with the
+        filters as run input. `generatedCode`, `id` and `layout` are never changed.
+
+        Args:
+            widget (dict): The saved widget.
+            filters (list | None): The sidebar filters, if any.
+            projectId (str): The project.
+            activeTables (frozenset[str]): Names of the project's active tables, for the SQL check.
+
+        Returns:
+            tuple[dict, bool]: The widget copy, and whether the re-run succeeded. A failed run returns the widget
+                as it was.
+
+        Raises:
+            SandboxBusyError: The sandbox has no free slot. Nothing is returned for the widget.
         """
         widget = widget.copy()
-        code = widget.get("generatedCode")
-        if "```" in code: code = _remove_code_fences(code)
-        tree = ast.parse(code)
-        transformer = _FetchDataFilterTransformer(filters)
-        tree = transformer.visit(tree)
-        ast.fix_missing_locations(tree)
-        code = ast.unparse(tree)
-        code = DashboardService._addCodeFences(code)
-        result = codeExecutor.run(code, projectId=projectId)
-        widget["generatedCode"] = code
         try:
-            resultDict = json.loads(result)
-            widget.update(resultDict)
-        except:
-            widgetChartType = widget.get("chartType")
-            if widgetChartType == "card":
-                widget["data"] = None
+            request = decodeGeneratedCode(widget.get("generatedCode"))
+            if request is not None:
+                result = renderChartRequest(replManager, projectId, request, activeTables, filters=filters, lenient=True)
             else:
-                dataKey = widget.get("data")
-                datasets = dataKey.get("datasets")
-                for dataset in datasets:
-                    dataset["data"] = list()
+                code = widget.get("generatedCode")
+                if isinstance(code, str) and "```" in code:
+                    code = _remove_code_fences(code)
+                result = json.loads(replManager.run(code, projectId=projectId, filters=filters))
+                if not isinstance(result, dict) or "error" in result:
+                    raise ValueError("the saved code did not return a chart")
+        except Exception as error:
+            if isBusy(error):
+                raise
+            logger.warning(f"Widget {widget.get('id')} could not be re-run: {error}")
+            return widget, False
+        kept = {key: widget.get(key) for key in ("id", "layout", "generatedCode") if key in widget}
+        widget.update(result if request is None else {key: result[key] for key in _CHART_KEYS if key in result})
+        widget.update(kept)
+        ensureScatterMapPointLabels(widget)
+        return widget, True
+
+    @staticmethod
+    def _emptiedWidget(widget: dict) -> dict:
+        """A copy of a widget whose re-run failed under a filter: an empty chart of its own type, never old numbers."""
+        widget = widget.copy()
+        try:
+            empty = emptyChart(widget.get("chartType"), widget.get("title"), widget.get("xLabels") or None, widget.get("yLabels") or None)
+        except ValueError:
+            return widget
+        savedLabel = widget.get("label")
+        if widget.get("chartType") == "card" and isinstance(savedLabel, str) and savedLabel:
+            empty["label"] = savedLabel
+        widget.update(empty)
         return widget
-    
+
+    @staticmethod
+    def _isRerunnable(widget: object) -> bool:
+        """A widget with no chart type, or the failure card of an automatic dashboard, has nothing to re-run."""
+        if not isinstance(widget, dict) or not widget.get("chartType"):
+            return False
+        code = widget.get("generatedCode")
+        return not (isinstance(code, str) and code.lstrip().startswith(FAILED_CODE_PREFIX))
+
+    @staticmethod
+    def _usesChartRequest(widget: dict) -> bool:
+        try:
+            return decodeGeneratedCode(widget.get("generatedCode")) is not None
+        except ValueError:
+            return True
+
+    def _rerunWidgets(self, widgets: list, filters: list | None, projectId: str) -> list[tuple[dict, bool]]:
+        """Re-run every re-runnable widget, four at a time. A widget that isn't re-runnable comes back (widget, False)."""
+        todo = [widget for widget in widgets if self._isRerunnable(widget)]
+        activeTables = frozenset()
+        if any(self._usesChartRequest(widget) for widget in todo):
+            activeTables = frozenset(ReportingService._filterActive(readJson(projectId, "metadata.json")))
+        with ThreadPoolExecutor(max_workers = 4) as executor:
+            outcomes = iter(list(executor.map(lambda widget: self._rerunWidget(widget, filters, projectId, activeTables), todo)))
+        return [next(outcomes) if self._isRerunnable(widget) else (widget, False) for widget in widgets]
+
     @staticmethod
     def _getDataTypes(projectId: str, tableName: str) -> list[dict]:   
         """
@@ -256,28 +301,19 @@ class DashboardService:
                 pass
             elif (details.filters) and (not details.refresh):
                 widgets = pageInfo.get("widgets")
-                numWidgets = len(widgets)
-                with ProcessPoolExecutor(max_workers = 4) as executor:
-                    results = executor.map(self._applyFilterToAWidget, widgets, [details.filters] * numWidgets, [replManager] * numWidgets, [details.projectId] * numWidgets)
-                pageInfo["widgets"] = [x for x in results]
+                outcomes = self._rerunWidgets(widgets, details.filters, details.projectId)
+                pageInfo["widgets"] = [widget if succeeded else (self._emptiedWidget(widget) if self._isRerunnable(widget) else widget) for widget, succeeded in outcomes]
             elif (not details.filters) and (details.refresh):
                 widgets = pageInfo.get("widgets")
-                numWidgets = len(widgets)
-                with ProcessPoolExecutor(max_workers = 4) as executor:
-                    results = executor.map(self._applyFilterToAWidget, widgets, [details.filters] * numWidgets, [replManager] * numWidgets, [details.projectId] * numWidgets)
-                pageInfo["widgets"] = [x for x in results] 
-                prevPageInfo = dashboardConfig.get(details.page)
-                for prevWidget in prevPageInfo.get("widgets"):
-                    for newWidget in pageInfo.get("widgets"):
-                        if newWidget.get("id") == prevWidget.get("id"):
-                            prevWidget.update(newWidget)
-                        else:
-                            continue
-                dashboardConfig[details.page] = prevPageInfo
-                with io.BytesIO() as buffer:
-                    buffer.write(json.dumps(dashboardConfig, indent=4).encode("utf-8"))
-                    buffer.seek(0)
-                    _ = self.client.storage.from_("AnalyticsHub").upload(path = f"{details.projectId}/dashboardConfig.json", file = buffer.getvalue(), file_options = {"upsert": "true"})    
+                outcomes = self._rerunWidgets(widgets, None, details.projectId)
+                if any(succeeded for _, succeeded in outcomes):
+                    for saved, (fresh, succeeded) in zip(widgets, outcomes):
+                        if succeeded:
+                            saved.update(fresh)
+                    with io.BytesIO() as buffer:
+                        buffer.write(json.dumps(dashboardConfig, indent=4).encode("utf-8"))
+                        buffer.seek(0)
+                        _ = self.client.storage.from_("AnalyticsHub").upload(path = f"{details.projectId}/dashboardConfig.json", file = buffer.getvalue(), file_options = {"upsert": "true"})
             else:
                 raise ValueError("Filters and Refresh cannot be implemented simultaneously.")
             widgets = pageInfo.get("widgets")
