@@ -656,6 +656,18 @@ def test_parallelErrorBecomesFailureCard(env, engine):
 
 
 @pytest.mark.parametrize("engine", ["off", "on"])
+def test_parallelFailureCardKeepsTheProjectsTableNames(env, engine):
+    env.mode(engine)
+    error = 'Binder Error: Table "orders" does not have a column named "secret_column"; did you mean "old"?'
+    (env.python if engine == "off" else env.sql).response = {"finalOutput": {"error": error}, "generatedCode": "x"}
+    metadata = {"orders": {"columns": [{"name": "a"}]}, "old": {"isActive": False, "columns": [{"name": "z"}]}}
+    response = rs.ReportingService._generateSingleChartForParallel(metadata, "p1", "q", "u1")
+    assert response["generatedCode"] == (
+        '# Failed to generate code for: q\n# Error: Binder Error: Table "orders" does not have a column named "?"; did you mean "?"?'
+    )
+
+
+@pytest.mark.parametrize("engine", ["off", "on"])
 def test_parallelErrorWithoutDataKeepsItsText(env, engine):
     env.mode(engine)
     (env.python if engine == "off" else env.sql).response = {"finalOutput": {"error": BUSY_MESSAGE}}

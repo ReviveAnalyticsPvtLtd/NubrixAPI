@@ -72,7 +72,8 @@ class State(OutputState, total=False):
     rawText: str
 
 
-def _activeTableNames(metadata: Any) -> list[str]:
+def activeTableNames(metadata: Any) -> list[str]:
+    """The project's active table names: every metadata entry not marked `isActive: false`."""
     if not isinstance(metadata, dict):
         return []
     return [name for name, entry in metadata.items() if not (isinstance(entry, dict) and entry.get("isActive") is False)]
@@ -213,7 +214,7 @@ class SqlChartWorkflow:
         return "format" if self._doubtOf(state) is not None else "ground"
 
     def _ground(self, state: State, config: RunnableConfig | None = None):
-        tables = _activeTableNames(state["metadata"])
+        tables = activeTableNames(state["metadata"])
         try:
             # A table that cannot be read is left out here and gets UNKNOWN types in the grounding.
             # A shadow run reads only while the sandbox has room to spare, else it ends as busy and is dropped.

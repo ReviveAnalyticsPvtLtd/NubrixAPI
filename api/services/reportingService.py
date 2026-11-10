@@ -13,7 +13,7 @@ from api.models import GenerateChartInput, PanelChartDetails, GenerateChartsInPa
 from nubrix.components.llmChainFactory import buildLlmChain
 from nubrix.workflows.reportingToolWorkflow import buildReportingWorkflow
 from nubrix.workflows.parallelReportingToolWorkflow import buildParallelReportingWorkflow
-from nubrix.workflows.sqlChartWorkflow import buildSqlChartWorkflow
+from nubrix.workflows.sqlChartWorkflow import activeTableNames, buildSqlChartWorkflow
 from nubrix.components.chartCompare import compareCharts
 from nubrix.components.chartContract import contractErrors
 from nubrix.components.chartEngineMode import chartEngineMode
@@ -774,8 +774,9 @@ class ReportingService:
                 )
             if isinstance(finalOutput, dict) and "error" in finalOutput:
                 # Either engine: a chart that ended in an error is a failure card, not a widget with no chart type.
-                # The saved text is the error's first line with data values redacted, as in the failure log.
-                return _failureCard(query, redactedFirstLine(str(finalOutput["error"])))
+                # The saved text is the error's first line with data values redacted, as in the failure log, which
+                # keeps the project's own table names.
+                return _failureCard(query, redactedFirstLine(str(finalOutput["error"]), activeTableNames(metadata)))
             return response
         except Exception as e:
             logger.error(f"Failed to generate parallel chart for query '{query}': {e}")
