@@ -139,17 +139,18 @@ def groundingText(metadata: dict, schemas: dict[str, pa.Schema]) -> str:
     Describes the project's active tables for the SQL chart prompts.
 
     Args:
-        metadata (dict): The project's metadata.json content. A table whose
-            `isActive` is false is left out; a missing key means active.
+        metadata (dict): The project's metadata.json content. Only tables listed
+            here are described: one whose `isActive` is false is left out, and a
+            missing key means active.
         schemas (dict[str, pa.Schema]): The stored Arrow schema of each table.
-            A table with no schema is listed from its metadata, with type UNKNOWN.
+            Used for the types only: a schema with no metadata entry is ignored,
+            and a listed table with no schema gets type UNKNOWN.
 
     Returns:
         str: One block per table, then a join hints block.
     """
     metadata = metadata if isinstance(metadata, dict) else {}
     names = [name for name, entry in metadata.items() if _isActive(entry)]
-    names += [name for name in schemas if name not in metadata]
 
     blocks: list[str] = []
     shared: dict[tuple[str, str], list[str]] = {}

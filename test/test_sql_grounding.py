@@ -97,6 +97,16 @@ def test_groundingSkipsInactiveTablesAndKeepsSchemaOrder():
     assert "Join hints: none" in text
 
 
+def test_groundingListsOnlyTablesTheMetadataMarksActive():
+    # A stored schema without a metadata entry is a table the project does not list, so it stays out.
+    text = groundingText({"customers": METADATA["customers"]}, {"orders": ORDERS, "customers": CUSTOMERS})
+
+    assert 'Table "customers"' in text
+    assert '"orders"' not in text and '"placed_at"' not in text
+    assert "Join hints: none" in text
+    assert groundingText({}, {"orders": ORDERS}) == "No active tables."
+
+
 def test_groundingCapsLongSampleValues():
     schema = pa.schema([("notes", pa.string()), ("tags", pa.string())])
     long = "x" * (SAMPLE_VALUE_CAP + 50)
