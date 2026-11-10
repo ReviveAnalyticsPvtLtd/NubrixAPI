@@ -30,6 +30,7 @@ import threading
 import time
 from collections import OrderedDict
 from utils.logger import logger
+from utils.runFilters import applyFilters
 from utils.projectStorage import downloadTable, objectUrl, readTableBytes
 from utils.storedTables import decodeStoredTable
 from typing import Callable, Iterable
@@ -49,6 +50,10 @@ except ImportError:
     pl = None
 
 _REDIS_POOL: redis.ConnectionPool | None = None
+
+# The dashboard filters of the run this process serves. Only a sandbox child sets them (see
+# ``sandbox_launcher``); the API process and the other launchers leave them empty, so their reads are unfiltered.
+_RUN_FILTERS: list | None = None
 
 _SIZING = None
 
@@ -70,6 +75,12 @@ def _sizing():
             "df_cache_entries": dataframe_cache_entries(resources),
         }
     return _SIZING
+
+
+def use_run_filters(filters: list | None) -> None:
+    """Make every table this process loads through the data functions narrow to ``filters``."""
+    global _RUN_FILTERS
+    _RUN_FILTERS = filters if isinstance(filters, list) and filters else None
 
 
 def _redis_pool() -> redis.ConnectionPool:
@@ -204,115 +215,11 @@ def serializer(obj):
         return {"real": obj.real, "imag": obj.imag}
 
 
-def _translate_to_pyarrow_filter(column: str, condition):
-    """Translate a single column condition into a PyArrow compute expression.
-
-    Supports the operator surface used by the reporting / transformation filters:
-      scalar      → pc.equal
-      list/tuple  → pc.is_in
-      {"min": x}  → pc.greater_equal
-      {"max": x}  → pc.less_equal
-      {"contains": s} (object dtype) → pc.match_substring_case_insensitive
-      {"startswith": s}              → pc.starts_with
-      {"endswith": s}                → pc.ends_with
-    Returns None when the condition cannot be expressed in Arrow.
-    """
-    if isinstance(condition, dict):
-        if "contains" in condition:
-            return pc.match_substring(pc.field(column), condition["contains"], ignore_case=True)
-        if "startswith" in condition:
-            return pc.starts_with(pc.field(column), condition["startswith"])
-        if "endswith" in condition:
-            return pc.ends_with(pc.field(column), condition["endswith"])
-        if "min" in condition:
-            return pc.greater_equal(pc.field(column), condition["min"])
-        if "max" in condition:
-            return pc.less_equal(pc.field(column), condition["max"])
-        return None
-    if isinstance(condition, (list, tuple, set)):
-        if not condition:
-            return None
-        return pc.is_in(pc.field(column), pa.array(list(condition)))
-    return pc.equal(pc.field(column), condition)
-
-
 def _fetch_data_from_supabase(projectId: str, tableName: str) -> "pa.Table":
     """Cold-path reader that pulls the full unfiltered table for caching."""
     if pq is None:
         raise RuntimeError("pyarrow is required.")
     return decodeStoredTable(projectId, tableName, readTableBytes(projectId, tableName))
-
-
-def _apply_filters_in_arrow_if_possible(table: "pa.Table", tableName: str, filters: list) -> "pa.Table":
-    """Apply remaining filters in Arrow if all expressions translate; fall back to pandas."""
-    predicates = []
-    fallback = False
-    for entry in filters or []:
-        if not isinstance(entry, dict):
-            continue
-        for column_path, condition in entry.items():
-            if "." in column_path:
-                column_table, column = column_path.split(".", 1)
-                if column_table != tableName:
-                    continue
-            else:
-                column = column_path
-            expr = _translate_to_pyarrow_filter(column, condition)
-            if expr is None:
-                fallback = True
-                break
-            predicates.append(expr)
-        if fallback:
-            break
-    if not predicates:
-        return table
-    if fallback:
-        df = table.to_pandas()
-        df = _apply_filters(df, tableName, filters)
-        return pa.Table.from_pandas(df, preserve_index=False)
-    try:
-        return table.filter(predicates[0] if len(predicates) == 1 else predicates)
-    except Exception:
-        df = table.to_pandas()
-        df = _apply_filters(df, tableName, filters)
-        return pa.Table.from_pandas(df, preserve_index=False)
-
-
-def _apply_filters(df: pd.DataFrame, tableName: str, baseFilters: list) -> pd.DataFrame:
-    """Apply baseFilters scoped to the current table; never touches other tables."""
-    if not baseFilters:
-        return df
-    for filter_entry in baseFilters:
-        if not isinstance(filter_entry, dict):
-            continue
-        for column_path, condition in filter_entry.items():
-            if "." in column_path:
-                column_table, column = column_path.split(".", 1)
-                if column_table != tableName:
-                    continue
-            else:
-                column = column_path
-            if column not in df.columns:
-                continue
-            if isinstance(condition, dict):
-                if str(df[column].dtype) == "object":
-                    if "contains" in condition:
-                        df = df[df[column].str.contains(condition["contains"], case=False, na=False)]
-                    elif "startswith" in condition:
-                        df = df[df[column].str.startswith(condition["startswith"], na=False)]
-                    elif "endswith" in condition:
-                        df = df[df[column].str.endswith(condition["endswith"], na=False)]
-                    else:
-                        continue
-                if "min" in condition:
-                    df = df[df[column] >= condition["min"]]
-                elif "max" in condition:
-                    df = df[df[column] <= condition["max"]]
-            elif isinstance(condition, (list, tuple, set)):
-                df = df[df[column].isin(condition)]
-            else:
-                df = df[df[column] == condition]
-    return df
 
 
 def _read_redis_bytes(redis_key: str) -> bytes | None:
@@ -383,8 +290,7 @@ def _load_table(projectId: str, tableName: str) -> "pa.Table":
             table = _fetch_data_from_redis(redis_key, projectId, tableName)
             if table is None:
                 # Cold path: scan without pushdown so the cached table is always the
-                # complete dataset. Filter translation + pushdown live in
-                # ``_apply_filters_in_arrow_if_possible`` for in-memory use.
+                # complete dataset. Filters are applied to a copy after the cache hit.
                 table = _fetch_data_from_supabase(projectId, tableName)
                 _store_to_redis(redis_key, table)
         _cache_put(cache_key, table)
@@ -418,48 +324,44 @@ def fetch_data(projectId: str, tableName: str, baseFilters: list | None = None, 
     """
     Fetch a DataFrame from in-process Arrow LRU → Redis Arrow cache → Supabase.
 
-    Returns a fresh ``pd.DataFrame`` (zero-copy view of the cached Arrow table
-    + a shallow copy for caller isolation) so the sandbox can mutate it freely.
-    ``baseFilters`` is never mutated.
+    Returns a fresh ``pd.DataFrame`` so the sandbox can mutate it freely. ``baseFilters`` is never mutated.
 
     Performance:
-      The cached table is always the FULL unfiltered dataset so the same cache
-      entry serves many filter combinations. Filters are translated to PyArrow
-      ``compute`` expressions and applied in-memory after the cache hit; the
-      cold path passes simple predicates through to the parquet scan for very
-      large datasets where pre-filtered bytes matter.
+      The cached table is always the FULL unfiltered dataset so the same cache entry serves many filter
+      combinations. The run's filters, ``baseFilters`` and any list arguments are combined and applied once, to a
+      copy, after the cache hit.
     """
-    filters: list = list(baseFilters) if baseFilters else []
+    filters: list = list(_RUN_FILTERS or [])
+    if baseFilters:
+        filters.extend(baseFilters)
     for arg in args:
         if isinstance(arg, list):
             filters.extend(arg)
 
-    table = _load_table(projectId, tableName)
-
-    if filters:
-        table = _apply_filters_in_arrow_if_possible(table, tableName, filters)
-    return table.to_pandas()
+    return applyFilters(_load_table(projectId, tableName), tableName, filters).to_pandas()
 
 
 def fetch_data_pl(projectId: str, tableName: str) -> "pl.DataFrame":
-    """Return a Polars eager DataFrame for the table.
+    """Return a Polars eager DataFrame for the table, narrowed to the run's filters.
 
-    Zero-copy from the cached Arrow table (Polars wraps Arrow buffers natively).
+    Zero-copy from the cached Arrow table when nothing filters it (Polars wraps Arrow buffers natively).
     5-10× faster than pandas for the same operations. For massive datasets where
     you want lazy + query-optimizer pushdown, use ``scan_data`` instead.
     """
     if pl is None:
         raise RuntimeError("polars is not installed.")
-    return pl.from_arrow(_load_table(projectId, tableName))
+    return pl.from_arrow(applyFilters(_load_table(projectId, tableName), tableName, _RUN_FILTERS))
 
 
 def scan_data(projectId: str, tableName: str) -> "pl.LazyFrame":
-    """Return a Polars LazyFrame for the table.
+    """Return a Polars LazyFrame for the table, narrowed to the run's filters.
 
     Polars' lazy engine pushes filters, projections, and aggregations through
     its query optimizer — only the columns/rows actually consumed by the final
     ``collect()`` are materialized. For massive datasets this is 10-100× faster
     than eager pandas because intermediate frames are never built.
+
+    It goes through ``fetch_data_pl``, which already applied the run's filters, so they are not applied twice.
     """
     if pl is None:
         raise RuntimeError("polars is not installed.")

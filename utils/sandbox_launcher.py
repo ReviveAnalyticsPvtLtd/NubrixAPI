@@ -14,10 +14,11 @@ def main():
         sys.exit(1)
 
     # 2. Setup data fetchers and sanitize imports
-    from utils.initMethods import fetch_data, fetch_data_pl, scan_data, serializer
+    from utils.initMethods import fetch_data, fetch_data_pl, scan_data, serializer, use_run_filters
     from utils.sandboxRunner import enterSandbox
 
     enterSandbox(input_data["channel"])
+    use_run_filters(input_data.get("filters"))
 
     def safe_fetch_data(targetProjectId, tableName, *args, **kwargs):
         if targetProjectId != projectId:

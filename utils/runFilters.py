@@ -4,7 +4,7 @@ The dashboard's filter list becomes ONE Arrow expression per table. The SQL laun
 registered table with ``Dataset.filter(expr)``; saved Python widgets call ``applyFilters`` on every table
 they load. Filter values are Arrow scalars and never reach SQL text.
 
-Meaning (same as ``_apply_filters`` in ``utils/initMethods.py``, plus the documented changes):
+Meaning (the old pandas ``_apply_filters`` of ``utils/initMethods.py``, plus the documented changes):
 - entries that are not dicts are ignored; a ``table.column`` key applies only to that table;
 - a column the table does not have is skipped; several conditions combine with AND;
 - a scalar means equals, a non-empty list means one of, ``min`` is ``>=``, ``max`` is ``<=`` (both apply);
