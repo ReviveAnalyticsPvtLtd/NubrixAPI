@@ -2,7 +2,8 @@
 
 Each schema lives in Redis at ``<projectId>::schema::<table>`` as ``schema.serialize()`` bytes, with the table data cache's TTL
 so a missed invalidation or a read/write race heals as fast as the data cache does;
-`invalidate_data_cache` and `forget_table` drop it. A Redis failure means reading without the cache.
+`invalidate_data_cache` and `forget_table` drop it. A Redis failure means reading without the cache. A miss reads
+only the schema (`storedTableSchema`): a table's footer, never a whole-table decode in this process.
 """
 
 from collections.abc import Iterable
@@ -10,9 +11,8 @@ from collections.abc import Iterable
 import pyarrow as pa
 
 from utils.logger import logger
-from utils.projectStorage import readTableBytes
 from utils.sandboxSlots import isBusy
-from utils.storedTables import decodeStoredTable
+from utils.storedTables import storedTableSchema
 
 
 def schemaKey(projectId: str, tableName: str) -> str:
@@ -72,9 +72,7 @@ def tableSchemas(projectId: str, tableNames: Iterable[str], skipUnreadable: bool
                 client = None
         if schema is None:
             try:
-                data = readTableBytes(projectId, tableName)
-                table = decodeStoredTable(projectId, tableName, data, leaveHeadroom=True) if leaveHeadroom else decodeStoredTable(projectId, tableName, data)
-                schema = table.schema
+                schema = storedTableSchema(projectId, tableName, leaveHeadroom=True) if leaveHeadroom else storedTableSchema(projectId, tableName)
             except Exception as exc:
                 if not skipUnreadable or isBusy(exc):
                     raise

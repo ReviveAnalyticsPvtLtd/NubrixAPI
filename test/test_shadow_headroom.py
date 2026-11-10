@@ -1,8 +1,10 @@
 """A shadow SQL run leaves headroom: it starts only while the sandbox has slots to spare and the project is idle."""
 
+import io
 import os
 import sys
 import types
+from contextlib import contextmanager
 from unittest.mock import MagicMock
 
 import pytest
@@ -253,12 +255,72 @@ def test_shadowGroundingReadTakesItsSlotWithoutWaiting(readerRun, monkeypatch):
     assert waits == [0]
 
 
-def test_shadowTableSchemasLetBusyPropagateEvenWhenSkippingUnreadable(readerRun, monkeypatch, tmp_path):
-    from utils import storedTables, tableSchemas
+def _unmarkedTableInStorage(monkeypatch):
+    """Storage holds a table with no marker, so its schema is a reader-child read; the child's answer reads as "schema"."""
+    from utils import projectStorage, storedTables
 
-    monkeypatch.setattr(tableSchemas, "readTableBytes", lambda p, t: b"x")
+    @contextmanager
+    def openTableFile(projectId, tableName):
+        yield io.BytesIO(b"x")
+
+    monkeypatch.setattr(projectStorage, "openTableFile", openTableFile)
+    monkeypatch.setattr(projectStorage, "readTableBytes", lambda p, t: b"x")
+    monkeypatch.setattr(storedTables, "_ipcSchema", lambda projectId, tableName, answer: "schema")
+
+
+def _readSchema(**kwargs):
+    from utils import storedTables
+
+    return storedTables.storedTableSchema("p1", "t", **kwargs)
+
+
+def test_shadowSchemaReadOfAnUnmarkedTableWithTooFewFreeSlotsIsBusyAndStartsNoReader(readerRun, monkeypatch, tmp_path):
+    _unmarkedTableInStorage(monkeypatch)
+    held = _hold(tmp_path, 4, 3)
+    try:
+        with pytest.raises(SandboxBusyError):
+            _readSchema(leaveHeadroom=True)
+        assert readerRun == []
+    finally:
+        _release(held)
+    assert freeRunSlots(str(tmp_path), 4) == 4
+
+
+def test_shadowSchemaReadWithRoomTakesItsSlotWithoutWaiting(readerRun, monkeypatch, tmp_path):
+    _unmarkedTableInStorage(monkeypatch)
+    waits = []
+    real = sandboxRunner.acquireRunSlot
+    monkeypatch.setattr(sandboxRunner, "acquireRunSlot", lambda root, maxRuns, wait: waits.append(wait) or real(root, maxRuns, 0))
+    monkeypatch.setenv("SANDBOX_SLOT_WAIT_SECONDS", "7")
+    held = _hold(tmp_path, 4, 2)
+    try:
+        assert _readSchema(leaveHeadroom=True) == "schema"
+        assert waits == [0]
+        assert len(readerRun) == 1
+    finally:
+        _release(held)
+
+
+def test_servedSchemaReadWaitsAsBefore(readerRun, monkeypatch, tmp_path):
+    _unmarkedTableInStorage(monkeypatch)
+    waits = []
+    real = sandboxRunner.acquireRunSlot
+    monkeypatch.setattr(sandboxRunner, "acquireRunSlot", lambda root, maxRuns, wait: waits.append(wait) or real(root, maxRuns, 0))
+    monkeypatch.setenv("SANDBOX_SLOT_WAIT_SECONDS", "7")
+    held = _hold(tmp_path, 4, 3)  # one free: too few for a shadow, enough for a served read
+    try:
+        assert _readSchema() == "schema"
+        assert waits == [7]
+        assert len(readerRun) == 1
+    finally:
+        _release(held)
+
+
+def test_shadowTableSchemasLetBusyPropagateEvenWhenSkippingUnreadable(readerRun, monkeypatch, tmp_path):
+    from utils import tableSchemas
+
+    _unmarkedTableInStorage(monkeypatch)
     monkeypatch.setattr(tableSchemas, "_client", lambda: (_ for _ in ()).throw(RuntimeError("no redis")))
-    monkeypatch.setattr(storedTables, "_trustedFooter", lambda *a, **k: None)
     held = _hold(tmp_path, 4, 3)
     try:
         with pytest.raises(SandboxBusyError):

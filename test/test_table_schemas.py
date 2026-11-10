@@ -51,11 +51,7 @@ def redisFake():
 @pytest.fixture
 def reader():
     schemas = {"sales": SALES, "costs": COSTS}
-    with mock.patch.object(tableSchemas, "readTableBytes", side_effect=lambda p, t: b"bytes-" + t.encode()) as read, \
-            mock.patch.object(
-                tableSchemas, "decodeStoredTable",
-                side_effect=lambda p, t, data: schemas[t].empty_table(),
-            ):
+    with mock.patch.object(tableSchemas, "storedTableSchema", side_effect=lambda p, t, **k: schemas[t]) as read:
         yield read
 
 
@@ -149,16 +145,16 @@ def test_aSchemaCachedAfterForgetTableExpiresWithTheDataCache(redisFake, reader)
     from utils import initMethods
     from utils.initMethods import forget_table
 
-    def readThenTheWriterReplacesTheTable(projectId, tableName):
+    def readThenTheWriterReplacesTheTable(projectId, tableName, **kwargs):
         forget_table(projectId, tableName)  # the writer finishes between our read and our cache write
-        return b"old-bytes"
+        return SALES
 
     reader.side_effect = readThenTheWriterReplacesTheTable
     tableSchemas.tableSchemas("p1", ["sales"])
     assert "p1::schema::sales" in redisFake.store  # the stale schema was cached after the delete
 
     redisFake.now += initMethods._REDIS_SMALL_TABLE_TTL_SECONDS
-    reader.side_effect = lambda p, t: b"new-bytes"
+    reader.side_effect = lambda p, t, **k: SALES
     tableSchemas.tableSchemas("p1", ["sales"])
     assert reader.call_count == 2
 
@@ -168,9 +164,8 @@ def test_aFailingRedisIsCalledOnceForTwentyTables(reader):
     broken.get.side_effect = ConnectionError("down")
     broken.set.side_effect = ConnectionError("down")
     names = [f"t{i}" for i in range(20)]
-    with mock.patch.object(
-        tableSchemas, "decodeStoredTable", side_effect=lambda p, t, data: SALES.empty_table()
-    ), mock.patch("utils.initMethods._redis_pool"), mock.patch("utils.initMethods.redis.Redis", return_value=broken):
+    reader.side_effect = lambda p, t, **k: SALES
+    with mock.patch("utils.initMethods._redis_pool"), mock.patch("utils.initMethods.redis.Redis", return_value=broken):
         result = tableSchemas.tableSchemas("p1", names)
     assert list(result) == names
     assert broken.get.call_count + broken.set.call_count == 1
@@ -182,9 +177,8 @@ def test_aFailingSetStopsAllLaterRedisCallsInThatCall(reader):
     broken.get.return_value = None
     broken.set.side_effect = ConnectionError("down")
     names = [f"t{i}" for i in range(20)]
-    with mock.patch.object(
-        tableSchemas, "decodeStoredTable", side_effect=lambda p, t, data: SALES.empty_table()
-    ), mock.patch("utils.initMethods._redis_pool"), mock.patch("utils.initMethods.redis.Redis", return_value=broken):
+    reader.side_effect = lambda p, t, **k: SALES
+    with mock.patch("utils.initMethods._redis_pool"), mock.patch("utils.initMethods.redis.Redis", return_value=broken):
         tableSchemas.tableSchemas("p1", names)
     assert broken.get.call_count == 1
     assert broken.set.call_count == 1
@@ -209,15 +203,15 @@ def test_projectWideDropScansInBatches(redisFake, reader):
 
 def test_skipUnreadableLeavesOutATableThatFailsAndKeepsTheRest(redisFake, reader):
     warnings = []
-    real = tableSchemas.decodeStoredTable
+    real = tableSchemas.storedTableSchema
 
-    def decode(projectId, tableName, data):
+    def decode(projectId, tableName, **kwargs):
         if tableName == "legacy":
             raise ValueError("unreadable 'Secret Corp'")
-        return SALES.empty_table()
+        return SALES
 
-    with mock.patch.object(tableSchemas, "decodeStoredTable", side_effect=decode), \
-            mock.patch.object(tableSchemas.logger, "warning", side_effect=lambda message, *a, **k: warnings.append(message)):
+    reader.side_effect = decode
+    with mock.patch.object(tableSchemas.logger, "warning", side_effect=lambda message, *a, **k: warnings.append(message)):
         result = tableSchemas.tableSchemas("p1", ["sales", "legacy", "costs"], skipUnreadable=True)
     assert list(result) == ["sales", "costs"]
     assert any("ValueError" in message for message in warnings)
@@ -226,8 +220,8 @@ def test_skipUnreadableLeavesOutATableThatFailsAndKeepsTheRest(redisFake, reader
 
 
 def test_unreadableTableStillRaisesByDefault(reader):
-    with mock.patch.object(tableSchemas, "decodeStoredTable", side_effect=ValueError("x")), \
-            mock.patch("utils.initMethods._redis_pool"), mock.patch("utils.initMethods.redis.Redis", return_value=mock.Mock(get=lambda k: None)):
+    reader.side_effect = ValueError("x")
+    with mock.patch("utils.initMethods._redis_pool"), mock.patch("utils.initMethods.redis.Redis", return_value=mock.Mock(get=lambda k: None)):
         with pytest.raises(ValueError):
             tableSchemas.tableSchemas("p1", ["sales"])
 
@@ -240,9 +234,9 @@ def test_busyPropagatesEvenWhenSkippingUnreadable(redisFake, reader, busy):
     if busy == "code":
         error = RuntimeError("busy")
         error.errorCode = BUSY_CODE
-    with mock.patch.object(tableSchemas, "decodeStoredTable", side_effect=error):
-        with pytest.raises(type(error)):
-            tableSchemas.tableSchemas("p1", ["sales"], skipUnreadable=True)
+    reader.side_effect = error
+    with pytest.raises(type(error)):
+        tableSchemas.tableSchemas("p1", ["sales"], skipUnreadable=True)
 
 
 def test_aFailingRedisGetsOneAttemptWhileSkippingUnreadable(reader):
@@ -251,13 +245,21 @@ def test_aFailingRedisGetsOneAttemptWhileSkippingUnreadable(reader):
     broken.set.side_effect = ConnectionError("down")
     names = [f"t{i}" for i in range(20)]
 
-    def decode(projectId, tableName, data):
+    def decode(projectId, tableName, **kwargs):
         if tableName == "t3":
             raise ValueError("x")
-        return SALES.empty_table()
+        return SALES
 
-    with mock.patch.object(tableSchemas, "decodeStoredTable", side_effect=decode), \
-            mock.patch("utils.initMethods._redis_pool"), mock.patch("utils.initMethods.redis.Redis", return_value=broken):
+    reader.side_effect = decode
+    with mock.patch("utils.initMethods._redis_pool"), mock.patch("utils.initMethods.redis.Redis", return_value=broken):
         result = tableSchemas.tableSchemas("p1", names, skipUnreadable=True)
     assert len(result) == 19
     assert broken.get.call_count + broken.set.call_count == 1
+
+
+def test_aMissReadsOnlyTheSchemaAndPassesHeadroomOnlyForAShadow(redisFake, reader):
+    assert not hasattr(tableSchemas, "readTableBytes")
+    assert not hasattr(tableSchemas, "decodeStoredTable")
+    tableSchemas.tableSchemas("p1", ["sales"])
+    tableSchemas.tableSchemas("p2", ["sales"], leaveHeadroom=True)
+    assert reader.call_args_list == [mock.call("p1", "sales"), mock.call("p2", "sales", leaveHeadroom=True)]
