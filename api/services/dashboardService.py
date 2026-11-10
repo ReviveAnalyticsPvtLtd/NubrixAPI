@@ -44,6 +44,36 @@ _CHART_KEYS = ("chartType", "title", "xLabels", "yLabels", "label", "data", "map
 FAILED_CODE_PREFIX = "# Failed to generate code"
 
 
+class _RerunFailure(Exception):
+    """A saved Python widget's run did not return a chart. `kind` is safe to log: it never holds output text."""
+
+    def __init__(self, kind: str) -> None:
+        super().__init__(kind)
+        self.kind = kind
+
+
+def _pythonResult(output: str) -> dict:
+    """The chart dict a saved Python widget printed, or `_RerunFailure` naming only the kind of failure."""
+    try:
+        result = json.loads(output)
+    except ValueError:
+        text = output.strip() if isinstance(output, str) else ""
+        if text.startswith("Execution timed out"):
+            raise _RerunFailure("timed out")
+        if text.startswith("Concurrency limit reached"):
+            raise _RerunFailure("concurrency limit")
+        if text.startswith("Traceback"):
+            # Only the exception class: the message after the first ":" can hold data values.
+            match = re.match(r"[A-Za-z_][\w.]*", text.splitlines()[-1].strip())
+            raise _RerunFailure(match.group(0) if match else "unknown exception")
+        raise _RerunFailure("not JSON")
+    if isinstance(result, dict) and "error" in result:
+        raise _RerunFailure("error key")
+    if not isinstance(result, dict):
+        raise _RerunFailure("not JSON")
+    return result
+
+
 class DashboardService:
     """
     Service class for managing dashboards, pages, widgets, and data retrieval.
@@ -81,6 +111,7 @@ class DashboardService:
             SandboxBusyError: The sandbox has no free slot. Nothing is returned for the widget.
         """
         widget = widget.copy()
+        form = "chartRequest"
         try:
             request = decodeGeneratedCode(widget.get("generatedCode"))
             if request is not None:
@@ -88,16 +119,17 @@ class DashboardService:
                     raise ValueError("the project's table list could not be read")
                 result = renderChartRequest(replManager, projectId, request, activeTables, filters=filters, lenient=True)
             else:
+                form = "python"
                 code = widget.get("generatedCode")
                 if isinstance(code, str) and "```" in code:
                     code = _remove_code_fences(code)
-                result = json.loads(replManager.run(code, projectId=projectId, filters=filters))
-                if not isinstance(result, dict) or "error" in result:
-                    raise ValueError("the saved code did not return a chart")
+                result = _pythonResult(replManager.run(code, projectId=projectId, filters=filters))
         except Exception as error:
             if isBusy(error):
                 raise
-            logger.warning(f"Widget {widget.get('id')} could not be re-run: {error}")
+            # Widget id, form and failure kind only: output text and filter values can hold data.
+            kind = error.kind if isinstance(error, _RerunFailure) else type(error).__name__
+            logger.warning(f"Widget {widget.get('id')} could not be re-run ({form}): {kind}")
             return widget, False
         kept = {key: widget.get(key) for key in ("id", "layout", "generatedCode") if key in widget}
         widget.update(result if request is None else {key: result[key] for key in _CHART_KEYS if key in result})

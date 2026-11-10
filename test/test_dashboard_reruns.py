@@ -333,3 +333,43 @@ def test_busyWhileReadingMetadataStillGives503(monkeypatch):
         service.getData(GetData(projectId="p1", page="pg", filters=FILTERS))
 
     assert caught.value.statusCode == 503
+
+
+def _failureLines(logLines, widgetId):
+    return [line for line in logLines if f"Widget {widgetId} " in line]
+
+
+@pytest.mark.parametrize("output, kind", [
+    ("Traceback (most recent call last):\n  File \"x\", line 1, in <module>\nValueError: bad value 4242-secret\n", "ValueError"),
+    ("Traceback (most recent call last):\n  File \"x\", line 1\nsqlalchemy.exc.OperationalError: (psycopg2) host=secret-host\n", "sqlalchemy.exc.OperationalError"),
+    ("\nExecution timed out after 35 seconds.\n", "timed out"),
+    ("Concurrency limit reached: Too many running code execution tasks for project 'p1'. Please try again in a few seconds.", "concurrency limit"),
+    ('{"error": "secret message 4242"}', "error key"),
+    ("revenue is 4242-secret", "not JSON"),
+    ("[1, 2]", "not JSON"),
+])
+def test_failedPythonRerunLogsIdFormAndKindOnly(monkeypatch, logLines, output, kind):
+    service, _, _ = _setup(monkeypatch, [_widget("W9")], run=lambda code, projectId=None, filters=None: output)
+
+    service.getData(GetData(projectId="p1", page="pg", filters=[{"region": "north-secret"}]))
+
+    lines = _failureLines(logLines, "W9")
+    assert len(lines) == 1
+    assert "python" in lines[0] and kind in lines[0]
+    for forbidden in ("4242", "secret", "psycopg2", "north"):
+        assert forbidden not in lines[0]
+
+
+def test_failedChartRequestRerunLogsIdFormAndClassOnly(monkeypatch, logLines):
+    def failRender(*args, **kwargs):
+        raise ChartFailure("run", "boom 4242-secret")
+
+    service, _, _ = _setup(monkeypatch, [_widget("W8", _request(), "bar")], render=failRender)
+
+    service.getData(GetData(projectId="p1", page="pg", filters=[{"region": "north-secret"}]))
+
+    lines = _failureLines(logLines, "W8")
+    assert len(lines) == 1
+    assert "chartRequest" in lines[0] and "ChartFailure" in lines[0]
+    for forbidden in ("4242", "secret", "boom", "north"):
+        assert forbidden not in lines[0]
