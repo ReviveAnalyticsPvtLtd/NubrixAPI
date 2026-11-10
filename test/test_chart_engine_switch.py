@@ -743,3 +743,54 @@ def test_shadowRunsOnACopyOfTheServedChart(env):
     env.chart()
     env.executor.wait()
     assert seen[0] == served and seen[0] is not served
+
+
+# One mode per batch
+
+def _runBatch(env, startMode, flipTo, queries=("q1", "q2", "q3")):
+    """Runs generateChartsInParallel for real, flipping the env var after the batch started. Returns once the charts are done."""
+    env.mode(startMode)
+    env.monkeypatch.setattr(rs, "buildParallelReportingWorkflow", lambda: env.python)
+    env.service._fetchJson = AsyncMock(return_value={"insights": []})
+    env.service._projectMetadataUrl = lambda projectId, fileName="metadata.json": fileName
+    stop = RuntimeError("stop after the charts")
+    env.service.client = MagicMock()
+    env.service.client.storage.from_.side_effect = stop
+
+    def workers():
+        env.mode(flipTo)  # runs after the batch read its mode and before its pool starts
+        return 2
+
+    env.monkeypatch.setattr("utils.sizing.parallel_chart_workers", workers)
+    from api.models import GenerateChartsInParallel
+
+    details = GenerateChartsInParallel(projectId="p1", inputQueries=list(queries))
+    with pytest.raises(Exception):
+        asyncio.run(env.service.generateChartsInParallel(details, userId="u1"))
+
+
+def test_parallelBatchIsServedByTheModeReadAtItsStart(env):
+    _runBatch(env, "on", "off")
+    assert len(env.sql.calls) == 3 and env.python.calls == []
+    assert not [c for c in env.sql.calls if "Error/No data" in str(c)]
+
+
+def test_parallelBatchKeepsPythonWhenModeFlipsToOn(env):
+    _runBatch(env, "off", "on")
+    assert len(env.python.calls) == 3 and env.sql.calls == [] and env.built == []
+
+
+def test_parallelHelpersTakeTheModeFromTheirCaller(env):
+    env.mode("off")
+    env.monkeypatch.setattr(rs.threadLocal, "parallelWorkflow", None, raising=False)
+    result = {}
+
+    def work():
+        rs.initParallelWorkflow("on")
+        result["chart"] = rs.ReportingService._generateSingleChartForParallel(METADATA, "p1", "q", "u1", "on")
+
+    thread = threading.Thread(target=work)
+    thread.start()
+    thread.join()
+    assert result["chart"]["finalOutput"] == CARD
+    assert len(env.sql.calls) == 1 and env.python.calls == []

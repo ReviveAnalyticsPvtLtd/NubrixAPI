@@ -71,10 +71,11 @@ def initWorkflow():
     finally:
         logger.enable("")
 
-def initParallelWorkflow():
+def initParallelWorkflow(mode: str | None = None):
+    """Builds this thread's parallel workflow for `mode` (the engine mode when not given), as the pool initializer."""
     logger.disable("")
     try:
-        if chartEngineMode() == "on":
+        if (mode or chartEngineMode()) == "on":
             threadLocal.sqlParallelWorkflow = buildSqlChartWorkflow(parallel=True)
         else:
             threadLocal.parallelWorkflow = buildParallelReportingWorkflow()
@@ -678,7 +679,7 @@ class ReportingService:
             raise exception
 
     @staticmethod
-    def _generateSingleChartForParallel(metadata: dict, projectId: str, query: str, userId: str | None = None) -> dict:
+    def _generateSingleChartForParallel(metadata: dict, projectId: str, query: str, userId: str | None = None, mode: str | None = None) -> dict:
         """
         Helper function to generate a single chart in parallel.
 
@@ -687,12 +688,13 @@ class ReportingService:
             projectId: The project ID.
             query: The input query for the chart.
             userId: The user ID for credit/observability tracking.
+            mode: The engine mode of the batch this chart belongs to; read from the environment when not given.
 
         Returns:
             dict: The generated chart data.
         """
         try:
-            mode = chartEngineMode()
+            mode = mode or chartEngineMode()
             if mode == "on":
                 workflow = _threadSqlParallelWorkflow()
                 reportConfig = _sqlConfig("ParallelReportingWorkflow", ["reporting", "parallelChart"], projectId, userId)
@@ -741,6 +743,8 @@ class ReportingService:
             than process workers is intentional and safe.
         """
         try:
+            # One mode for the whole batch: the pool threads and every chart use the mode read here.
+            mode = chartEngineMode()
             metadata = await self._getProjectMetadata(details.projectId)
             insightsUrl = self._projectMetadataUrl(details.projectId, "insights.json")
             try:
@@ -756,9 +760,9 @@ class ReportingService:
             # Scale workers with the box; cap to avoid LLM rate-limit thrash on huge batches.
             from utils.sizing import parallel_chart_workers
             max_workers = parallel_chart_workers()
-            with ThreadPoolExecutor(max_workers=max_workers, initializer=initParallelWorkflow) as executor:
+            with ThreadPoolExecutor(max_workers=max_workers, initializer=initParallelWorkflow, initargs=(mode,)) as executor:
                 futures = [
-                    executor.submit(self._generateSingleChartForParallel, metadata, details.projectId, query, userId)
+                    executor.submit(self._generateSingleChartForParallel, metadata, details.projectId, query, userId, mode)
                     for query in uniqueQueries
                 ]
                 responses = [f.result() for f in futures]
