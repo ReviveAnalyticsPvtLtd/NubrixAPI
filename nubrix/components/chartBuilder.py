@@ -37,7 +37,15 @@ APOSTROPHE = "’"
 
 
 class ChartBuildError(ValueError):
-    """The query result cannot be drawn as the requested chart; the message names the fix."""
+    """The query result cannot be drawn as the requested chart; the message names the fix.
+
+    The message goes to the repair prompt and may quote labels or cells. `logMessage` says the same without
+    any data (no labels, cells or column names); it is what the failure log records.
+    """
+
+    def __init__(self, message: str, *, logMessage: str):
+        super().__init__(message)
+        self.logMessage = logMessage
 
 
 def readableLabel(column: str) -> str:
@@ -147,7 +155,8 @@ def _checkColumn(table: pa.Table, name: str) -> None:
     if table.column_names.count(name) != 1:
         raise ChartBuildError(
             f"The query result has no single column '{name}'; its columns are {table.column_names}. "
-            "Use the exact output column names in the encoding."
+            "Use the exact output column names in the encoding.",
+            logMessage="The query result has no single column for a name in the encoding.",
         )
 
 
@@ -162,7 +171,10 @@ def _requireNumeric(table: pa.Table, names: list[str], fix: str) -> None:
         kind = table.schema.field(name).type
         numeric = pa.types.is_integer(kind) or pa.types.is_floating(kind) or pa.types.is_decimal(kind)
         if not (numeric or pa.types.is_null(kind)):
-            raise ChartBuildError(f"Column '{name}' has type {kind} but must be numeric. {fix}")
+            raise ChartBuildError(
+                f"Column '{name}' has type {kind} but must be numeric. {fix}",
+                logMessage=f"A column has type {kind} but must be numeric. {fix}",
+            )
 
 
 def _checkLabelCount(request: ChartRequest, count: int, truncated: bool, lenient: bool) -> None:
@@ -180,7 +192,8 @@ def _checkLabelCount(request: ChartRequest, count: int, truncated: bool, lenient
             logger.warning("The %s; the data is incomplete", problem)
         return
     raise ChartBuildError(
-        f"The {problem} (limit {LABEL_CAP}). Aggregate further, and add ORDER BY and LIMIT {LABEL_CAP}."
+        f"The {problem} (limit {LABEL_CAP}). Aggregate further, and add ORDER BY and LIMIT {LABEL_CAP}.",
+        logMessage=f"The {problem} (limit {LABEL_CAP}).",
     )
 
 
@@ -227,7 +240,8 @@ def _buildCategory(request: ChartRequest, table: pa.Table, truncated: bool, leni
             if index in column:
                 raise ChartBuildError(
                     f"The query has more than one row for x '{label}' and series '{name}'. "
-                    "Aggregate with GROUP BY so each pair appears once."
+                    "Aggregate with GROUP BY so each pair appears once.",
+                    logMessage="The query has more than one row for an x and series pair.",
                 )
             column[index] = value
         datasets = [
@@ -279,13 +293,15 @@ def _buildCard(request: ChartRequest, table: pa.Table) -> dict:
     if table.num_rows > 1:
         raise ChartBuildError(
             f"A card shows one value but the query returned {table.num_rows} rows. "
-            "Aggregate to a single row, or add LIMIT 1."
+            "Aggregate to a single row, or add LIMIT 1.",
+            logMessage=f"A card shows one value but the query returned {table.num_rows} rows.",
         )
     column = request.encoding.value
     raw = _column(table, column)[0]
     if isinstance(raw, (list, tuple, dict)):
         raise ChartBuildError(
-            f"Column '{column}' holds a list or struct, which a card cannot show. Return a single number or text."
+            f"Column '{column}' holds a list or struct, which a card cannot show. Return a single number or text.",
+            logMessage="The card column holds a list or struct, which a card cannot show.",
         )
     value = "true" if raw is True else "false" if raw is False else _cell(raw)
     return {
@@ -316,7 +332,8 @@ def _buildPivot(request: ChartRequest, table: pa.Table, truncated: bool) -> dict
     if truncated:
         raise ChartBuildError(
             "The pivot query returned more rows than a pivot can use, so its totals would be wrong. "
-            "Aggregate further so fewer (row, column) pairs are returned."
+            "Aggregate further so fewer (row, column) pairs are returned.",
+            logMessage="The pivot query returned more rows than a pivot can use.",
         )
     _requireNumeric(table, [encoding.value], "Return a numeric value column, aggregated with SUM, AVG or COUNT.")
     rowLevels = zip(*[[_levelText(v) for v in _column(table, name)] for name in encoding.rows])
@@ -330,7 +347,8 @@ def _buildPivot(request: ChartRequest, table: pa.Table, truncated: bool) -> dict
         if rowKey in column:
             raise ChartBuildError(
                 f"The query has more than one row for pivot row {rowKey} and column {columnKey}. "
-                "Aggregate with GROUP BY so each pair appears once."
+                "Aggregate with GROUP BY so each pair appears once.",
+                logMessage="The query has more than one row for a pivot row and column pair.",
             )
         column[rowKey] = _number(value)
     return {

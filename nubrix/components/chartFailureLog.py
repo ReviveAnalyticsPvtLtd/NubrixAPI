@@ -48,8 +48,13 @@ def _redactor(tableNames: Iterable[str] | None):
     return replace
 
 
+def _messageOf(error: BaseException | str) -> str:
+    logMessage = getattr(error, "logMessage", None)
+    return logMessage if isinstance(logMessage, str) else str(error)
+
+
 def _redactedFirstLine(error: BaseException | str, tableNames: Iterable[str] | None = None) -> str:
-    firstLine = str(error).split("\n", 1)[0]
+    firstLine = _messageOf(error).split("\n", 1)[0]
     return _REDACT.sub(_redactor(tableNames), firstLine)[:_MAX_ERROR_CHARACTERS]
 
 
@@ -68,6 +73,7 @@ def logChartFailure(
 
     `errorClass` is the exception's class name, or "str" when the error is a plain string.
     `tableNames` are the project's tables: the only double-quoted text kept from the error.
+    An error with a `logMessage` (a ChartBuildError) is logged through that data-free text.
     The cut to 300 characters comes after the redaction, so it never leaves half a literal.
     """
     record = {

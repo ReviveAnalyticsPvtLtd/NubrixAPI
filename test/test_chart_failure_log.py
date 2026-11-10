@@ -196,3 +196,19 @@ def test_traceIdOf():
     other = SimpleNamespace(last_trace_id="zzz")
     assert module.traceIdOf({"callbacks": [first, empty, withId, other]}) == "abc"
     assert module.traceIdOf({"callbacks": [first]}) is None
+
+
+def test_errorWithALogMessageIsLoggedThroughIt(records):
+    from nubrix.components.chartBuilder import ChartBuildError
+
+    error = ChartBuildError("more than one row for pivot row Alice and column North", logMessage="more than one row for a pair")
+    record = logOne(records, error, stage="build")
+    assert record["error"] == "more than one row for a pair"
+    assert record["errorClass"] == "ChartBuildError"
+
+
+def test_logMessageIsStillRedacted(records):
+    from nubrix.components.chartBuilder import ChartBuildError
+
+    error = ChartBuildError("full", logMessage="x 'Alice' and 42")
+    assert logOne(records, error)["error"] == "x '?' and ?"
