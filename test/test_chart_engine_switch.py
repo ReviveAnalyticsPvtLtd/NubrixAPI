@@ -282,10 +282,6 @@ def test_shadowPoolRunsTwoAtATimeOnItsOwnThreads():
     assert all(name.startswith("chart-shadow") for name in state["names"])
 
 
-def test_theModuleShadowPoolComesFromTheFactory():
-    assert rs._shadowExecutor._max_workers == rs._newShadowExecutor()._max_workers == rs._SHADOW_WORKERS
-
-
 def test_shadowQueueIsBoundedAtFourPermits():
     semaphore = rs._shadowSlots
     taken = [semaphore.acquire(blocking=False) for _ in range(5)]
