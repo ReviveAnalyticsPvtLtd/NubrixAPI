@@ -109,3 +109,94 @@ def test_compareCharts_scatterDatasetsByLabel():
 @pytest.mark.parametrize("a, b", [({}, {}), (None, BAR), (BAR, "x"), ({"chartType": "bar"}, BAR)])
 def test_compareCharts_neverRaises(a, b):
     assert compareCharts(a, b) in ("match", "differ")
+
+
+def _scatter(points, label="a"):
+    return {"chartType": "scatter", "data": {"datasets": [{"label": label, "data": points}]}}
+
+
+def test_compareCharts_scatterPointOrderDoesNotCount():
+    a = _scatter([{"x": 1, "y": 2}, {"x": 3, "y": 4}, {"x": 5, "y": 6}])
+    b = _scatter([{"x": 5, "y": 6}, {"x": 1, "y": 2}, {"x": 3, "y": 4}])
+    assert compareCharts(a, b) == "match"
+    b["data"]["datasets"][0]["data"][0]["y"] = 7
+    assert compareCharts(a, b) == "differ"
+
+
+def test_compareCharts_bubblePointsAreAMultiset():
+    def bubble(points):
+        return {"chartType": "bubble", "data": {"datasets": [{"label": "a", "data": points}]}}
+
+    a = bubble([{"x": 1, "y": 2, "r": 3}, {"x": 1, "y": 2, "r": 3}, {"x": 2, "y": 2, "r": 3}])
+    assert compareCharts(a, bubble([{"x": 2, "y": 2, "r": 3}, {"x": 1, "y": 2, "r": 3}, {"x": 1, "y": 2, "r": 3}])) == "match"
+    assert compareCharts(a, bubble([{"x": 2, "y": 2, "r": 3}, {"x": 2, "y": 2, "r": 3}, {"x": 1, "y": 2, "r": 3}])) == "differ"
+
+
+def test_compareCharts_tableRowOrderDoesNotCount():
+    a = {"chartType": "table", "data": [{"a": 1, "b": "x"}, {"a": 2, "b": "y"}]}
+    b = {"chartType": "table", "data": [{"a": 2, "b": "y"}, {"a": 1, "b": "x"}]}
+    assert compareCharts(a, b) == "match"
+    b["data"][0]["b"] = "z"
+    assert compareCharts(a, b) == "differ"
+
+
+def test_compareCharts_tableIntegersAreExactAndOthersUseRelTol():
+    def table(value):
+        return {"chartType": "table", "data": [{"a": value}]}
+
+    assert compareCharts(table(1234567), table(1234570)) == "differ"
+    assert compareCharts(table(1234567), table(1234567.0)) == "match"
+    assert compareCharts(table(2.5), table(2.5000001)) == "match"
+    assert compareCharts(table(2.5), table(2.51)) == "differ"
+
+
+def test_compareCharts_categoryLabelOrderDoesNotCount():
+    other = copy.deepcopy(BAR)
+    other["data"]["labels"].reverse()
+    for dataset in other["data"]["datasets"]:
+        dataset["data"].reverse()
+    assert compareCharts(BAR, other) == "match"
+    other["data"]["datasets"][0]["data"][0] = 99
+    assert compareCharts(BAR, other) == "differ"
+    wrongLabel = copy.deepcopy(BAR)
+    wrongLabel["data"]["labels"] = ["north", "east"]
+    assert compareCharts(BAR, wrongLabel) == "differ"
+
+
+def test_compareCharts_duplicateLabelsFallBackToOrderedLists():
+    a = {"chartType": "bar", "data": {"labels": ["x", "x"], "datasets": [{"label": "n", "data": [1, 2]}]}}
+    assert compareCharts(a, copy.deepcopy(a)) == "match"
+    swapped = {"chartType": "bar", "data": {"labels": ["x", "x"], "datasets": [{"label": "n", "data": [2, 1]}]}}
+    assert compareCharts(a, swapped) == "differ"
+
+
+def test_compareCharts_nanNoneAndMissingAreEqual():
+    a = copy.deepcopy(BAR)
+    b = copy.deepcopy(BAR)
+    a["data"]["datasets"][1]["data"][1] = float("nan")
+    assert compareCharts(a, b) == "match"
+    assert compareCharts(_scatter([{"x": 1, "y": float("nan")}]), _scatter([{"x": 1, "y": None}])) == "match"
+
+
+def test_compareCharts_integersCompareExactly():
+    def bar(value):
+        return {"chartType": "bar", "data": {"labels": ["a"], "datasets": [{"label": "n", "data": [value]}]}}
+
+    assert compareCharts(bar(1234567), bar(1234568)) == "differ"
+    assert compareCharts(bar(1234567), bar(1234567.0)) == "match"
+    assert compareCharts(bar(1.0000001), bar(1.0)) == "match"
+
+
+def test_compareCharts_numericTextEqualsTheNumber():
+    assert compareCharts({"chartType": "card", "data": "5"}, {"chartType": "card", "data": 5}) == "match"
+    assert compareCharts({"chartType": "card", "data": "5"}, {"chartType": "card", "data": 6}) == "differ"
+    assert compareCharts({"chartType": "card", "data": "n/a"}, {"chartType": "card", "data": "n/b"}) == "differ"
+
+
+def test_compareCharts_midnightDateLabelsEqualTheDate():
+    def bar(label):
+        return {"chartType": "bar", "data": {"labels": [label], "datasets": [{"label": "n", "data": [1]}]}}
+
+    assert compareCharts(bar("2024-01-01 00:00:00"), bar("2024-01-01")) == "match"
+    assert compareCharts(bar("2024-01-01T00:00:00"), bar("2024-01-01")) == "match"
+    assert compareCharts(bar("2024-01-01 10:00:00"), bar("2024-01-01")) == "differ"

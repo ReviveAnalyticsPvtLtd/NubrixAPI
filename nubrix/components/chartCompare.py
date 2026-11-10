@@ -7,46 +7,88 @@ Both charts are the `finalOutput` of a successful run.
 __all__ = ["compareCharts"]
 
 import math
+import re
 from typing import Any, Literal
 
 _ABS_TOL = 1e-12
+_MIDNIGHT = re.compile(r"[ T]00:00:00$")
 
 
 def _isNumber(value: Any) -> bool:
     return isinstance(value, (int, float)) and not isinstance(value, bool)
 
 
+def _isIntegral(value: Any) -> bool:
+    return isinstance(value, int) or (isinstance(value, float) and value.is_integer())
+
+
+def _norm(value: Any) -> Any:
+    """A scalar in comparable form: missing values (None, NaN) are None, numeric text is its number, midnight dates are dates."""
+    if value is None or (isinstance(value, float) and math.isnan(value)):
+        return None
+    if isinstance(value, str):
+        text = _MIDNIGHT.sub("", value.strip())
+        try:
+            number = float(text)
+        except ValueError:
+            return text
+        return number if math.isfinite(number) else text
+    return value
+
+
+def _key(value: Any) -> tuple:
+    """A sort key that puts equal data next to each other, whatever the order it arrived in."""
+    value = _norm(value)
+    if isinstance(value, dict):
+        return (3, tuple(sorted((str(k), _key(v)) for k, v in value.items())), "")
+    if isinstance(value, (list, tuple)):
+        return (4, tuple(_key(v) for v in value), "")
+    if value is None:
+        return (0, 0, "")
+    if _isNumber(value):
+        return (1, float(f"{value:.6g}"), "")
+    return (2, 0, str(value))
+
+
 def _same(a: Any, b: Any, relTol: float) -> bool:
-    """Equal values: None with None, numbers within `relTol`, text after trimming, containers item by item."""
+    """Equal values: missing with missing, integral numbers exactly, other numbers within `relTol`, containers item by item."""
+    if isinstance(a, dict) and isinstance(b, dict):
+        keysA = {str(k): v for k, v in a.items()}
+        keysB = {str(k): v for k, v in b.items()}
+        return keysA.keys() == keysB.keys() and all(_same(keysA[k], keysB[k], relTol) for k in keysA)
+    if isinstance(a, (list, tuple)) and isinstance(b, (list, tuple)):
+        return len(a) == len(b) and all(_same(x, y, relTol) for x, y in zip(a, b))
+    a, b = _norm(a), _norm(b)
     if a is None or b is None:
         return a is None and b is None
     if _isNumber(a) and _isNumber(b):
-        if math.isnan(a) or math.isnan(b):
-            return math.isnan(a) and math.isnan(b)
+        if _isIntegral(a) and _isIntegral(b):
+            return a == b
         return math.isclose(a, b, rel_tol=relTol, abs_tol=_ABS_TOL)
-    if isinstance(a, dict) and isinstance(b, dict):
-        return a.keys() == b.keys() and all(_same(a[key], b[key], relTol) for key in a)
-    if isinstance(a, (list, tuple)) and isinstance(b, (list, tuple)):
-        return len(a) == len(b) and all(_same(x, y, relTol) for x, y in zip(a, b))
-    if isinstance(a, str) and isinstance(b, str):
-        return a.strip() == b.strip()
     return a == b
 
 
+def _sameMultiset(a: list, b: list, relTol: float) -> bool:
+    """The same items in any order: both sides sorted by a normalised key, then compared pairwise."""
+    return len(a) == len(b) and all(_same(x, y, relTol) for x, y in zip(sorted(a, key=_key), sorted(b, key=_key)))
+
+
 def _text(value: Any) -> str:
-    return "" if value is None else str(value).strip()
+    return "" if value is None else str(_norm(value)) if isinstance(value, str) else str(value).strip()
 
 
-def _sameLabels(a: dict, b: dict) -> bool:
-    labelsA = (a.get("data") or {}).get("labels") or []
-    labelsB = (b.get("data") or {}).get("labels") or []
-    return [_text(x) for x in labelsA] == [_text(x) for x in labelsB]
+def _labelKeys(chart: dict) -> list:
+    labels = (chart.get("data") or {}).get("labels") or []
+    return [_key(label) for label in labels]
 
 
-def _sameDatasets(a: dict, b: dict, relTol: float) -> bool:
-    """Datasets are matched by label, in any order; the data inside each is compared in order."""
-    datasetsA = (a.get("data") or {}).get("datasets") or []
-    datasetsB = (b.get("data") or {}).get("datasets") or []
+def _datasets(chart: dict) -> list:
+    return (chart.get("data") or {}).get("datasets") or []
+
+
+def _pairDatasets(a: dict, b: dict, sameData) -> bool:
+    """Datasets are matched by label, in any order; `sameData(datasetA, datasetB)` says whether two carry the same data."""
+    datasetsA, datasetsB = _datasets(a), _datasets(b)
     if len(datasetsA) != len(datasetsB):
         return False
     byLabel: dict[str, list[dict]] = {}
@@ -56,24 +98,41 @@ def _sameDatasets(a: dict, b: dict, relTol: float) -> bool:
         candidates = byLabel.get(_text(dataset.get("label")))
         if not candidates:
             return False
-        match = next((i for i, other in enumerate(candidates) if _same(dataset.get("data"), other.get("data"), relTol)), None)
+        match = next((i for i, other in enumerate(candidates) if sameData(dataset, other)), None)
         if match is None:
             return False
         candidates.pop(match)
     return True
 
 
-def _normalisedRow(row: Any, relTol: float) -> Any:
-    """A table row as text: numbers print with 6 significant digits, so an int and an equal float agree."""
-    if not isinstance(row, dict):
-        return _text(row)
-    return {_text(key): (None if value is None else f"{value:.6g}" if _isNumber(value) else _text(value)) for key, value in row.items()}
+def _byLabel(keys: list, dataset: dict) -> dict | None:
+    values = dataset.get("data") or []
+    return dict(zip(keys, values)) if len(values) == len(keys) else None
+
+
+def _sameCategory(a: dict, b: dict, relTol: float) -> bool:
+    """Labels and values as a mapping label -> value, so order does not count; duplicate labels compare as ordered lists."""
+    keysA, keysB = _labelKeys(a), _labelKeys(b)
+    if len(keysA) != len(keysB):
+        return False
+    if len(set(keysA)) != len(keysA) or len(set(keysB)) != len(keysB):
+        return keysA == keysB and _pairDatasets(a, b, lambda x, y: _same(x.get("data"), y.get("data"), relTol))
+    if set(keysA) != set(keysB):
+        return False
+
+    def sameData(x: dict, y: dict) -> bool:
+        mapA, mapB = _byLabel(keysA, x), _byLabel(keysB, y)
+        return mapA is not None and mapB is not None and all(_same(mapA[k], mapB[k], relTol) for k in mapA)
+
+    return _pairDatasets(a, b, sameData)
+
+
+def _sameScatter(a: dict, b: dict, relTol: float) -> bool:
+    return _pairDatasets(a, b, lambda x, y: _sameMultiset(x.get("data") or [], y.get("data") or [], relTol))
 
 
 def _sameTable(a: dict, b: dict, relTol: float) -> bool:
-    rowsA = a.get("data") or []
-    rowsB = b.get("data") or []
-    return len(rowsA) == len(rowsB) and all(_normalisedRow(x, relTol) == _normalisedRow(y, relTol) for x, y in zip(rowsA, rowsB))
+    return _sameMultiset(a.get("data") or [], b.get("data") or [], relTol)
 
 
 def _points(chart: dict) -> set | None:
@@ -97,13 +156,15 @@ def compareCharts(a: dict, b: dict, relTol: float = 1e-6) -> Literal["match", "d
 
     Returns:
         Literal["match", "differ"]: "match" when the chart type is the same and:
-            - category charts: labels agree in order, datasets agree by label in any order;
-            - scatter and bubble: datasets agree by label, points in order;
+            - category charts: each dataset agrees as a mapping label -> value, so the order of labels does not count;
+              datasets pair by label in any order; a duplicate label falls back to ordered lists;
+            - scatter and bubble: datasets agree by label, points as a multiset;
             - card: the value agrees;
-            - table: rows agree as text, in order;
+            - table: rows agree as a multiset, in any order;
             - pivot: every key and value agrees;
             - geoMap: the set of (lat, long, label) agrees to 6 decimals.
-        Numbers agree within `relTol`, and null only equals null.
+        Missing values (None, NaN) agree with each other. Two integral numbers agree only when equal, other numbers
+        within `relTol`. Numeric text equals its number, and a label ending in a midnight time equals the bare date.
     """
     try:
         return "match" if _compare(a, b, relTol) else "differ"
@@ -127,5 +188,5 @@ def _compare(a: dict, b: dict, relTol: float) -> bool:
         pointsA, pointsB = _points(a), _points(b)
         return pointsA is not None and pointsA == pointsB
     if chartType in ("scatter", "bubble"):
-        return _sameDatasets(a, b, relTol)
-    return _sameLabels(a, b) and _sameDatasets(a, b, relTol)
+        return _sameScatter(a, b, relTol)
+    return _sameCategory(a, b, relTol)
