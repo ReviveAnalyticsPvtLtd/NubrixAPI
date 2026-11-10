@@ -2858,9 +2858,9 @@ sqlChartGeneratorPrompt: |
         - differences and offsets: date_diff('day', "start_col", "end_col"), "col" + INTERVAL 30 DAY;
         - a year: "col" >= DATE '2024-01-01' AND "col" < DATE '2025-01-01';
         - missing periods: for counts and sums, list every period in a CTE with SELECT unnest(generate_series(start, end, INTERVAL 1 MONTH)), LEFT JOIN the data to it and COALESCE the measure to 0 (with a series, CROSS JOIN the periods with the series values first). Averages stay NULL;
-        - relative periods count back from today: use CURRENT_DATE, never a literal date, so the chart moves forward when it is refreshed. Weeks start on Monday. Name the period in words in the title ("Orders, Last 30 Days"), never the computed dates:
-          - "last 30 days" (the 30 days ending today): CAST("col" AS DATE) > CURRENT_DATE - 30 AND CAST("col" AS DATE) <= CURRENT_DATE
-          - "this month", "month to date", "so far" (up to today): "col" >= date_trunc('month', CURRENT_DATE) AND CAST("col" AS DATE) <= CURRENT_DATE
+        - relative periods count back from today: use CURRENT_DATE, never a literal date, so the chart moves forward when it is refreshed. Weeks start on Monday. Name the period in words in the title ("Orders, Last 30 Days"), never the computed dates. Compare the column itself with a range that includes the start and excludes the end:
+          - "last 30 days" (the 30 days ending today): "col" >= CURRENT_DATE - 29 AND "col" < CURRENT_DATE + 1
+          - "this month", "month to date", "this month so far" (the same for any unit, as in "year to date" or "this week so far"; up to today): "col" >= date_trunc('month', CURRENT_DATE) AND "col" < CURRENT_DATE + 1
           - "last month", "previous month" (the previous full month): "col" >= date_trunc('month', CURRENT_DATE) - INTERVAL 1 MONTH AND "col" < date_trunc('month', CURRENT_DATE)
           - "last 6 months" (the 6 full months before this one): "col" >= date_trunc('month', CURRENT_DATE) - INTERVAL 6 MONTH AND "col" < date_trunc('month', CURRENT_DATE)
           - weeks, quarters and years work the same way: 'week' with INTERVAL n WEEK, 'quarter' with INTERVAL 3n MONTH, 'year' with INTERVAL n YEAR;
@@ -3129,9 +3129,9 @@ sqlChartRepairPrompt: |
         - differences and offsets: date_diff('day', "start_col", "end_col"), "col" + INTERVAL 30 DAY;
         - a year: "col" >= DATE '2024-01-01' AND "col" < DATE '2025-01-01';
         - missing periods: for counts and sums, list every period in a CTE with SELECT unnest(generate_series(start, end, INTERVAL 1 MONTH)), LEFT JOIN the data to it and COALESCE the measure to 0 (with a series, CROSS JOIN the periods with the series values first). Averages stay NULL;
-        - relative periods count back from today: use CURRENT_DATE, never a literal date, so the chart moves forward when it is refreshed. Weeks start on Monday. Name the period in words in the title ("Orders, Last 30 Days"), never the computed dates:
-          - "last 30 days" (the 30 days ending today): CAST("col" AS DATE) > CURRENT_DATE - 30 AND CAST("col" AS DATE) <= CURRENT_DATE
-          - "this month", "month to date", "so far" (up to today): "col" >= date_trunc('month', CURRENT_DATE) AND CAST("col" AS DATE) <= CURRENT_DATE
+        - relative periods count back from today: use CURRENT_DATE, never a literal date, so the chart moves forward when it is refreshed. Weeks start on Monday. Name the period in words in the title ("Orders, Last 30 Days"), never the computed dates. Compare the column itself with a range that includes the start and excludes the end:
+          - "last 30 days" (the 30 days ending today): "col" >= CURRENT_DATE - 29 AND "col" < CURRENT_DATE + 1
+          - "this month", "month to date", "this month so far" (the same for any unit, as in "year to date" or "this week so far"; up to today): "col" >= date_trunc('month', CURRENT_DATE) AND "col" < CURRENT_DATE + 1
           - "last month", "previous month" (the previous full month): "col" >= date_trunc('month', CURRENT_DATE) - INTERVAL 1 MONTH AND "col" < date_trunc('month', CURRENT_DATE)
           - "last 6 months" (the 6 full months before this one): "col" >= date_trunc('month', CURRENT_DATE) - INTERVAL 6 MONTH AND "col" < date_trunc('month', CURRENT_DATE)
           - weeks, quarters and years work the same way: 'week' with INTERVAL n WEEK, 'quarter' with INTERVAL 3n MONTH, 'year' with INTERVAL n YEAR;

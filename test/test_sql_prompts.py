@@ -625,61 +625,144 @@ def test_seriesOrderByTotalRunsAndPutsTheBiggestCategoryFirst():
     assert order != sorted(order)  # the total order is not the alphabetical one on this data
 
 
-PINNED_TODAY = datetime.date(2024, 5, 15)  # a Wednesday
-D = datetime.date
-
-# (phrase whose rule line gives the expression, date_trunc unit, count, first day, last day) with today pinned.
-RELATIVE_PERIODS = [
-    ("last 30 days", None, None, D(2024, 4, 16), D(2024, 5, 15)),
-    ("this month", "month", 1, D(2024, 5, 1), D(2024, 5, 15)),
-    ("this month", "week", 1, D(2024, 5, 13), D(2024, 5, 15)),
-    ("this month", "quarter", 1, D(2024, 4, 1), D(2024, 5, 15)),
-    ("this month", "year", 1, D(2024, 1, 1), D(2024, 5, 15)),
-    ("last month", "month", 1, D(2024, 4, 1), D(2024, 4, 30)),
-    ("last month", "week", 1, D(2024, 5, 6), D(2024, 5, 12)),
-    ("last month", "quarter", 1, D(2024, 1, 1), D(2024, 3, 31)),
-    ("last month", "year", 1, D(2023, 1, 1), D(2023, 12, 31)),
-    ("last 6 months", "month", 6, D(2023, 11, 1), D(2024, 4, 30)),
-    ("last 6 months", "week", 4, D(2024, 4, 15), D(2024, 5, 12)),
-    ("last 6 months", "quarter", 2, D(2023, 10, 1), D(2024, 3, 31)),
-    ("last 6 months", "year", 3, D(2021, 1, 1), D(2023, 12, 31)),
+PINNED_TODAYS = [
+    datetime.date(*day)
+    for day in (
+        (2024, 2, 29),  # leap day
+        (2024, 3, 1),
+        (2024, 3, 31),
+        (2024, 4, 1),  # quarter start
+        (2024, 5, 15),  # a Wednesday
+        (2024, 5, 19),  # a Sunday
+        (2024, 5, 20),  # a Monday
+        (2024, 12, 31),
+        (2025, 1, 1),
+        (2023, 1, 1),  # a Sunday whose week starts in 2022
+        (2024, 1, 1),  # a Monday
+        (2025, 3, 1),
+    )
 ]
+PERIOD_COLUMN_TYPES = ("DATE", "TIMESTAMP", "TIMESTAMP_NS", "TIMESTAMPTZ")
+PERIOD_UNITS = {"week": (1, "WEEK"), "month": (1, "MONTH"), "quarter": (3, "MONTH"), "year": (1, "YEAR")}
+RELATIVE_PHRASES = (
+    [f"last {days} days" for days in (1, 7, 30, 90)]
+    + [f"this {unit}" for unit in PERIOD_UNITS]
+    + [f"last {unit}" for unit in PERIOD_UNITS]
+    + [f"last 3 {unit}s" for unit in PERIOD_UNITS]
+)
 
 
 def _periodRule(phrase: str) -> str:
-    """The SQL condition the prompt's rule line gives for a relative-period phrase."""
-    text = _formatted("sqlChartGeneratorPrompt")
-    match = re.search(r'^\s*- "' + re.escape(phrase) + r'"[^\n]*?\): (.+)$', text, flags=re.MULTILINE)
-    assert match, phrase
-    return match.group(1).strip()
+    """The SQL condition the prompt's rule line gives for a relative-period phrase (the same in both chart prompts)."""
+    lines = []
+    for key in ("sqlChartGeneratorPrompt", "sqlChartRepairPrompt"):
+        match = re.search(r'^\s*- "' + re.escape(phrase) + r'"[^\n]*?\): (.+)$', _formatted(key), flags=re.MULTILINE)
+        assert match, (key, phrase)
+        lines.append(match.group(1).strip())
+    assert lines[0] == lines[1], phrase
+    return lines[0]
 
 
-def _periodCondition(phrase: str, unit: str | None, count: int | None) -> str:
-    """The rule's condition for one unit, built the way the rule says (week, quarter = 3 months, year)."""
-    condition = _periodRule(phrase)
-    if unit is None or unit == "month":
-        return condition.replace("INTERVAL 6 MONTH", f"INTERVAL {count} MONTH") if count else condition
-    sizes = {"week": (1, "WEEK"), "quarter": (3, "MONTH"), "year": (1, "YEAR")}
-    multiple, name = sizes[unit]
-    condition = condition.replace("'month'", f"'{unit}'")
+def _periodCondition(phrase: str) -> str:
+    """The condition for a phrase, derived from the rule lines the way the rule says (week, quarter = 3 months, year)."""
+    words = phrase.split()
+    if words[-1] == "days":
+        # The rule's 30 days start 29 days before today.
+        return _periodRule("last 30 days").replace("CURRENT_DATE - 29", f"CURRENT_DATE - {int(words[1]) - 1}")
+    unit = words[-1].removesuffix("s")
+    count = int(words[1]) if len(words) == 3 else 1
+    rule = {"this": "this month", "last": "last month" if count == 1 and len(words) == 2 else "last 6 months"}[words[0]]
+    multiple, name = PERIOD_UNITS[unit]
+    condition = _periodRule(rule).replace("'month'", f"'{unit}'")
     return re.sub(r"INTERVAL \d+ MONTH", f"INTERVAL {count * multiple} {name}", condition)
 
 
-@pytest.mark.parametrize(("phrase", "unit", "count", "first", "last"), RELATIVE_PERIODS)
-def test_relativePeriodsCountBackFromToday(phrase, unit, count, first, last):
-    condition = _periodCondition(phrase, unit, count)
+def _periodBounds(phrase: str, today: datetime.date) -> tuple[datetime.date, datetime.date]:
+    """First and last day of a phrase's period, from the Python calendar (weeks start on Monday)."""
+
+    def start(day: datetime.date, unit: str) -> datetime.date:
+        if unit == "week":
+            return day - datetime.timedelta(days=day.weekday())
+        months = {"month": 1, "quarter": 3, "year": 12}[unit]
+        return datetime.date(day.year, (day.month - 1) // months * months + 1, 1)
+
+    def back(first: datetime.date, unit: str, count: int) -> datetime.date:
+        if unit == "week":
+            return first - datetime.timedelta(weeks=count)
+        index = first.year * 12 + first.month - 1 - {"month": 1, "quarter": 3, "year": 12}[unit] * count
+        return datetime.date(index // 12, index % 12 + 1, 1)
+
+    words = phrase.split()
+    if words[-1] == "days":
+        return today - datetime.timedelta(days=int(words[1]) - 1), today
+    unit = words[-1].removesuffix("s")
+    if words[0] == "this":
+        return start(today, unit), today
+    count = int(words[1]) if len(words) == 3 else 1
+    current = start(today, unit)
+    return back(current, unit, count), current - datetime.timedelta(days=1)
+
+
+@pytest.fixture(scope="module")
+def periodRows():
+    """Every day 2019-2026 at 00:00 and 23:30, as DATE, TIMESTAMP, TIMESTAMP_NS and TIMESTAMPTZ (UTC session)."""
+    connection = duckdb.connect()
+    connection.execute("SET TimeZone = 'UTC'")
+    connection.execute(
+        "CREATE TABLE period_rows AS SELECT CAST(g AS DATE) AS d, CAST(g AS DATE) AS c_date, "
+        "CAST(g + o AS TIMESTAMP) AS c_timestamp, CAST(g + o AS TIMESTAMP_NS) AS c_timestamp_ns, "
+        "CAST(CAST(g + o AS TIMESTAMP) AS TIMESTAMPTZ) AS c_timestamptz "
+        "FROM generate_series(TIMESTAMP '2019-01-01', TIMESTAMP '2026-12-31', INTERVAL 1 DAY) AS t(g) "
+        "CROSS JOIN (VALUES (INTERVAL 0 MINUTE), (INTERVAL 1410 MINUTE)) AS v(o)"
+    )
+    yield connection
+    connection.close()
+
+
+@pytest.mark.parametrize("phrase", RELATIVE_PHRASES)
+def test_relativePeriodsCountBackFromToday(phrase, periodRows):
+    condition = _periodCondition(phrase)
     # Today comes from the database at run time, so a refreshed chart moves forward.
     assert "CURRENT_DATE" in condition
     assert re.search(r"DATE '\d", condition) is None
-
+    # A half-open range on the raw column, so the filter can reach the scan.
+    assert "CAST(" not in condition
     onOrders = condition.replace('"col"', '"order_date"')
     checkSql(f'SELECT COUNT(*) AS order_count FROM "orders" WHERE {onOrders}', EXAMPLE_SCHEMAS)
 
-    pinned = condition.replace("CURRENT_DATE", f"DATE '{PINNED_TODAY.isoformat()}'")
-    days = "unnest(generate_series(DATE '2020-01-01', DATE '2025-12-31', INTERVAL 1 DAY))"
-    for column in (f"CAST({days} AS DATE)", f"{days} + INTERVAL 23 HOUR + INTERVAL 30 MINUTE", f"CAST({days} AS TIMESTAMP)"):
-        sql = f'WITH t AS (SELECT {column} AS "col") SELECT MIN(CAST("col" AS DATE)), MAX(CAST("col" AS DATE)) FROM t WHERE {pinned}'
-        assert _query(sql, {}) == [(first, last)], (phrase, unit, column)
+    for today in PINNED_TODAYS:
+        first, last = _periodBounds(phrase, today)
+        span = (last - first).days + 1
+        pinned = condition.replace("CURRENT_DATE", f"DATE '{today.isoformat()}'")
+        for columnType in PERIOD_COLUMN_TYPES:
+            where = pinned.replace('"col"', "c_" + columnType.lower())
+            row = periodRows.execute(f"SELECT MIN(d), MAX(d), COUNT(DISTINCT d), COUNT(*) FROM period_rows WHERE {where}").fetchone()
+            assert row == (first, last, span, 2 * span), (phrase, today, columnType)
+
+
+def test_relativePeriodRangesMatchTheCastFormOnTimestampTzUnderUtc():
+    connection = duckdb.connect()
+    connection.execute("SET TimeZone = 'UTC'")
+    connection.execute(
+        'CREATE TABLE tz_rows AS SELECT CAST(g + o AS TIMESTAMPTZ) AS "col" '
+        "FROM generate_series(CAST(CURRENT_DATE - 1500 AS TIMESTAMP), CAST(CURRENT_DATE + 10 AS TIMESTAMP), INTERVAL 1 DAY) AS t(g) "
+        "CROSS JOIN (VALUES (INTERVAL 0 MINUTE), (INTERVAL 1410 MINUTE)) AS v(o)"
+    )
+    for phrase in RELATIVE_PHRASES:
+        condition = _periodCondition(phrase)
+        castForm = condition.replace('"col"', 'CAST("col" AS DATE)').replace("< CURRENT_DATE + 1", "<= CURRENT_DATE")
+        ranged = connection.execute(f'SELECT "col" FROM tz_rows WHERE {condition} ORDER BY 1').fetchall()
+        cast = connection.execute(f'SELECT "col" FROM tz_rows WHERE {castForm} ORDER BY 1').fetchall()
+        assert ranged and ranged == cast, phrase
+    connection.close()
+
+
+def test_soFarAndToDateApplyToEveryUnit():
+    rule = next(
+        line for line in _formatted("sqlChartGeneratorPrompt").splitlines() if line.strip().startswith('- "this month"')
+    )
+    for words in ('"year to date"', '"this week so far"', "any unit"):
+        assert words in rule, words
 
 
 @pytest.mark.parametrize("key", sorted(NEW_PROMPTS))
