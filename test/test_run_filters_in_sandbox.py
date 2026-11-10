@@ -5,13 +5,18 @@ Each test runs real sandbox children: the filters travel in the run's stdin, `sa
 """
 
 import copy
+import datetime
 import io
 import json
 import string
+import sys
 from pathlib import Path
 from unittest.mock import MagicMock
 
 import polars as pl
+import pyarrow as pa
+import pyarrow.dataset as ds
+import pyarrow.parquet as pq
 import pytest
 import yaml
 
@@ -19,6 +24,7 @@ from test.privateStorageFixtures import SERVICE_KEY, FakePrivateStorage
 from test.test_sandbox_storage_reads import PROJECT
 from api.models import GetData
 from utils import codeExecutor
+from utils.runFilters import applyFilters, filterDataset
 
 TEMPLATES_FILE = Path(__file__).resolve().parent.parent / "codeTemplates.yaml"
 SALES = {"state": ["SP", "RJ", "SP", "MG"], "amount": [1, 2, 3, 4]}
@@ -202,3 +208,23 @@ def test_getDataRefreshSavesSucceededWidgetsAndKeepsTheFailedOne(dashboardServic
     assert sorted(saved[1]["data"]["labels"]) == ["MG", "RJ", "SP"]
     assert saved[2]["data"] == [{"a": 1}]
     assert [w["data"] for w in page["widgets"]] == [w["data"] for w in saved]
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="Arrow has no time zone database on Windows")
+@pytest.mark.parametrize("zone", ["UTC", "Asia/Kolkata"])
+def test_textFilterOnTimeZoneTimestampsMatchesByTheColumnsText(zone, tmp_path):
+    """Runs in the production image: its Arrow must find a time zone database to turn tz-aware timestamps into text."""
+    moments = [datetime.datetime(2024, 1, 15, 6), datetime.datetime(2024, 2, 15, 6), datetime.datetime(2023, 1, 15, 6)]
+    table = pa.table({"id": pa.array([1, 2, 3], type=pa.int64()), "at": pa.array(moments, type=pa.timestamp("us", tz=zone))})
+    path = tmp_path / "t.parquet"
+    pq.write_table(table, path)
+    texts = table.column("at").cast(pa.string()).to_pylist()
+    assert all(text.startswith(("2024-01-15", "2024-02-15", "2023-01-15")) for text in texts), texts
+
+    for flt, expected in (
+        ([{"at": {"startswith": "2024-01"}}], [1]),
+        ([{"at": {"startswith": "2023"}}], [3]),
+        ([{"at": {"contains": "2024-02-15"}}], [2]),
+    ):
+        assert applyFilters(table, "t", flt).column("id").to_pylist() == expected
+        assert filterDataset(ds.dataset(path), "t", flt).to_table().column("id").to_pylist() == expected
