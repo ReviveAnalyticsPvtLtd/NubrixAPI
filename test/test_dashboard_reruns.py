@@ -250,3 +250,86 @@ def test_pythonErrorOrNonJsonOutputIsAFailure(monkeypatch, output):
 
     service.client.storage.from_.assert_not_called()
     assert page["widgets"][0]["data"] == "old"
+
+
+def _unreadableMetadata(monkeypatch, service_module_name="api.services.dashboardService"):
+    import importlib
+
+    module = importlib.import_module(service_module_name)
+    original = module.readJson
+
+    def read(projectId, name):
+        if name == "metadata.json":
+            raise RuntimeError("storage said no secret-table-name")
+        return original(projectId, name)
+
+    monkeypatch.setattr(module, "readJson", read)
+
+
+@pytest.fixture
+def logLines():
+    """Messages the app logs (loguru does not reach pytest's caplog)."""
+    from utils.logger import logger
+
+    lines: list[str] = []
+    sinkId = logger.add(lambda message: lines.append(message.record["message"]), level="WARNING")
+    yield lines
+    logger.remove(sinkId)
+
+
+def test_unreadableMetadataFailsOnlyTheChartRequestWidgetsUnderAFilter(monkeypatch, logLines):
+    code = _request()
+    saved = [_widget("R", code, "bar", data={"datasets": [{"data": [1]}]}), _widget("P")]
+    service, manager, renderer = _setup(monkeypatch, saved)
+    _unreadableMetadata(monkeypatch)
+
+    page = service.getData(GetData(projectId="p1", page="pg", filters=FILTERS))
+
+    chartRequest, python = page["widgets"]
+    assert chartRequest["chartType"] == "bar" and chartRequest["data"] == {"labels": [], "datasets": []}
+    assert chartRequest["generatedCode"] == code and chartRequest["id"] == "R"
+    assert python["data"] == "new"
+    renderer.assert_not_called()
+    manager.run.assert_called_once()
+    assert any("table list" in line for line in logLines)
+    assert not any("secret-table-name" in line for line in logLines)
+
+
+def test_unreadableMetadataKeepsSavedChartRequestDataOnRefresh(monkeypatch):
+    saved = [_widget("R", _request(), "bar"), _widget("P")]
+    service, manager, renderer = _setup(monkeypatch, saved)
+    _unreadableMetadata(monkeypatch)
+
+    page = service.getData(GetData(projectId="p1", page="pg", refresh=True))
+
+    assert [w["data"] for w in page["widgets"]] == ["old", "new"]
+    assert [w["data"] for w in _uploaded(service)["pg"]["widgets"]] == ["old", "new"]
+    renderer.assert_not_called()
+
+
+def test_unreadableMetadataWithOnlyPythonWidgetsIsNeverRead(monkeypatch):
+    service, _, _ = _setup(monkeypatch, [_widget("P")])
+    _unreadableMetadata(monkeypatch)
+
+    page = service.getData(GetData(projectId="p1", page="pg", filters=FILTERS))
+
+    assert page["widgets"][0]["data"] == "new"
+
+
+def test_busyWhileReadingMetadataStillGives503(monkeypatch):
+    from api.services import dashboardService as module
+
+    service, _, _ = _setup(monkeypatch, [_widget("R", _request(), "bar")])
+    original = module.readJson
+
+    def read(projectId, name):
+        if name == "metadata.json":
+            raise SandboxBusyError()
+        return original(projectId, name)
+
+    monkeypatch.setattr(module, "readJson", read)
+
+    with pytest.raises(CustomException) as caught:
+        service.getData(GetData(projectId="p1", page="pg", filters=FILTERS))
+
+    assert caught.value.statusCode == 503

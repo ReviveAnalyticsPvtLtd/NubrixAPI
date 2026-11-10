@@ -59,7 +59,7 @@ class DashboardService:
         self.client = client
 
     @staticmethod
-    def _rerunWidget(widget: dict, filters: list | None, projectId: str, activeTables: frozenset[str]) -> tuple[dict, bool]:
+    def _rerunWidget(widget: dict, filters: list | None, projectId: str, activeTables: frozenset[str] | None) -> tuple[dict, bool]:
         """
         Re-run one saved widget in its own form and return a copy with the new chart data.
 
@@ -70,7 +70,8 @@ class DashboardService:
             widget (dict): The saved widget.
             filters (list | None): The sidebar filters, if any.
             projectId (str): The project.
-            activeTables (frozenset[str]): Names of the project's active tables, for the SQL check.
+            activeTables (frozenset[str] | None): Names of the project's active tables, for the SQL check. None means the
+                list could not be read, so a ChartRequest widget fails (a Python widget does not need it).
 
         Returns:
             tuple[dict, bool]: The widget copy, and whether the re-run succeeded. A failed run returns the widget
@@ -83,6 +84,8 @@ class DashboardService:
         try:
             request = decodeGeneratedCode(widget.get("generatedCode"))
             if request is not None:
+                if activeTables is None:
+                    raise ValueError("the project's table list could not be read")
                 result = renderChartRequest(replManager, projectId, request, activeTables, filters=filters, lenient=True)
             else:
                 code = widget.get("generatedCode")
@@ -145,7 +148,14 @@ class DashboardService:
         todo = [widget for widget in widgets if self._isRerunnable(widget)]
         activeTables = frozenset()
         if any(self._usesChartRequest(widget) for widget in todo):
-            activeTables = frozenset(ReportingService._filterActive(readJson(projectId, "metadata.json")))
+            try:
+                activeTables = frozenset(ReportingService._filterActive(readJson(projectId, "metadata.json")))
+            except Exception as error:
+                if isBusy(error):
+                    raise
+                # Only the new chart widgets need the list; the Python ones still run. Never log the message.
+                logger.warning(f"The table list of project {projectId} could not be read ({type(error).__name__}); its chart widgets are not re-run.")
+                activeTables = None
         with ThreadPoolExecutor(max_workers = 4) as executor:
             outcomes = iter(list(executor.map(lambda widget: self._rerunWidget(widget, filters, projectId, activeTables), todo)))
         return [next(outcomes) if self._isRerunnable(widget) else (widget, False) for widget in widgets]
