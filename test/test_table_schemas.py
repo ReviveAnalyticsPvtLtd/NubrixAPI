@@ -205,3 +205,59 @@ def test_projectWideDropScansInBatches(redisFake, reader):
     tableSchemas.tableSchemas("p1", ["sales"])
     invalidate_data_cache("p1")
     assert redisFake.scanKwargs == {"count": 1000}
+
+
+def test_skipUnreadableLeavesOutATableThatFailsAndKeepsTheRest(redisFake, reader):
+    warnings = []
+    real = tableSchemas.decodeStoredTable
+
+    def decode(projectId, tableName, data):
+        if tableName == "legacy":
+            raise ValueError("unreadable 'Secret Corp'")
+        return SALES.empty_table()
+
+    with mock.patch.object(tableSchemas, "decodeStoredTable", side_effect=decode), \
+            mock.patch.object(tableSchemas.logger, "warning", side_effect=lambda message, *a, **k: warnings.append(message)):
+        result = tableSchemas.tableSchemas("p1", ["sales", "legacy", "costs"], skipUnreadable=True)
+    assert list(result) == ["sales", "costs"]
+    assert any("ValueError" in message for message in warnings)
+    assert not any("Secret Corp" in message for message in warnings)
+    assert real is not None
+
+
+def test_unreadableTableStillRaisesByDefault(reader):
+    with mock.patch.object(tableSchemas, "decodeStoredTable", side_effect=ValueError("x")), \
+            mock.patch("utils.initMethods._redis_pool"), mock.patch("utils.initMethods.redis.Redis", return_value=mock.Mock(get=lambda k: None)):
+        with pytest.raises(ValueError):
+            tableSchemas.tableSchemas("p1", ["sales"])
+
+
+@pytest.mark.parametrize("busy", ["error", "code"])
+def test_busyPropagatesEvenWhenSkippingUnreadable(redisFake, reader, busy):
+    from utils.sandboxSlots import BUSY_CODE, SandboxBusyError
+
+    error = SandboxBusyError()
+    if busy == "code":
+        error = RuntimeError("busy")
+        error.errorCode = BUSY_CODE
+    with mock.patch.object(tableSchemas, "decodeStoredTable", side_effect=error):
+        with pytest.raises(type(error)):
+            tableSchemas.tableSchemas("p1", ["sales"], skipUnreadable=True)
+
+
+def test_aFailingRedisGetsOneAttemptWhileSkippingUnreadable(reader):
+    broken = mock.Mock()
+    broken.get.side_effect = ConnectionError("down")
+    broken.set.side_effect = ConnectionError("down")
+    names = [f"t{i}" for i in range(20)]
+
+    def decode(projectId, tableName, data):
+        if tableName == "t3":
+            raise ValueError("x")
+        return SALES.empty_table()
+
+    with mock.patch.object(tableSchemas, "decodeStoredTable", side_effect=decode), \
+            mock.patch("utils.initMethods._redis_pool"), mock.patch("utils.initMethods.redis.Redis", return_value=broken):
+        result = tableSchemas.tableSchemas("p1", names, skipUnreadable=True)
+    assert len(result) == 19
+    assert broken.get.call_count + broken.set.call_count == 1

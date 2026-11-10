@@ -90,7 +90,7 @@ def test_evaluateGetsActiveTablesAndTheManager(harness):
     assert args.args[1] == "p1"
     assert args.args[2].chartType == "bar"
     assert list(args.args[3]) == ["orders"]
-    harness.schemas.assert_called_once_with("p1", ["orders"])
+    harness.schemas.assert_called_once_with("p1", ["orders"], skipUnreadable=True)
     assert "orders" in harness.generator.invoke.call_args.args[0]["grounding"]
     assert harness.generator.invoke.call_args.args[0]["plan"] == "plan"
     assert harness.generator.invoke.call_args.args[0]["question"] == "Totals by a"
@@ -327,22 +327,25 @@ TWO_TABLES = {"orders": {"columns": [{"name": "a"}]}, "legacy": {"columns": [{"n
 
 
 def test_groundingFallsBackPerTable(harness):
-    def read(projectId, names):
-        if names == ["legacy"]:
-            raise ValueError("This table could not be read safely.")
-        return {name: pa.schema([("a", pa.int64())]) for name in names}
+    def read(projectId, names, skipUnreadable=False):
+        return {"orders": pa.schema([("a", pa.int64())])}
 
     harness.schemas.side_effect = read
     state = harness.run(metadata=TWO_TABLES)
     assert state["finalOutput"] == CHART
-    assert [call.args for call in harness.schemas.call_args_list] == [("p1", ["orders"]), ("p1", ["legacy"])]
+    harness.schemas.assert_called_once_with("p1", ["orders", "legacy"], skipUnreadable=True)
     grounding = harness.generator.invoke.call_args.args[0]["grounding"]
     assert '"a" BIGINT' in grounding
     assert '"z" UNKNOWN' in grounding
 
 
-def test_busyGroundingEndsAsBusyWithoutAModelCall(harness):
-    harness.schemas.side_effect = SandboxBusyError()
+@pytest.mark.parametrize("kind", ["error", "code"])
+def test_busyGroundingEndsAsBusyWithoutAModelCall(harness, kind):
+    error = SandboxBusyError()
+    if kind == "code":
+        error = RuntimeError("busy")
+        error.errorCode = "SANDBOX_BUSY"
+    harness.schemas.side_effect = error
     state = harness.run(metadata=TWO_TABLES)
     harness.generator.invoke.assert_not_called()
     harness.render.assert_not_called()
@@ -351,4 +354,4 @@ def test_busyGroundingEndsAsBusyWithoutAModelCall(harness):
     assert harness.schemas.call_count == 1
     records = harness.failureRecords()
     assert len(records) == 1 and records[0]["stage"] == "busy" and records[0]["chartType"] is None
-    assert records[0]["errorClass"] == "SandboxBusyError"
+    assert records[0]["errorClass"] == type(error).__name__

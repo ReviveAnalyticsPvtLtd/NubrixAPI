@@ -34,7 +34,7 @@ from nubrix.components.sqlGrounding import groundingText
 from utils.codeExecutor import REPLManager
 from utils.initMethods import serializer
 from utils.logger import logger
-from utils.sandboxSlots import BUSY_MESSAGE, SandboxBusyError
+from utils.sandboxSlots import BUSY_MESSAGE, SandboxBusyError, isBusy
 from utils.tableSchemas import tableSchemas
 
 MAX_REPAIRS = 2
@@ -167,16 +167,14 @@ class SqlChartWorkflow:
 
     def _ground(self, state: State):
         tables = _activeTableNames(state["metadata"])
-        schemas: dict = {}
-        for table in tables:
-            try:
-                schemas.update(tableSchemas(state["projectId"], [table]))
-            except SandboxBusyError as error:
-                # No model call is worth making when the sandbox that reads the tables is full.
-                return {"tables": tables, "failure": {"stage": "busy", "message": BUSY_MESSAGE, "error": error}}
-            except Exception as error:
-                # This table's types come back as UNKNOWN; the model can still use its name and samples.
-                logger.warning(f"Table schema unavailable for grounding: {type(error).__name__}")
+        try:
+            # A table that cannot be read is left out here and gets UNKNOWN types in the grounding.
+            schemas = tableSchemas(state["projectId"], tables, skipUnreadable=True)
+        except Exception as error:
+            if not isBusy(error):
+                raise
+            # No model call is worth making when the sandbox that reads the tables is full.
+            return {"tables": tables, "failure": {"stage": "busy", "message": BUSY_MESSAGE, "error": error}}
         return {"tables": tables, "grounding": groundingText(state["metadata"], schemas), "failure": None}
 
     @staticmethod

@@ -11,6 +11,7 @@ import pyarrow as pa
 
 from utils.logger import logger
 from utils.projectStorage import readTableBytes
+from utils.sandboxSlots import isBusy
 from utils.storedTables import decodeStoredTable
 
 
@@ -42,11 +43,14 @@ def _store(client, key: str, schema: pa.Schema) -> None:
     client.set(key, schema.serialize().to_pybytes(), ex=initMethods._REDIS_SMALL_TABLE_TTL_SECONDS)
 
 
-def tableSchemas(projectId: str, tableNames: Iterable[str]) -> dict[str, pa.Schema]:
+def tableSchemas(projectId: str, tableNames: Iterable[str], skipUnreadable: bool = False) -> dict[str, pa.Schema]:
     """The Arrow schema of each named table: from Redis, else read from storage and cached.
 
     After the first Redis failure in a call, the rest of that call makes no Redis calls: a Redis that is down
     would otherwise cost a connection timeout for every table.
+
+    With `skipUnreadable`, a table whose read fails is left out of the result and logged by exception class only, and
+    the rest are still read. A busy sandbox (`isBusy`) always propagates.
     """
     try:
         client = _client()
@@ -64,7 +68,13 @@ def tableSchemas(projectId: str, tableNames: Iterable[str]) -> dict[str, pa.Sche
                 logger.warning(f"Table schema cache read failed: {type(exc).__name__}")
                 client = None
         if schema is None:
-            schema = decodeStoredTable(projectId, tableName, readTableBytes(projectId, tableName)).schema
+            try:
+                schema = decodeStoredTable(projectId, tableName, readTableBytes(projectId, tableName)).schema
+            except Exception as exc:
+                if not skipUnreadable or isBusy(exc):
+                    raise
+                logger.warning(f"Table schema unreadable, skipped: {type(exc).__name__}")
+                continue
             if client is not None:
                 try:
                     _store(client, key, schema)
