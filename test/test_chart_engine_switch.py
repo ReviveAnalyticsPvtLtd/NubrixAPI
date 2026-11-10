@@ -262,17 +262,28 @@ def test_shadowPoolRunsTwoAtATimeOnItsOwnThreads():
         with lock:
             state["running"] -= 1
 
-    futures = [rs._shadowExecutor.submit(task) for _ in range(4)]
-    deadline = time.time() + 10
-    while state["running"] < 2 and time.time() < deadline:
-        time.sleep(0.01)
-    time.sleep(0.2)  # a third task would have started by now if the pool allowed it
-    assert state["running"] == 2
-    gate.set()
-    for future in futures:
-        future.result(timeout=10)
+    # A fresh pool from the module's own factory: the module pool may already be shut down by an earlier test that ran
+    # the app's shutdown hook in this process.
+    pool = rs._newShadowExecutor()
+    try:
+        futures = [pool.submit(task) for _ in range(4)]
+        deadline = time.time() + 10
+        while state["running"] < 2 and time.time() < deadline:
+            time.sleep(0.01)
+        time.sleep(0.2)  # a third task would have started by now if the pool allowed it
+        assert state["running"] == 2
+        gate.set()
+        for future in futures:
+            future.result(timeout=10)
+    finally:
+        gate.set()
+        pool.shutdown(wait=True)
     assert state["peak"] == 2
     assert all(name.startswith("chart-shadow") for name in state["names"])
+
+
+def test_theModuleShadowPoolComesFromTheFactory():
+    assert rs._shadowExecutor._max_workers == rs._newShadowExecutor()._max_workers == rs._SHADOW_WORKERS
 
 
 def test_shadowQueueIsBoundedAtFourPermits():

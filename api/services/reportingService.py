@@ -122,7 +122,14 @@ def _sqlConfig(traceName: str, tags: list[str], projectId: str, userId: str | No
 # Shadow runs: at most 2 at a time, at most 4 queued or running, and never on the request's thread.
 _SHADOW_WORKERS = 2
 _SHADOW_PERMITS = 4
-_shadowExecutor = ThreadPoolExecutor(max_workers=_SHADOW_WORKERS, thread_name_prefix="chart-shadow")
+
+
+def _newShadowExecutor() -> ThreadPoolExecutor:
+    """The shadow pool: `_SHADOW_WORKERS` threads named chart-shadow."""
+    return ThreadPoolExecutor(max_workers=_SHADOW_WORKERS, thread_name_prefix="chart-shadow")
+
+
+_shadowExecutor = _newShadowExecutor()
 _shadowSlots = threading.BoundedSemaphore(_SHADOW_PERMITS)
 _shadowClosed = threading.Event()
 _shadowCancelled = 0
