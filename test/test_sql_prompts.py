@@ -465,6 +465,91 @@ def test_tablesReturnEveryMatchingRow():
         assert "100 unless" not in _prompts()[key], key
 
 
+def _withoutRows(tables: dict[str, pa.Table], name: str, where: str) -> dict[str, pa.Table]:
+    connection = duckdb.connect()
+    for tableName, table in tables.items():
+        connection.register(tableName, table)
+    kept = connection.execute(f'SELECT * FROM "{name}" WHERE NOT ({where})').fetch_arrow_table().cast(EXAMPLE_SCHEMAS[name])
+    return {**tables, name: kept}
+
+
+def test_examplesGiveTheSameChartWhateverTheRowOrder():
+    tables = _exampleTables()
+    reversedTables = {name: table.take(list(range(table.num_rows - 1, -1, -1))) for name, table in tables.items()}
+    requests = _examples() + [ChartRequest.model_validate(answer) for answer in _answers(_formatted("sqlChartRepairPrompt"))]
+
+    for request in requests:
+        assert _runExample(request, tables) == _runExample(request, reversedTables), request.chartType
+
+
+def test_missingPeriodsAreFilledWithZero():
+    tables = _withoutRows(_exampleTables(), "orders", "month(\"order_date\") = 6 AND year(\"order_date\") = 2024")
+
+    for chartType in ("line", "area"):
+        chart = _runExample(_example(chartType), tables)
+        assert chart["data"]["labels"] == MONTHS_2024, chartType
+        june = MONTHS_2024.index("2024-06")
+        for dataset in chart["data"]["datasets"]:
+            assert dataset["data"][june] is not None, chartType
+
+    # Without a grid of periods, a month with no orders disappears from the axis.
+    plain = ChartRequest(
+        chartType="line",
+        title="Monthly Revenue",
+        sql="SELECT strftime(\"order_date\", '%Y-%m') AS month, SUM(\"total_amount\") AS revenue FROM \"orders\" "
+        "WHERE year(\"order_date\") = 2024 GROUP BY ALL ORDER BY month",
+        encoding={"x": "month", "y": ["revenue"]},
+    )
+    assert "2024-06" not in _runExample(plain, tables)["data"]["labels"]
+
+
+def test_geoMapSkipsUnreadableCoordinates():
+    tables = _exampleTables()
+    stores = tables["stores"]
+    textual = stores.set_column(
+        stores.schema.get_field_index("latitude"), "latitude", pa.array(["52.1", "", "53.4"], pa.string())
+    )
+    geoMap = _example("geoMap")
+
+    chart = _runExample(geoMap, {**tables, "stores": textual})
+
+    assert sorted(point["id"] for point in chart["map"]["data"]["points"]) == ["1", "3"]
+
+
+@pytest.mark.parametrize("key", ["sqlChartGeneratorPrompt", "sqlChartRepairPrompt"])
+def test_chartPromptsNameTheTimestampTypesAndAllowOtherFunctions(key):
+    text = _formatted(key)
+
+    assert "TIMESTAMP_S, TIMESTAMP_MS, TIMESTAMP_NS and TIMESTAMP WITH TIME ZONE are ordinary timestamps" in text
+    assert "use only the DuckDB functions" not in text
+    assert re.search(r"(?<!TRY_)CAST them AS DOUBLE", text) is None
+
+
+def test_seriesOrderByTotalRunsAndPutsTheBiggestCategoryFirst():
+    rule = "aggregate in a CTE, then ORDER BY SUM(m) OVER (PARTITION BY x) DESC, x, series"
+    for key in ("sqlChartGeneratorPrompt", "sqlChartRepairPrompt"):
+        assert rule in _formatted(key), key
+
+    sql = (
+        'WITH t AS (SELECT p."category" AS category, o."channel" AS channel, '
+        'SUM(oi."quantity" * oi."unit_price") AS revenue FROM "order_items" AS oi '
+        'JOIN "orders" AS o ON o."order_id" = oi."order_id" '
+        'JOIN "products" AS p ON p."product_id" = oi."product_id" GROUP BY ALL) '
+        "SELECT category, channel, revenue FROM t "
+        "ORDER BY SUM(revenue) OVER (PARTITION BY category) DESC, category, channel"
+    )
+    checkSql(sql, EXAMPLE_SCHEMAS)
+    rows = _query(sql, _exampleTables())
+
+    totals: dict[str, float] = {}
+    for category, _channel, revenue in rows:
+        totals[category] = totals.get(category, 0.0) + float(revenue)
+    order = list(dict.fromkeys(category for category, _channel, _revenue in rows))
+    assert order == sorted(totals, key=lambda category: (-totals[category], category))
+    assert len(order) == 5
+    assert order != sorted(order)  # the total order is not the alphabetical one on this data
+
+
 @pytest.mark.parametrize("key", ["sqlChartGeneratorPrompt", "sqlChartRepairPrompt"])
 def test_chartPromptsCarryTheEncodingTableAndRules(key):
     text = _formatted(key)

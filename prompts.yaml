@@ -2832,8 +2832,8 @@ sqlChartGeneratorPrompt: |
     - bubble "r" is the third measure itself, zero or more (for example COUNT(*) AS order_count). Never rescale it: the client sizes the bubbles and shows the value.
     - card: the query returns exactly one row. "value" is its column (a number, or text such as a name). "label" is literal text shown with the value, not a column name.
     - table: "columns" lists the result columns to show, in order. Leave it out to show every result column in query order.
-    - pivot: return long-form rows, already aggregated, one row per combination of the "rows" and "columns" columns. The backend builds the cross-table. GROUP BY every "rows" and "columns" column so each combination appears once.
-    - geoMap: "lat" and "long" are numeric latitude and longitude columns (CAST them AS DOUBLE when they are stored as text). Rows with missing or out-of-range coordinates are dropped. Give each point a readable "label" (for example a name and the measure) and an "id" when the data has one.
+    - pivot: return long-form rows, already aggregated, one per combination of the "rows" and "columns" columns (GROUP BY all of them). The backend builds the cross-table.
+    - geoMap: "lat" and "long" are numeric latitude and longitude columns (TRY_CAST them AS DOUBLE when they are stored as text). Rows with missing or out-of-range coordinates are dropped. Give each point a readable "label" (for example a name and the measure) and an "id" when the data has one.
 
     ## SQL rules (DuckDB 1.3)
 
@@ -2844,6 +2844,7 @@ sqlChartGeneratorPrompt: |
        - numbers stored as VARCHAR: TRY_CAST("col" AS DOUBLE);
        - dates stored as VARCHAR: TRY_CAST("col" AS DATE) or TRY_CAST("col" AS TIMESTAMP) for ISO text, try_strptime("col", '%d/%m/%Y') for another layout (match the layout of the sample value);
        - epoch numbers: to_timestamp("seconds_col"), epoch_ms("milliseconds_col"); the other way, epoch("timestamp_col");
+       - TIMESTAMP_S, TIMESTAMP_MS, TIMESTAMP_NS and TIMESTAMP WITH TIME ZONE are ordinary timestamps: use them directly;
        - prefer TRY_CAST over CAST, so one bad value becomes NULL instead of failing the query.
     5. Match text the user typed (a city, category, product, name or status) case-insensitively: "col" ILIKE 'electronics' for a whole value, "col" ILIKE '%garden%' for part of one, lower("col") IN ('north', 'south') for a list. Use the sample values to guess how values are stored. Double a single quote inside a literal: 'O''Neil'.
     6. Aggregate with SUM, AVG, COUNT(*), COUNT(DISTINCT ...), MIN, MAX, median(...), quantile_cont(..., 0.9), stddev(...), arg_max(..., ...). GROUP BY ALL groups by every SELECT column that is not an aggregate. List the grouping columns yourself when the key is not shown, for example GROUP BY p."product_id", p."list_price" so two products with the same price stay separate.
@@ -2856,18 +2857,19 @@ sqlChartGeneratorPrompt: |
         - labels: strftime(date_trunc('month', "col"), '%Y-%m'), strftime("col", '%Y-%m-%d'), 'Q' || CAST(quarter("col") AS VARCHAR);
         - differences and offsets: date_diff('day', "start_col", "end_col"), "col" + INTERVAL 30 DAY;
         - a year: "col" >= DATE '2024-01-01' AND "col" < DATE '2025-01-01';
+        - missing periods: for counts and sums, list every period in a CTE with SELECT unnest(generate_series(start, end, INTERVAL 1 MONTH)), LEFT JOIN the data to it and COALESCE the measure to 0 (with a series, CROSS JOIN the periods with the series values first). Averages stay NULL;
         - relative periods ("last 30 days", "last quarter", "this year") count back from the latest date in the data, not from today, because uploaded data is often historical: "col" > (SELECT MAX("col") FROM "orders") - INTERVAL 30 DAY. Name the period in the title.
-    11. Rankings and latest rows: ORDER BY ... LIMIT n for a top or bottom n. Window functions such as row_number(), rank(), lag() and SUM(...) OVER (ORDER BY ...) give ranks, previous values and running totals; QUALIFY filters on them, for example QUALIFY row_number() OVER (PARTITION BY "customer_id" ORDER BY "order_date" DESC) = 1 keeps each customer's latest row.
+    11. Rankings and latest rows: ORDER BY ... LIMIT n for a top or bottom n. Window functions such as row_number(), rank(), lag() and SUM(...) OVER (ORDER BY ...) give ranks, previous values and running totals; QUALIFY filters on them, for example QUALIFY row_number() OVER (PARTITION BY "customer_id" ORDER BY "order_date" DESC, "order_id" DESC) = 1 keeps each customer's latest row.
     12. Text and lists: lower(), upper(), trim(), ||, split_part("col", '-', 1), regexp_extract("col", 'pattern'), string_agg("col", ', '), length(); len(list), list_contains(list, value), and unnest(list) only in the SELECT list.
     13. Do not use PIVOT or UNPIVOT. Return long-form rows; the backend spreads them with the series, rows and columns roles. Put several measures side by side as one column each, or stack them in one column with UNION ALL.
     14. Questions about the data itself (rows per table, number of tables): one SELECT per table joined with UNION ALL, for example SELECT 'orders' AS table_name, COUNT(*) AS row_count FROM "orders" UNION ALL SELECT 'customers', COUNT(*) FROM "customers".
 
     ## Row order and size
 
-    The chart keeps the rows in query order, so always end with ORDER BY:
+    The chart keeps the rows in query order, so always end with ORDER BY and a unique tie-breaker (a name or id), so ties and LIMIT give the same rows on every run:
     - time on the x axis: ascending time. Order by the date or by a sortable label such as '%Y-%m', never by a month or weekday name as text.
     - categories compared by a measure (bar, pie, doughnut, polarArea): the measure descending, unless the categories have a natural order (weekdays, months, bins, age bands), which wins.
-    - with a series column: ORDER BY x, then series.
+    - with a series column: ORDER BY x, then series. When x has no natural order, put the biggest x first: aggregate in a CTE, then ORDER BY SUM(m) OVER (PARTITION BY x) DESC, x, series.
     - pivot: ORDER BY the "columns" columns first, then the "rows" columns, with sortable labels: the client keeps the column order it receives.
     - tables: the order the user asked for, else the most meaningful measure or date descending.
 
@@ -2876,7 +2878,7 @@ sqlChartGeneratorPrompt: |
     - A time axis is never cut: pick a bucket (day, week, month, quarter, year) that gives at most 500 periods for the range asked about.
     - pie, doughnut and polarArea show the whole, so never LIMIT them: the client's percentages are shares of the slices it gets. With more than 10 slices, keep the top 9 by the measure and sum the rest into one 'Other' slice, last: rank in a CTE with row_number() OVER (ORDER BY m DESC, label) AS rn and COUNT(*) OVER () AS n, then SELECT CASE WHEN rn <= 9 OR n <= 10 THEN label ELSE 'Other' END AS label, SUM(m) ... GROUP BY ALL ORDER BY MIN(rn).
     - Other category charts (bar, line, area, histogram, radar) show at most 50 categories unless the user asks for more. Without a series, keep the top 50 with ORDER BY the measure DESC LIMIT 50. With a series, or for a top N of the series values, rank them in a CTE and filter on it: WITH top_x AS (SELECT x FROM ... GROUP BY x ORDER BY SUM(m) DESC, x LIMIT 50) ... WHERE x IN (SELECT x FROM top_x).
-    - card: exactly one row. Aggregate without GROUP BY, or ORDER BY ... LIMIT 1 for "the top ..." questions.
+    - card: aggregate without GROUP BY, or ORDER BY ... LIMIT 1 for "the top ..." questions.
     - table: no LIMIT unless the user asks for a number or a top/bottom N; then put N in the title ("Latest 20 Orders"). The backend shows at most 1000 rows. Do not aggregate unless the user asks.
     - scatter and bubble: at most 5000 points. geoMap: at most 2000 points. pivot: at most 10000 long-form rows.
 
@@ -2946,15 +2948,15 @@ sqlChartGeneratorPrompt: |
 
     ### Example 2: line with a series column (long form) and a top-N cut
     Question: Monthly revenue in 2024 for our top 3 product categories
-    Plan: Line chart, one line per category. Join "order_items" to "orders" and "products"; keep 2024 orders; pick the 3 categories with the most revenue in 2024; sum quantity times unit_price per month (YYYY-MM label) and category for those 3; sort by month, then category. Result columns: month, category, revenue.
+    Plan: Line chart, one line per category. Join "order_items" to "orders" and "products"; keep 2024 orders; pick the 3 categories with the most revenue in 2024; sum quantity times unit_price per month (YYYY-MM label) and category for those 3, with 0 for a month without sales; sort by month, then category. Result columns: month, category, revenue.
     Answer:
-    {{"chartType": "line", "title": "Monthly Revenue of the Top 3 Categories, 2024", "xLabel": "Month", "yLabel": "Revenue", "sql": "WITH sales AS (SELECT date_trunc('month', o.\"order_date\") AS month_start, p.\"category\" AS category, oi.\"quantity\" * oi.\"unit_price\" AS revenue FROM \"order_items\" AS oi JOIN \"orders\" AS o ON o.\"order_id\" = oi.\"order_id\" JOIN \"products\" AS p ON p.\"product_id\" = oi.\"product_id\" WHERE o.\"order_date\" >= DATE '2024-01-01' AND o.\"order_date\" < DATE '2025-01-01'), top_categories AS (SELECT category FROM sales GROUP BY category ORDER BY SUM(revenue) DESC, category LIMIT 3) SELECT strftime(month_start, '%Y-%m') AS month, category, round(SUM(revenue), 2) AS revenue FROM sales WHERE category IN (SELECT category FROM top_categories) GROUP BY ALL ORDER BY month, category", "encoding": {{"x": "month", "y": ["revenue"], "series": "category"}}}}
+    {{"chartType": "line", "title": "Monthly Revenue of the Top 3 Categories, 2024", "xLabel": "Month", "yLabel": "Revenue", "sql": "WITH sales AS (SELECT date_trunc('month', o.\"order_date\") AS month_start, p.\"category\" AS category, oi.\"quantity\" * oi.\"unit_price\" AS revenue FROM \"order_items\" AS oi JOIN \"orders\" AS o ON o.\"order_id\" = oi.\"order_id\" JOIN \"products\" AS p ON p.\"product_id\" = oi.\"product_id\" WHERE o.\"order_date\" >= DATE '2024-01-01' AND o.\"order_date\" < DATE '2025-01-01'), top_categories AS (SELECT category FROM sales GROUP BY category ORDER BY SUM(revenue) DESC, category LIMIT 3), months AS (SELECT unnest(generate_series(DATE '2024-01-01', DATE '2024-12-01', INTERVAL 1 MONTH)) AS month_start) SELECT strftime(m.month_start, '%Y-%m') AS month, t.category AS category, round(COALESCE(SUM(s.revenue), 0), 2) AS revenue FROM months AS m CROSS JOIN top_categories AS t LEFT JOIN sales AS s ON s.month_start = m.month_start AND s.category = t.category GROUP BY ALL ORDER BY month, category", "encoding": {{"x": "month", "y": ["revenue"], "series": "category"}}}}
 
     ### Example 3: area with a running total
     Question: How did revenue build up over 2024?
-    Plan: Area chart of cumulative revenue. From "orders" dated in 2024, sum total_amount per month, then a running total over the months in order. Result columns: month, cumulative_revenue.
+    Plan: Area chart of cumulative revenue. From "orders" dated in 2024, sum total_amount per month (0 for a month without orders), then a running total over the months in order. Result columns: month, cumulative_revenue.
     Answer:
-    {{"chartType": "area", "title": "Cumulative Revenue by Month, 2024", "xLabel": "Month", "yLabel": "Cumulative revenue", "sql": "WITH monthly AS (SELECT date_trunc('month', \"order_date\") AS month_start, SUM(\"total_amount\") AS revenue FROM \"orders\" WHERE \"order_date\" >= DATE '2024-01-01' AND \"order_date\" < DATE '2025-01-01' GROUP BY ALL) SELECT strftime(month_start, '%Y-%m') AS month, SUM(revenue) OVER (ORDER BY month_start) AS cumulative_revenue FROM monthly ORDER BY month_start", "encoding": {{"x": "month", "y": ["cumulative_revenue"]}}}}
+    {{"chartType": "area", "title": "Cumulative Revenue by Month, 2024", "xLabel": "Month", "yLabel": "Cumulative revenue", "sql": "WITH months AS (SELECT unnest(generate_series(DATE '2024-01-01', DATE '2024-12-01', INTERVAL 1 MONTH)) AS month_start), monthly AS (SELECT date_trunc('month', \"order_date\") AS month_start, SUM(\"total_amount\") AS revenue FROM \"orders\" WHERE \"order_date\" >= DATE '2024-01-01' AND \"order_date\" < DATE '2025-01-01' GROUP BY ALL) SELECT strftime(m.month_start, '%Y-%m') AS month, SUM(COALESCE(r.revenue, 0)) OVER (ORDER BY m.month_start) AS cumulative_revenue FROM months AS m LEFT JOIN monthly AS r ON r.month_start = m.month_start ORDER BY m.month_start", "encoding": {{"x": "month", "y": ["cumulative_revenue"]}}}}
 
     ### Example 4: histogram (the query computes the bins)
     Question: Distribution of order values
@@ -2972,7 +2974,7 @@ sqlChartGeneratorPrompt: |
     Question: Share of orders by status
     Plan: Pie chart. From "orders", count orders per status (missing status as Unknown); sort descending. Result columns: status, order_count.
     Answer:
-    {{"chartType": "pie", "title": "Orders by Status", "sql": "SELECT COALESCE(\"status\", 'Unknown') AS status, COUNT(*) AS order_count FROM \"orders\" GROUP BY ALL ORDER BY order_count DESC", "encoding": {{"label": "status", "value": "order_count"}}}}
+    {{"chartType": "pie", "title": "Orders by Status", "sql": "SELECT COALESCE(\"status\", 'Unknown') AS status, COUNT(*) AS order_count FROM \"orders\" GROUP BY ALL ORDER BY order_count DESC, status", "encoding": {{"label": "status", "value": "order_count"}}}}
 
     ### Example 7: doughnut with an 'Other' slice
     Question: What share of revenue comes from each product?
@@ -2990,13 +2992,13 @@ sqlChartGeneratorPrompt: |
     Question: Is there a relationship between a product's price and how many units it sells?
     Plan: Scatter chart, one dataset per category. From "products" left-joined to "order_items", per product: list price and total units sold (0 when never sold). Result columns: list_price, units_sold, category.
     Answer:
-    {{"chartType": "scatter", "title": "List Price vs Units Sold per Product", "xLabel": "List price", "yLabel": "Units sold", "sql": "SELECT p.\"list_price\" AS list_price, COALESCE(SUM(oi.\"quantity\"), 0) AS units_sold, p.\"category\" AS category FROM \"products\" AS p LEFT JOIN \"order_items\" AS oi ON oi.\"product_id\" = p.\"product_id\" WHERE p.\"list_price\" IS NOT NULL GROUP BY p.\"product_id\", p.\"list_price\", p.\"category\" ORDER BY category", "encoding": {{"x": "list_price", "y": ["units_sold"], "series": "category"}}}}
+    {{"chartType": "scatter", "title": "List Price vs Units Sold per Product", "xLabel": "List price", "yLabel": "Units sold", "sql": "SELECT p.\"list_price\" AS list_price, COALESCE(SUM(oi.\"quantity\"), 0) AS units_sold, p.\"category\" AS category FROM \"products\" AS p LEFT JOIN \"order_items\" AS oi ON oi.\"product_id\" = p.\"product_id\" WHERE p.\"list_price\" IS NOT NULL GROUP BY p.\"product_id\", p.\"list_price\", p.\"category\" ORDER BY category, list_price, p.\"product_id\"", "encoding": {{"x": "list_price", "y": ["units_sold"], "series": "category"}}}}
 
     ### Example 10: bubble
     Question: Store size vs revenue, sized by number of orders, coloured by region
     Plan: Bubble chart, one dataset per region. Join "stores" to "orders" on store_id; per store: floor area, total revenue and the number of orders. Result columns: floor_area, revenue, order_count, region.
     Answer:
-    {{"chartType": "bubble", "title": "Store Floor Area vs Revenue (bubble size: orders)", "xLabel": "Floor area (sq m)", "yLabel": "Revenue", "sql": "SELECT s.\"floor_area_sqm\" AS floor_area, SUM(o.\"total_amount\") AS revenue, COUNT(*) AS order_count, s.\"region\" AS region FROM \"stores\" AS s JOIN \"orders\" AS o ON o.\"store_id\" = s.\"store_id\" GROUP BY s.\"store_id\", s.\"floor_area_sqm\", s.\"region\" ORDER BY region", "encoding": {{"x": "floor_area", "y": ["revenue"], "r": "order_count", "series": "region"}}}}
+    {{"chartType": "bubble", "title": "Store Floor Area vs Revenue (bubble size: orders)", "xLabel": "Floor area (sq m)", "yLabel": "Revenue", "sql": "SELECT s.\"floor_area_sqm\" AS floor_area, SUM(o.\"total_amount\") AS revenue, COUNT(*) AS order_count, s.\"region\" AS region FROM \"stores\" AS s JOIN \"orders\" AS o ON o.\"store_id\" = s.\"store_id\" GROUP BY s.\"store_id\", s.\"floor_area_sqm\", s.\"region\" ORDER BY region, floor_area, s.\"store_id\"", "encoding": {{"x": "floor_area", "y": ["revenue"], "r": "order_count", "series": "region"}}}}
 
     ### Example 11: card
     Question: What percentage of orders got a discount?
@@ -3018,9 +3020,9 @@ sqlChartGeneratorPrompt: |
 
     ### Example 14: geoMap
     Question: Map our stores with their 2024 revenue
-    Plan: Geo map. From "stores" left-joined to 2024 "orders" on store_id; per store with coordinates: id, latitude, longitude and a label with the store name and its revenue. Result columns: store_id, latitude, longitude, label.
+    Plan: Geo map. From "stores" left-joined to 2024 "orders" on store_id; per store: id, latitude and longitude read as numbers, and a label with the store name and its revenue; biggest revenue first. Result columns: store_id, latitude, longitude, label.
     Answer:
-    {{"chartType": "geoMap", "title": "Stores by Revenue, 2024", "sql": "SELECT CAST(s.\"store_id\" AS VARCHAR) AS store_id, CAST(s.\"latitude\" AS DOUBLE) AS latitude, CAST(s.\"longitude\" AS DOUBLE) AS longitude, s.\"store_name\" || ': ' || CAST(round(COALESCE(SUM(o.\"total_amount\"), 0), 0) AS VARCHAR) || ' revenue' AS label FROM \"stores\" AS s LEFT JOIN \"orders\" AS o ON o.\"store_id\" = s.\"store_id\" AND o.\"order_date\" >= DATE '2024-01-01' AND o.\"order_date\" < DATE '2025-01-01' WHERE s.\"latitude\" IS NOT NULL AND s.\"longitude\" IS NOT NULL GROUP BY s.\"store_id\", s.\"latitude\", s.\"longitude\", s.\"store_name\" LIMIT 2000", "encoding": {{"lat": "latitude", "long": "longitude", "label": "label", "id": "store_id"}}}}
+    {{"chartType": "geoMap", "title": "Stores by Revenue, 2024", "sql": "SELECT CAST(s.\"store_id\" AS VARCHAR) AS store_id, TRY_CAST(s.\"latitude\" AS DOUBLE) AS latitude, TRY_CAST(s.\"longitude\" AS DOUBLE) AS longitude, s.\"store_name\" || ': ' || CAST(round(COALESCE(SUM(o.\"total_amount\"), 0), 0) AS VARCHAR) || ' revenue' AS label FROM \"stores\" AS s LEFT JOIN \"orders\" AS o ON o.\"store_id\" = s.\"store_id\" AND o.\"order_date\" >= DATE '2024-01-01' AND o.\"order_date\" < DATE '2025-01-01' WHERE s.\"latitude\" IS NOT NULL AND s.\"longitude\" IS NOT NULL GROUP BY s.\"store_id\", s.\"latitude\", s.\"longitude\", s.\"store_name\" ORDER BY COALESCE(SUM(o.\"total_amount\"), 0) DESC, s.\"store_id\" LIMIT 2000", "encoding": {{"lat": "latitude", "long": "longitude", "label": "label", "id": "store_id"}}}}
 
     ## Project tables
 
@@ -3044,7 +3046,7 @@ sqlChartRepairPrompt: |
     Read the error, find its cause, fix that cause, then check the whole request against the rules again before you answer.
     - The reply was not a valid chart request (not JSON, a missing or unknown key, a role the chart type does not use, a wrong number of "y" columns): return a valid JSON object that follows the output and role rules. When the previous request is raw text rather than JSON, write the request from the question and the plan.
     - The query was refused before it ran (not a single SELECT, a table that is not available, a table function or file read, a schema-qualified name, a parse error): rewrite it as one plain SELECT over the project tables.
-    - Binder errors (a column, table or function not found, no function matching the argument types, a column that "must appear in the GROUP BY clause"): use the exact names and types under "Project tables", double-quote them, prefix them with the right table alias, convert types with TRY_CAST, use GROUP BY ALL, and use only the DuckDB functions named in the rules. A "Candidate bindings" hint names the real columns closest to the wrong one.
+    - Binder errors (a column, table or function not found, no function matching the argument types, a column that "must appear in the GROUP BY clause"): use the exact names and types under "Project tables", double-quote them, prefix them with the right table alias, convert types with TRY_CAST, use GROUP BY ALL, and prefer the DuckDB functions named in the rules (other DuckDB scalar functions are fine). A "Candidate bindings" hint names the real columns closest to the wrong one.
     - Conversion or run errors (could not convert a string, out of range, division by zero): use TRY_CAST, try_strptime with the layout of the sample value, and NULLIF around divisors.
     - Chart build errors:
       - too many labels for the chart: for a time axis use a larger bucket (week, month); otherwise keep the top 50 categories as the size rules say (LIMIT 50 only without a series, else a ranked CTE);
@@ -3095,8 +3097,8 @@ sqlChartRepairPrompt: |
     - bubble "r" is the third measure itself, zero or more (for example COUNT(*) AS order_count). Never rescale it: the client sizes the bubbles and shows the value.
     - card: the query returns exactly one row. "value" is its column (a number, or text such as a name). "label" is literal text shown with the value, not a column name.
     - table: "columns" lists the result columns to show, in order. Leave it out to show every result column in query order.
-    - pivot: return long-form rows, already aggregated, one row per combination of the "rows" and "columns" columns. The backend builds the cross-table. GROUP BY every "rows" and "columns" column so each combination appears once.
-    - geoMap: "lat" and "long" are numeric latitude and longitude columns (CAST them AS DOUBLE when they are stored as text). Rows with missing or out-of-range coordinates are dropped. Give each point a readable "label" (for example a name and the measure) and an "id" when the data has one.
+    - pivot: return long-form rows, already aggregated, one per combination of the "rows" and "columns" columns (GROUP BY all of them). The backend builds the cross-table.
+    - geoMap: "lat" and "long" are numeric latitude and longitude columns (TRY_CAST them AS DOUBLE when they are stored as text). Rows with missing or out-of-range coordinates are dropped. Give each point a readable "label" (for example a name and the measure) and an "id" when the data has one.
 
     ## SQL rules (DuckDB 1.3)
 
@@ -3107,6 +3109,7 @@ sqlChartRepairPrompt: |
        - numbers stored as VARCHAR: TRY_CAST("col" AS DOUBLE);
        - dates stored as VARCHAR: TRY_CAST("col" AS DATE) or TRY_CAST("col" AS TIMESTAMP) for ISO text, try_strptime("col", '%d/%m/%Y') for another layout (match the layout of the sample value);
        - epoch numbers: to_timestamp("seconds_col"), epoch_ms("milliseconds_col"); the other way, epoch("timestamp_col");
+       - TIMESTAMP_S, TIMESTAMP_MS, TIMESTAMP_NS and TIMESTAMP WITH TIME ZONE are ordinary timestamps: use them directly;
        - prefer TRY_CAST over CAST, so one bad value becomes NULL instead of failing the query.
     5. Match text the user typed (a city, category, product, name or status) case-insensitively: "col" ILIKE 'electronics' for a whole value, "col" ILIKE '%garden%' for part of one, lower("col") IN ('north', 'south') for a list. Use the sample values to guess how values are stored. Double a single quote inside a literal: 'O''Neil'.
     6. Aggregate with SUM, AVG, COUNT(*), COUNT(DISTINCT ...), MIN, MAX, median(...), quantile_cont(..., 0.9), stddev(...), arg_max(..., ...). GROUP BY ALL groups by every SELECT column that is not an aggregate. List the grouping columns yourself when the key is not shown, for example GROUP BY p."product_id", p."list_price" so two products with the same price stay separate.
@@ -3119,18 +3122,19 @@ sqlChartRepairPrompt: |
         - labels: strftime(date_trunc('month', "col"), '%Y-%m'), strftime("col", '%Y-%m-%d'), 'Q' || CAST(quarter("col") AS VARCHAR);
         - differences and offsets: date_diff('day', "start_col", "end_col"), "col" + INTERVAL 30 DAY;
         - a year: "col" >= DATE '2024-01-01' AND "col" < DATE '2025-01-01';
+        - missing periods: for counts and sums, list every period in a CTE with SELECT unnest(generate_series(start, end, INTERVAL 1 MONTH)), LEFT JOIN the data to it and COALESCE the measure to 0 (with a series, CROSS JOIN the periods with the series values first). Averages stay NULL;
         - relative periods ("last 30 days", "last quarter", "this year") count back from the latest date in the data, not from today, because uploaded data is often historical: "col" > (SELECT MAX("col") FROM "orders") - INTERVAL 30 DAY. Name the period in the title.
-    11. Rankings and latest rows: ORDER BY ... LIMIT n for a top or bottom n. Window functions such as row_number(), rank(), lag() and SUM(...) OVER (ORDER BY ...) give ranks, previous values and running totals; QUALIFY filters on them, for example QUALIFY row_number() OVER (PARTITION BY "customer_id" ORDER BY "order_date" DESC) = 1 keeps each customer's latest row.
+    11. Rankings and latest rows: ORDER BY ... LIMIT n for a top or bottom n. Window functions such as row_number(), rank(), lag() and SUM(...) OVER (ORDER BY ...) give ranks, previous values and running totals; QUALIFY filters on them, for example QUALIFY row_number() OVER (PARTITION BY "customer_id" ORDER BY "order_date" DESC, "order_id" DESC) = 1 keeps each customer's latest row.
     12. Text and lists: lower(), upper(), trim(), ||, split_part("col", '-', 1), regexp_extract("col", 'pattern'), string_agg("col", ', '), length(); len(list), list_contains(list, value), and unnest(list) only in the SELECT list.
     13. Do not use PIVOT or UNPIVOT. Return long-form rows; the backend spreads them with the series, rows and columns roles. Put several measures side by side as one column each, or stack them in one column with UNION ALL.
     14. Questions about the data itself (rows per table, number of tables): one SELECT per table joined with UNION ALL, for example SELECT 'orders' AS table_name, COUNT(*) AS row_count FROM "orders" UNION ALL SELECT 'customers', COUNT(*) FROM "customers".
 
     ## Row order and size
 
-    The chart keeps the rows in query order, so always end with ORDER BY:
+    The chart keeps the rows in query order, so always end with ORDER BY and a unique tie-breaker (a name or id), so ties and LIMIT give the same rows on every run:
     - time on the x axis: ascending time. Order by the date or by a sortable label such as '%Y-%m', never by a month or weekday name as text.
     - categories compared by a measure (bar, pie, doughnut, polarArea): the measure descending, unless the categories have a natural order (weekdays, months, bins, age bands), which wins.
-    - with a series column: ORDER BY x, then series.
+    - with a series column: ORDER BY x, then series. When x has no natural order, put the biggest x first: aggregate in a CTE, then ORDER BY SUM(m) OVER (PARTITION BY x) DESC, x, series.
     - pivot: ORDER BY the "columns" columns first, then the "rows" columns, with sortable labels: the client keeps the column order it receives.
     - tables: the order the user asked for, else the most meaningful measure or date descending.
 
@@ -3139,7 +3143,7 @@ sqlChartRepairPrompt: |
     - A time axis is never cut: pick a bucket (day, week, month, quarter, year) that gives at most 500 periods for the range asked about.
     - pie, doughnut and polarArea show the whole, so never LIMIT them: the client's percentages are shares of the slices it gets. With more than 10 slices, keep the top 9 by the measure and sum the rest into one 'Other' slice, last: rank in a CTE with row_number() OVER (ORDER BY m DESC, label) AS rn and COUNT(*) OVER () AS n, then SELECT CASE WHEN rn <= 9 OR n <= 10 THEN label ELSE 'Other' END AS label, SUM(m) ... GROUP BY ALL ORDER BY MIN(rn).
     - Other category charts (bar, line, area, histogram, radar) show at most 50 categories unless the user asks for more. Without a series, keep the top 50 with ORDER BY the measure DESC LIMIT 50. With a series, or for a top N of the series values, rank them in a CTE and filter on it: WITH top_x AS (SELECT x FROM ... GROUP BY x ORDER BY SUM(m) DESC, x LIMIT 50) ... WHERE x IN (SELECT x FROM top_x).
-    - card: exactly one row. Aggregate without GROUP BY, or ORDER BY ... LIMIT 1 for "the top ..." questions.
+    - card: aggregate without GROUP BY, or ORDER BY ... LIMIT 1 for "the top ..." questions.
     - table: no LIMIT unless the user asks for a number or a top/bottom N; then put N in the title ("Latest 20 Orders"). The backend shows at most 1000 rows. Do not aggregate unless the user asks.
     - scatter and bubble: at most 5000 points. geoMap: at most 2000 points. pivot: at most 10000 long-form rows.
 
@@ -3155,7 +3159,7 @@ sqlChartRepairPrompt: |
     Error: Binder Error: Referenced column "city" not found in FROM clause! Candidate bindings: "channel", "customer_id"
     Fix: "city" is a column of "customers", not "orders", so join the two tables on customer_id and prefix each column with its table alias; keep the top 50 cities.
     Answer:
-    {{"chartType": "bar", "title": "Revenue by City", "xLabel": "City", "yLabel": "Revenue", "sql": "SELECT c.\"city\" AS city, SUM(o.\"total_amount\") AS revenue FROM \"orders\" AS o JOIN \"customers\" AS c ON c.\"customer_id\" = o.\"customer_id\" GROUP BY ALL ORDER BY revenue DESC LIMIT 50", "encoding": {{"x": "city", "y": ["revenue"]}}}}
+    {{"chartType": "bar", "title": "Revenue by City", "xLabel": "City", "yLabel": "Revenue", "sql": "SELECT c.\"city\" AS city, SUM(o.\"total_amount\") AS revenue FROM \"orders\" AS o JOIN \"customers\" AS c ON c.\"customer_id\" = o.\"customer_id\" GROUP BY ALL ORDER BY revenue DESC, city LIMIT 50", "encoding": {{"x": "city", "y": ["revenue"]}}}}
 
     The example's tables are invented. Take table and column names only from "Project tables".
 
