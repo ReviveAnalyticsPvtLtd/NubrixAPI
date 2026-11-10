@@ -2882,7 +2882,8 @@ sqlChartGeneratorPrompt: |
     - Never put LIMIT on a time axis, on a long-form query (one with a series column) or on a pivot: it silently drops periods or series.
     - A time axis is never cut: pick a bucket (day, week, month, quarter, year) that gives at most 500 periods for the range asked about.
     - pie, doughnut and polarArea show the whole, so never LIMIT them: the client's percentages are shares of the slices it gets. With more than 10 slices, keep the top 9 by the measure and sum the rest into one 'Other' slice, last: rank in a CTE with row_number() OVER (ORDER BY m DESC, label) AS rn and COUNT(*) OVER () AS n, then SELECT CASE WHEN rn <= 9 OR n <= 10 THEN label ELSE 'Other' END AS label, SUM(m) ... GROUP BY ALL ORDER BY MIN(rn).
-    - Other category charts (bar, line, area, histogram, radar) show at most 50 categories unless the user asks for more. Without a series, keep the top 50 with ORDER BY the measure DESC LIMIT 50. With a series, or for a top N of the series values, rank them in a CTE and filter on it: WITH top_x AS (SELECT x FROM ... GROUP BY x ORDER BY SUM(m) DESC, x LIMIT 50) ... WHERE x IN (SELECT x FROM top_x).
+    - A category x axis (bar and radar; line and area only when x is not a time) shows at most 50 categories unless the user asks for more. Without a series, keep the top 50 with ORDER BY the measure DESC LIMIT 50. With a series, or for a top N of the series values, rank them in a CTE and filter on it: WITH top_x AS (SELECT x FROM ... GROUP BY x ORDER BY SUM(m) DESC, x LIMIT 50) ... WHERE x IN (SELECT x FROM top_x).
+    - A histogram is never cut: widen the bins so there are at most 50, and ORDER BY the bin.
     - card: aggregate without GROUP BY, or ORDER BY ... LIMIT 1 for "the top ..." questions.
     - table: no LIMIT unless the user asks for a number or a top/bottom N; then put N in the title ("Latest 20 Orders"). The backend shows at most 1000 rows. Do not aggregate unless the user asks.
     - scatter and bubble: at most 5000 points. geoMap: at most 2000 points. pivot: at most 10000 long-form rows.
@@ -3054,7 +3055,7 @@ sqlChartRepairPrompt: |
     - Binder errors (a column, table or function not found, no function matching the argument types, a column that "must appear in the GROUP BY clause"): use the exact names and types under "Project tables", double-quote them, prefix them with the right table alias, convert types with TRY_CAST, use GROUP BY ALL, and prefer the DuckDB functions named in the rules (other DuckDB scalar functions are fine). A "Candidate bindings" hint names the real columns closest to the wrong one.
     - Conversion or run errors (could not convert a string, out of range, division by zero): use TRY_CAST, try_strptime with the layout of the sample value, and NULLIF around divisors.
     - Chart build errors:
-      - too many labels for the chart: for a time axis use a larger bucket (week, month); otherwise keep the top 50 categories as the size rules say (LIMIT 50 only without a series, else a ranked CTE);
+      - too many labels for the chart: for a time axis use a larger bucket (week, month), for a histogram wider bins; otherwise keep the top 50 categories as the size rules say (LIMIT 50 only without a series, else a ranked CTE);
       - a card got more than one row: aggregate to exactly one row, or ORDER BY ... LIMIT 1;
       - more than one row for an x and series pair, or for a pivot row and column: GROUP BY all of those columns so each pair appears once;
       - a value column is not numeric: aggregate a numeric column, or TRY_CAST it AS DOUBLE;
@@ -3152,7 +3153,8 @@ sqlChartRepairPrompt: |
     - Never put LIMIT on a time axis, on a long-form query (one with a series column) or on a pivot: it silently drops periods or series.
     - A time axis is never cut: pick a bucket (day, week, month, quarter, year) that gives at most 500 periods for the range asked about.
     - pie, doughnut and polarArea show the whole, so never LIMIT them: the client's percentages are shares of the slices it gets. With more than 10 slices, keep the top 9 by the measure and sum the rest into one 'Other' slice, last: rank in a CTE with row_number() OVER (ORDER BY m DESC, label) AS rn and COUNT(*) OVER () AS n, then SELECT CASE WHEN rn <= 9 OR n <= 10 THEN label ELSE 'Other' END AS label, SUM(m) ... GROUP BY ALL ORDER BY MIN(rn).
-    - Other category charts (bar, line, area, histogram, radar) show at most 50 categories unless the user asks for more. Without a series, keep the top 50 with ORDER BY the measure DESC LIMIT 50. With a series, or for a top N of the series values, rank them in a CTE and filter on it: WITH top_x AS (SELECT x FROM ... GROUP BY x ORDER BY SUM(m) DESC, x LIMIT 50) ... WHERE x IN (SELECT x FROM top_x).
+    - A category x axis (bar and radar; line and area only when x is not a time) shows at most 50 categories unless the user asks for more. Without a series, keep the top 50 with ORDER BY the measure DESC LIMIT 50. With a series, or for a top N of the series values, rank them in a CTE and filter on it: WITH top_x AS (SELECT x FROM ... GROUP BY x ORDER BY SUM(m) DESC, x LIMIT 50) ... WHERE x IN (SELECT x FROM top_x).
+    - A histogram is never cut: widen the bins so there are at most 50, and ORDER BY the bin.
     - card: aggregate without GROUP BY, or ORDER BY ... LIMIT 1 for "the top ..." questions.
     - table: no LIMIT unless the user asks for a number or a top/bottom N; then put N in the title ("Latest 20 Orders"). The backend shows at most 1000 rows. Do not aggregate unless the user asks.
     - scatter and bubble: at most 5000 points. geoMap: at most 2000 points. pivot: at most 10000 long-form rows.

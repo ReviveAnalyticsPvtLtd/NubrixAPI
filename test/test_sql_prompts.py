@@ -411,6 +411,44 @@ def test_limitCutsATimeAxisSoNoTimeAxisOrLongFormExampleUsesIt():
             assert not _hasOuterLimit(request.sql), request.chartType
 
 
+def test_histogramsAreNeverCutOnlyWidened():
+    tables = _exampleTables()
+    orders = tables["orders"]
+    # Spread the order values over 0..1000, a quarter of them bunched at 500..560, so narrow bins outnumber
+    # the 50-row cut and have uneven counts.
+    values = [(i * 37) % 1000 if i % 4 else 500 + i % 60 for i in range(orders.num_rows)]
+    spread = pa.array([Decimal(value) + Decimal("0.25") for value in values], pa.decimal128(12, 2))
+    tables = {**tables, "orders": orders.set_column(orders.schema.get_field_index("total_amount"), "total_amount", spread)}
+    totalOrders = _query('SELECT COUNT(*) FROM "orders" WHERE "total_amount" IS NOT NULL', tables)[0][0]
+    narrow = (
+        'WITH binned AS (SELECT CAST(floor("total_amount" / 5) AS INTEGER) AS bin FROM "orders" '
+        'WHERE "total_amount" IS NOT NULL) SELECT bin, COUNT(*) AS order_count FROM binned GROUP BY bin'
+    )
+    allBins = _query(narrow + " ORDER BY bin", tables)
+    assert len(allBins) > 50
+    # The top-50 rule applied to a histogram: by count the bins lose their range order, by bin the upper tail goes.
+    byCount = _query(narrow + " ORDER BY order_count DESC, bin LIMIT 50", tables)
+    assert [row[0] for row in byCount] != sorted(row[0] for row in byCount)
+    byBin = _query(narrow + " ORDER BY bin LIMIT 50", tables)
+    assert sum(row[1] for row in byBin) < totalOrders
+
+    # The rule's form: wider bins, every bin kept, in range order.
+    histogram = _example("histogram")
+    assert not _hasOuterLimit(histogram.sql)
+    rows = _query(histogram.sql, tables)
+    assert 1 < len(rows) <= 50
+    assert sum(row[1] for row in rows) == totalOrders
+    lows = [int(row[0].split("-")[0]) for row in rows]
+    assert lows == sorted(lows)
+
+    for key in ("sqlChartGeneratorPrompt", "sqlChartRepairPrompt"):
+        text = _formatted(key)
+        assert "A histogram is never cut: widen the bins so there are at most 50" in text, key
+        # The top-50 cut names category axes only, never a time axis or a histogram.
+        sizeRule = next(line for line in text.splitlines() if "at most 50 categories" in line)
+        assert "histogram" not in sizeRule and "only when x is not a time" in sizeRule, key
+
+
 def test_topCategoriesOfALongFormChartKeepEveryMonth():
     tables = _exampleTables()
     line = _example("line")
