@@ -489,9 +489,12 @@ def forget_table(projectId: str, tableName: str) -> None:
 
     _drop_local_cache(projectId, tableName)
     r = redis.Redis(connection_pool=_redis_pool())
-    r.delete(
+    # One transaction, so a failure can't clear the data and leave the schema cached; execute raises as a lone DEL did.
+    pipe = r.pipeline(transaction=True)
+    pipe.delete(
         f"{projectId}::{tableName}",
         f"{projectId}::metadata.json",
         f"{projectId}::metadata",
     )
-    r.hdel(schemasKey(projectId), tableName)
+    pipe.hdel(schemasKey(projectId), tableName)
+    pipe.execute()

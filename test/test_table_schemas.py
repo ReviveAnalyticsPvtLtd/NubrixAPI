@@ -61,8 +61,34 @@ class FakeRedis:
         self.calls.append(("scan",))
         return []
 
+    def pipeline(self, transaction=True):
+        return FakePipeline(self, transaction)
+
     def callNames(self):
         return [call[0] for call in self.calls]
+
+
+class FakePipeline:
+    """Queues commands and applies them on `execute`, which the parent records as one ("pipeline", commands) call."""
+
+    def __init__(self, parent, transaction):
+        self.parent = parent
+        self.transaction = transaction
+        self.queued = []
+
+    def __getattr__(self, name):
+        if name not in ("hset", "expire", "hdel", "delete"):
+            raise AttributeError(name)
+        return lambda *args, **kwargs: self.queued.append((name, args, kwargs))
+
+    def execute(self):
+        parent = self.parent
+        before = len(parent.calls)
+        for name, args, kwargs in self.queued:
+            getattr(parent, name)(*args, **kwargs)
+        del parent.calls[before:]
+        parent.calls.append(("pipeline", self.transaction, tuple((name, *args) for name, args, _ in self.queued)))
+        return [None] * len(self.queued)
 
 
 SALES = pa.schema([("id", pa.int64()), ("region", pa.string())])
@@ -112,7 +138,7 @@ def test_forgetTableAlsoDeletesTheSchemaKey(redisFake, reader):
     tableSchemas.tableSchemas("p1", ["sales", "costs"])
     forget_table("p1", "sales")
     assert _cachedTables(redisFake, "p1") == {"costs"}
-    assert ("hdel", "p1::schemas", "sales") in redisFake.calls
+    assert redisFake.calls[-1] == ("pipeline", True, (("delete", "p1::sales", "p1::metadata.json", "p1::metadata"), ("hdel", "p1::schemas", "sales")))
 
 
 def test_invalidateWholeProjectDropsItsSchemas(redisFake, reader):
@@ -242,7 +268,8 @@ def test_dropsMakeNoScan(redisFake, reader):
     redisFake.calls.clear()
     forget_table("p1", "costs")
     assert "scan" not in redisFake.callNames()
-    assert ("hdel", "p1::schemas", "costs") in redisFake.calls
+    assert redisFake.calls[-1][0] == "pipeline"
+    assert ("hdel", "p1::schemas", "costs") in redisFake.calls[-1][2]
 
 
 def test_skipUnreadableLeavesOutATableThatFailsAndKeepsTheRest(redisFake, reader):
