@@ -249,3 +249,9 @@ def test_requireNumericLogMessageNamesNoStructFields():
     with pytest.raises(ChartBuildError) as caught:
         buildChart(request, table)
     assert "SecretField" not in caught.value.logMessage
+
+
+def test_redactedFirstLineIsPublicAndKeepsOnlyTheFirstRedactedLine():
+    line = module.redactedFirstLine("Binder error at line 3: bad value 'secret'\nsecond line")
+    assert "\n" not in line and "secret" not in line and "second line" not in line
+    assert module.redactedFirstLine(RuntimeError("plain text")) == "plain text"

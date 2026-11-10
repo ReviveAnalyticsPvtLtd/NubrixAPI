@@ -248,9 +248,34 @@ def test_shadowRunsOnItsOwnThreadAndNeverBlocksTheRequest(env):
     assert len(env.shadowLines()) == 1
 
 
-def test_shadowPoolAndQueueAreBounded():
-    assert rs._shadowExecutor._max_workers == 2
-    assert rs._shadowExecutor._thread_name_prefix == "chart-shadow"
+def test_shadowPoolRunsTwoAtATimeOnItsOwnThreads():
+    gate = threading.Event()
+    lock = threading.Lock()
+    state = {"running": 0, "peak": 0, "names": set()}
+
+    def task():
+        with lock:
+            state["running"] += 1
+            state["peak"] = max(state["peak"], state["running"])
+            state["names"].add(threading.current_thread().name)
+        gate.wait(10)
+        with lock:
+            state["running"] -= 1
+
+    futures = [rs._shadowExecutor.submit(task) for _ in range(4)]
+    deadline = time.time() + 10
+    while state["running"] < 2 and time.time() < deadline:
+        time.sleep(0.01)
+    time.sleep(0.2)  # a third task would have started by now if the pool allowed it
+    assert state["running"] == 2
+    gate.set()
+    for future in futures:
+        future.result(timeout=10)
+    assert state["peak"] == 2
+    assert all(name.startswith("chart-shadow") for name in state["names"])
+
+
+def test_shadowQueueIsBoundedAtFourPermits():
     semaphore = rs._shadowSlots
     taken = [semaphore.acquire(blocking=False) for _ in range(5)]
     for ok in taken:

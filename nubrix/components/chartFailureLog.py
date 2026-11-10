@@ -61,7 +61,7 @@ def _messageOf(error: BaseException | str) -> str:
     return logMessage if isinstance(logMessage, str) else str(error)
 
 
-def _redactedFirstLine(error: BaseException | str, tableNames: Iterable[str] | None = None) -> str:
+def redactedFirstLine(error: BaseException | str, tableNames: Iterable[str] | None = None) -> str:
     firstLine = _messageOf(error).split("\n", 1)[0]
     return _REDACT.sub(_redactor(tableNames), firstLine)[:_MAX_ERROR_CHARACTERS]
 
@@ -87,7 +87,7 @@ def logChartFailure(
     record = {
         "stage": stage,
         "errorClass": _classOf(error),
-        "error": _redactedFirstLine(error, tableNames),
+        "error": redactedFirstLine(error, tableNames),
         "traceId": traceId,
         "projectId": projectId,
         "chartType": chartType,
