@@ -434,6 +434,37 @@ def test_shareChartsKeepTheWhole():
             assert not _hasOuterLimit(request.sql), request.chartType
 
 
+def test_pivotColumnsComeOutInOrderWhenDataIsSparse():
+    tables = _exampleTables()
+    sparse = _query(
+        "SELECT * FROM \"orders\" WHERE NOT (\"store_id\" IN (1, 3) AND \"order_date\" BETWEEN DATE '2024-01-01' AND DATE '2024-03-31')",
+        tables,
+    )
+    names = EXAMPLE_SCHEMAS["orders"].names
+    tables["orders"] = pa.table({name: [row[index] for row in sparse] for index, name in enumerate(names)}, schema=EXAMPLE_SCHEMAS["orders"])
+    pivot = _example("pivot")
+
+    chart = _runExample(pivot, tables)
+
+    # The client keeps the column keys in the order it gets them.
+    assert list(chart["data"]) == ["Q1", "Q2", "Q3", "Q4"]
+    rowsFirst = pivot.sql.replace("ORDER BY order_quarter, region", "ORDER BY region, order_quarter")
+    assert rowsFirst != pivot.sql
+    assert list(_runExample(pivot.model_copy(update={"sql": rowsFirst}), tables)["data"]) == ["Q2", "Q3", "Q4", "Q1"]
+
+
+def test_tablesReturnEveryMatchingRow():
+    tables = _exampleTables()
+    table = _example("table")
+
+    chart = _runExample(table, tables)
+
+    assert not _hasOuterLimit(table.sql)
+    assert len(chart["data"]) == _query('SELECT COUNT(DISTINCT "customer_id") FROM "orders"', tables)[0][0]
+    for key in NEW_PROMPTS:
+        assert "100 unless" not in _prompts()[key], key
+
+
 @pytest.mark.parametrize("key", ["sqlChartGeneratorPrompt", "sqlChartRepairPrompt"])
 def test_chartPromptsCarryTheEncodingTableAndRules(key):
     text = _formatted(key)

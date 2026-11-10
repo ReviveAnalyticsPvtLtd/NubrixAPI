@@ -2295,7 +2295,7 @@ sqlQueryRephraserAgentPrompt: |
     - Top or bottom N: say N. Category charts show at most 50 categories unless the user asks for more: keep the top 50 by the measure. With one dataset per category, the top N picks the categories and every period stays.
     - A time axis is never cut to a number of periods: choose a coarser time bucket instead.
     - Pie, doughnut and polarArea always show the whole: with more than 10 slices, keep the top 9 and group the rest as 'Other'.
-    - Tables: say which columns to show and how many rows (100 unless the user says otherwise).
+    - Tables: say which columns to show; return every matching row unless the user asks for a number of rows.
 
     ### **6. RESULT COLUMNS**
     - End rephrasedOutput with "Result columns:" followed by the columns the result must have, in order, with a short snake_case name each, e.g. "Result columns: month (YYYY-MM), channel, revenue."
@@ -2470,7 +2470,7 @@ sqlQueryRephraserAgentPrompt: |
     **Metadata:** "sales" with columns: region (object), date (datetime64), amount (float64)
     ```json
     {{
-    "rephrasedOutput": "Pivot with regions as rows and years as columns, showing total sales. Steps: 1) From table 'sales', take the year of 'date'. 2) Sum 'amount' per region and year. 3) Sort by region, then year. Result columns: region, year, total_sales.",
+    "rephrasedOutput": "Pivot with regions as rows and years as columns, showing total sales. Steps: 1) From table 'sales', take the year of 'date'. 2) Sum 'amount' per region and year. 3) Sort by year, then region. Result columns: region, year, total_sales.",
     "doubt": null
     }}
     ```
@@ -2633,7 +2633,7 @@ parallelSqlQueryRephraserAgentPrompt: |
     - Top or bottom N: say N. Category charts show at most 50 categories unless the user asks for more: keep the top 50 by the measure. With one dataset per category, the top N picks the categories and every period stays.
     - A time axis is never cut to a number of periods: choose a coarser time bucket instead.
     - Pie, doughnut and polarArea always show the whole: with more than 10 slices, keep the top 9 and group the rest as 'Other'.
-    - Tables: say which columns to show and how many rows (100 unless the user says otherwise).
+    - Tables: say which columns to show; return every matching row unless the user asks for a number of rows.
 
     ### **6. RESULT COLUMNS**
     - End rephrasedOutput with "Result columns:" followed by the columns the result must have, in order, with a short snake_case name each, e.g. "Result columns: month (YYYY-MM), channel, revenue."
@@ -2868,6 +2868,7 @@ sqlChartGeneratorPrompt: |
     - time on the x axis: ascending time. Order by the date or by a sortable label such as '%Y-%m', never by a month or weekday name as text.
     - categories compared by a measure (bar, pie, doughnut, polarArea): the measure descending, unless the categories have a natural order (weekdays, months, bins, age bands), which wins.
     - with a series column: ORDER BY x, then series.
+    - pivot: ORDER BY the "columns" columns first, then the "rows" columns, with sortable labels: the client keeps the column order it receives.
     - tables: the order the user asked for, else the most meaningful measure or date descending.
 
     Size (LIMIT counts rows, not categories):
@@ -2876,7 +2877,7 @@ sqlChartGeneratorPrompt: |
     - pie, doughnut and polarArea show the whole, so never LIMIT them: the client's percentages are shares of the slices it gets. With more than 10 slices, keep the top 9 by the measure and sum the rest into one 'Other' slice, last: rank in a CTE with row_number() OVER (ORDER BY m DESC, label) AS rn and COUNT(*) OVER () AS n, then SELECT CASE WHEN rn <= 9 OR n <= 10 THEN label ELSE 'Other' END AS label, SUM(m) ... GROUP BY ALL ORDER BY MIN(rn).
     - Other category charts (bar, line, area, histogram, radar) show at most 50 categories unless the user asks for more. Without a series, keep the top 50 with ORDER BY the measure DESC LIMIT 50. With a series, or for a top N of the series values, rank them in a CTE and filter on it: WITH top_x AS (SELECT x FROM ... GROUP BY x ORDER BY SUM(m) DESC, x LIMIT 50) ... WHERE x IN (SELECT x FROM top_x).
     - card: exactly one row. Aggregate without GROUP BY, or ORDER BY ... LIMIT 1 for "the top ..." questions.
-    - table: LIMIT 100 unless the user asks for a number (at most 1000). Do not aggregate unless the user asks.
+    - table: no LIMIT unless the user asks for a number or a top/bottom N; then put N in the title ("Latest 20 Orders"). The backend shows at most 1000 rows. Do not aggregate unless the user asks.
     - scatter and bubble: at most 5000 points. geoMap: at most 2000 points. pivot: at most 10000 long-form rows.
 
     ## Choosing the chart type
@@ -3005,15 +3006,15 @@ sqlChartGeneratorPrompt: |
 
     ### Example 12: table with QUALIFY
     Question: Show each customer's most recent order
-    Plan: Table. Join "orders" to "customers" on customer_id; keep each customer's latest order; show customer name, city, order date and amount, newest first. Result columns: customer, city, last_order_date, order_amount.
+    Plan: Table. Join "orders" to "customers" on customer_id; keep each customer's latest order; show customer name, city, order date and amount for every customer, newest first. Result columns: customer, city, last_order_date, order_amount.
     Answer:
-    {{"chartType": "table", "title": "Most Recent Order per Customer", "sql": "SELECT c.\"full_name\" AS customer, c.\"city\" AS city, o.\"order_date\" AS last_order_date, o.\"total_amount\" AS order_amount FROM \"orders\" AS o JOIN \"customers\" AS c ON c.\"customer_id\" = o.\"customer_id\" QUALIFY row_number() OVER (PARTITION BY o.\"customer_id\" ORDER BY o.\"order_date\" DESC, o.\"order_id\" DESC) = 1 ORDER BY last_order_date DESC LIMIT 100", "encoding": {{"columns": ["customer", "city", "last_order_date", "order_amount"]}}}}
+    {{"chartType": "table", "title": "Most Recent Order per Customer", "sql": "SELECT c.\"full_name\" AS customer, c.\"city\" AS city, o.\"order_date\" AS last_order_date, o.\"total_amount\" AS order_amount FROM \"orders\" AS o JOIN \"customers\" AS c ON c.\"customer_id\" = o.\"customer_id\" QUALIFY row_number() OVER (PARTITION BY o.\"customer_id\" ORDER BY o.\"order_date\" DESC, o.\"order_id\" DESC) = 1 ORDER BY last_order_date DESC, customer", "encoding": {{"columns": ["customer", "city", "last_order_date", "order_amount"]}}}}
 
     ### Example 13: pivot (long-form rows)
     Question: Revenue by region and quarter for 2024 as a pivot table
-    Plan: Pivot with regions as rows and quarters as columns. Join "orders" to "stores" on store_id; keep orders dated in 2024; sum total_amount per region and quarter label (Q1 to Q4). Result columns: region, order_quarter, revenue.
+    Plan: Pivot with regions as rows and quarters as columns. Join "orders" to "stores" on store_id; keep orders dated in 2024; sum total_amount per region and quarter label (Q1 to Q4); sort by quarter, then region. Result columns: region, order_quarter, revenue.
     Answer:
-    {{"chartType": "pivot", "title": "Revenue by Region and Quarter, 2024", "sql": "SELECT s.\"region\" AS region, 'Q' || CAST(quarter(o.\"order_date\") AS VARCHAR) AS order_quarter, SUM(o.\"total_amount\") AS revenue FROM \"orders\" AS o JOIN \"stores\" AS s ON s.\"store_id\" = o.\"store_id\" WHERE o.\"order_date\" >= DATE '2024-01-01' AND o.\"order_date\" < DATE '2025-01-01' GROUP BY ALL ORDER BY region, order_quarter", "encoding": {{"rows": ["region"], "columns": ["order_quarter"], "value": "revenue"}}}}
+    {{"chartType": "pivot", "title": "Revenue by Region and Quarter, 2024", "sql": "SELECT s.\"region\" AS region, 'Q' || CAST(quarter(o.\"order_date\") AS VARCHAR) AS order_quarter, SUM(o.\"total_amount\") AS revenue FROM \"orders\" AS o JOIN \"stores\" AS s ON s.\"store_id\" = o.\"store_id\" WHERE o.\"order_date\" >= DATE '2024-01-01' AND o.\"order_date\" < DATE '2025-01-01' GROUP BY ALL ORDER BY order_quarter, region", "encoding": {{"rows": ["region"], "columns": ["order_quarter"], "value": "revenue"}}}}
 
     ### Example 14: geoMap
     Question: Map our stores with their 2024 revenue
@@ -3130,6 +3131,7 @@ sqlChartRepairPrompt: |
     - time on the x axis: ascending time. Order by the date or by a sortable label such as '%Y-%m', never by a month or weekday name as text.
     - categories compared by a measure (bar, pie, doughnut, polarArea): the measure descending, unless the categories have a natural order (weekdays, months, bins, age bands), which wins.
     - with a series column: ORDER BY x, then series.
+    - pivot: ORDER BY the "columns" columns first, then the "rows" columns, with sortable labels: the client keeps the column order it receives.
     - tables: the order the user asked for, else the most meaningful measure or date descending.
 
     Size (LIMIT counts rows, not categories):
@@ -3138,7 +3140,7 @@ sqlChartRepairPrompt: |
     - pie, doughnut and polarArea show the whole, so never LIMIT them: the client's percentages are shares of the slices it gets. With more than 10 slices, keep the top 9 by the measure and sum the rest into one 'Other' slice, last: rank in a CTE with row_number() OVER (ORDER BY m DESC, label) AS rn and COUNT(*) OVER () AS n, then SELECT CASE WHEN rn <= 9 OR n <= 10 THEN label ELSE 'Other' END AS label, SUM(m) ... GROUP BY ALL ORDER BY MIN(rn).
     - Other category charts (bar, line, area, histogram, radar) show at most 50 categories unless the user asks for more. Without a series, keep the top 50 with ORDER BY the measure DESC LIMIT 50. With a series, or for a top N of the series values, rank them in a CTE and filter on it: WITH top_x AS (SELECT x FROM ... GROUP BY x ORDER BY SUM(m) DESC, x LIMIT 50) ... WHERE x IN (SELECT x FROM top_x).
     - card: exactly one row. Aggregate without GROUP BY, or ORDER BY ... LIMIT 1 for "the top ..." questions.
-    - table: LIMIT 100 unless the user asks for a number (at most 1000). Do not aggregate unless the user asks.
+    - table: no LIMIT unless the user asks for a number or a top/bottom N; then put N in the title ("Latest 20 Orders"). The backend shows at most 1000 rows. Do not aggregate unless the user asks.
     - scatter and bubble: at most 5000 points. geoMap: at most 2000 points. pivot: at most 10000 long-form rows.
 
     ## Choosing the chart type
