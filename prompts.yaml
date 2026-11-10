@@ -2283,7 +2283,7 @@ sqlQueryRephraserAgentPrompt: |
 
     ### **3. FILTERS**
     - Restate every filter the user gave, with the value as the user wrote it. Text values are matched case-insensitively, so do not change their spelling; when a sample value shows how values are stored, mention it.
-    - Relative periods ("last 30 days", "last quarter", "this year") count back from the latest date in the data, not from today; say so in the plan.
+    - Relative periods count back from today, by the calendar: "last 30 days" is the 30 days ending today; "this month" (week, quarter, year, "so far", "to date") is the current period up to today; "last month" or "previous month" is the previous full month; "last 6 months" is the 6 full months before this one. Weeks start on Monday. Name the period in words in the plan, never as computed dates.
 
     ### **4. MEASURES, GROUPING AND TIME**
     - Name the aggregation: sum, average, count of rows, count of distinct values, minimum, maximum, median, a ratio or a percentage (say numerator and denominator).
@@ -2450,7 +2450,7 @@ sqlQueryRephraserAgentPrompt: |
     **Metadata:** "orders" with columns: order_id (int64), order_date (datetime64)
     ```json
     {{
-    "rephrasedOutput": "Line chart of daily order counts over the last 30 days of data. Steps: 1) From table 'orders', keep rows whose 'order_date' is within 30 days before the latest 'order_date' in the table. 2) Bucket 'order_date' by day. 3) Count orders per day. 4) Sort by day ascending. Result columns: day (YYYY-MM-DD), order_count.",
+    "rephrasedOutput": "Line chart of daily order counts over the last 30 days. Steps: 1) From table 'orders', keep rows whose 'order_date' falls in the 30 days ending today. 2) Bucket 'order_date' by day. 3) Count orders per day. 4) Sort by day ascending. Result columns: day (YYYY-MM-DD), order_count.",
     "doubt": null
     }}
     ```
@@ -2621,7 +2621,7 @@ parallelSqlQueryRephraserAgentPrompt: |
 
     ### **3. FILTERS**
     - Restate every filter the user gave, with the value as the user wrote it. Text values are matched case-insensitively, so do not change their spelling; when a sample value shows how values are stored, mention it.
-    - Relative periods ("last 30 days", "last quarter", "this year") count back from the latest date in the data, not from today; say so in the plan.
+    - Relative periods count back from today, by the calendar: "last 30 days" is the 30 days ending today; "this month" (week, quarter, year, "so far", "to date") is the current period up to today; "last month" or "previous month" is the previous full month; "last 6 months" is the 6 full months before this one. Weeks start on Monday. Name the period in words in the plan, never as computed dates.
 
     ### **4. MEASURES, GROUPING AND TIME**
     - Name the aggregation: sum, average, count of rows, count of distinct values, minimum, maximum, median, a ratio or a percentage (say numerator and denominator).
@@ -2858,7 +2858,12 @@ sqlChartGeneratorPrompt: |
         - differences and offsets: date_diff('day', "start_col", "end_col"), "col" + INTERVAL 30 DAY;
         - a year: "col" >= DATE '2024-01-01' AND "col" < DATE '2025-01-01';
         - missing periods: for counts and sums, list every period in a CTE with SELECT unnest(generate_series(start, end, INTERVAL 1 MONTH)), LEFT JOIN the data to it and COALESCE the measure to 0 (with a series, CROSS JOIN the periods with the series values first). Averages stay NULL;
-        - relative periods ("last 30 days", "last quarter", "this year") count back from the latest date in the data, not from today, because uploaded data is often historical: "col" > (SELECT MAX("col") FROM "orders") - INTERVAL 30 DAY. Name the period in the title.
+        - relative periods count back from today: use CURRENT_DATE, never a literal date, so the chart moves forward when it is refreshed. Weeks start on Monday. Name the period in words in the title ("Orders, Last 30 Days"), never the computed dates:
+          - "last 30 days" (the 30 days ending today): CAST("col" AS DATE) > CURRENT_DATE - 30 AND CAST("col" AS DATE) <= CURRENT_DATE
+          - "this month", "month to date", "so far" (up to today): "col" >= date_trunc('month', CURRENT_DATE) AND CAST("col" AS DATE) <= CURRENT_DATE
+          - "last month", "previous month" (the previous full month): "col" >= date_trunc('month', CURRENT_DATE) - INTERVAL 1 MONTH AND "col" < date_trunc('month', CURRENT_DATE)
+          - "last 6 months" (the 6 full months before this one): "col" >= date_trunc('month', CURRENT_DATE) - INTERVAL 6 MONTH AND "col" < date_trunc('month', CURRENT_DATE)
+          - weeks, quarters and years work the same way: 'week' with INTERVAL n WEEK, 'quarter' with INTERVAL 3n MONTH, 'year' with INTERVAL n YEAR;
     11. Rankings and latest rows: ORDER BY ... LIMIT n for a top or bottom n. Window functions such as row_number(), rank(), lag() and SUM(...) OVER (ORDER BY ...) give ranks, previous values and running totals; QUALIFY filters on them, for example QUALIFY row_number() OVER (PARTITION BY "customer_id" ORDER BY "order_date" DESC, "order_id" DESC) = 1 keeps each customer's latest row.
     12. Text and lists: lower(), upper(), trim(), ||, split_part("col", '-', 1), regexp_extract("col", 'pattern'), string_agg("col", ', '), length(); len(list), list_contains(list, value), and unnest(list) only in the SELECT list.
     13. Do not use PIVOT or UNPIVOT. Return long-form rows; the backend spreads them with the series, rows and columns roles. Put several measures side by side as one column each, or stack them in one column with UNION ALL.
@@ -3123,7 +3128,12 @@ sqlChartRepairPrompt: |
         - differences and offsets: date_diff('day', "start_col", "end_col"), "col" + INTERVAL 30 DAY;
         - a year: "col" >= DATE '2024-01-01' AND "col" < DATE '2025-01-01';
         - missing periods: for counts and sums, list every period in a CTE with SELECT unnest(generate_series(start, end, INTERVAL 1 MONTH)), LEFT JOIN the data to it and COALESCE the measure to 0 (with a series, CROSS JOIN the periods with the series values first). Averages stay NULL;
-        - relative periods ("last 30 days", "last quarter", "this year") count back from the latest date in the data, not from today, because uploaded data is often historical: "col" > (SELECT MAX("col") FROM "orders") - INTERVAL 30 DAY. Name the period in the title.
+        - relative periods count back from today: use CURRENT_DATE, never a literal date, so the chart moves forward when it is refreshed. Weeks start on Monday. Name the period in words in the title ("Orders, Last 30 Days"), never the computed dates:
+          - "last 30 days" (the 30 days ending today): CAST("col" AS DATE) > CURRENT_DATE - 30 AND CAST("col" AS DATE) <= CURRENT_DATE
+          - "this month", "month to date", "so far" (up to today): "col" >= date_trunc('month', CURRENT_DATE) AND CAST("col" AS DATE) <= CURRENT_DATE
+          - "last month", "previous month" (the previous full month): "col" >= date_trunc('month', CURRENT_DATE) - INTERVAL 1 MONTH AND "col" < date_trunc('month', CURRENT_DATE)
+          - "last 6 months" (the 6 full months before this one): "col" >= date_trunc('month', CURRENT_DATE) - INTERVAL 6 MONTH AND "col" < date_trunc('month', CURRENT_DATE)
+          - weeks, quarters and years work the same way: 'week' with INTERVAL n WEEK, 'quarter' with INTERVAL 3n MONTH, 'year' with INTERVAL n YEAR;
     11. Rankings and latest rows: ORDER BY ... LIMIT n for a top or bottom n. Window functions such as row_number(), rank(), lag() and SUM(...) OVER (ORDER BY ...) give ranks, previous values and running totals; QUALIFY filters on them, for example QUALIFY row_number() OVER (PARTITION BY "customer_id" ORDER BY "order_date" DESC, "order_id" DESC) = 1 keeps each customer's latest row.
     12. Text and lists: lower(), upper(), trim(), ||, split_part("col", '-', 1), regexp_extract("col", 'pattern'), string_agg("col", ', '), length(); len(list), list_contains(list, value), and unnest(list) only in the SELECT list.
     13. Do not use PIVOT or UNPIVOT. Return long-form rows; the backend spreads them with the series, rows and columns roles. Put several measures side by side as one column each, or stack them in one column with UNION ALL.

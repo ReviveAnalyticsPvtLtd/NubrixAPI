@@ -587,6 +587,79 @@ def test_seriesOrderByTotalRunsAndPutsTheBiggestCategoryFirst():
     assert order != sorted(order)  # the total order is not the alphabetical one on this data
 
 
+PINNED_TODAY = datetime.date(2024, 5, 15)  # a Wednesday
+D = datetime.date
+
+# (phrase whose rule line gives the expression, date_trunc unit, count, first day, last day) with today pinned.
+RELATIVE_PERIODS = [
+    ("last 30 days", None, None, D(2024, 4, 16), D(2024, 5, 15)),
+    ("this month", "month", 1, D(2024, 5, 1), D(2024, 5, 15)),
+    ("this month", "week", 1, D(2024, 5, 13), D(2024, 5, 15)),
+    ("this month", "quarter", 1, D(2024, 4, 1), D(2024, 5, 15)),
+    ("this month", "year", 1, D(2024, 1, 1), D(2024, 5, 15)),
+    ("last month", "month", 1, D(2024, 4, 1), D(2024, 4, 30)),
+    ("last month", "week", 1, D(2024, 5, 6), D(2024, 5, 12)),
+    ("last month", "quarter", 1, D(2024, 1, 1), D(2024, 3, 31)),
+    ("last month", "year", 1, D(2023, 1, 1), D(2023, 12, 31)),
+    ("last 6 months", "month", 6, D(2023, 11, 1), D(2024, 4, 30)),
+    ("last 6 months", "week", 4, D(2024, 4, 15), D(2024, 5, 12)),
+    ("last 6 months", "quarter", 2, D(2023, 10, 1), D(2024, 3, 31)),
+    ("last 6 months", "year", 3, D(2021, 1, 1), D(2023, 12, 31)),
+]
+
+
+def _periodRule(phrase: str) -> str:
+    """The SQL condition the prompt's rule line gives for a relative-period phrase."""
+    text = _formatted("sqlChartGeneratorPrompt")
+    match = re.search(r'^\s*- "' + re.escape(phrase) + r'"[^\n]*?\): (.+)$', text, flags=re.MULTILINE)
+    assert match, phrase
+    return match.group(1).strip()
+
+
+def _periodCondition(phrase: str, unit: str | None, count: int | None) -> str:
+    """The rule's condition for one unit, built the way the rule says (week, quarter = 3 months, year)."""
+    condition = _periodRule(phrase)
+    if unit is None or unit == "month":
+        return condition.replace("INTERVAL 6 MONTH", f"INTERVAL {count} MONTH") if count else condition
+    sizes = {"week": (1, "WEEK"), "quarter": (3, "MONTH"), "year": (1, "YEAR")}
+    multiple, name = sizes[unit]
+    condition = condition.replace("'month'", f"'{unit}'")
+    return re.sub(r"INTERVAL \d+ MONTH", f"INTERVAL {count * multiple} {name}", condition)
+
+
+@pytest.mark.parametrize(("phrase", "unit", "count", "first", "last"), RELATIVE_PERIODS)
+def test_relativePeriodsCountBackFromToday(phrase, unit, count, first, last):
+    condition = _periodCondition(phrase, unit, count)
+    # Today comes from the database at run time, so a refreshed chart moves forward.
+    assert "CURRENT_DATE" in condition
+    assert re.search(r"DATE '\d", condition) is None
+
+    onOrders = condition.replace('"col"', '"order_date"')
+    checkSql(f'SELECT COUNT(*) AS order_count FROM "orders" WHERE {onOrders}', EXAMPLE_SCHEMAS)
+
+    pinned = condition.replace("CURRENT_DATE", f"DATE '{PINNED_TODAY.isoformat()}'")
+    days = "unnest(generate_series(DATE '2020-01-01', DATE '2025-12-31', INTERVAL 1 DAY))"
+    for column in (f"CAST({days} AS DATE)", f"{days} + INTERVAL 23 HOUR + INTERVAL 30 MINUTE", f"CAST({days} AS TIMESTAMP)"):
+        sql = f'WITH t AS (SELECT {column} AS "col") SELECT MIN(CAST("col" AS DATE)), MAX(CAST("col" AS DATE)) FROM t WHERE {pinned}'
+        assert _query(sql, {}) == [(first, last)], (phrase, unit, column)
+
+
+@pytest.mark.parametrize("key", sorted(NEW_PROMPTS))
+def test_noPromptAnchorsPeriodsOnTheData(key):
+    text = _prompts()[key]
+
+    assert "latest date" not in text and "latest 'order_date'" not in text
+    assert "count back from today" in text
+
+
+@pytest.mark.parametrize("key", ["sqlChartGeneratorPrompt", "sqlChartRepairPrompt"])
+def test_relativePeriodTitlesNameThePeriodNotDates(key):
+    text = _formatted(key)
+
+    assert "Weeks start on Monday" in text
+    assert "never the computed dates" in text
+
+
 @pytest.mark.parametrize("key", ["sqlChartGeneratorPrompt", "sqlChartRepairPrompt"])
 def test_chartPromptsCarryTheEncodingTable(key):
     assert ENCODING_TABLE in _formatted(key)
