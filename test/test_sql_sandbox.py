@@ -152,7 +152,23 @@ def test_lockDownRefusesWritesAndSettingChangesEvenWithoutTheCheck(orders, tmp_p
     reply, _ = _run(_request(template.format(out=out)))
 
     assert reply["ok"] is False
+    assert reply["stage"] == "bind"
     assert not [name for name in os.listdir(tmp_path) if name.startswith("out")]
+
+
+def test_configureLocksExternalAccessAndConfiguration(tmp_path):
+    """Unit: after `_configure`, unlocking or turning external access back on must raise (fails if `_configure` is skipped)."""
+    import duckdb
+
+    from utils.sql_launcher import _configure
+
+    con = duckdb.connect(":memory:")
+    _configure(con, currentRunLimits(threads=0, maxRunMemory=0, maxDiskBytes=0), str(tmp_path / "duckdb-tmp"))
+
+    with pytest.raises(duckdb.Error):
+        con.execute("SET enable_external_access=true")
+    with pytest.raises(duckdb.Error):
+        con.execute("SET lock_configuration=false")
 
 
 def test_externalAccessStaysOffAndTheConfigurationLocked(storage):
@@ -202,6 +218,27 @@ def test_moreThanOneStatementIsRefused(orders):
 
     assert reply["ok"] is False
     assert reply["stage"] == "bind"
+    assert reply["message"] == "Write exactly one SELECT statement."
+
+
+def test_selectThenCopyIsRefusedAtBind(orders, tmp_path):
+    out = (tmp_path / "out.csv").as_posix()
+
+    reply, _ = _run(_request(f"SELECT 1; COPY (SELECT 1) TO '{out}'"))
+
+    assert reply == {"ok": False, "stage": "bind", "message": "Write exactly one SELECT statement."}
+    assert not os.path.exists(out)
+
+
+def test_dynamicPivotRuns(storage):
+    _putTable(storage, "sales", pa.table({"c": ["a", "b", "a"], "v": [1, 2, 3]}))
+
+    reply, table = _run(_request("SELECT * FROM (PIVOT sales ON c USING sum(v))", tables=["sales"]))
+
+    assert reply["ok"] is True
+    assert reply["truncated"] is False
+    assert table.num_rows == 1
+    assert table.to_pylist() == [{"a": 4, "b": 2}]
 
 
 def test_trailingSemicolonAndCommentRun(orders):
@@ -362,6 +399,27 @@ def test_runChartQueryReturnsTheTableAndTheTruncationFlag(storage):
 @separateUids
 def test_underSeccomp(orders):
     assert currentRunLimits().blockNetwork is True
+
+    reply, table = _run(_request("SELECT state, sum(amount) AS total FROM orders GROUP BY state ORDER BY state"))
+
+    assert reply == {"ok": True, "truncated": False, "rows": 3}
+    assert table.column("total").to_pylist() == [60, 90, 60]
+    assert _liveRunUidProcesses() == []
+
+
+@separateUids
+def test_duckdbThreadPoolFitsUnderATightProcessLimit(orders, monkeypatch):
+    """Connect-time threads must be capped: a CPU-sized pool would exceed NPROC; the run's capped pool must fit."""
+    threads = 2
+    cpus = os.cpu_count() or 1
+    # Room for the process and the other capped pools (Arrow etc.); still below a CPU-sized DuckDB pool.
+    # Measured on the image: capped needs threads+9; plain connect peaks near `cpus` workers before SET threads.
+    overhead = 9
+    maxProcesses = threads + overhead
+    if cpus <= maxProcesses:
+        pytest.skip("os.cpu_count() is too small to tell a CPU-sized DuckDB pool from the capped one")
+    monkeypatch.setenv("SANDBOX_RUN_THREADS", str(threads))
+    monkeypatch.setenv("SANDBOX_MAX_RUN_PROCESSES", str(maxProcesses))
 
     reply, table = _run(_request("SELECT state, sum(amount) AS total FROM orders GROUP BY state ORDER BY state"))
 

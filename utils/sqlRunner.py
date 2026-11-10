@@ -43,6 +43,13 @@ def _firstLine(text: str) -> str:
     return next((line.strip() for line in text.splitlines() if line.strip()), "")
 
 
+def _unreadable(result: SandboxResult) -> str:
+    """What to tell the model when stdout had no usable reply; keep the first stderr line when present."""
+    message = "The query run returned no readable answer."
+    detail = _firstLine(result.stderr)
+    return f"{message} {detail}" if detail else message
+
+
 def _reply(result: SandboxResult) -> dict:
     """The one JSON line the launcher printed, or a ChartRunError when it printed none."""
     lines = [line for line in result.stdout.splitlines() if line.strip()]
@@ -51,9 +58,9 @@ def _reply(result: SandboxResult) -> dict:
     except ValueError:
         reply = None
     if not isinstance(reply, dict) or not isinstance(reply.get("ok"), bool):
-        raise ChartRunError("run", "The query run returned no readable answer.")
+        raise ChartRunError("run", _unreadable(result))
     if not reply["ok"] and (reply.get("stage") not in _REPLY_STAGES or not isinstance(reply.get("message"), str)):
-        raise ChartRunError("run", "The query run returned no readable answer.")
+        raise ChartRunError("run", _unreadable(result))
     return reply
 
 

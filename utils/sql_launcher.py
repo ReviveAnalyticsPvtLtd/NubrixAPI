@@ -72,13 +72,33 @@ def _configure(con: duckdb.DuckDBPyConnection, limits: RunLimits, tempFolder: st
     con.execute("SET lock_configuration=true")
 
 
-def _bindFailure(con: duckdb.DuckDBPyConnection, sql: str, requiredColumns: list[str]) -> str | None:
-    """Bind the query without running it. Returns why it can't be run, or None."""
+def _selectStatements(con: duckdb.DuckDBPyConnection, sql: str) -> list | str:
+    """The CREATE* + final SELECT DuckDB split the text into, or a bind-failure message.
+
+    A connection runs every statement it is given, so anything except leading CREATEs (DuckDB's own
+    dynamic-PIVOT expansion) followed by one SELECT is refused before any of it runs.
+    """
+    statements = list(con.extract_statements(sql))
+    if (
+        not statements
+        or statements[-1].type != duckdb.StatementType.SELECT
+        or any(statement.type != duckdb.StatementType.CREATE for statement in statements[:-1])
+    ):
+        return "Write exactly one SELECT statement."
+    return statements
+
+
+def _bindFailure(con: duckdb.DuckDBPyConnection, statements: list, requiredColumns: list[str]) -> str | None:
+    """Run leading CREATEs once, then bind the final SELECT without fetching rows. Returns why it can't be run, or None."""
     try:
-        # A connection runs every statement it is given, so more than one is refused before any is described.
-        if len(con.extract_statements(sql)) != 1:
-            return "Write exactly one SELECT statement."
-        columns = [row[0] for row in con.execute("DESCRIBE " + sql).fetchall()]
+        for statement in statements[:-1]:
+            con.execute(statement)
+        select = statements[-1]
+        if select.query:
+            columns = [row[0] for row in con.execute("DESCRIBE " + select.query).fetchall()]
+        else:
+            # Dynamic PIVOT's rewritten SELECT has no query text; columns come from the bound relation.
+            columns = list(con.sql(select).columns)
     except duckdb.Error as error:
         return str(error)
     for name in requiredColumns:
@@ -87,9 +107,9 @@ def _bindFailure(con: duckdb.DuckDBPyConnection, sql: str, requiredColumns: list
     return None
 
 
-def _runQuery(con: duckdb.DuckDBPyConnection, sql: str, rowLimit: int) -> tuple[pa.Table, bool]:
-    """Run the query for at most rowLimit + 1 rows; the extra row only says there were more."""
-    table = con.sql(sql).limit(rowLimit + 1).fetch_arrow_table()
+def _runQuery(con: duckdb.DuckDBPyConnection, select, rowLimit: int) -> tuple[pa.Table, bool]:
+    """Run the final SELECT for at most rowLimit + 1 rows; the extra row only says there were more."""
+    table = con.sql(select).limit(rowLimit + 1).fetch_arrow_table()
     if table.num_rows > rowLimit:
         return table.slice(0, rowLimit), True
     return table, False
@@ -118,7 +138,13 @@ def main() -> None:
 
     enterSandbox(channel)
     limits = RunLimits.fromChannel(channel["limits"])
-    con = duckdb.connect(":memory:")
+    # Size the pool at connect time: SET threads afterwards does not shrink a CPU-sized pool, and each
+    # worker counts against RLIMIT_NPROC. Omit config when threads is 0 (DuckDB rejects config=None).
+    con = (
+        duckdb.connect(":memory:", config={"threads": limits.threads})
+        if limits.threads > 0
+        else duckdb.connect(":memory:")
+    )
     try:
         for name in tables:
             # The exact name the project gives it, so DuckDB's own case rules decide what the query's text matches.
@@ -128,12 +154,16 @@ def main() -> None:
         return
     _configure(con, limits, os.path.join(os.path.dirname(resultPath), "duckdb-tmp"))
 
-    problem = _bindFailure(con, sql, requiredColumns)
+    statements = _selectStatements(con, sql)
+    if isinstance(statements, str):
+        _failure("bind", statements)
+        return
+    problem = _bindFailure(con, statements, requiredColumns)
     if problem is not None:
         _failure("bind", problem)
         return
     try:
-        table, truncated = _runQuery(con, sql, rowLimit)
+        table, truncated = _runQuery(con, statements[-1], rowLimit)
     except (duckdb.Error, pa.ArrowException) as error:
         _failure("run", str(error))
         return

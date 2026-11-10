@@ -541,7 +541,7 @@ def runSandbox(launcherName: str, projectId: str, code: str, timeoutSeconds: int
 
 
 def runSqlSandbox(projectId: str, request: dict, timeoutSeconds: int, slotWaitSeconds: float | None = None) -> SandboxResult:
-    """Run one checked SQL query in `sql_launcher.py`, which writes an Arrow stream the parent reads up to the cap.
+    """Run one checked SQL query in `sql_launcher.py`, which writes an Arrow IPC file the parent reads up to the cap.
 
     The child asks for its tables over the table channel. `slotWaitSeconds` overrides the slot wait (0 tries once).
     Raises SandboxBusyError when no slot is free and ResultTooLargeError when the result is over the cap.

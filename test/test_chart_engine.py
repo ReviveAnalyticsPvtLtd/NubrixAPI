@@ -95,9 +95,10 @@ def test_tablesAreSentWithTheirProjectNames():
 def test_truncationReachesTheBuilder():
     table = pa.table({"state": [f"label{n}" for n in range(8)], "total": list(range(8))})
 
-    chart = renderChartRequest(_Manager(_success(table, truncated=True)), PROJECT, _bar(), TABLES, lenient=True)
+    failure = _failure(_Manager(_success(table, truncated=True)), _bar(), lenient=False)
 
-    assert len(chart["data"]["labels"]) == 8
+    assert failure.stage == "build"
+    assert "more rows" in failure.message
 
 
 def test_lenientIsPassedToTheBuilder():
@@ -179,6 +180,14 @@ def test_missingOrGarbledReplyIsARunFailure(stdout):
     failure = _failure(_Manager(SandboxResult(stdout, "", 0, None)), _bar())
 
     assert failure.stage == "run"
+    assert failure.message == "The query run returned no readable answer."
+
+
+def test_missingOrGarbledReplyIncludesTheFirstStderrLine():
+    failure = _failure(_Manager(SandboxResult("not json\n", "\nOSError: disk gone\nTraceback ...\n", 0, None)), _bar())
+
+    assert failure.stage == "run"
+    assert failure.message == "The query run returned no readable answer. OSError: disk gone"
 
 
 def test_successWithoutAResultFileIsARunFailure():
