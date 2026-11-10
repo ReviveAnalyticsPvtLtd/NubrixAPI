@@ -283,3 +283,15 @@ def test_unexpectedRunErrorEndsAsAnErrorWithoutRepair(harness, error):
     assert len(records) == 1
     assert records[0]["stage"] == "run" and records[0]["errorClass"] == type(error).__name__
     assert "Secret Corp" not in harness.logs[0] and "uid" not in harness.logs[0]
+
+
+def test_lastValidRequestSurvivesInvalidRepairs(harness):
+    harness.render.side_effect = ChartFailure("run", "Binder Error: nope")
+    harness.repair.invoke.side_effect = ["not json 1", "not json 2"]
+    state = harness.run()
+    assert decodeGeneratedCode(state["generatedCode"]).sql == REQUEST["sql"]
+    records = harness.failureRecords()
+    assert len(records) == 1 and records[0]["stage"] == "model" and records[0]["chartType"] == "bar"
+    second = harness.repair.invoke.call_args_list[1].args[0]
+    assert json.loads(second["previous_request"])["sql"] == REQUEST["sql"]
+    assert second["error"].startswith("The reply is not a valid chart request")

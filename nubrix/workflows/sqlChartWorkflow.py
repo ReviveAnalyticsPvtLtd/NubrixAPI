@@ -61,6 +61,8 @@ class State(OutputState, total=False):
     """The response keys plus the internal state that never reaches the response."""
 
     chartRequest: dict | None
+    # The last request the model produced that validated, kept through later invalid replies.
+    lastRequest: dict | None
     chart: dict | None
     # {stage, message, error, repairable?}: `error` is the exception behind the failure, kept for the failure log.
     failure: dict | None
@@ -163,7 +165,8 @@ class SqlChartWorkflow:
             request = ChartRequest.model_validate_json(_cleanModelText(text))
         except ValidationError as error:
             return {"rawText": text, "chartRequest": None, "chart": None, "failure": {"stage": "model", "message": "", "error": _modelFailure(error)}}
-        return {"rawText": text, "chartRequest": request.model_dump(exclude_none=True), "chart": None, "failure": None}
+        valid = request.model_dump(exclude_none=True)
+        return {"rawText": text, "chartRequest": valid, "lastRequest": valid, "chart": None, "failure": None}
 
     @staticmethod
     def _withMessage(update: dict) -> dict:
@@ -179,7 +182,7 @@ class SqlChartWorkflow:
         return self._withMessage(self._parse(str(text)))
 
     def _repair(self, state: State, config: RunnableConfig):
-        previous = json.dumps(state["chartRequest"], ensure_ascii=False) if state.get("chartRequest") else state.get("rawText", "")
+        previous = json.dumps(state["lastRequest"], ensure_ascii=False) if state.get("lastRequest") else state.get("rawText", "")
         text = self.repairChain.invoke(
             {
                 "question": state["inputQuery"],
@@ -246,13 +249,13 @@ class SqlChartWorkflow:
             doubt = self._doubtOf(state) or "Query could not be processed."
             return {"finalOutput": {"response": doubt}}
 
-        chartRequest = state.get("chartRequest")
+        lastRequest = state.get("lastRequest")
         logChartFailure(
             stage=failure["stage"],
             error=failure["error"],
             traceId=traceIdOf({"callbacks": _callbackHandlers(config)}),
             projectId=state["projectId"],
-            chartType=chartRequest["chartType"] if chartRequest else None,
+            chartType=lastRequest["chartType"] if lastRequest else None,
             repairs=state.get("debugAttempts", 0),
             shadow=_isShadow(config),
             tableNames=state.get("tables"),
@@ -267,9 +270,9 @@ class SqlChartWorkflow:
 
     @staticmethod
     def _generatedCode(state: State) -> str:
-        """The request when the model produced a valid one, else its raw text, which the data endpoint treats as failing code."""
-        if state.get("chartRequest"):
-            return encodeGeneratedCode(ChartRequest.model_validate(state["chartRequest"]))
+        """The last valid request the model produced; its latest raw text only when it never produced one (the data endpoint runs that as failing code)."""
+        if state.get("lastRequest"):
+            return encodeGeneratedCode(ChartRequest.model_validate(state["lastRequest"]))
         return state.get("rawText", "")
 
     def createWorkflow(self):
