@@ -173,7 +173,7 @@ def _requireNumeric(table: pa.Table, names: list[str], fix: str) -> None:
         if not (numeric or pa.types.is_null(kind)):
             raise ChartBuildError(
                 f"Column '{name}' has type {kind} but must be numeric. {fix}",
-                logMessage=f"A column has type {kind} but must be numeric. {fix}",
+                logMessage=f"A column is not numeric. {fix}",
             )
 
 

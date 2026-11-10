@@ -18,13 +18,14 @@ _MAX_ERROR_CHARACTERS = 300
 #      (DuckDB echoes values and SQL literals inside double quotes as well as identifiers);
 #   2. a single-quoted literal becomes '?'. DuckDB prints the raw value, so a quote closes the literal only when
 #      it is not followed by a word character ('D'Souza' is one literal; '' is an escaped quote). A literal that
-#      never closes is redacted to the end of the line. An apostrophe right after a letter, as in "can't", is a
-#      contraction and opens nothing;
+#      never closes is redacted to the end of the line. An apostrophe right after a letter is a contraction, and
+#      opens nothing, only when it is followed by s, t, d, m, re, ve or ll and a word boundary ("can't", "it's");
+#      otherwise it opens a literal (E'..', x'..', b'..', LIKE'..');
 #   3. any other word-like token (joined parts such as 12.5, 2024-13-01, 10:30:00, UUIDs, 0xFF, 5kg) that contains
 #      a digit becomes ?, unless it is a DuckDB type name such as INT32 or FLOAT8.
 _REDACT = re.compile(
     r'(?P<identifier>"(?:[^"]|"")*"|"[^"]*$)'
-    r"|(?P<literal>(?<![A-Za-z])(?:'(?:''|'(?=\w)|[^'])*'(?!\w)|'.*$))"
+    r"|(?P<literal>(?:(?<![A-Za-z])|(?!'(?i:s|t|d|m|re|ve|ll)\b))(?:'(?:''|'(?=\w)|[^'])*'(?!\w)|'.*$))"
     r"|(?P<token>\w+(?:[.:/+\-]\w+)*)"
 )
 _TYPE_NAME = re.compile(r"U?(?:TINY|SMALL|BIG|HUGE)?INT(?:1|2|4|8|16|32|64|128)?|FLOAT[48]")

@@ -212,3 +212,40 @@ def test_logMessageIsStillRedacted(records):
 
     error = ChartBuildError("full", logMessage="x 'Alice' and 42")
     assert logOne(records, error)["error"] == "x '?' and ?"
+
+
+@pytest.mark.parametrize(
+    "message, secret",
+    [
+        ("near E'secret' here", "secret"),
+        ("near x'Smith' here", "Smith"),
+        ("near b'abc' here", "abc"),
+        ("near LIKE'%Smith%' here", "Smith"),
+        ("near N'Jones' here", "Jones"),
+    ],
+)
+def test_failureLogRedactsLiteralsGluedToALetter(records, message, secret):
+    error = logOne(records, message)["error"]
+    assert secret not in error
+    assert "'?'" in error
+
+
+@pytest.mark.parametrize(
+    "message",
+    ["can't cast this", "doesn't match", "it's wrong", "they're missing", "we've seen I'm sure", "you'll see", "he'd go", "Can't Stop"],
+)
+def test_failureLogKeepsContractions(records, message):
+    assert logOne(records, message)["error"] == message
+
+
+def test_requireNumericLogMessageNamesNoStructFields():
+    import pyarrow as pa
+
+    from nubrix.components.chartBuilder import ChartBuildError, buildChart
+    from nubrix.components.chartRequest import ChartRequest
+
+    request = ChartRequest(chartType="bar", title="t", sql="SELECT 1", encoding={"x": "a", "y": "b"})
+    table = pa.table({"a": ["x"], "b": [{"SecretField": 1}]})
+    with pytest.raises(ChartBuildError) as caught:
+        buildChart(request, table)
+    assert "SecretField" not in caught.value.logMessage
