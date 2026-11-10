@@ -267,14 +267,23 @@ def _unreadableMetadata(monkeypatch, service_module_name="api.services.dashboard
 
 
 @pytest.fixture
-def logLines():
-    """Messages the app logs (loguru does not reach pytest's caplog)."""
-    from utils.logger import logger
+def logLines(monkeypatch):
+    """Messages the service logs. Loguru does not reach caplog, and other tests replace `utils.logger.logger`."""
+    from api.services import dashboardService as module
 
-    lines: list[str] = []
-    sinkId = logger.add(lambda message: lines.append(message.record["message"]), level="WARNING")
-    yield lines
-    logger.remove(sinkId)
+    class Recorder:
+        def __init__(self):
+            self.lines: list[str] = []
+
+        def warning(self, message, *args, **kwargs):
+            self.lines.append(str(message))
+
+        def __getattr__(self, name):
+            return lambda *args, **kwargs: None
+
+    recorder = Recorder()
+    monkeypatch.setattr(module, "logger", recorder)
+    return recorder.lines
 
 
 def test_unreadableMetadataFailsOnlyTheChartRequestWidgetsUnderAFilter(monkeypatch, logLines):
