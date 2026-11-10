@@ -32,6 +32,7 @@ from api.models import (
     CreatePage,
     GetData
 )
+import builtins
 import pandas as pd
 import tempfile
 import uuid
@@ -52,6 +53,36 @@ class _RerunFailure(Exception):
         self.kind = kind
 
 
+_EXCEPTION_SUFFIXES = ("Error", "Exception", "Warning", "Exit", "Interrupt")
+
+
+def _exceptionClass(traceback: str) -> str:
+    """
+    The exception class of a Python traceback, or "unknown exception". Never any message text.
+
+    The exception line is the first line without leading whitespace after the last `  File "` frame line (source
+    and caret lines are indented); the message may continue on later lines, which can hold data values. The dotted
+    name at its start counts only when `:` or the end of the line follows it, and it looks like an exception class.
+    """
+    lines = traceback.splitlines()
+    frames = [index for index, line in enumerate(lines) if line.startswith('  File "')]
+    if not frames:
+        return "unknown exception"
+    for line in lines[frames[-1] + 1:]:
+        if not line or line[0].isspace():
+            continue
+        match = re.match(r"([A-Za-z_]\w*(?:\.[A-Za-z_]\w*)*)(?::|$)", line.rstrip())
+        if match is None:
+            return "unknown exception"
+        name = match.group(1)
+        last = name.rsplit(".", 1)[-1]
+        builtin = getattr(builtins, last, None) if "." not in name else None
+        if last.endswith(_EXCEPTION_SUFFIXES) or (isinstance(builtin, type) and issubclass(builtin, BaseException)):
+            return name
+        return "unknown exception"
+    return "unknown exception"
+
+
 def _pythonResult(output: str) -> dict:
     """The chart dict a saved Python widget printed, or `_RerunFailure` naming only the kind of failure."""
     try:
@@ -63,9 +94,7 @@ def _pythonResult(output: str) -> dict:
         if text.startswith("Concurrency limit reached"):
             raise _RerunFailure("concurrency limit")
         if text.startswith("Traceback"):
-            # Only the exception class: the message after the first ":" can hold data values.
-            match = re.match(r"[A-Za-z_][\w.]*", text.splitlines()[-1].strip())
-            raise _RerunFailure(match.group(0) if match else "unknown exception")
+            raise _RerunFailure(_exceptionClass(text))
         raise _RerunFailure("not JSON")
     if isinstance(result, dict) and "error" in result:
         raise _RerunFailure("error key")

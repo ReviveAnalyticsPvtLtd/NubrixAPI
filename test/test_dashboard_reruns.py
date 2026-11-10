@@ -484,3 +484,91 @@ def test_refreshOfAChartRequestWidgetSavesOnlyChartKeys(monkeypatch):
     assert saved["data"] == "new" and saved["note"] == "n"
     assert "sql" not in saved and "extra" not in saved
     assert page["widgets"][0] == saved
+
+
+def _traceback(raiser) -> str:
+    import traceback
+
+    try:
+        raiser()
+    except Exception:
+        return traceback.format_exc()
+    raise AssertionError("did not raise")
+
+
+def _loggedKind(monkeypatch, logLines, output) -> str:
+    service, _, _ = _setup(monkeypatch, [_widget("K1")], run=lambda code, projectId=None, filters=None: output)
+    service.getData(GetData(projectId="p1", page="pg", refresh=True))
+    (line,) = _failureLines(logLines, "K1")
+    return line.split("(python): ", 1)[1]
+
+
+def test_multiLineValueErrorLogsOnlyTheClass(monkeypatch, logLines):
+    def raiser():
+        raise ValueError("bad row\nAlice_Smith owes 4242")
+
+    kind = _loggedKind(monkeypatch, logLines, _traceback(raiser))
+
+    assert kind == "ValueError"
+    assert not any("Alice_Smith" in line or "4242" in line for line in logLines)
+
+
+def test_polarsColumnNotFoundLogsItsDottedClass(monkeypatch, logLines):
+    import polars as pl
+
+    def raiser():
+        pl.DataFrame({"a": [1]}).select("nope_secret")
+
+    text = _traceback(raiser)
+    assert text.rstrip().splitlines()[-1] != text.rstrip().splitlines()[0]
+
+    assert _loggedKind(monkeypatch, logLines, text) == "polars.exceptions.ColumnNotFoundError"
+    assert not any("nope_secret" in line for line in logLines)
+
+
+def test_polarsMultiLineCastErrorLogsItsClass(monkeypatch, logLines):
+    import polars as pl
+
+    def raiser():
+        pl.DataFrame({"v": ["x_secret"]}).select(pl.col("v").cast(pl.Int64))
+
+    kind = _loggedKind(monkeypatch, logLines, _traceback(raiser))
+
+    assert kind.startswith("polars.exceptions.") and kind.endswith("Error")
+    assert not any("x_secret" in line for line in logLines)
+
+
+def test_chainedExceptionLogsTheFinalClass(monkeypatch, logLines):
+    def raiser():
+        try:
+            raise KeyError("first_secret")
+        except KeyError:
+            raise RuntimeError("second_secret")
+
+    text = _traceback(raiser)
+    assert "During handling of the above exception" in text
+
+    assert _loggedKind(monkeypatch, logLines, text) == "RuntimeError"
+    assert not any("secret" in line for line in logLines)
+
+
+@pytest.mark.parametrize("tail", [
+    "Alice_Smith owes 4242",
+    "\tcol(\"v\").strict_cast(Int64)",
+    "revenue: 4242",
+    "secret_thing",
+    "secret.module.Thing: message",
+    "",
+])
+def test_garbageAfterTheFrameLogsUnknownException(monkeypatch, logLines, tail):
+    text = 'Traceback (most recent call last):\n  File "x", line 1, in <module>\n    boom()\n' + tail
+
+    kind = _loggedKind(monkeypatch, logLines, text)
+
+    assert kind == "unknown exception"
+    assert not any("Alice" in line or "secret" in line or "4242" in line or "revenue" in line for line in logLines)
+
+
+def test_exceptionWithoutMessageAndBuiltinNamesAreAccepted(monkeypatch, logLines):
+    text = 'Traceback (most recent call last):\n  File "x", line 1, in <module>\nStopIteration'
+    assert _loggedKind(monkeypatch, logLines, text) == "StopIteration"
