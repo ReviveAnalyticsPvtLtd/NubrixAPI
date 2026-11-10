@@ -443,3 +443,44 @@ def test_refreshUploadsNothingWhenEverySucceededWidgetWasDeleted(monkeypatch):
     service.getData(GetData(projectId="p1", page="pg", refresh=True))
 
     service.client.storage.from_.assert_not_called()
+
+
+def test_refreshSavesEveryKeyAPythonWidgetReturnsAndTheResponseMatches(monkeypatch):
+    output = {"data": "new", "options": {"x": 1}, "id": "other", "layout": {"x": 99}, "generatedCode": "evil"}
+    service, _, _ = _setup(monkeypatch, [_widget("A")], run=lambda code, projectId=None, filters=None: json.dumps(output))
+    _secondReadDiffers(monkeypatch, service, [_widget("A")])
+
+    page = service.getData(GetData(projectId="p1", page="pg", refresh=True))
+
+    saved = _uploaded(service)["pg"]["widgets"][0]
+    assert saved["options"] == {"x": 1} and saved["data"] == "new"
+    assert saved["id"] == "A" and saved["layout"] == {"x": 1} and saved["generatedCode"] == PYTHON
+    assert page["widgets"][0] == saved
+    assert page["widgets"] == _uploaded(service)["pg"]["widgets"]
+
+
+def test_refreshKeepsANonOutputKeyEditedDuringTheRuns(monkeypatch):
+    service, _, _ = _setup(monkeypatch, [_widget("A", note="stale")])
+    _secondReadDiffers(monkeypatch, service, [_widget("A", note="edited meanwhile", title="Renamed")])
+
+    page = service.getData(GetData(projectId="p1", page="pg", refresh=True))
+
+    saved = _uploaded(service)["pg"]["widgets"][0]
+    assert saved["note"] == "edited meanwhile"
+    assert saved["data"] == "new"
+    assert page["widgets"][0]["note"] == "edited meanwhile"
+
+
+def test_refreshOfAChartRequestWidgetSavesOnlyChartKeys(monkeypatch):
+    service, _, _ = _setup(
+        monkeypatch, [_widget("R", _request(), "bar", note="n")],
+        render=lambda *a, **k: {"chartType": "bar", "title": "t", "data": "new", "sql": "select 1", "extra": 1},
+    )
+    _secondReadDiffers(monkeypatch, service, [_widget("R", _request(), "bar", note="n")])
+
+    page = service.getData(GetData(projectId="p1", page="pg", refresh=True))
+
+    saved = _uploaded(service)["pg"]["widgets"][0]
+    assert saved["data"] == "new" and saved["note"] == "n"
+    assert "sql" not in saved and "extra" not in saved
+    assert page["widgets"][0] == saved

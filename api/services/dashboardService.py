@@ -90,6 +90,12 @@ class DashboardService:
 
     @staticmethod
     def _rerunWidget(widget: dict, filters: list | None, projectId: str, activeTables: frozenset[str] | None) -> tuple[dict, bool]:
+        """Re-run one saved widget; see `_rerunWidgetProduced`. Returns the widget copy and whether the run succeeded."""
+        fresh, produced = DashboardService._rerunWidgetProduced(widget, filters, projectId, activeTables)
+        return fresh, produced is not None
+
+    @staticmethod
+    def _rerunWidgetProduced(widget: dict, filters: list | None, projectId: str, activeTables: frozenset[str] | None) -> tuple[dict, dict | None]:
         """
         Re-run one saved widget in its own form and return a copy with the new chart data.
 
@@ -104,8 +110,10 @@ class DashboardService:
                 list could not be read, so a ChartRequest widget fails (a Python widget does not need it).
 
         Returns:
-            tuple[dict, bool]: The widget copy, and whether the re-run succeeded. A failed run returns the widget
-                as it was.
+            tuple[dict, dict | None]: The widget copy, and the keys the run produced (None when it failed, and
+                the widget is returned as it was). A Python run produces every key of its output except `id`,
+                `layout` and `generatedCode`; a ChartRequest run produces the chart keys it returned. A refresh
+                saves exactly these keys.
 
         Raises:
             SandboxBusyError: The sandbox has no free slot. Nothing is returned for the widget.
@@ -130,12 +138,17 @@ class DashboardService:
             # Widget id, form and failure kind only: output text and filter values can hold data.
             kind = error.kind if isinstance(error, _RerunFailure) else type(error).__name__
             logger.warning(f"Widget {widget.get('id')} could not be re-run ({form}): {kind}")
-            return widget, False
+            return widget, None
         kept = {key: widget.get(key) for key in ("id", "layout", "generatedCode") if key in widget}
-        widget.update(result if request is None else {key: result[key] for key in _CHART_KEYS if key in result})
+        produced = (
+            {key for key in result if key not in ("id", "layout", "generatedCode")}
+            if request is None
+            else {key for key in _CHART_KEYS if key in result}
+        )
+        widget.update({key: result[key] for key in produced})
         widget.update(kept)
         ensureScatterMapPointLabels(widget)
-        return widget, True
+        return widget, {key: widget[key] for key in produced}
 
     @staticmethod
     def _emptiedWidget(widget: dict) -> dict:
@@ -177,6 +190,10 @@ class DashboardService:
 
     def _rerunWidgets(self, widgets: list, filters: list | None, projectId: str) -> list[tuple[dict, bool]]:
         """Re-run every re-runnable widget, four at a time. A widget that isn't re-runnable comes back (widget, False)."""
+        return [(widget, produced is not None) for widget, produced in self._rerunProduced(widgets, filters, projectId)]
+
+    def _rerunProduced(self, widgets: list, filters: list | None, projectId: str) -> list[tuple[dict, dict | None]]:
+        """Like `_rerunWidgets`, but each result carries the keys the run produced (None when it failed or didn't run)."""
         todo = [widget for widget in widgets if self._isRerunnable(widget)]
         activeTables = frozenset()
         if any(self._usesChartRequest(widget) for widget in todo):
@@ -189,8 +206,8 @@ class DashboardService:
                 logger.warning(f"The table list of project {projectId} could not be read ({type(error).__name__}); its chart widgets are not re-run.")
                 activeTables = None
         with ThreadPoolExecutor(max_workers = 4) as executor:
-            outcomes = iter(list(executor.map(lambda widget: self._rerunWidget(widget, filters, projectId, activeTables), todo)))
-        return [next(outcomes) if self._isRerunnable(widget) else (widget, False) for widget in widgets]
+            outcomes = iter(list(executor.map(lambda widget: self._rerunWidgetProduced(widget, filters, projectId, activeTables), todo)))
+        return [next(outcomes) if self._isRerunnable(widget) else (widget, None) for widget in widgets]
 
     @staticmethod
     def _getDataTypes(projectId: str, tableName: str) -> list[dict]:   
@@ -331,13 +348,13 @@ class DashboardService:
             logger.error(exception)
             raise exception  
         
-    def _saveRefreshed(self, details: GetData, refreshed: list[dict]) -> dict | None:
+    def _saveRefreshed(self, details: GetData, produced: dict) -> dict | None:
         """
         Save refreshed widget data into the latest dashboard, not the copy read before the re-runs.
 
         The re-runs can take minutes, so the dashboard may have changed meanwhile (a widget deleted, a layout
-        moved). The file is read again and each refreshed widget is merged by `id` into that copy: only the chart
-        keys change, and `id`, `layout` and `generatedCode` stay as they are there. A widget that no longer exists
+        moved). The file is read again and each refreshed widget is merged by `id` into that copy: only the keys the
+        re-run produced change (`produced` maps widget id to them), so an edit made meanwhile to any other key stays. A widget that no longer exists
         is skipped. Nothing is uploaded when no widget was merged.
 
         Returns:
@@ -347,12 +364,11 @@ class DashboardService:
         latestPage = latest.get(details.page)
         if not isinstance(latestPage, dict) or not isinstance(latestPage.get("widgets"), list):
             return None
-        byId = {fresh.get("id"): fresh for fresh in refreshed if fresh.get("id") is not None}
         merged = 0
         for widget in latestPage["widgets"]:
-            fresh = byId.get(widget.get("id")) if isinstance(widget, dict) else None
-            if fresh is not None:
-                widget.update({key: fresh[key] for key in _CHART_KEYS if key in fresh})
+            keys = produced.get(widget.get("id")) if isinstance(widget, dict) else None
+            if keys is not None:
+                widget.update(keys)
                 merged += 1
         if not merged:
             return None
@@ -387,12 +403,12 @@ class DashboardService:
                 pageInfo["widgets"] = [widget if succeeded else (self._emptiedWidget(widget) if self._isRerunnable(widget) and widget.get("chartType") else widget) for widget, succeeded in outcomes]
             elif (not details.filters) and (details.refresh):
                 widgets = pageInfo.get("widgets")
-                outcomes = self._rerunWidgets(widgets, None, details.projectId)
-                if any(succeeded for _, succeeded in outcomes):
-                    for saved, (fresh, succeeded) in zip(widgets, outcomes):
-                        if succeeded:
+                outcomes = self._rerunProduced(widgets, None, details.projectId)
+                if any(produced is not None for _, produced in outcomes):
+                    for saved, (fresh, produced) in zip(widgets, outcomes):
+                        if produced is not None:
                             saved.update(fresh)
-                    pageInfo = self._saveRefreshed(details, [fresh for fresh, succeeded in outcomes if succeeded]) or pageInfo
+                    pageInfo = self._saveRefreshed(details, {fresh.get("id"): produced for fresh, produced in outcomes if produced is not None and fresh.get("id") is not None}) or pageInfo
             else:
                 raise ValueError("Filters and Refresh cannot be implemented simultaneously.")
             widgets = pageInfo.get("widgets")
