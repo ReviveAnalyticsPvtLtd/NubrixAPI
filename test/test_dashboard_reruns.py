@@ -572,3 +572,18 @@ def test_garbageAfterTheFrameLogsUnknownException(monkeypatch, logLines, tail):
 def test_exceptionWithoutMessageAndBuiltinNamesAreAccepted(monkeypatch, logLines):
     text = 'Traceback (most recent call last):\n  File "x", line 1, in <module>\nStopIteration'
     assert _loggedKind(monkeypatch, logLines, text) == "StopIteration"
+
+
+def test_refreshReturnsTheLatestPageWhenEverySucceededWidgetWasDeleted(monkeypatch):
+    def run(code, projectId=None, filters=None):
+        return json.dumps({"data": "newA"}) if "marker_a" in code else "Traceback"
+
+    service, _, _ = _setup(monkeypatch, [_widget("A", PYTHON + "\n# marker_a"), _widget("B")], run=run)
+    _secondReadDiffers(monkeypatch, service, [_widget("B", data="latest")])
+
+    page = service.getData(GetData(projectId="p1", page="pg", refresh=True))
+
+    service.client.storage.from_.assert_not_called()
+    assert page["name"] == "renamed"
+    assert [(w["id"], w["data"]) for w in page["widgets"]] == [("B", "latest")]
+    assert page["id"] == "pg"

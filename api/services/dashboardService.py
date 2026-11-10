@@ -387,7 +387,8 @@ class DashboardService:
         is skipped. Nothing is uploaded when no widget was merged.
 
         Returns:
-            dict | None: The saved page (with its `id`), or None when nothing was saved.
+            dict | None: The latest page (with its `id`), as saved, or as it already is when nothing was merged
+                (every refreshed widget was deleted meanwhile). None when the page is gone from the latest file.
         """
         latest = readJson(details.projectId, "dashboardConfig.json")
         latestPage = latest.get(details.page)
@@ -399,12 +400,11 @@ class DashboardService:
             if keys is not None:
                 widget.update(keys)
                 merged += 1
-        if not merged:
-            return None
-        with io.BytesIO() as buffer:
-            buffer.write(json.dumps(latest, indent=4).encode("utf-8"))
-            buffer.seek(0)
-            _ = self.client.storage.from_("AnalyticsHub").upload(path = f"{details.projectId}/dashboardConfig.json", file = buffer.getvalue(), file_options = {"upsert": "true"})
+        if merged:
+            with io.BytesIO() as buffer:
+                buffer.write(json.dumps(latest, indent=4).encode("utf-8"))
+                buffer.seek(0)
+                _ = self.client.storage.from_("AnalyticsHub").upload(path = f"{details.projectId}/dashboardConfig.json", file = buffer.getvalue(), file_options = {"upsert": "true"})
         return {**latestPage, "id": details.page}
 
     def getData(self, details: GetData) -> dict:
