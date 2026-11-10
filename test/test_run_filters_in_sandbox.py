@@ -7,7 +7,6 @@ Each test runs real sandbox children: the filters travel in the run's stdin, `sa
 import io
 import json
 import os
-import re
 from unittest.mock import MagicMock
 
 import polars as pl
@@ -28,6 +27,9 @@ def salesStorage(monkeypatch):
     buffer = io.BytesIO()
     pl.DataFrame(SALES).write_parquet(buffer)
     fake.put(PROJECT, "sales.parquet", buffer.getvalue())
+    regions = io.BytesIO()
+    pl.DataFrame({"state": ["SP", "RJ", "MG"], "zone": ["south", "east", "west"]}).write_parquet(regions)
+    fake.put(PROJECT, "regions.parquet", regions.getvalue())
     monkeypatch.setenv("SUPABASE_URL", fake.url)
     monkeypatch.setenv("SUPABASE_KEY", SERVICE_KEY)
     monkeypatch.setenv("REDIS_HOST", "127.0.0.1")
@@ -103,14 +105,29 @@ def test_panelTemplateWidgetIsFilteredThroughRunInput(salesStorage):
         selectedColumns=None, mapType="", isFilterApplied=False, filters=None, geoCodeColumn="None",
     )
 
-    # The sandbox import allowlist refuses orjson, random and string, which the template imports but a bar chart
-    # never uses. Dropping those three lines isolates what this test is about: how the table is loaded.
-    for name in ("orjson", "random", "string"):
-        code = re.sub(rf"^[ \t]*import {name}\n", "", code, flags=re.M)
-
     everything = json.loads(runCode(code))
     assert sorted(everything["data"]["labels"]) == ["MG", "RJ", "SP"]
 
     filtered = json.loads(runCode(code, [{"state": "SP"}]))
     assert filtered["data"]["labels"] == ["SP"]
+    assert filtered["data"]["datasets"][0]["data"] == [4]
+
+
+def test_panelBlendTemplateWidgetIsFilteredThroughRunInput(salesStorage):
+    """The blend template loads every table with fetch_data, so the run's filters narrow each one before the merge."""
+    import string
+
+    templates = yaml.safe_load(open(os.path.join(os.getcwd(), "codeTemplates.yaml"), encoding="utf-8"))
+    code = string.Template(templates["panelChartWithBlend"]).substitute(
+        projectId=PROJECT, chartType="bar", xAxis="zone", yAxis="amount", aggregationMetric="sum",
+        dataSourceName="blend", tablesUsed=["sales", "regions"], joinTypes=["inner"], blendOn=["state"],
+        index=None, columns=None, values=None, selectedColumns=None, mapType="", isFilterApplied=False,
+        filters=None, geoCodeColumn="None",
+    )
+
+    everything = json.loads(runCode(code))
+    assert sorted(everything["data"]["labels"]) == ["east", "south", "west"]
+
+    filtered = json.loads(runCode(code, [{"state": "SP"}]))
+    assert filtered["data"]["labels"] == ["south"]
     assert filtered["data"]["datasets"][0]["data"] == [4]

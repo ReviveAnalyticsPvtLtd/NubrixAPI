@@ -43,6 +43,7 @@ def main():
         "polars", "pl", "json", "math", "datetime", "decimal",
         "collections", "itertools", "functools", "statistics",
         "numpy", "np", "pandas", "pd",
+        "orjson", "random", "string",  # the saved panel chart templates import these
     })
 
     def _safe_import(name, *args, **kwargs):
