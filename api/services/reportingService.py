@@ -124,6 +124,38 @@ _SHADOW_WORKERS = 2
 _SHADOW_PERMITS = 4
 _shadowExecutor = ThreadPoolExecutor(max_workers=_SHADOW_WORKERS, thread_name_prefix="chart-shadow")
 _shadowSlots = threading.BoundedSemaphore(_SHADOW_PERMITS)
+_shadowClosed = threading.Event()
+_shadowCancelled = 0
+_shadowCancelledLock = threading.Lock()
+
+
+def _shadowDone(future: Future) -> None:
+    """Done-callback of every admitted run. A run cancelled before it started never reaches its `finally`, so its permit comes back here."""
+    global _shadowCancelled
+    if future.cancelled():
+        _shadowSlots.release()
+        with _shadowCancelledLock:
+            _shadowCancelled += 1
+
+
+def shutdownShadow() -> None:
+    """Stops admitting shadow runs and cancels the queued ones, without waiting for the running ones. Call it when the app shuts down.
+
+    Each cancelled run gives its permit back and is counted in the `chart_shadow_shutdown` line.
+    """
+    _shadowClosed.set()
+    with _shadowCancelledLock:
+        before = _shadowCancelled
+    try:
+        _shadowExecutor.shutdown(wait=False, cancel_futures=True)
+    except Exception as e:
+        logger.warning(f"Could not shut down the shadow chart pool: {type(e).__name__}")
+    with _shadowCancelledLock:
+        cancelled = _shadowCancelled - before
+    try:
+        logger.info("chart_shadow_shutdown " + json.dumps({"cancelled": cancelled}))
+    except Exception as e:
+        logger.warning(f"chart_shadow_shutdown line could not be written: {type(e).__name__}")
 
 
 def _chartOk(output) -> bool:
@@ -189,12 +221,17 @@ def _submitShadow(*, parallel: bool, projectId: str, userId: str | None, metadat
     permit is released by the shadow run, or here when it cannot be queued. Call it off the event loop.
     """
     try:
+        if _shadowClosed.is_set():
+            _logShadow(_shadowRecord(parallel, projectId, pythonOutput, result="dropped_shutdown"))
+            return None
         if not _shadowSlots.acquire(blocking=False):
             _logShadow(_shadowRecord(parallel, projectId, pythonOutput, result="dropped_queue"))
             return None
         try:
             pythonOutput = copy.deepcopy(pythonOutput)
-            return _shadowExecutor.submit(_runShadow, parallel, projectId, userId, metadata, query, pythonOutput)
+            future = _shadowExecutor.submit(_runShadow, parallel, projectId, userId, metadata, query, pythonOutput)
+            future.add_done_callback(_shadowDone)
+            return future
         except BaseException:
             _shadowSlots.release()
             raise

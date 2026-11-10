@@ -5,6 +5,7 @@ import copy
 import json
 import sys
 import threading
+import time
 from concurrent.futures import ThreadPoolExecutor
 from unittest.mock import AsyncMock, MagicMock
 
@@ -77,9 +78,13 @@ class RecordingExecutor:
         self.futures.append(future)
         return future
 
+    def shutdown(self, wait=True, *, cancel_futures=False):
+        self.pool.shutdown(wait=wait, cancel_futures=cancel_futures)
+
     def wait(self):
         for future in list(self.futures):
-            future.result(timeout=20)
+            if not future.cancelled():
+                future.result(timeout=20)
 
 
 class Env:
@@ -103,6 +108,7 @@ class Env:
         monkeypatch.setattr(rs, "CreditTrackingCallback", FakeCredit)
         monkeypatch.setattr(rs, "_shadowExecutor", self.executor)
         monkeypatch.setattr(rs, "_shadowSlots", threading.BoundedSemaphore(4))
+        monkeypatch.setattr(rs, "_shadowClosed", threading.Event())
         monkeypatch.setattr("utils.llm.getLangfuseConfig", self.getConfig)
         monkeypatch.setattr(rs.logger, "info", lambda message, *a, **k: self.logs.append(str(message)))
         monkeypatch.setattr(rs.logger, "warning", lambda message, *a, **k: self.logs.append(str(message)))
@@ -794,3 +800,72 @@ def test_parallelHelpersTakeTheModeFromTheirCaller(env):
     thread.join()
     assert result["chart"]["finalOutput"] == CARD
     assert len(env.sql.calls) == 1 and env.python.calls == []
+
+
+# Shutdown
+
+def _startFourShadowRuns(env):
+    """Two runs hold the pool's workers at a gate, two wait in its queue. All four permits are taken."""
+    env.mode("shadow")
+    env.sql.gate = threading.Event()
+    for _ in range(4):
+        env.chart()
+    deadline = time.time() + 10
+    while len(env.sql.calls) < 2 and time.time() < deadline:
+        time.sleep(0.01)
+    assert len(env.sql.calls) == 2
+
+
+def test_shutdownCancelsQueuedShadowRunsAndReturnsTheirPermits(env):
+    _startFourShadowRuns(env)
+    assert not env.free()
+    rs.shutdownShadow()
+    assert [line for line in env.logs if line.startswith("chart_shadow_shutdown")] == ['chart_shadow_shutdown {"cancelled": 2}']
+    assert sum(future.cancelled() for future in env.executor.futures) == 2
+    # The two queued permits are back at once; the running two come back when they finish.
+    taken = 0
+    while rs._shadowSlots.acquire(blocking=False):
+        taken += 1
+    for _ in range(taken):
+        rs._shadowSlots.release()
+    assert taken == 2
+    env.sql.gate.set()
+    env.executor.wait()
+    assert env.free()
+    assert len(env.shadowLines()) == 2 and len(env.sql.calls) == 2
+
+
+def test_shutdownIsSafeToCallTwiceAndWithNothingQueued(env):
+    rs.shutdownShadow()
+    rs.shutdownShadow()
+    assert [line for line in env.logs if line.startswith("chart_shadow_shutdown")][0] == 'chart_shadow_shutdown {"cancelled": 0}'
+    assert env.free()
+
+
+def test_shadowAfterShutdownIsDroppedAndNothingIsRaised(env):
+    env.mode("shadow")
+    rs.shutdownShadow()
+    response = env.chart()
+    assert response == PY_RESPONSE
+    assert env.sql.calls == []
+    (line,) = env.shadowLines()
+    assert line["result"] == "dropped_shutdown" and line["sqlOk"] is None and line["pythonOk"] is True
+    assert env.free()
+    parallel = env.parallel()
+    assert parallel["finalOutput"] == CARD
+    assert [item["result"] for item in env.shadowLines()] == ["dropped_shutdown", "dropped_shutdown"]
+    assert env.free()
+
+
+def test_theAppCallsShutdownShadowOnShutdown():
+    """main.py needs the full environment to import, so read its source: a shutdown hook must call shutdownShadow."""
+    import ast
+    import pathlib
+
+    tree = ast.parse((pathlib.Path(rs.__file__).resolve().parents[2] / "main.py").read_text(encoding="utf-8"))
+    hooks = [
+        node for node in ast.walk(tree)
+        if isinstance(node, ast.AsyncFunctionDef)
+        and any("on_event" in ast.unparse(d) and "shutdown" in ast.unparse(d) for d in node.decorator_list)
+    ]
+    assert hooks and any("shutdownShadow" in ast.unparse(hook) for hook in hooks)
