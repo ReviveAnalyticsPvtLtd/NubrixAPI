@@ -9,14 +9,23 @@ from utils import tableSchemas
 class FakeRedis:
     def __init__(self):
         self.store = {}
+        self.expiresAt = {}
+        self.now = 0.0
         self.setCalls = []
 
     def get(self, key):
+        if key in self.expiresAt and self.now >= self.expiresAt[key]:
+            self.store.pop(key, None)
+            del self.expiresAt[key]
         return self.store.get(key)
 
-    def set(self, key, value, *args, **kwargs):
-        self.setCalls.append((key, args, kwargs))
+    def set(self, key, value, *args, ex=None, **kwargs):
+        self.setCalls.append((key, args, dict(kwargs, ex=ex)))
         self.store[key] = value
+        if ex is not None:
+            self.expiresAt[key] = self.now + ex
+        else:
+            self.expiresAt.pop(key, None)
 
     def delete(self, *keys):
         for key in keys:
@@ -56,8 +65,7 @@ def test_schemaCachedAndInvalidated(redisFake, reader):
     assert first["sales"].equals(SALES)
     assert reader.call_count == 1
     assert "p1::schema::sales" in redisFake.store
-    key, args, kwargs = redisFake.setCalls[0]
-    assert not args and "ex" not in kwargs and "px" not in kwargs
+    assert redisFake.setCalls[0][0] == "p1::schema::sales"
 
     second = tableSchemas.tableSchemas("p1", ["sales"])
     assert second["sales"].equals(SALES)
@@ -125,3 +133,30 @@ def test_corruptCachedValueIsAMiss(redisFake, reader):
     result = tableSchemas.tableSchemas("p1", ["sales"])
     assert result["sales"].equals(SALES)
     assert reader.call_count == 1
+
+
+def test_schemaKeysUseTheTableDataCacheTtl(redisFake, reader):
+    from utils import initMethods
+
+    tableSchemas.tableSchemas("p1", ["sales"])
+    key, args, kwargs = redisFake.setCalls[0]
+    assert kwargs["ex"] == initMethods._REDIS_SMALL_TABLE_TTL_SECONDS
+    assert kwargs["ex"] >= initMethods._REDIS_MEDIUM_TABLE_TTL_SECONDS
+
+
+def test_aSchemaCachedAfterForgetTableExpiresWithTheDataCache(redisFake, reader):
+    from utils import initMethods
+    from utils.initMethods import forget_table
+
+    def readThenTheWriterReplacesTheTable(projectId, tableName):
+        forget_table(projectId, tableName)  # the writer finishes between our read and our cache write
+        return b"old-bytes"
+
+    reader.side_effect = readThenTheWriterReplacesTheTable
+    tableSchemas.tableSchemas("p1", ["sales"])
+    assert "p1::schema::sales" in redisFake.store  # the stale schema was cached after the delete
+
+    redisFake.now += initMethods._REDIS_SMALL_TABLE_TTL_SECONDS
+    reader.side_effect = lambda p, t: b"new-bytes"
+    tableSchemas.tableSchemas("p1", ["sales"])
+    assert reader.call_count == 2

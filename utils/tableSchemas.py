@@ -1,6 +1,7 @@
 """Cached Arrow schemas of stored tables, for the chart generator's grounding.
 
-Each schema lives in Redis at ``<projectId>::schema::<table>`` as ``schema.serialize()`` bytes, with no TTL;
+Each schema lives in Redis at ``<projectId>::schema::<table>`` as ``schema.serialize()`` bytes, with the table data cache's TTL
+so a missed invalidation or a read/write race heals as fast as the data cache does;
 `invalidate_data_cache` and `forget_table` drop it. A Redis failure means reading without the cache.
 """
 
@@ -43,7 +44,9 @@ def _store(client, key: str, schema: pa.Schema) -> None:
     if client is None:
         return
     try:
-        client.set(key, schema.serialize().to_pybytes())
+        from utils import initMethods
+
+        client.set(key, schema.serialize().to_pybytes(), ex=initMethods._REDIS_SMALL_TABLE_TTL_SECONDS)
     except Exception as exc:
         logger.warning(f"Table schema cache write failed: {type(exc).__name__}")
 

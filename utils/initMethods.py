@@ -111,6 +111,9 @@ _REDIS_MAX_ROWS = 100000
 # The largest file the parent caches for a sandbox. It never decodes one, so all it can go on is the file's size.
 _REDIS_MAX_SPOOLED_BYTES = 64 * 1024 * 1024
 _REDIS_SPOOLED_TTL_SECONDS = 300
+# How long Redis keeps a cached table: the small one, and a medium one (over 10,000 rows). Cached schemas use the longer.
+_REDIS_SMALL_TABLE_TTL_SECONDS = 600
+_REDIS_MEDIUM_TABLE_TTL_SECONDS = 300
 
 # Set in sandbox children, where the parent process supplies tables.
 _TABLE_SOURCE: "Callable[[str], pa.Table] | None" = None
@@ -252,9 +255,9 @@ def _store_to_redis(redis_key: str, table: "pa.Table") -> None:
         return
 
     if num_rows <= 10000:
-        ttl = 600  # 10 minutes for small tables
+        ttl = _REDIS_SMALL_TABLE_TTL_SECONDS
     else:
-        ttl = 300  # 5 minutes for medium tables
+        ttl = _REDIS_MEDIUM_TABLE_TTL_SECONDS
 
     r = redis.Redis(connection_pool=_redis_pool())
     try:
