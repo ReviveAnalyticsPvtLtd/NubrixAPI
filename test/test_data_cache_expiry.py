@@ -71,7 +71,9 @@ def test_forgetTableClearsRedisAndThisWorker():
     with mock.patch("utils.initMethods._redis_pool"), mock.patch("utils.initMethods.redis.Redis", return_value=redisClient):
         initMethods.forget_table("project_1", "sales")
 
-    redisClient.delete.assert_called_once_with("project_1::sales", "project_1::metadata.json", "project_1::metadata")
+    redisClient.delete.assert_called_once_with(
+        "project_1::sales", "project_1::metadata.json", "project_1::metadata", "project_1::schema::sales"
+    )
     assert initMethods._cache_get(KEY) is None
     assert initMethods._cache_get(otherTable) is not None
 

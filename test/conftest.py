@@ -58,3 +58,15 @@ def _freshPaymentWorkerHeartbeat(request):
                 INSERT INTO private.payment_recovery_runtime(singleton,worker_seen_at) VALUES(true,clock_timestamp())
                 ON CONFLICT(singleton) DO UPDATE SET worker_seen_at=EXCLUDED.worker_seen_at; END IF; END $$''')
         db.close()
+
+
+@pytest.fixture(autouse=True)
+def _noSchemaCacheTraffic(request):
+    """`invalidate_data_cache` also drops cached schemas from Redis; no other test may wait on a Redis that isn't there."""
+    if request.node.fspath.basename == "test_table_schemas.py":
+        yield
+        return
+    from unittest import mock
+
+    with mock.patch("utils.tableSchemas.dropSchemas"):
+        yield

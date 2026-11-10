@@ -446,7 +446,18 @@ def classify_table_size(projectId: str, tableName: str) -> dict:
 
 
 def invalidate_data_cache(projectId: str | None = None, tableName: str | None = None) -> None:
-    """Drop cached tables for a project/table. Call after transformations apply."""
+    """Drop cached tables for a project/table. Call after transformations apply.
+
+    Also drops the cached Arrow schemas (best effort, never raises) when a project is named.
+    """
+    _drop_local_cache(projectId, tableName)
+    if projectId is not None:
+        from utils.tableSchemas import dropSchemas
+
+        dropSchemas(projectId, tableName)
+
+
+def _drop_local_cache(projectId: str | None, tableName: str | None) -> None:
     global _DF_CACHE_BYTES
     with _DF_CACHE_LOCK:
         if projectId is None and tableName is None:
@@ -471,6 +482,13 @@ def forget_table(projectId: str, tableName: str) -> None:
     Other workers drop their copy when it expires. This worker's copy goes first,
     then Redis, which raises if it fails so a caller that can retry the delete may stop.
     """
-    invalidate_data_cache(projectId, tableName)
+    from utils.tableSchemas import schemaKey
+
+    _drop_local_cache(projectId, tableName)
     r = redis.Redis(connection_pool=_redis_pool())
-    r.delete(f"{projectId}::{tableName}", f"{projectId}::metadata.json", f"{projectId}::metadata")
+    r.delete(
+        f"{projectId}::{tableName}",
+        f"{projectId}::metadata.json",
+        f"{projectId}::metadata",
+        schemaKey(projectId, tableName),
+    )
