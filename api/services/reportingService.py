@@ -183,14 +183,16 @@ def _runShadow(parallel: bool, projectId: str, userId: str | None, metadata: dic
 def _submitShadow(*, parallel: bool, projectId: str, userId: str | None, metadata: dict, query: str, pythonOutput) -> Future | None:
     """Queue the SQL run for a request Python has answered. Drops it, with a log line, when 4 are already queued or running.
 
-    Never raises into the request. The permit taken here is released by the shadow run, or here when it cannot be queued.
+    Never raises into the request. The permit is taken first, so a dropped run pays nothing. Only an admitted run copies
+    the chart (the served dict may still be changed by the caller, so the shadow thread must not read it), and the
+    permit is released by the shadow run, or here when it cannot be queued. Call it off the event loop.
     """
     try:
-        pythonOutput = copy.deepcopy(pythonOutput)
         if not _shadowSlots.acquire(blocking=False):
             _logShadow(_shadowRecord(parallel, projectId, pythonOutput, result="dropped_queue"))
             return None
         try:
+            pythonOutput = copy.deepcopy(pythonOutput)
             return _shadowExecutor.submit(_runShadow, parallel, projectId, userId, metadata, query, pythonOutput)
         except BaseException:
             _shadowSlots.release()
@@ -661,9 +663,13 @@ class ReportingService:
             )
             updateProjectModifiedAt(chartDetails.projectId)
             if mode == "shadow":
-                _submitShadow(
-                    parallel=False, projectId=chartDetails.projectId, userId=userId, metadata=metadata,
-                    query=chartDetails.inputQuery, pythonOutput=response.get("finalOutput"),
+                # Not awaited: the permit check and the copy run on a pool thread and never delay the response.
+                loop.run_in_executor(
+                    None,
+                    lambda: _submitShadow(
+                        parallel=False, projectId=chartDetails.projectId, userId=userId, metadata=metadata,
+                        query=chartDetails.inputQuery, pythonOutput=response.get("finalOutput"),
+                    ),
                 )
             return response
         except Exception as e:

@@ -3,6 +3,7 @@
 import asyncio
 import copy
 import json
+import sys
 import threading
 from concurrent.futures import ThreadPoolExecutor
 from unittest.mock import AsyncMock, MagicMock
@@ -681,3 +682,64 @@ def test_getLangfuseConfigWithoutKeysIsEmpty(monkeypatch):
     monkeypatch.setattr(llm, "_langfuse_handler", None)
     assert llm.getLangfuseConfig(trace_name="x") == {}
     assert llm.getLangfuseConfig(trace_name="x", perRequestHandler=True) == {}
+
+
+# Copy cost: nothing paid by a dropped run, nothing on the event loop
+
+def _countCopies(env):
+    """Records, per deepcopy call made by the reporting service, whether it ran inside an event loop."""
+    calls = []
+    original = copy.deepcopy
+
+    def recording(value, *args, **kwargs):
+        if sys._getframe(1).f_globals.get("__name__") != "api.services.reportingService":
+            return original(value, *args, **kwargs)
+        try:
+            asyncio.get_running_loop()
+            onLoop = True
+        except RuntimeError:
+            onLoop = False
+        calls.append(onLoop)
+        return original(value, *args, **kwargs)
+
+    env.monkeypatch.setattr(rs.copy, "deepcopy", recording)
+    return calls
+
+
+def test_droppedShadowMakesNoCopy(env):
+    env.mode("shadow")
+    for _ in range(4):
+        assert rs._shadowSlots.acquire(blocking=False)
+    calls = _countCopies(env)
+    env.chart()
+    assert calls == []
+    assert env.shadowLines()[0]["result"] == "dropped_queue"
+    for _ in range(4):
+        rs._shadowSlots.release()
+
+
+def test_singleChartShadowCopyIsMadeOffTheEventLoop(env):
+    env.mode("shadow")
+    calls = _countCopies(env)
+    env.chart()
+    env.executor.wait()
+    assert calls == [False]
+    assert len(env.shadowLines()) == 1
+
+
+def test_shadowRunsOnACopyOfTheServedChart(env):
+    env.mode("shadow")
+    seen = []
+    env.python.response = copy.deepcopy(PY_RESPONSE)
+    original = rs._runShadow
+
+    def spy(parallel, projectId, userId, metadata, query, pythonOutput):
+        seen.append(pythonOutput)
+        return original(parallel, projectId, userId, metadata, query, pythonOutput)
+
+    env.monkeypatch.setattr(rs, "_runShadow", spy)
+    served = env.python.response["finalOutput"]
+    env.python.invoke = lambda inputs, config=None: {"finalOutput": served}
+    env.chart()
+    env.executor.wait()
+    assert seen[0] == served and seen[0] is not served
