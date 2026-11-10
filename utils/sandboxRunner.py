@@ -575,7 +575,7 @@ def _writeInput(tablesFolder: str, inputBytes: bytes, runUid: int | None) -> str
     return path
 
 
-def runTrustedSandbox(launcherName: str, projectId: str, inputBytes: bytes, request: dict, timeoutSeconds: int, maxResultBytes: int, limits: RunLimits | None = None) -> SandboxResult:
+def runTrustedSandbox(launcherName: str, projectId: str, inputBytes: bytes, request: dict, timeoutSeconds: int, maxResultBytes: int, limits: RunLimits | None = None, leaveHeadroom: bool = False) -> SandboxResult:
     """Run one of our own launchers on bytes this process hands it, under every limit a code run has.
 
     The run is given no table access and no secret: `request` is the only thing besides the input that reaches it,
@@ -583,6 +583,7 @@ def runTrustedSandbox(launcherName: str, projectId: str, inputBytes: bytes, requ
     the file `work/result`, read through `readResult` up to `maxResultBytes`; a larger one raises ResultTooLargeError.
     The slot cap and the slot wait come from the environment (`currentRunLimits()`), not from `limits`.
     `request` must be a JSON-serialisable dict and `maxResultBytes` positive; both are checked before a slot is taken.
+    `leaveHeadroom` (a shadow run's read) takes the slot without waiting and only while the sandbox has slots to spare.
     Raises SandboxBusyError when no slot is free, as `runSandbox` does.
     """
     if not isinstance(request, dict):
@@ -606,7 +607,9 @@ def runTrustedSandbox(launcherName: str, projectId: str, inputBytes: bytes, requ
         )
         return _runChild(launcherName, projectId, "", timeoutSeconds, True, runUid, runFolder, tablesFolder, workFolder, limits or runLimits, kind)
 
-    return _inFreshRun(lambda runUid, tablesFolder: inputPath.append(_writeInput(tablesFolder, inputBytes, runUid)), runIt)
+    if leaveHeadroom:
+        checkSlotHeadroom(os.environ.get("SANDBOX_RUN_ROOT"), currentRunLimits().maxConcurrentRuns)
+    return _inFreshRun(lambda runUid, tablesFolder: inputPath.append(_writeInput(tablesFolder, inputBytes, runUid)), runIt, 0 if leaveHeadroom else None)
 
 
 def _withinHardLimit(wanted: int, hard: int) -> int:

@@ -221,6 +221,14 @@ def test_shadowDoesNotWaitForASlot(harness):
     assert harness.render.call_args.kwargs["waitForSlot"] is False
 
 
+def test_shadowGroundingLeavesHeadroomAndServedGroundingIsUnchanged(harness):
+    harness.run(config={"configurable": {"shadow": True}})
+    harness.schemas.assert_called_once_with("p1", ["orders"], skipUnreadable=True, leaveHeadroom=True)
+    harness.schemas.reset_mock()
+    harness.run()
+    harness.schemas.assert_called_once_with("p1", ["orders"], skipUnreadable=True)
+
+
 def test_servedRunWaitsForASlot(harness):
     harness.run()
     assert harness.render.call_args.kwargs["waitForSlot"] is True

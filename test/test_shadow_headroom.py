@@ -188,3 +188,81 @@ def test_servedRunIsUnchangedWhileTheProjectHasARunningTask(monkeypatch):
     monkeypatch.setattr(codeExecutor, "runSqlSandbox", sql)
     assert manager.runSql({"sql": "x"}, "p1") is OK
     assert "requireHeadroom" not in sql.call_args.kwargs
+
+
+# The shadow's grounding read: the reader child takes a slot like a SQL run does, so it leaves headroom too.
+
+
+@pytest.fixture
+def readerRun(flock, monkeypatch, tmp_path):
+    from utils import storedTables
+
+    children = _runWith(monkeypatch, tmp_path, 4)
+    monkeypatch.setenv("TABLE_READER_MEMORY_BYTES", str(256 * 1024 * 1024))
+    monkeypatch.setattr(sandboxRunner, "_writeInput", lambda *a: "input")
+    monkeypatch.setattr(storedTables, "_ipcTable", lambda projectId, tableName, answer: "table")
+    return children
+
+
+def _readTable(**kwargs):
+    from utils import storedTables
+
+    return storedTables.readUntrustedTable("p1", "t", b"x", **kwargs)
+
+
+def test_shadowGroundingReadWithTooFewFreeSlotsIsBusyAndStartsNoReader(readerRun, tmp_path):
+    held = _hold(tmp_path, 4, 3)
+    try:
+        with pytest.raises(SandboxBusyError):
+            _readTable(leaveHeadroom=True)
+        assert readerRun == []
+    finally:
+        _release(held)
+    assert freeRunSlots(str(tmp_path), 4) == 4
+
+
+def test_shadowGroundingReadWithRoomProceeds(readerRun, tmp_path):
+    held = _hold(tmp_path, 4, 2)
+    try:
+        assert _readTable(leaveHeadroom=True) == "table"
+        assert len(readerRun) == 1
+    finally:
+        _release(held)
+
+
+def test_servedGroundingReadWaitsAsBefore(readerRun, monkeypatch, tmp_path):
+    waits = []
+    real = sandboxRunner.acquireRunSlot
+    monkeypatch.setattr(sandboxRunner, "acquireRunSlot", lambda root, maxRuns, wait: waits.append(wait) or real(root, maxRuns, 0))
+    monkeypatch.setenv("SANDBOX_SLOT_WAIT_SECONDS", "7")
+    held = _hold(tmp_path, 4, 3)  # one free: too few for a shadow, enough for a served read
+    try:
+        assert _readTable() == "table"
+        assert waits == [7]
+        assert len(readerRun) == 1
+    finally:
+        _release(held)
+
+
+def test_shadowGroundingReadTakesItsSlotWithoutWaiting(readerRun, monkeypatch):
+    waits = []
+    real = sandboxRunner.acquireRunSlot
+    monkeypatch.setattr(sandboxRunner, "acquireRunSlot", lambda root, maxRuns, wait: waits.append(wait) or real(root, maxRuns, 0))
+    monkeypatch.setenv("SANDBOX_SLOT_WAIT_SECONDS", "7")
+    _readTable(leaveHeadroom=True)
+    assert waits == [0]
+
+
+def test_shadowTableSchemasLetBusyPropagateEvenWhenSkippingUnreadable(readerRun, monkeypatch, tmp_path):
+    from utils import storedTables, tableSchemas
+
+    monkeypatch.setattr(tableSchemas, "readTableBytes", lambda p, t: b"x")
+    monkeypatch.setattr(tableSchemas, "_client", lambda: (_ for _ in ()).throw(RuntimeError("no redis")))
+    monkeypatch.setattr(storedTables, "_trustedFooter", lambda *a, **k: None)
+    held = _hold(tmp_path, 4, 3)
+    try:
+        with pytest.raises(SandboxBusyError):
+            tableSchemas.tableSchemas("p1", ["t"], skipUnreadable=True, leaveHeadroom=True)
+        assert readerRun == []
+    finally:
+        _release(held)

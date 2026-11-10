@@ -365,6 +365,28 @@ def test_shadowBusyIsDropped(env, busy):
     assert env.free()
 
 
+def test_shadowWhoseGroundingIsBusyIsLoggedAsDroppedBusy(env, monkeypatch):
+    from test.test_sql_chart_workflow import Harness
+
+    harness = Harness(monkeypatch)
+    harness.schemas.side_effect = SandboxBusyError()
+    metadata = {"orders": {"columns": [{"name": "a"}, {"name": "b"}]}, "old": {"columns": [{"name": "z"}]}}
+
+    class Real:
+        def invoke(self, inputs, config=None):
+            return harness.graph.invoke(inputs, config=config)
+
+    env.sql = Real()
+    env.service._getProjectMetadata = AsyncMock(return_value=metadata)
+    env.mode("shadow")
+    env.chart()
+    env.executor.wait()
+    (line,) = env.shadowLines()
+    assert line["result"] == "dropped_busy" and line["sqlOk"] is None
+    assert harness.schemas.call_args.kwargs["leaveHeadroom"] is True
+    harness.generator.invoke.assert_not_called()
+
+
 @pytest.mark.parametrize("error", [RuntimeError("quota for key 12345 exceeded"), ValueError("secret value"), KeyError("k")])
 def test_shadowCatchesEveryErrorAndReleasesItsPermit(env, error):
     env.mode("shadow")

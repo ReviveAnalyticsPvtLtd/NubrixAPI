@@ -43,7 +43,7 @@ def _store(client, key: str, schema: pa.Schema) -> None:
     client.set(key, schema.serialize().to_pybytes(), ex=initMethods._REDIS_SMALL_TABLE_TTL_SECONDS)
 
 
-def tableSchemas(projectId: str, tableNames: Iterable[str], skipUnreadable: bool = False) -> dict[str, pa.Schema]:
+def tableSchemas(projectId: str, tableNames: Iterable[str], skipUnreadable: bool = False, leaveHeadroom: bool = False) -> dict[str, pa.Schema]:
     """The Arrow schema of each named table: from Redis, else read from storage and cached.
 
     After the first Redis failure in a call, the rest of that call makes no Redis calls: a Redis that is down
@@ -51,6 +51,9 @@ def tableSchemas(projectId: str, tableNames: Iterable[str], skipUnreadable: bool
 
     With `skipUnreadable`, a table whose read fails is left out of the result and logged by exception class only, and
     the rest are still read. A busy sandbox (`isBusy`) always propagates.
+
+    With `leaveHeadroom` (a shadow run), a table that needs the reader child gets it only without waiting and while the
+    sandbox has slots to spare; otherwise the read raises SandboxBusyError, which is never skipped.
     """
     try:
         client = _client()
@@ -69,7 +72,9 @@ def tableSchemas(projectId: str, tableNames: Iterable[str], skipUnreadable: bool
                 client = None
         if schema is None:
             try:
-                schema = decodeStoredTable(projectId, tableName, readTableBytes(projectId, tableName)).schema
+                data = readTableBytes(projectId, tableName)
+                table = decodeStoredTable(projectId, tableName, data, leaveHeadroom=True) if leaveHeadroom else decodeStoredTable(projectId, tableName, data)
+                schema = table.schema
             except Exception as exc:
                 if not skipUnreadable or isBusy(exc):
                     raise

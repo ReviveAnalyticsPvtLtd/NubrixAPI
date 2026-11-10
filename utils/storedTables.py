@@ -384,8 +384,11 @@ def normaliseRunOutput(projectId: str, tableName: str, parquetBytes: bytes) -> b
     return result.resultBytes
 
 
-def _readInChild(projectId: str, tableName: str, data: bytes, request: dict) -> bytes:
-    """Run the reader child on `data` and return its answer, mapping every failure to the user's copy."""
+def _readInChild(projectId: str, tableName: str, data: bytes, request: dict, leaveHeadroom: bool = False) -> bytes:
+    """Run the reader child on `data` and return its answer, mapping every failure to the user's copy.
+
+    `leaveHeadroom` takes the sandbox slot only without waiting and with slots to spare, else raises SandboxBusyError.
+    """
     from utils import sandboxRunner
 
     limit = maxDecodedBytes()
@@ -396,7 +399,8 @@ def _readInChild(projectId: str, tableName: str, data: bytes, request: dict) -> 
     what = f"Reading a table ({request['op']})"
     try:
         result = sandboxRunner.runTrustedSandbox(
-            _READER_LAUNCHER, projectId, data, {**request, "maxDecodedBytes": limit}, _READER_TIMEOUT_SECONDS, cap, limits=limits
+            _READER_LAUNCHER, projectId, data, {**request, "maxDecodedBytes": limit}, _READER_TIMEOUT_SECONDS, cap, limits=limits,
+            **({"leaveHeadroom": True} if leaveHeadroom else {}),
         )
     except SandboxBusyError:
         raise
@@ -440,18 +444,19 @@ def _inProcess(what: str, projectId: str, tableName: str, decode):
         raise
 
 
-def readUntrustedTable(projectId: str, tableName: str, data: bytes) -> "pa.Table":
+def readUntrustedTable(projectId: str, tableName: str, data: bytes, leaveHeadroom: bool = False) -> "pa.Table":
     """Decode a whole table that may not be the API's own, in a child limited to TABLE_READER_MEMORY_BYTES.
 
     Dictionary columns, at any depth, come back decoded and the schema keeps only a valid pandas entry. Raises
     SandboxBusyError unchanged, TableTooLargeError over STORED_TABLE_MAX_DECODED_BYTES and TableUnreadableError for
     anything the child or its answer does wrong. Errors of the sandbox itself (no free uid, a uid that could not be
     cleared, a TypeError) propagate as they do for code runs. With TABLE_READER_MEMORY_BYTES=0 the table is decoded in
-    this process as before, after the same size check.
+    this process as before, after the same size check. With `leaveHeadroom` (a shadow run's read) the child's sandbox slot
+    is taken without waiting and only while the sandbox has slots to spare, else SandboxBusyError is raised.
     """
     if not readerMemoryBytes():
         return _inProcess("Reading a table (table)", projectId, tableName, lambda limit: decodeTable(data, limit))
-    return _ipcTable(projectId, tableName, _readInChild(projectId, tableName, data, {"op": "table"}))
+    return _ipcTable(projectId, tableName, _readInChild(projectId, tableName, data, {"op": "table"}, leaveHeadroom))
 
 
 def readUntrustedPage(projectId: str, tableName: str, data: bytes, offset: int, limit: int) -> tuple["pl.DataFrame", int]:
@@ -550,14 +555,15 @@ def _trustedFooter(projectId: str, tableName: str, metadata: "pq.FileMetaData | 
     return metadata
 
 
-def decodeStoredTable(projectId: str, tableName: str, data: bytes) -> "pa.Table":
+def decodeStoredTable(projectId: str, tableName: str, data: bytes, leaveHeadroom: bool = False) -> "pa.Table":
     """Decode a stored table: in this process when the API wrote it, else in the reader child.
 
     Raises TableTooLargeError over STORED_TABLE_MAX_DECODED_BYTES, and whatever `readUntrustedTable` raises.
+    `leaveHeadroom` only matters for the reader child, as in `readUntrustedTable`.
     """
     if _trustedFooter(projectId, tableName, readFooter(data), "Reading a table (table)") is not None:
         return pq.read_table(pa.BufferReader(data))
-    return readUntrustedTable(projectId, tableName, data)
+    return readUntrustedTable(projectId, tableName, data, leaveHeadroom) if leaveHeadroom else readUntrustedTable(projectId, tableName, data)
 
 
 def readStoredTablePage(projectId: str, tableName: str, offset: int, limit: int) -> tuple["pl.DataFrame", int]:

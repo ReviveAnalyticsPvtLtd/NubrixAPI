@@ -179,11 +179,13 @@ class SqlChartWorkflow:
     def _afterRephrase(self, state: State):
         return "format" if self._doubtOf(state) is not None else "ground"
 
-    def _ground(self, state: State):
+    def _ground(self, state: State, config: RunnableConfig | None = None):
         tables = _activeTableNames(state["metadata"])
         try:
             # A table that cannot be read is left out here and gets UNKNOWN types in the grounding.
-            schemas = tableSchemas(state["projectId"], tables, skipUnreadable=True)
+            # A shadow run reads only while the sandbox has room to spare, else it ends as busy and is dropped.
+            options = {"leaveHeadroom": True} if _isShadow(config) else {}
+            schemas = tableSchemas(state["projectId"], tables, skipUnreadable=True, **options)
         except Exception as error:
             if not isBusy(error):
                 raise
