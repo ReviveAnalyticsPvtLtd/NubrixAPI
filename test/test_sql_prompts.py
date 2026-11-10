@@ -400,6 +400,40 @@ def test_topCategoriesOfALongFormChartKeepEveryMonth():
     assert cut["data"]["labels"][-1] != "2024-12" or any(None in dataset["data"] for dataset in cut["data"]["datasets"])
 
 
+def test_bubbleRadiusIsTheRawMeasure():
+    tables = _exampleTables()
+
+    chart = _runExample(_example("bubble"), tables)
+
+    # The client scales r to a bubble size and shows the raw value in the tooltip.
+    counts = _query('SELECT s."floor_area_sqm", COUNT(*) FROM "stores" AS s JOIN "orders" AS o ON o."store_id" = s."store_id" GROUP BY ALL', tables)
+    points = [point for dataset in chart["data"]["datasets"] for point in dataset["data"]]
+    assert sorted((point["x"], point["r"]) for point in points) == sorted(counts)
+
+
+def test_shareChartsKeepTheWhole():
+    tables = _exampleTables()
+    total = _query('SELECT SUM("quantity" * "unit_price") FROM "order_items"', tables)[0][0]
+    byProduct = (
+        'SELECT p."product_name" AS product, SUM(oi."quantity" * oi."unit_price") AS revenue FROM "order_items" AS oi '
+        'JOIN "products" AS p ON p."product_id" = oi."product_id" GROUP BY ALL'
+    )
+    doughnut = _example("doughnut")
+
+    chart = _runExample(doughnut, tables)
+
+    values = chart["data"]["datasets"][0]["data"]
+    assert sum(values) == pytest.approx(total, abs=0.05)
+    assert len(values) == 10 and chart["data"]["labels"][-1] == "Other"
+    assert values[:9] == sorted(values[:9], reverse=True)
+    # The old shape: the top 10 slices only. The client's percentages would then be shares of those 10.
+    cut = _runExample(doughnut.model_copy(update={"sql": byProduct + " ORDER BY revenue DESC, product LIMIT 10"}), tables)
+    assert sum(cut["data"]["datasets"][0]["data"]) < total - 1
+    for request in _examples():
+        if request.chartType in ("pie", "doughnut", "polarArea"):
+            assert not _hasOuterLimit(request.sql), request.chartType
+
+
 @pytest.mark.parametrize("key", ["sqlChartGeneratorPrompt", "sqlChartRepairPrompt"])
 def test_chartPromptsCarryTheEncodingTableAndRules(key):
     text = _formatted(key)

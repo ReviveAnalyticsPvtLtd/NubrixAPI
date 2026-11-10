@@ -2294,6 +2294,7 @@ sqlQueryRephraserAgentPrompt: |
     - Say how the result is sorted: time ascending for trends, natural order for weekdays, months or bins, otherwise by the measure descending.
     - Top or bottom N: say N. Category charts show at most 50 categories unless the user asks for more: keep the top 50 by the measure. With one dataset per category, the top N picks the categories and every period stays.
     - A time axis is never cut to a number of periods: choose a coarser time bucket instead.
+    - Pie, doughnut and polarArea always show the whole: with more than 10 slices, keep the top 9 and group the rest as 'Other'.
     - Tables: say which columns to show and how many rows (100 unless the user says otherwise).
 
     ### **6. RESULT COLUMNS**
@@ -2631,6 +2632,7 @@ parallelSqlQueryRephraserAgentPrompt: |
     - Say how the result is sorted: time ascending for trends, natural order for weekdays, months or bins, otherwise by the measure descending.
     - Top or bottom N: say N. Category charts show at most 50 categories unless the user asks for more: keep the top 50 by the measure. With one dataset per category, the top N picks the categories and every period stays.
     - A time axis is never cut to a number of periods: choose a coarser time bucket instead.
+    - Pie, doughnut and polarArea always show the whole: with more than 10 slices, keep the top 9 and group the rest as 'Other'.
     - Tables: say which columns to show and how many rows (100 unless the user says otherwise).
 
     ### **6. RESULT COLUMNS**
@@ -2827,7 +2829,7 @@ sqlChartGeneratorPrompt: |
       - long form: one row per (x, series) pair, one "y" column, and a "series" column whose values become the datasets. Each (x, series) pair must appear once, so GROUP BY both.
     - Values (y, value, r and the pivot value) must be numeric. Labels (x, label, series, pivot rows and columns) can be text, numbers or dates. The backend shows labels as text and dates as ISO text (2024-03-01), so format dates with strftime when a shorter label reads better.
     - scatter and bubble need numeric x, y and r. For a text or date x use a line or bar chart instead.
-    - bubble "r" is the bubble radius in pixels: scale it to about 5 to 30, for example round(5 + 25 * COUNT(*) / MAX(COUNT(*)) OVER (), 1).
+    - bubble "r" is the third measure itself, zero or more (for example COUNT(*) AS order_count). Never rescale it: the client sizes the bubbles and shows the value.
     - card: the query returns exactly one row. "value" is its column (a number, or text such as a name). "label" is literal text shown with the value, not a column name.
     - table: "columns" lists the result columns to show, in order. Leave it out to show every result column in query order.
     - pivot: return long-form rows, already aggregated, one row per combination of the "rows" and "columns" columns. The backend builds the cross-table. GROUP BY every "rows" and "columns" column so each combination appears once.
@@ -2871,7 +2873,8 @@ sqlChartGeneratorPrompt: |
     Size (LIMIT counts rows, not categories):
     - Never put LIMIT on a time axis, on a long-form query (one with a series column) or on a pivot: it silently drops periods or series.
     - A time axis is never cut: pick a bucket (day, week, month, quarter, year) that gives at most 500 periods for the range asked about.
-    - Category charts (bar, line, area, histogram, radar, pie, doughnut, polarArea) show at most 50 categories unless the user asks for more. Without a series, keep the top 50 with ORDER BY the measure DESC LIMIT 50. With a series, or for a top N of the series values, rank them in a CTE and filter on it: WITH top_x AS (SELECT x FROM ... GROUP BY x ORDER BY SUM(m) DESC, x LIMIT 50) ... WHERE x IN (SELECT x FROM top_x).
+    - pie, doughnut and polarArea show the whole, so never LIMIT them: the client's percentages are shares of the slices it gets. With more than 10 slices, keep the top 9 by the measure and sum the rest into one 'Other' slice, last: rank in a CTE with row_number() OVER (ORDER BY m DESC, label) AS rn and COUNT(*) OVER () AS n, then SELECT CASE WHEN rn <= 9 OR n <= 10 THEN label ELSE 'Other' END AS label, SUM(m) ... GROUP BY ALL ORDER BY MIN(rn).
+    - Other category charts (bar, line, area, histogram, radar) show at most 50 categories unless the user asks for more. Without a series, keep the top 50 with ORDER BY the measure DESC LIMIT 50. With a series, or for a top N of the series values, rank them in a CTE and filter on it: WITH top_x AS (SELECT x FROM ... GROUP BY x ORDER BY SUM(m) DESC, x LIMIT 50) ... WHERE x IN (SELECT x FROM top_x).
     - card: exactly one row. Aggregate without GROUP BY, or ORDER BY ... LIMIT 1 for "the top ..." questions.
     - table: LIMIT 100 unless the user asks for a number (at most 1000). Do not aggregate unless the user asks.
     - scatter and bubble: at most 5000 points. geoMap: at most 2000 points. pivot: at most 10000 long-form rows.
@@ -2970,11 +2973,11 @@ sqlChartGeneratorPrompt: |
     Answer:
     {{"chartType": "pie", "title": "Orders by Status", "sql": "SELECT COALESCE(\"status\", 'Unknown') AS status, COUNT(*) AS order_count FROM \"orders\" GROUP BY ALL ORDER BY order_count DESC", "encoding": {{"label": "status", "value": "order_count"}}}}
 
-    ### Example 7: doughnut
-    Question: What share of revenue comes from each customer segment?
-    Plan: Doughnut chart. Join "orders" to "customers" on customer_id; sum total_amount per segment; sort descending. Result columns: segment, revenue.
+    ### Example 7: doughnut with an 'Other' slice
+    Question: What share of revenue comes from each product?
+    Plan: Doughnut chart. Join "order_items" to "products"; sum quantity times unit_price per product; keep the top 9 products and group the rest as 'Other', last. Result columns: product, revenue.
     Answer:
-    {{"chartType": "doughnut", "title": "Revenue Share by Customer Segment", "sql": "SELECT COALESCE(c.\"segment\", 'Unknown') AS segment, SUM(o.\"total_amount\") AS revenue FROM \"orders\" AS o JOIN \"customers\" AS c ON c.\"customer_id\" = o.\"customer_id\" GROUP BY ALL ORDER BY revenue DESC", "encoding": {{"label": "segment", "value": "revenue"}}}}
+    {{"chartType": "doughnut", "title": "Revenue Share by Product", "sql": "WITH per_product AS (SELECT p.\"product_name\" AS product, SUM(oi.\"quantity\" * oi.\"unit_price\") AS revenue FROM \"order_items\" AS oi JOIN \"products\" AS p ON p.\"product_id\" = oi.\"product_id\" GROUP BY p.\"product_id\", p.\"product_name\"), ranked AS (SELECT product, revenue, row_number() OVER (ORDER BY revenue DESC, product) AS rn, COUNT(*) OVER () AS n FROM per_product) SELECT CASE WHEN rn <= 9 OR n <= 10 THEN product ELSE 'Other' END AS product, round(SUM(revenue), 2) AS revenue FROM ranked GROUP BY ALL ORDER BY MIN(rn)", "encoding": {{"label": "product", "value": "revenue"}}}}
 
     ### Example 8: polarArea with a natural order
     Question: Orders by day of the week
@@ -2990,9 +2993,9 @@ sqlChartGeneratorPrompt: |
 
     ### Example 10: bubble
     Question: Store size vs revenue, sized by number of orders, coloured by region
-    Plan: Bubble chart, one dataset per region. Join "stores" to "orders" on store_id; per store: floor area, total revenue and the order count scaled to a bubble radius. Result columns: floor_area, revenue, bubble_size, region.
+    Plan: Bubble chart, one dataset per region. Join "stores" to "orders" on store_id; per store: floor area, total revenue and the number of orders. Result columns: floor_area, revenue, order_count, region.
     Answer:
-    {{"chartType": "bubble", "title": "Store Floor Area vs Revenue (bubble size: orders)", "xLabel": "Floor area (sq m)", "yLabel": "Revenue", "sql": "SELECT s.\"floor_area_sqm\" AS floor_area, SUM(o.\"total_amount\") AS revenue, round(5 + 25 * COUNT(*) / MAX(COUNT(*)) OVER (), 1) AS bubble_size, s.\"region\" AS region FROM \"stores\" AS s JOIN \"orders\" AS o ON o.\"store_id\" = s.\"store_id\" GROUP BY s.\"store_id\", s.\"floor_area_sqm\", s.\"region\" ORDER BY region", "encoding": {{"x": "floor_area", "y": ["revenue"], "r": "bubble_size", "series": "region"}}}}
+    {{"chartType": "bubble", "title": "Store Floor Area vs Revenue (bubble size: orders)", "xLabel": "Floor area (sq m)", "yLabel": "Revenue", "sql": "SELECT s.\"floor_area_sqm\" AS floor_area, SUM(o.\"total_amount\") AS revenue, COUNT(*) AS order_count, s.\"region\" AS region FROM \"stores\" AS s JOIN \"orders\" AS o ON o.\"store_id\" = s.\"store_id\" GROUP BY s.\"store_id\", s.\"floor_area_sqm\", s.\"region\" ORDER BY region", "encoding": {{"x": "floor_area", "y": ["revenue"], "r": "order_count", "series": "region"}}}}
 
     ### Example 11: card
     Question: What percentage of orders got a discount?
@@ -3088,7 +3091,7 @@ sqlChartRepairPrompt: |
       - long form: one row per (x, series) pair, one "y" column, and a "series" column whose values become the datasets. Each (x, series) pair must appear once, so GROUP BY both.
     - Values (y, value, r and the pivot value) must be numeric. Labels (x, label, series, pivot rows and columns) can be text, numbers or dates. The backend shows labels as text and dates as ISO text (2024-03-01), so format dates with strftime when a shorter label reads better.
     - scatter and bubble need numeric x, y and r. For a text or date x use a line or bar chart instead.
-    - bubble "r" is the bubble radius in pixels: scale it to about 5 to 30, for example round(5 + 25 * COUNT(*) / MAX(COUNT(*)) OVER (), 1).
+    - bubble "r" is the third measure itself, zero or more (for example COUNT(*) AS order_count). Never rescale it: the client sizes the bubbles and shows the value.
     - card: the query returns exactly one row. "value" is its column (a number, or text such as a name). "label" is literal text shown with the value, not a column name.
     - table: "columns" lists the result columns to show, in order. Leave it out to show every result column in query order.
     - pivot: return long-form rows, already aggregated, one row per combination of the "rows" and "columns" columns. The backend builds the cross-table. GROUP BY every "rows" and "columns" column so each combination appears once.
@@ -3132,7 +3135,8 @@ sqlChartRepairPrompt: |
     Size (LIMIT counts rows, not categories):
     - Never put LIMIT on a time axis, on a long-form query (one with a series column) or on a pivot: it silently drops periods or series.
     - A time axis is never cut: pick a bucket (day, week, month, quarter, year) that gives at most 500 periods for the range asked about.
-    - Category charts (bar, line, area, histogram, radar, pie, doughnut, polarArea) show at most 50 categories unless the user asks for more. Without a series, keep the top 50 with ORDER BY the measure DESC LIMIT 50. With a series, or for a top N of the series values, rank them in a CTE and filter on it: WITH top_x AS (SELECT x FROM ... GROUP BY x ORDER BY SUM(m) DESC, x LIMIT 50) ... WHERE x IN (SELECT x FROM top_x).
+    - pie, doughnut and polarArea show the whole, so never LIMIT them: the client's percentages are shares of the slices it gets. With more than 10 slices, keep the top 9 by the measure and sum the rest into one 'Other' slice, last: rank in a CTE with row_number() OVER (ORDER BY m DESC, label) AS rn and COUNT(*) OVER () AS n, then SELECT CASE WHEN rn <= 9 OR n <= 10 THEN label ELSE 'Other' END AS label, SUM(m) ... GROUP BY ALL ORDER BY MIN(rn).
+    - Other category charts (bar, line, area, histogram, radar) show at most 50 categories unless the user asks for more. Without a series, keep the top 50 with ORDER BY the measure DESC LIMIT 50. With a series, or for a top N of the series values, rank them in a CTE and filter on it: WITH top_x AS (SELECT x FROM ... GROUP BY x ORDER BY SUM(m) DESC, x LIMIT 50) ... WHERE x IN (SELECT x FROM top_x).
     - card: exactly one row. Aggregate without GROUP BY, or ORDER BY ... LIMIT 1 for "the top ..." questions.
     - table: LIMIT 100 unless the user asks for a number (at most 1000). Do not aggregate unless the user asks.
     - scatter and bubble: at most 5000 points. geoMap: at most 2000 points. pivot: at most 10000 long-form rows.
