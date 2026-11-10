@@ -55,19 +55,32 @@ def _entry(value, now: float) -> pa.Schema | None:
         return None
 
 
-def _store(client, projectId: str, tableName: str, schema: pa.Schema) -> None:
-    """Cache a schema with its write time, and renew the hash's expiry. Raises when Redis fails."""
-    key = schemasKey(projectId)
-    value = repr(_now()).encode() + _TIME_SEPARATOR + schema.serialize().to_pybytes()
-    client.hset(key, tableName, value)
-    client.expire(key, _ttlSeconds())
+def _entryValue(schema: pa.Schema) -> bytes:
+    """A cache entry: the time the schema was read, then its bytes."""
+    return repr(_now()).encode() + _TIME_SEPARATOR + schema.serialize().to_pybytes()
+
+
+def _storeAll(client, projectId: str, entries: dict[str, bytes]) -> None:
+    """Cache a call's entries and renew the hash's expiry in one transaction. Never raises: a failure is logged once."""
+    if not entries:
+        return
+    try:
+        key = schemasKey(projectId)
+        pipe = client.pipeline(transaction=True)
+        for tableName, value in entries.items():
+            pipe.hset(key, tableName, value)
+        pipe.expire(key, _ttlSeconds())
+        pipe.execute()
+    except Exception as exc:
+        logger.warning(f"Table schema cache write failed: {type(exc).__name__}")
 
 
 def tableSchemas(projectId: str, tableNames: Iterable[str], skipUnreadable: bool = False, leaveHeadroom: bool = False) -> dict[str, pa.Schema]:
     """The Arrow schema of each named table: from Redis (one HMGET), else read from storage and cached.
 
     After the first Redis failure in a call, the rest of that call makes no Redis calls: a Redis that is down
-    would otherwise cost a connection timeout for every table.
+    would otherwise cost a connection timeout for every table. What the call reads is cached at its end, in one
+    transaction (the entries and one EXPIRE), and a failure of that write is logged once and never raises.
 
     With `skipUnreadable`, a table whose read fails is left out of the result and logged by exception class only, and
     the rest are still read. A busy sandbox (`isBusy`) always propagates.
@@ -91,23 +104,25 @@ def tableSchemas(projectId: str, tableNames: Iterable[str], skipUnreadable: bool
             logger.warning(f"Table schema cache read failed: {type(exc).__name__}")
             client = None
     schemas: dict[str, pa.Schema] = {}
-    for tableName in names:
-        schema = cached.get(tableName)
-        if schema is None:
-            try:
-                schema = storedTableSchema(projectId, tableName, leaveHeadroom=True) if leaveHeadroom else storedTableSchema(projectId, tableName)
-            except Exception as exc:
-                if not skipUnreadable or isBusy(exc):
-                    raise
-                logger.warning(f"Table schema unreadable, skipped: {type(exc).__name__}")
-                continue
-            if client is not None:
+    fresh: dict[str, bytes] = {}
+    try:
+        for tableName in names:
+            schema = cached.get(tableName)
+            if schema is None:
                 try:
-                    _store(client, projectId, tableName, schema)
+                    schema = storedTableSchema(projectId, tableName, leaveHeadroom=True) if leaveHeadroom else storedTableSchema(projectId, tableName)
                 except Exception as exc:
-                    logger.warning(f"Table schema cache write failed: {type(exc).__name__}")
-                    client = None
-        schemas[tableName] = schema
+                    if not skipUnreadable or isBusy(exc):
+                        raise
+                    logger.warning(f"Table schema unreadable, skipped: {type(exc).__name__}")
+                    continue
+                if client is not None:
+                    fresh[tableName] = _entryValue(schema)
+            schemas[tableName] = schema
+    finally:
+        # One round trip for what this call read, also when a later table raises.
+        if client is not None:
+            _storeAll(client, projectId, fresh)
     return schemas
 
 

@@ -26,7 +26,7 @@ class FakeRedis:
         found = self._live(key) or {}
         return [found.get(field) for field in fields]
 
-    def hset(self, key, field, value):
+    def hset(self, key, field=None, value=None):
         self.calls.append(("hset", key, field))
         self._live(key)
         self.store.setdefault(key, {})[field] = value
@@ -87,7 +87,7 @@ class FakePipeline:
         for name, args, kwargs in self.queued:
             getattr(parent, name)(*args, **kwargs)
         del parent.calls[before:]
-        parent.calls.append(("pipeline", self.transaction, tuple((name, *args) for name, args, _ in self.queued)))
+        parent.calls.append(("pipeline", self.transaction, tuple((name, *args[:2]) if name == "hset" else (name, *args) for name, args, _ in self.queued)))
         return [None] * len(self.queued)
 
 
@@ -165,16 +165,61 @@ def test_returnsOnlyTheNamedTables(redisFake, reader):
 def test_redisGetAndSetErrorsFallBackToReading(reader):
     broken = mock.Mock()
     broken.hmget.side_effect = ConnectionError("down")
-    broken.hset.side_effect = ConnectionError("down")
+    broken.pipeline.return_value.execute.side_effect = ConnectionError("down")
     with mock.patch("utils.initMethods._redis_pool"), mock.patch("utils.initMethods.redis.Redis", return_value=broken):
         result = tableSchemas.tableSchemas("p1", ["sales"])
     assert result["sales"].equals(SALES)
 
 
 def test_redisSetErrorStillReturnsTheSchema(redisFake, reader):
-    redisFake.hset = mock.Mock(side_effect=ConnectionError("down"))
+    redisFake.pipeline = mock.Mock(side_effect=ConnectionError("down"))
     result = tableSchemas.tableSchemas("p1", ["sales"])
     assert result["sales"].equals(SALES)
+
+
+def test_aColdCallOverThreeTablesWritesInOnePipeline(redisFake, reader):
+    from utils import initMethods
+
+    reader.side_effect = lambda p, t, **k: SALES
+    tableSchemas.tableSchemas("p1", ["a", "b", "c"])
+    ttl = initMethods._REDIS_SMALL_TABLE_TTL_SECONDS
+    assert redisFake.calls == [
+        ("hmget", "p1::schemas", ["a", "b", "c"]),
+        ("pipeline", True, (("hset", "p1::schemas", "a"), ("hset", "p1::schemas", "b"), ("hset", "p1::schemas", "c"), ("expire", "p1::schemas", ttl))),
+    ]
+    assert _cachedTables(redisFake, "p1") == {"a", "b", "c"}
+
+
+def test_aFullyCachedCallWritesNothing(redisFake, reader):
+    tableSchemas.tableSchemas("p1", ["sales", "costs"])
+    redisFake.calls.clear()
+    tableSchemas.tableSchemas("p1", ["sales", "costs"])
+    assert redisFake.callNames() == ["hmget"]
+
+
+def test_aFailingPipelineIsLoggedOnceWithNoDataAndTheSchemasAreStillReturned(redisFake, reader):
+    messages = []
+    reader.side_effect = lambda p, t, **k: SALES
+    redisFake.pipeline = mock.Mock(return_value=mock.Mock(execute=mock.Mock(side_effect=ConnectionError("secret-host"))))
+    with mock.patch("utils.tableSchemas.logger.warning", side_effect=lambda message, *a, **k: messages.append(message)):
+        result = tableSchemas.tableSchemas("p1", ["a", "b", "c"])
+    assert list(result) == ["a", "b", "c"]
+    assert messages == ["Table schema cache write failed: ConnectionError"]
+    assert redisFake.pipeline.call_count == 1
+
+
+def test_theTablesReadBeforeABusyRefusalAreStillCached(redisFake, reader):
+    from utils.sandboxSlots import SandboxBusyError
+
+    def read(projectId, tableName, **kwargs):
+        if tableName == "b":
+            raise SandboxBusyError()
+        return SALES
+
+    reader.side_effect = read
+    with pytest.raises(SandboxBusyError):
+        tableSchemas.tableSchemas("p1", ["a", "b"])
+    assert _cachedTables(redisFake, "p1") == {"a"}
 
 
 def test_poolErrorFallsBackToReading(reader):
@@ -198,7 +243,7 @@ def test_schemaKeysUseTheTableDataCacheTtl(redisFake, reader):
     from utils import initMethods
 
     tableSchemas.tableSchemas("p1", ["sales"])
-    assert redisFake.calls[-2:] == [("hset", "p1::schemas", "sales"), ("expire", "p1::schemas", initMethods._REDIS_SMALL_TABLE_TTL_SECONDS)]
+    assert redisFake.calls[-1] == ("pipeline", True, (("hset", "p1::schemas", "sales"), ("expire", "p1::schemas", initMethods._REDIS_SMALL_TABLE_TTL_SECONDS)))
     assert initMethods._REDIS_SMALL_TABLE_TTL_SECONDS >= initMethods._REDIS_MEDIUM_TABLE_TTL_SECONDS
 
 
@@ -223,27 +268,28 @@ def test_aSchemaCachedAfterForgetTableExpiresWithTheDataCache(redisFake, reader)
 def test_aFailingRedisIsCalledOnceForTwentyTables(reader):
     broken = mock.Mock()
     broken.hmget.side_effect = ConnectionError("down")
-    broken.hset.side_effect = ConnectionError("down")
     names = [f"t{i}" for i in range(20)]
     reader.side_effect = lambda p, t, **k: SALES
     with mock.patch("utils.initMethods._redis_pool"), mock.patch("utils.initMethods.redis.Redis", return_value=broken):
         result = tableSchemas.tableSchemas("p1", names)
     assert list(result) == names
-    assert broken.hmget.call_count + broken.hset.call_count + broken.expire.call_count == 1
+    assert broken.hmget.call_count == 1
+    assert broken.method_calls == [mock.call.hmget("p1::schemas", names)]
     assert reader.call_count == 20
 
 
-def test_aFailingSetStopsAllLaterRedisCallsInThatCall(reader):
+def test_aFailingWriteIsTriedOnceForTwentyTables(reader):
     broken = mock.Mock()
     names = [f"t{i}" for i in range(20)]
     broken.hmget.return_value = [None] * len(names)
-    broken.hset.side_effect = ConnectionError("down")
+    broken.pipeline.return_value.execute.side_effect = ConnectionError("down")
     reader.side_effect = lambda p, t, **k: SALES
     with mock.patch("utils.initMethods._redis_pool"), mock.patch("utils.initMethods.redis.Redis", return_value=broken):
         tableSchemas.tableSchemas("p1", names)
     assert broken.hmget.call_count == 1
-    assert broken.hset.call_count == 1
-    assert broken.expire.call_count == 0
+    assert broken.pipeline.call_count == 1
+    assert broken.pipeline.return_value.execute.call_count == 1
+    assert broken.hset.call_count == broken.expire.call_count == 0
 
 
 def test_theNextCallTriesRedisAgain(redisFake, reader):
@@ -311,7 +357,6 @@ def test_busyPropagatesEvenWhenSkippingUnreadable(redisFake, reader, busy):
 def test_aFailingRedisGetsOneAttemptWhileSkippingUnreadable(reader):
     broken = mock.Mock()
     broken.hmget.side_effect = ConnectionError("down")
-    broken.hset.side_effect = ConnectionError("down")
     names = [f"t{i}" for i in range(20)]
 
     def decode(projectId, tableName, **kwargs):
@@ -323,7 +368,7 @@ def test_aFailingRedisGetsOneAttemptWhileSkippingUnreadable(reader):
     with mock.patch("utils.initMethods._redis_pool"), mock.patch("utils.initMethods.redis.Redis", return_value=broken):
         result = tableSchemas.tableSchemas("p1", names, skipUnreadable=True)
     assert len(result) == 19
-    assert broken.hmget.call_count + broken.hset.call_count + broken.expire.call_count == 1
+    assert broken.method_calls == [mock.call.hmget("p1::schemas", names)]
 
 
 def test_aMissReadsOnlyTheSchemaAndPassesHeadroomOnlyForAShadow(redisFake, reader):
