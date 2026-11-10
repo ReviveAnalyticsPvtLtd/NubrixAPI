@@ -373,3 +373,64 @@ def test_failedChartRequestRerunLogsIdFormAndClassOnly(monkeypatch, logLines):
     assert "chartRequest" in lines[0] and "ChartFailure" in lines[0]
     for forbidden in ("4242", "secret", "boom", "north"):
         assert forbidden not in lines[0]
+
+
+def _secondReadDiffers(monkeypatch, service, latestWidgets):
+    """The first dashboardConfig.json read returns the setup copy; later reads return `latestWidgets`."""
+    from api.services import dashboardService as module
+
+    original = module.readJson
+    reads = []
+
+    def read(projectId, name):
+        if name != "dashboardConfig.json":
+            return original(projectId, name)
+        reads.append(name)
+        if len(reads) == 1:
+            return original(projectId, name)
+        return {"pg": {"name": "renamed", "widgets": copy.deepcopy(latestWidgets)}}
+
+    monkeypatch.setattr(module, "readJson", read)
+    return reads
+
+
+def test_refreshSavesIntoTheLatestDashboardNotTheCopyReadBeforeTheRuns(monkeypatch):
+    a, b, c = _widget("A", PYTHON + "\n# a"), _widget("B", PYTHON + "\n# b"), _widget("C", PYTHON + "\n# c")
+    service, _, _ = _setup(monkeypatch, [a, b, c],
+                           run=lambda code, projectId=None, filters=None: json.dumps({"data": "newA"} if "# a" in code else {"data": "newC"} if "# c" in code else {"error": "x"}))
+    movedA = dict(copy.deepcopy(a), layout={"x": 99})
+    editedC = dict(copy.deepcopy(c), generatedCode="edited code")
+    reads = _secondReadDiffers(monkeypatch, service, [movedA, editedC])
+
+    page = service.getData(GetData(projectId="p1", page="pg", refresh=True))
+
+    saved = _uploaded(service)["pg"]
+    assert len(reads) == 2
+    assert saved["name"] == "renamed"
+    assert [w["id"] for w in saved["widgets"]] == ["A", "C"]
+    assert [w["data"] for w in saved["widgets"]] == ["newA", "newC"]
+    assert saved["widgets"][0]["layout"] == {"x": 99}
+    assert saved["widgets"][1]["generatedCode"] == "edited code"
+    assert [w["id"] for w in page["widgets"]] == ["A", "C"] and page["id"] == "pg"
+    assert [w["data"] for w in page["widgets"]] == ["newA", "newC"]
+
+
+def test_refreshDoesNotBringBackAWidgetDeletedDuringTheRuns(monkeypatch):
+    service, _, _ = _setup(monkeypatch, [_widget("A"), _widget("B")])
+    _secondReadDiffers(monkeypatch, service, [_widget("B")])
+
+    service.getData(GetData(projectId="p1", page="pg", refresh=True))
+
+    assert [w["id"] for w in _uploaded(service)["pg"]["widgets"]] == ["B"]
+
+
+def test_refreshUploadsNothingWhenEverySucceededWidgetWasDeleted(monkeypatch):
+    def run(code, projectId=None, filters=None):
+        return json.dumps({"data": "newA"}) if "marker_a" in code else "Traceback"
+
+    service, _, _ = _setup(monkeypatch, [_widget("A", PYTHON + "\n# marker_a"), _widget("B")], run=run)
+    _secondReadDiffers(monkeypatch, service, [_widget("B")])
+
+    service.getData(GetData(projectId="p1", page="pg", refresh=True))
+
+    service.client.storage.from_.assert_not_called()

@@ -331,6 +331,37 @@ class DashboardService:
             logger.error(exception)
             raise exception  
         
+    def _saveRefreshed(self, details: GetData, refreshed: list[dict]) -> dict | None:
+        """
+        Save refreshed widget data into the latest dashboard, not the copy read before the re-runs.
+
+        The re-runs can take minutes, so the dashboard may have changed meanwhile (a widget deleted, a layout
+        moved). The file is read again and each refreshed widget is merged by `id` into that copy: only the chart
+        keys change, and `id`, `layout` and `generatedCode` stay as they are there. A widget that no longer exists
+        is skipped. Nothing is uploaded when no widget was merged.
+
+        Returns:
+            dict | None: The saved page (with its `id`), or None when nothing was saved.
+        """
+        latest = readJson(details.projectId, "dashboardConfig.json")
+        latestPage = latest.get(details.page)
+        if not isinstance(latestPage, dict) or not isinstance(latestPage.get("widgets"), list):
+            return None
+        byId = {fresh.get("id"): fresh for fresh in refreshed if fresh.get("id") is not None}
+        merged = 0
+        for widget in latestPage["widgets"]:
+            fresh = byId.get(widget.get("id")) if isinstance(widget, dict) else None
+            if fresh is not None:
+                widget.update({key: fresh[key] for key in _CHART_KEYS if key in fresh})
+                merged += 1
+        if not merged:
+            return None
+        with io.BytesIO() as buffer:
+            buffer.write(json.dumps(latest, indent=4).encode("utf-8"))
+            buffer.seek(0)
+            _ = self.client.storage.from_("AnalyticsHub").upload(path = f"{details.projectId}/dashboardConfig.json", file = buffer.getvalue(), file_options = {"upsert": "true"})
+        return {**latestPage, "id": details.page}
+
     def getData(self, details: GetData) -> dict:
         """
         Retrieve data for a dashboard page, applying filters if provided.
@@ -361,10 +392,7 @@ class DashboardService:
                     for saved, (fresh, succeeded) in zip(widgets, outcomes):
                         if succeeded:
                             saved.update(fresh)
-                    with io.BytesIO() as buffer:
-                        buffer.write(json.dumps(dashboardConfig, indent=4).encode("utf-8"))
-                        buffer.seek(0)
-                        _ = self.client.storage.from_("AnalyticsHub").upload(path = f"{details.projectId}/dashboardConfig.json", file = buffer.getvalue(), file_options = {"upsert": "true"})
+                    pageInfo = self._saveRefreshed(details, [fresh for fresh, succeeded in outcomes if succeeded]) or pageInfo
             else:
                 raise ValueError("Filters and Refresh cannot be implemented simultaneously.")
             widgets = pageInfo.get("widgets")
