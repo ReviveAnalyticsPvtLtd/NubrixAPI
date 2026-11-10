@@ -146,6 +146,18 @@ def _isShadow(config: RunnableConfig | None) -> bool:
     return ((config or {}).get("configurable") or {}).get("shadow") is True
 
 
+def _shadowOutcome(config: RunnableConfig | None) -> dict | None:
+    """A shadow run's outcome sink (`configurable["outcome"]`), which the format node fills with the failure's stage."""
+    outcome = ((config or {}).get("configurable") or {}).get("outcome")
+    return outcome if _isShadow(config) and isinstance(outcome, dict) else None
+
+
+def _endedBusy(failure: dict) -> bool:
+    """Whether a failure is a busy sandbox, whichever node it came from, including a busy error wrapped as a run failure."""
+    error = failure.get("error")
+    return failure["stage"] == "busy" or isBusy(error) or isBusy(getattr(error, "__cause__", None))
+
+
 # Slice charts share their roles (label, value) and their SQL rules, so the type is only a presentation choice. When the
 # plan opens by naming one and the model answered with another, the plan's type is served.
 _SLICE_TYPES = {"pie": "pie", "doughnut": "doughnut", "polararea": "polarArea"}
@@ -314,6 +326,16 @@ class SqlChartWorkflow:
             doubt = self._doubtOf(state) or "Query could not be processed."
             return {"finalOutput": {"response": doubt}}
 
+        shadow = _isShadow(config)
+        if shadow and _endedBusy(failure):
+            # A shadow that found the sandbox busy is dropped, not failed: only its chart_shadow line says so.
+            outcome = _shadowOutcome(config)
+            if outcome is not None:
+                outcome["stage"] = "busy"
+            return {"finalOutput": {"error": BUSY_MESSAGE}, "codeOutput": json.dumps({"error": BUSY_MESSAGE}), "generatedCode": self._generatedCode(state)}
+        outcome = _shadowOutcome(config)
+        if outcome is not None:
+            outcome["stage"] = failure["stage"]
         lastRequest = state.get("lastRequest")
         logChartFailure(
             stage=failure["stage"],
@@ -322,7 +344,7 @@ class SqlChartWorkflow:
             projectId=state["projectId"],
             chartType=lastRequest["chartType"] if lastRequest else None,
             repairs=state.get("debugAttempts", 0),
-            shadow=_isShadow(config),
+            shadow=shadow,
             tableNames=state.get("tables"),
         )
         if failure["stage"] == "busy":

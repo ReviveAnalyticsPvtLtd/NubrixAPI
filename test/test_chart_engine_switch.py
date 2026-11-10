@@ -394,6 +394,63 @@ def test_shadowWhoseGroundingIsBusyIsLoggedAsDroppedBusy(env, monkeypatch):
     harness.generator.invoke.assert_not_called()
 
 
+def _shadowThroughTheRealWorkflow(env, monkeypatch):
+    """The shadow runs the real SQL workflow graph (stubbed chains and sandbox) behind the service's own config."""
+    from test.test_sql_chart_workflow import Harness
+
+    harness = Harness(monkeypatch)
+    harness.schemas.return_value = {}
+
+    class Real:
+        def invoke(self, inputs, config=None):
+            return harness.graph.invoke(inputs, config=config)
+
+    env.sql = Real()
+    env.mode("shadow")
+    return harness
+
+
+@pytest.mark.parametrize("stage", ["model", "check", "bind", "run", "timeout", "build"])
+def test_shadowLineCarriesTheFailureStage(env, monkeypatch, stage):
+    from nubrix.components.chartEngine import ChartFailure
+
+    harness = _shadowThroughTheRealWorkflow(env, monkeypatch)
+    if stage == "model":
+        harness.generator.invoke.return_value = "not a request"
+        harness.repair.invoke.return_value = "still not a request"
+    else:
+        harness.render.side_effect = ChartFailure(stage, f'Secret Corp "secret_column" {stage} failed')
+    env.chart()
+    env.executor.wait()
+    (line,) = env.shadowLines()
+    assert line["sqlOk"] is False and line["sqlStage"] == stage
+    assert "result" not in line and "Secret" not in json.dumps(line) and "secret_column" not in json.dumps(line)
+    (record,) = harness.failureRecords()
+    assert record["stage"] == stage and record["shadow"] is True
+    assert env.free()
+
+
+@pytest.mark.parametrize("where", ["grounding", "run", "wrappedRun"])
+def test_aBusyShadowLogsOnlyItsShadowLine(env, monkeypatch, where):
+    harness = _shadowThroughTheRealWorkflow(env, monkeypatch)
+    error = SandboxBusyError()
+    if where == "wrappedRun":
+        error = RuntimeError("503")
+        error.errorCode = "SANDBOX_BUSY"
+    if where == "grounding":
+        harness.schemas.side_effect = error
+    else:
+        harness.render.side_effect = error
+    response = env.chart()
+    env.executor.wait()
+    assert response == PY_RESPONSE
+    (line,) = env.shadowLines()
+    assert line["result"] == "dropped_busy" and line["sqlOk"] is None and line["sqlStage"] is None
+    assert harness.failureRecords() == []
+    assert not [entry for entry in env.logs if entry.startswith("chart_failure ")]
+    assert env.free()
+
+
 @pytest.mark.parametrize("error", [RuntimeError("quota for key 12345 exceeded"), ValueError("secret value"), KeyError("k")])
 def test_shadowCatchesEveryErrorAndReleasesItsPermit(env, error):
     env.mode("shadow")

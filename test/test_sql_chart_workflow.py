@@ -240,6 +240,45 @@ def test_shadowFailureIsLoggedAsShadow(harness):
     assert harness.failureRecords()[0]["shadow"] is True
 
 
+def test_shadowFailureFillsItsOutcomeWithTheStage(harness):
+    outcome = {}
+    harness.render.side_effect = ChartFailure("bind", 'Binder Error: column "secret_column" not found')
+    harness.run(config={"configurable": {"shadow": True, "outcome": outcome}})
+    assert outcome == {"stage": "bind"}
+
+
+def test_servedFailureFillsNoOutcome(harness):
+    outcome = {}
+    harness.render.side_effect = ChartFailure("bind", "x")
+    harness.run(config={"configurable": {"outcome": outcome}})
+    assert outcome == {}
+
+
+@pytest.mark.parametrize("where", ["grounding", "run", "wrappedRun"])
+def test_aBusyShadowWritesNoFailureLine(harness, where):
+    error = SandboxBusyError()
+    if where == "wrappedRun":
+        error = RuntimeError("503")
+        error.errorCode = "SANDBOX_BUSY"
+    if where == "grounding":
+        harness.schemas.side_effect = error
+    else:
+        harness.render.side_effect = error
+    state = harness.run(config={"configurable": {"shadow": True}})
+    assert state["finalOutput"] == {"error": BUSY_MESSAGE}
+    assert harness.failureRecords() == []
+    harness.repair.invoke.assert_not_called()
+
+
+def test_aServedRunWithAWrappedBusyErrorIsUnchanged(harness):
+    error = RuntimeError("503")
+    error.errorCode = "SANDBOX_BUSY"
+    harness.render.side_effect = error
+    state = harness.run()
+    assert state["finalOutput"] == {"error": module._UNEXPECTED_MESSAGE}
+    assert [record["stage"] for record in harness.failureRecords()] == ["run"]
+
+
 def test_internalKeysNeverLeak(harness):
     harness.render.side_effect = [ChartFailure("run", "boom"), CHART]
     state = harness.run()

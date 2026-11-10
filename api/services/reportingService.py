@@ -108,12 +108,12 @@ def _sqlConfig(traceName: str, tags: list[str], projectId: str, userId: str | No
     """The config of one SQL run: its own Langfuse handler (so its trace id is its own) and, served, the credit callback.
 
     A shadow run never carries `CreditTrackingCallback` and says so in `configurable`, which makes the sandbox calls
-    skip waiting for a slot.
+    skip waiting for a slot. It also gets an empty `outcome` dict there, which the workflow fills with a failure's stage.
     """
     from utils.llm import getLangfuseConfig
     config = getLangfuseConfig(trace_name=traceName, projectId=projectId, userId=userId, tags=tags, perRequestHandler=True)
     if shadow:
-        config.setdefault("configurable", {})["shadow"] = True
+        config.setdefault("configurable", {}).update(shadow=True, outcome={})
     elif userId:
         config.setdefault("callbacks", []).append(CreditTrackingCallback(userId=userId, operationType="reporting_query"))
     return config
@@ -202,9 +202,12 @@ def _runShadow(parallel: bool, projectId: str, userId: str | None, metadata: dic
                 record.update(sqlOk=True, contractErrors=len(contractErrors(output)))
                 if record["pythonOk"]:
                     record["agreement"] = compareCharts(pythonOutput, output)
+            elif isinstance(output, dict) and "error" in output:
+                # The workflow's stage name (as in the chart_failure line), never the message.
+                stage = (config.get("configurable") or {}).get("outcome", {}).get("stage")
+                record.update(sqlOk=False, sqlStage=stage if isinstance(stage, str) else "failed")
             else:
-                # The stage is in the chart_failure line of the same trace id (shadow: true).
-                record.update(sqlOk=False, sqlStage="failed" if isinstance(output, dict) and "error" in output else "doubt")
+                record.update(sqlOk=False, sqlStage="doubt")
         except Exception as error:
             if isBusy(error):
                 record["result"] = "dropped_busy"
