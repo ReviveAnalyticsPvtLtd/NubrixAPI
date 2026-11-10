@@ -4,8 +4,10 @@ The API is several processes (web workers and Celery), so the slots are files th
 a lock goes when its holder does, however it dies.
 """
 
+import json
 import os
 import stat
+import threading
 import time
 
 from utils.logger import logger
@@ -14,6 +16,10 @@ SLOT_POLL_SECONDS = 0.1
 SLOTS_FOLDER = "slots"
 BUSY_CODE = "SANDBOX_BUSY"
 BUSY_MESSAGE = "Too many analyses are running right now. Please try again in a moment."
+
+# A shadow needs at least 2 free slots, so a cap below 2 refuses every one. That is said once per process.
+_shadowDisabledWarned = False
+_shadowDisabledLock = threading.Lock()
 
 
 class SandboxBusyError(RuntimeError):
@@ -131,8 +137,15 @@ def freeRunSlots(runRoot: str | None, maxRuns: int) -> int | None:
 def requireHeadroom(runRoot: str | None, maxRuns: int) -> None:
     """Raise SandboxBusyError unless at least `max(2, maxRuns // 2)` slots are free, so a shadow run leaves room for served ones.
 
-    Does nothing where the cap is off. It takes no slot: the caller takes its own afterwards.
+    Does nothing where the cap is off. It takes no slot: the caller takes its own afterwards. A cap below 2 refuses every
+    shadow; the first such refusal in a process logs one `chart_shadow_disabled` warning saying why.
     """
+    global _shadowDisabledWarned
     free = freeRunSlots(runRoot, maxRuns)
     if free is not None and free < max(2, maxRuns // 2):
+        if maxRuns < 2:
+            with _shadowDisabledLock:
+                warn, _shadowDisabledWarned = not _shadowDisabledWarned, True
+            if warn:
+                logger.warning("chart_shadow_disabled " + json.dumps({"reason": "sandbox cap below 2"}))
         raise SandboxBusyError()

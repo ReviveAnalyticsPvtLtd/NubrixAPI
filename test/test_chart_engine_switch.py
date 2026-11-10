@@ -949,8 +949,16 @@ def test_shutdownCancelsQueuedShadowRunsAndReturnsTheirPermits(env):
 def test_shutdownIsSafeToCallTwiceAndWithNothingQueued(env):
     rs.shutdownShadow()
     rs.shutdownShadow()
-    assert [line for line in env.logs if line.startswith("chart_shadow_shutdown")][0] == 'chart_shadow_shutdown {"cancelled": 0}'
+    assert [line for line in env.logs if line.startswith("chart_shadow_shutdown")] == []
     assert env.free()
+
+
+def test_offModeLogsNothingAtShutdown(env):
+    env.mode("off")
+    env.chart()
+    env.parallel()
+    rs.shutdownShadow()
+    assert env.logs == []
 
 
 def test_shadowAfterShutdownIsDroppedAndNothingIsRaised(env):
@@ -980,3 +988,24 @@ def test_theAppCallsShutdownShadowOnShutdown():
         and any("on_event" in ast.unparse(d) and "shutdown" in ast.unparse(d) for d in node.decorator_list)
     ]
     assert hooks and any("shutdownShadow" in ast.unparse(hook) for hook in hooks)
+
+
+# A sandbox cap below 2 leaves a shadow no headroom ever
+
+from test.test_shadow_headroom import flock  # noqa: E402,F401
+
+
+def test_aSandboxCapBelowTwoWarnsOnceAndDropsEveryShadowAsBusy(env, monkeypatch, flock, tmp_path):  # noqa: F811
+    from utils import sandboxSlots
+
+    monkeypatch.setattr(sandboxSlots, "_shadowDisabledWarned", False)
+    harness = _shadowThroughTheRealWorkflow(env, monkeypatch)
+    harness.schemas.side_effect = lambda *args, **kwargs: sandboxSlots.requireHeadroom(str(tmp_path), 1)
+    for _ in range(3):
+        assert env.chart() == PY_RESPONSE
+        env.executor.wait()
+    assert [line["result"] for line in env.shadowLines()] == ["dropped_busy"] * 3
+    logged = harness.logs + env.logs
+    assert [line for line in logged if line.startswith("chart_shadow_disabled")] == ['chart_shadow_disabled {"reason": "sandbox cap below 2"}']
+    assert harness.failureRecords() == []
+    assert env.free()

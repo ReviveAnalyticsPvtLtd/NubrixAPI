@@ -148,7 +148,8 @@ def _shadowDone(future: Future) -> None:
 def shutdownShadow() -> None:
     """Stops admitting shadow runs and cancels the queued ones, without waiting for the running ones. Call it when the app shuts down.
 
-    Each cancelled run gives its permit back and is counted in the `chart_shadow_shutdown` line.
+    Each cancelled run gives its permit back and is counted in the `chart_shadow_shutdown` line, which is written only
+    when at least one run was cancelled, so a worker that queued none (off mode) logs nothing at exit.
     """
     _shadowClosed.set()
     with _shadowCancelledLock:
@@ -159,6 +160,8 @@ def shutdownShadow() -> None:
         logger.warning(f"Could not shut down the shadow chart pool: {type(e).__name__}")
     with _shadowCancelledLock:
         cancelled = _shadowCancelled - before
+    if not cancelled:
+        return
     try:
         logger.info("chart_shadow_shutdown " + json.dumps({"cancelled": cancelled}))
     except Exception as e:

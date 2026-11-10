@@ -328,3 +328,30 @@ def test_shadowTableSchemasLetBusyPropagateEvenWhenSkippingUnreadable(readerRun,
         assert readerRun == []
     finally:
         _release(held)
+
+
+@pytest.fixture
+def warnings(monkeypatch):
+    seen = []
+    monkeypatch.setattr(sandboxSlots, "_shadowDisabledWarned", False)
+    monkeypatch.setattr(sandboxSlots.logger, "warning", lambda message, *a, **k: seen.append(str(message)))
+    return seen
+
+
+def test_aCapBelowTwoRefusesEveryShadowAndWarnsOncePerProcess(flock, tmp_path, warnings):
+    for _ in range(3):
+        with pytest.raises(SandboxBusyError):
+            requireHeadroom(str(tmp_path), 1)
+    assert warnings == ['chart_shadow_disabled {"reason": "sandbox cap below 2"}']
+
+
+def test_aBusySandboxWithACapOfTwoOrMoreDoesNotWarn(flock, tmp_path, warnings):
+    held = _hold(tmp_path, 2, 1)
+    try:
+        with pytest.raises(SandboxBusyError):
+            requireHeadroom(str(tmp_path), 2)
+    finally:
+        _release(held)
+    requireHeadroom(str(tmp_path), 2)
+    requireHeadroom(None, 1)  # no cap here: nothing to say
+    assert warnings == []
