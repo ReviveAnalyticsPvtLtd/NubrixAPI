@@ -86,7 +86,9 @@ def _readRequest(text: str) -> ChartRequest:
     so each '{' is tried as the start of an object. When none validates, the error raised is the one for the object
     most likely to be the request: the last one with a `chartType` key, else the longest. When a '{' that did not
     decode starts a longer stretch than that object, with no `chartType` object after it, the reply was cut off or is
-    not JSON, and the error is the invalid-JSON one for that stretch.
+    not JSON, and the error is the invalid-JSON one for that stretch. A '{' inside a decoded object (in one of its
+    strings) starts nothing, and a stretch only outranks an object with a `chartType` key when it holds `"chartType"`
+    itself, since only then can it be a cut-off request.
     """
     decoder = json.JSONDecoder()
     decoded: list[tuple[int, int, dict]] = []
@@ -106,12 +108,13 @@ def _readRequest(text: str) -> ChartRequest:
                     decoded.append((position, end, parsed))
                     errors[position] = error
         position = text.find("{", position + 1)
+    undecoded = [cut for cut in undecoded if not any(start < cut < end for start, end, _ in decoded)]
     withType = [item for item in decoded if "chartType" in item[2]]
     best = withType[-1] if withType else max(decoded, key=lambda item: item[1] - item[0], default=None)
     span = best[1] - best[0] if best else 0
     after = best[0] if withType else -1
     for cut in undecoded:
-        if len(text) - cut > span and cut > after:
+        if len(text) - cut > span and cut > after and (not withType or '"chartType"' in text[cut:]):
             # Invalid JSON, for the stretch that could not be read.
             return ChartRequest.model_validate_json(text[cut:].strip())
     if best:

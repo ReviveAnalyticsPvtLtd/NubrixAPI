@@ -419,6 +419,24 @@ def test_invalidRequestReportsTheRequestsOwnError():
     assert _errorsOf(reply) == [("missing", ("encoding",))]
 
 
+INVALID_REQUEST = json.dumps({"chartType": "bar", "title": "T", "sql": "S"})
+PROSE = " and that is my plan," * 20
+
+
+def test_invalidRequestFollowedByProseWithABraceReportsItsOwnError():
+    reply = INVALID_REQUEST + "\nNote:" + PROSE + " { see above" + PROSE
+    assert _errorsOf(reply) == [("missing", ("encoding",))]
+
+
+def test_braceInsideAStringOfTheRequestStartsNothing():
+    reply = json.dumps({"chartType": "bar", "title": "T {x}", "sql": "S"}) + "\n" + PROSE * 2
+    assert _errorsOf(reply) == [("missing", ("encoding",))]
+
+
+def test_invalidRequestThenATruncatedRequestIsInvalidJson():
+    assert _errorsOf(INVALID_REQUEST + "\n" + MODEL_TEXT[:-20]) == [("json_invalid", ())]
+
+
 def test_truncatedRequestAfterEmptyBracesIsInvalidJson():
     assert _errorsOf("Use {} maybe.\n" + MODEL_TEXT[:-20]) == [("json_invalid", ())]
 
