@@ -119,8 +119,11 @@ def _comparable(field: pc.Expression, dataType: pa.DataType) -> tuple[pc.Express
 
 
 def _hasStringCast(dataType: pa.DataType) -> bool:
+    """Whether the column's values can be cast to text. A tz-aware timestamp needs the time zone database to do
+    so, and an empty array would not reach it, so those are probed with one value (no database: no text form)."""
     try:
-        pa.array([], type=dataType).cast(pa.string())
+        needsValue = pa.types.is_timestamp(dataType) and dataType.tz is not None
+        pa.array([0] if needsValue else [], type=dataType).cast(pa.string())
     except (pa.ArrowException, NotImplementedError):
         return False
     return True

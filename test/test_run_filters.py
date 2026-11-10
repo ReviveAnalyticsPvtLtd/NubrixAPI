@@ -332,3 +332,27 @@ def test_stringViewColumnsAreFilteredAsText():
     assert applyFilters(t, "t", [{"s": {"contains": "ALP"}}]).num_rows == 2
     assert applyFilters(t, "t", [{"s": {"startswith": "al"}}]).num_rows == 1
     assert applyFilters(t, "t", [{"s": {"min": "b"}}]).num_rows == 1
+
+
+def test_textFilterMatchesNoRowsWhenTheColumnsTextFormCannotBeBuilt(monkeypatch, tmp_path):
+    """A tz-aware timestamp needs a time zone database to become text; without one the condition matches nothing."""
+    table = pa.table(
+        {
+            "id": pa.array([1, 2], type=pa.int64()),
+            "at": pa.array([datetime.datetime(2024, 1, 15, 6), datetime.datetime(2023, 1, 15, 6)], type=pa.timestamp("us", tz="UTC")),
+        }
+    )
+    path = tmp_path / "t.parquet"
+    pq.write_table(table, path)
+    realArray = pa.array
+
+    def noTimeZoneDatabase(values, type=None, *args, **kwargs):
+        if type is not None and pa.types.is_timestamp(type) and type.tz is not None and len(values):
+            raise pa.ArrowInvalid("Cannot locate timezone 'UTC': Timezone database not found")
+        return realArray(values, type, *args, **kwargs)
+
+    monkeypatch.setattr(pa, "array", noTimeZoneDatabase)
+
+    flt = [{"at": {"startswith": "2024"}}]
+    assert applyFilters(table, "t", flt).num_rows == 0
+    assert filterDataset(ds.dataset(path), "t", flt).to_table().num_rows == 0
