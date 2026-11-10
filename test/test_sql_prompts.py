@@ -6,6 +6,7 @@ DuckDB over a few invented rows and build a chart the client can read.
 """
 
 import datetime
+import hashlib
 import json
 import os
 import re
@@ -36,6 +37,22 @@ NEW_PROMPTS = {
     "sqlChartRepairPrompt": {"grounding", "question", "plan", "previous_request", "error"},
 }
 OLD_PROMPTS = ("queryRephraserAgentPrompt", "parallelQueryRephraserAgentPrompt", "codeGeneratorAgentPrompt", "codeDebuggerAgentPrompt")
+
+# sha256 of every prompt that existed before the SQL chart prompts; the old engine must keep reading them unchanged.
+OLD_PROMPT_SHA256 = {
+    "metadataGeneratorPrompt": "c7b0abac47efff4e4de4d692c89dee8bac9a2b7ad298ec04b77c70dd5196b5a7",
+    "queryRephraserAgentPrompt": "652cedc1e0aac6f2e56cdc004759a2289fdbb58e3287e1410b686c90ee0d2c99",
+    "parallelQueryRephraserAgentPrompt": "ddfd9a2632702a3489e05ec6e6c3b00796663bf9c606731a873bd7bbd56603f0",
+    "codeGeneratorAgentPrompt": "6a671adf30593e5d0e47da104b13bf4604ff7e415df6c3281c41df6aa57e78f4",
+    "codeDebuggerAgentPrompt": "492636fcb512ac31ab138c8346175aa99ea734b6a9fa3b03927d7f38f239abff",
+    "insightGeneratorAgentPrompt": "842b034c10df6e0031c7eac4912759ed0379f36fd72005cfcf6081f60daf3539",
+    "imageToInsightGeneratorPrompt": "c6e225d12b696c18857f968c5fab2496101ab136cee3c58208e2f33bbaa54dd7",
+    "pdfTableExtractionPrompt": "cbcf60f9fd77cb72d4ad3b53c45a7fbbc21da36f4e3686f0655c6cc1712f35ce",
+    "pdfTableMergePrompt": "33e351b750bc2b94442278e3f37ffb47219d6549a267b3cc0ab0f7f7cc9d3f4d",
+    "domainAwareKpiMappingAgentPrompt": "653f03ff0f3036e55675ca9113c3b0c0c1196c27c407609c0daefa31cf72932e",
+    "dashboardNameGeneratorPrompt": "b1a771f36e133c5c323393175134b42b5294d64f30a36664d55fa1c37f578710",
+    "transformationAgentPrompt": "2e5c850fecd73c32d387e0c96261a43a2a9196fcfbad2f0dab33170c97485390",
+}
 
 # Spec section 6.1, verbatim.
 ENCODING_TABLE = """| chartType | encoding (column names from the query result) |
@@ -330,6 +347,26 @@ def test_oldPromptsStay():
         assert isinstance(prompts.get(key), str) and prompts[key].strip()
 
 
+def test_oldPromptsAreByteForByteUnchanged():
+    prompts = _prompts()
+
+    assert set(prompts) == set(OLD_PROMPT_SHA256) | set(NEW_PROMPTS)
+    for key, digest in OLD_PROMPT_SHA256.items():
+        assert hashlib.sha256(prompts[key].encode("utf-8")).hexdigest() == digest, key
+
+
+def test_repairPromptSharesTheGeneratorRulesWordForWord():
+    prompts = _prompts()
+    generator = prompts["sqlChartGeneratorPrompt"]
+    repair = prompts["sqlChartRepairPrompt"]
+
+    generatorRules = generator[generator.index("## Output\n") : generator.index("\n## Worked examples\n")]
+    repairRules = repair[repair.index("## Output\n") : repair.index("\n## Example\n")]
+
+    assert len(generatorRules) > 5000
+    assert repairRules == generatorRules
+
+
 def test_examplesAreValidChartRequests():
     text = _formatted("sqlChartGeneratorPrompt")
     tables = _exampleTables()
@@ -551,28 +588,51 @@ def test_seriesOrderByTotalRunsAndPutsTheBiggestCategoryFirst():
 
 
 @pytest.mark.parametrize("key", ["sqlChartGeneratorPrompt", "sqlChartRepairPrompt"])
-def test_chartPromptsCarryTheEncodingTableAndRules(key):
-    text = _formatted(key)
+def test_chartPromptsCarryTheEncodingTable(key):
+    assert ENCODING_TABLE in _formatted(key)
 
-    assert ENCODING_TABLE in text
-    for phrase in (
-        "double quotes",
-        "ILIKE",
-        "lower(",
-        "GROUP BY ALL",
-        "date_trunc",
-        "strftime",
-        "date_diff",
-        "QUALIFY",
-        "TRY_CAST",
-        "NULLIF",
-        "COALESCE",
-        "at most 50",
-        "exactly one row",
-        "PIVOT",
-        "only a JSON object",
-    ):
-        assert phrase in text, phrase
+
+def _exampleSql() -> list[str]:
+    repair = [ChartRequest.model_validate(answer) for answer in _answers(_formatted("sqlChartRepairPrompt"))]
+    return [request.sql for request in _examples() + repair[-1:]]
+
+
+def test_examplesQuoteEverySchemaTableAndColumn():
+    columns = {name: set(schema.names) for name, schema in EXAMPLE_SCHEMAS.items()}
+
+    for sql in _exampleSql():
+        tree = sqlglot.parse_one(sql, read="duckdb")
+        aliases: dict[str, str] = {}
+        for table in tree.find_all(sqlglot.exp.Table):
+            if table.name in columns:
+                assert table.this.quoted, (table.name, sql)
+                aliases[table.alias_or_name] = table.name
+        for column in tree.find_all(sqlglot.exp.Column):
+            if column.table in aliases:
+                assert column.name in columns[aliases[column.table]], (column.sql(), sql)
+                assert column.this.quoted, (column.sql(), sql)
+
+
+def test_examplesNeverUsePivotAndReadOnlyTheirTables():
+    for sql in _exampleSql():
+        tree = sqlglot.parse_one(sql, read="duckdb")
+        assert not list(tree.find_all(sqlglot.exp.Pivot)), sql
+        checkSql(sql, EXAMPLE_SCHEMAS)
+
+
+def test_examplesMatchTypedTextWhateverItsCase():
+    tables = _exampleTables()
+    products = tables["products"]
+    index = products.schema.get_field_index("category")
+    shouting = products.set_column(
+        index, "category", pa.array([value.upper() for value in products.column("category").to_pylist()], pa.string())
+    )
+
+    bar = _example("bar")
+    chart = _runExample(bar, tables)
+
+    assert chart["data"]["labels"]
+    assert _runExample(bar, {**tables, "products": shouting}) == chart
 
 
 @pytest.mark.parametrize("key", sorted(NEW_PROMPTS))
