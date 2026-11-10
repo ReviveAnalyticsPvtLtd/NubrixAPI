@@ -18,6 +18,7 @@ The response keeps the keys of the Python chart workflows. Everything else stays
 __all__ = ["buildSqlChartWorkflow"]
 
 import json
+import re
 from typing import Any
 
 from langchain_core.runnables import RunnableConfig
@@ -145,6 +146,26 @@ def _isShadow(config: RunnableConfig | None) -> bool:
     return ((config or {}).get("configurable") or {}).get("shadow") is True
 
 
+# Slice charts share their roles (label, value) and their SQL rules, so the type is only a presentation choice. When the
+# plan opens by naming one and the model answered with another, the plan's type is served.
+_SLICE_TYPES = {"pie": "pie", "doughnut": "doughnut", "polararea": "polarArea"}
+_PLAN_SLICE_TYPE = re.compile(r"^\W*(?:an?\s+)?(pie|doughnut|polar\s*area)\s+chart\b", re.IGNORECASE)
+
+
+def _withPlanSliceType(update: dict, plan: str) -> dict:
+    request = update.get("chartRequest")
+    if not request or request.get("chartType") not in _SLICE_TYPES.values():
+        return update
+    match = _PLAN_SLICE_TYPE.match(plan or "")
+    if match is None:
+        return update
+    named = _SLICE_TYPES[re.sub(r"\s+", "", match.group(1)).lower()]
+    if named != request["chartType"]:
+        request = {**request, "chartType": named}
+        update.update(chartRequest=request, lastRequest=request)
+    return update
+
+
 class SqlChartWorkflow:
     """Builds the nodes; each workflow owns its chains and sandbox manager so parallel runs share no state."""
 
@@ -224,7 +245,7 @@ class SqlChartWorkflow:
         text = self.generatorChain.invoke(
             {"question": state["inputQuery"], "plan": self._plan(state), "grounding": state["grounding"]}, config
         )
-        return self._withMessage(self._parse(str(text)))
+        return self._withMessage(_withPlanSliceType(self._parse(str(text)), self._plan(state)))
 
     def _repair(self, state: State, config: RunnableConfig):
         previous = json.dumps(state["lastRequest"], ensure_ascii=False) if state.get("lastRequest") else state.get("rawText", "")
@@ -238,7 +259,7 @@ class SqlChartWorkflow:
             },
             config,
         )
-        update = self._withMessage(self._parse(str(text)))
+        update = self._withMessage(_withPlanSliceType(self._parse(str(text)), self._plan(state)))
         update["debugAttempts"] = state.get("debugAttempts", 0) + 1
         return update
 

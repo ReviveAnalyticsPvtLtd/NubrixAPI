@@ -404,3 +404,49 @@ def test_requestIsPickedOutOfSurroundingBraces(reply):
 def test_firstOfTwoValidRequestsIsTaken():
     other = json.dumps({**REQUEST, "title": "Other"})
     assert module._readRequest(MODEL_TEXT + "\n" + other).title == "Totals"
+
+
+SLICE_REQUEST = {
+    "chartType": "doughnut",
+    "title": "Share",
+    "sql": 'SELECT "a", SUM("b") AS total FROM "orders" GROUP BY ALL',
+    "encoding": {"label": "a", "value": "total"},
+}
+
+
+@pytest.mark.parametrize(
+    "plan, replied, served",
+    [
+        ("Pie chart of revenue share by category. Steps: ...", "doughnut", "pie"),
+        ("pie chart. Steps: ...", "polarArea", "pie"),
+        ("A doughnut chart of orders by status.", "pie", "doughnut"),
+        ("Polar area chart of units by region.", "pie", "polarArea"),
+        ("polarArea chart of units by region.", "doughnut", "polarArea"),
+        ("Doughnut chart of orders by status.", "doughnut", "doughnut"),
+        ("Share of revenue by category.", "doughnut", "doughnut"),
+        ("Bar chart of revenue by category.", "doughnut", "doughnut"),
+        ("Pies sold per bakery as a bar chart.", "doughnut", "doughnut"),
+    ],
+)
+def test_sliceChartServesTheTypeThePlanNames(harness, plan, replied, served):
+    harness.rephraser.invoke.return_value = {"rephrasedOutput": plan, "doubt": None}
+    harness.generator.invoke.return_value = json.dumps({**SLICE_REQUEST, "chartType": replied})
+    state = harness.run()
+    assert harness.render.call_args.args[2].chartType == served
+    assert decodeGeneratedCode(state["generatedCode"]).chartType == served
+
+
+def test_sliceTypeIsAlignedAfterARepairToo(harness):
+    harness.rephraser.invoke.return_value = {"rephrasedOutput": "Pie chart of revenue share.", "doubt": None}
+    harness.generator.invoke.return_value = "not json"
+    harness.repair.invoke.return_value = json.dumps(SLICE_REQUEST)
+    state = harness.run()
+    assert harness.render.call_args.args[2].chartType == "pie"
+    assert decodeGeneratedCode(state["generatedCode"]).chartType == "pie"
+
+
+def test_nonSliceRequestIsNeverRetyped(harness):
+    harness.rephraser.invoke.return_value = {"rephrasedOutput": "Pie chart of revenue share.", "doubt": None}
+    state = harness.run()
+    assert harness.render.call_args.args[2].chartType == "bar"
+    assert decodeGeneratedCode(state["generatedCode"]).chartType == "bar"
