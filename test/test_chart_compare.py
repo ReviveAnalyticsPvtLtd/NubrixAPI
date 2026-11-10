@@ -237,3 +237,65 @@ def test_compareCharts_aRealDifferenceInsideATieGroupDiffers():
     wholeA = {"chartType": "table", "data": [{"id": 1000001}, {"id": 1000002}]}
     wholeB = {"chartType": "table", "data": [{"id": 1000002}, {"id": 1000003}]}
     assert compareCharts(wholeA, wholeB) == "differ"
+
+
+def _tableOf(values):
+    return {"chartType": "table", "data": [{"v": v} for v in values]}
+
+
+def test_compareCharts_threeTiedFloatsMatchWhenTheOrderIsOpposite():
+    values = [1234561.5, 1234562.5, 1234563.5]
+    assert compareCharts(_tableOf(values), _tableOf(list(reversed(values)))) == "match"
+
+
+@pytest.mark.parametrize("seed", range(20))
+def test_compareCharts_randomAmountsInOneBucketMatchDescAgainstAsc(seed):
+    import random
+
+    rng = random.Random(seed)
+    values = sorted(round(rng.uniform(1.0e6, 1.1e6), 2) for _ in range(1000))
+    assert compareCharts(_tableOf(values), _tableOf(list(reversed(values)))) == "match"
+
+
+def test_compareCharts_aRealDifferenceInATieGroupOfManyDiffers():
+    values = [1234561.5 + i for i in range(50)]
+    changed = list(reversed(values))
+    changed[10] += 7.0
+    assert compareCharts(_tableOf(values), _tableOf(changed)) == "differ"
+
+
+def test_compareCharts_theWorstCaseForTheTieGroupFinishesQuickly():
+    import time
+
+    n = 10000
+    rows = [{"v": 1.0 + 1.1e-6 * (i * 8 // n)} for i in range(n)]
+    a, b = {"chartType": "table", "data": rows}, {"chartType": "table", "data": list(reversed(rows))}
+    start = time.perf_counter()
+    assert compareCharts(a, b) == "match"
+    assert time.perf_counter() - start < 2.0
+
+
+def test_compareCharts_theGreedyFallbackStopsAtItsBudget(monkeypatch):
+    from nubrix.components import chartCompare
+
+    real = chartCompare._same
+    state = {"calls": 0, "depth": 0}
+
+    def counting(a, b, relTol):
+        top = state["depth"] == 0
+        state["calls"] += top
+        state["depth"] += 1
+        try:
+            return real(a, b, relTol)
+        finally:
+            state["depth"] -= 1
+
+    monkeypatch.setattr(chartCompare, "_same", counting)
+    monkeypatch.setattr(chartCompare, "_GREEDY_BUDGET", 500)
+    # The two sides differ in every row of one tie group, so nothing pairs in order and the greedy pass has to scan.
+    n = 400
+    a = _tableOf([1234561.0 + 0.01 * i for i in range(n)])
+    b = _tableOf([1234561.0 + 0.01 * i + 3.0 for i in range(n)])
+    assert compareCharts(a, b) == "differ"
+    assert state["calls"] <= 500 + n
+    assert state["calls"] >= 500

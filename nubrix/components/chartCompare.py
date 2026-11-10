@@ -13,6 +13,12 @@ from typing import Any, Literal
 _ABS_TOL = 1e-12
 _MIDNIGHT = re.compile(r"[ T]00:00:00$")
 _WHOLE = re.compile(r"[+-]?\d+$")
+# Calls of `_same` that the greedy fallback may make in one comparison; past it the answer is "differ".
+_GREEDY_BUDGET = 200_000
+
+
+class _BudgetExhausted(Exception):
+    pass
 
 
 def _isNumber(value: Any) -> bool:
@@ -73,15 +79,37 @@ def _same(a: Any, b: Any, relTol: float) -> bool:
     return a == b
 
 
-def _sameMultiset(a: list, b: list, relTol: float) -> bool:
-    """The same items in any order: both sides sorted by a normalised key, then items that tie on the key are paired greedily."""
+def _exactKey(value: Any) -> tuple:
+    """An unrounded, type-tagged sort key: integral numbers as ints, other floats as floats, text as text, missing first."""
+    value = _norm(value)
+    if isinstance(value, dict):
+        return (3, tuple(sorted((str(k), _exactKey(v)) for k, v in value.items())), "")
+    if isinstance(value, (list, tuple)):
+        return (4, tuple(_exactKey(v) for v in value), "")
+    if value is None:
+        return (0, 0, "")
+    if _isNumber(value):
+        return (1, int(value) if _isIntegral(value) else float(value), "")
+    return (2, 0, str(value))
+
+
+def _sameMultiset(a: list, b: list, relTol: float, budget: list) -> bool:
+    """
+    The same items in any order: both sides sorted by a normalised key, then the items that tie on the key are paired.
+
+    Ties are paired in exact (unrounded) order first, which is correct for identical data in any arrival order and costs
+    O(n log n). Only the items this exact-order pairing leaves unmatched go to a greedy tolerance matching, which has a fixed budget of `_same`
+    calls (`_GREEDY_BUDGET`, shared by the whole comparison). A comparison that runs out of budget answers "differ", so
+    pathological data (many tolerance classes inside one key bucket, not in identical order) can give a "differ" for
+    charts that carry the same data.
+    """
     if len(a) != len(b):
         return False
     groupsA, groupsB = _groups(a), _groups(b)
     if [k for k, _ in groupsA] != [k for k, _ in groupsB]:
         # Rounded keys can differ for values that agree within the tolerance: fall back to one pool.
-        return _pairOff(sorted(a, key=_key), sorted(b, key=_key), relTol)
-    return all(_pairOff(x, y, relTol) for (_, x), (_, y) in zip(groupsA, groupsB))
+        return _pairOff(a, b, relTol, budget)
+    return all(_pairOff(x, y, relTol, budget) for (_, x), (_, y) in zip(groupsA, groupsB))
 
 
 def _groups(items: list) -> list:
@@ -95,16 +123,28 @@ def _groups(items: list) -> list:
     return groups
 
 
-def _pairOff(a: list, b: list, relTol: float) -> bool:
-    """Every item of `a` takes the first unused equal item of `b`."""
+def _pairOff(a: list, b: list, relTol: float, budget: list) -> bool:
+    """Pairs the items in exact order, then pairs what is left greedily within the budget of `_same` calls."""
     if len(a) != len(b):
         return False
-    free = list(b)
-    for x in a:
-        index = next((i for i, y in enumerate(free) if _same(x, y, relTol)), None)
+    a, b = sorted(a, key=_exactKey), sorted(b, key=_exactKey)
+    leftA, leftB = [], []
+    for x, y in zip(a, b):
+        if not _same(x, y, relTol):
+            leftA.append(x)
+            leftB.append(y)
+    for x in leftA:
+        index = None
+        for i, y in enumerate(leftB):
+            budget[0] -= 1
+            if budget[0] < 0:
+                raise _BudgetExhausted
+            if _same(x, y, relTol):
+                index = i
+                break
         if index is None:
             return False
-        free.pop(index)
+        leftB.pop(index)
     return True
 
 
@@ -162,12 +202,12 @@ def _sameCategory(a: dict, b: dict, relTol: float) -> bool:
     return _pairDatasets(a, b, sameData)
 
 
-def _sameScatter(a: dict, b: dict, relTol: float) -> bool:
-    return _pairDatasets(a, b, lambda x, y: _sameMultiset(x.get("data") or [], y.get("data") or [], relTol))
+def _sameScatter(a: dict, b: dict, relTol: float, budget: list) -> bool:
+    return _pairDatasets(a, b, lambda x, y: _sameMultiset(x.get("data") or [], y.get("data") or [], relTol, budget))
 
 
-def _sameTable(a: dict, b: dict, relTol: float) -> bool:
-    return _sameMultiset(a.get("data") or [], b.get("data") or [], relTol)
+def _sameTable(a: dict, b: dict, relTol: float, budget: list) -> bool:
+    return _sameMultiset(a.get("data") or [], b.get("data") or [], relTol, budget)
 
 
 def _points(chart: dict) -> set | None:
@@ -200,10 +240,12 @@ def compareCharts(a: dict, b: dict, relTol: float = 1e-6) -> Literal["match", "d
             - geoMap: the set of (lat, long, label) agrees to 6 decimals.
         Missing values (None, NaN) agree with each other. Two integral numbers agree only when equal, other numbers
         within `relTol`. Numeric text equals its number, and a label ending in a midnight time equals the bare date.
+        Table and scatter rows that tie on a rounded key are paired in exact order first, then greedily within a fixed
+        budget of `_same` calls; pathological data can exhaust it, and that gives "differ".
     """
     try:
         return "match" if _compare(a, b, relTol) else "differ"
-    except Exception:
+    except Exception:  # includes _BudgetExhausted: a budget-exhausted "differ" is possible for pathological data
         return "differ"
 
 
@@ -215,13 +257,14 @@ def _compare(a: dict, b: dict, relTol: float) -> bool:
         return False
     if chartType == "card":
         return _same(a.get("data"), b.get("data"), relTol)
+    budget = [_GREEDY_BUDGET]
     if chartType == "table":
-        return _sameTable(a, b, relTol)
+        return _sameTable(a, b, relTol, budget)
     if chartType == "pivot":
         return _same(a.get("data"), b.get("data"), relTol)
     if chartType == "geoMap":
         pointsA, pointsB = _points(a), _points(b)
         return pointsA is not None and pointsA == pointsB
     if chartType in ("scatter", "bubble"):
-        return _sameScatter(a, b, relTol)
+        return _sameScatter(a, b, relTol, budget)
     return _sameCategory(a, b, relTol)
