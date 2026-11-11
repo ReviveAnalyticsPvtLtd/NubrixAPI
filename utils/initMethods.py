@@ -400,12 +400,32 @@ def _classify_rows(n_rows: int) -> str:
     return "massive"
 
 
-def classify_table_size(projectId: str, tableName: str) -> dict:
+def _size_from_metadata(md: dict, tableName: str) -> dict | None:
+    """The size answer a `metadata.json` row count gives for one table, or None when it holds none."""
+    try:
+        entry = (md or {}).get(tableName) or (md.get("tables") or {}).get(tableName)
+        if isinstance(entry, dict):
+            shape = entry.get("shape") or entry.get("rows")
+            rows = shape[0] if isinstance(shape, list) else shape
+            cols = shape[1] if isinstance(shape, list) else len(entry.get("columns") or [])
+            if isinstance(rows, int):
+                sz = _classify_rows(rows)
+                return {"rows_estimate": rows, "columns": cols,
+                        "size_class": sz, "hint": _SIZE_HINTS[sz]}
+    except Exception:
+        pass
+    return None
+
+
+def classify_table_size(projectId: str, tableName: str, knownMetadata: dict | None = None) -> dict:
     """Return ``{rows_estimate, columns, size_class, hint}`` for the table.
 
     Falls back to the Redis-cached ``metadata.json`` row count when the Arrow
     table isn't in the in-process LRU, then to this worker's last seen shape,
     then to ``None`` if no signal exists.
+
+    ``knownMetadata`` is for a caller that already holds the project's ``metadata.json`` (the chart evaluation
+    harness, which has no Redis): it is used in place of the Redis copy. Served callers never pass it.
     """
     cache_key = (projectId, tableName)
     table = _cache_get(cache_key)
@@ -416,27 +436,26 @@ def classify_table_size(projectId: str, tableName: str) -> dict:
         return {"rows_estimate": rows, "columns": cols, "size_class": sz,
                 "hint": _SIZE_HINTS[sz]}
     # metadata.json row counts in the Redis cache come next: clearing a table drops them on every worker.
-    redis_key = f"{projectId}::metadata"
-    try:
-        r = redis.Redis(connection_pool=_redis_pool())
-        raw = r.get(redis_key)
-    except Exception:
+    if knownMetadata is not None:
         raw = None
+        known = _size_from_metadata(knownMetadata, tableName)
+        if known is not None:
+            return known
+    else:
+        redis_key = f"{projectId}::metadata"
+        try:
+            r = redis.Redis(connection_pool=_redis_pool())
+            raw = r.get(redis_key)
+        except Exception:
+            raw = None
     if raw:
         try:
             import orjson
-            md = orjson.loads(raw)
-            entry = (md or {}).get(tableName) or (md.get("tables") or {}).get(tableName)
-            if isinstance(entry, dict):
-                shape = entry.get("shape") or entry.get("rows")
-                rows = shape[0] if isinstance(shape, list) else shape
-                cols = shape[1] if isinstance(shape, list) else len(entry.get("columns") or [])
-                if isinstance(rows, int):
-                    sz = _classify_rows(rows)
-                    return {"rows_estimate": rows, "columns": cols,
-                            "size_class": sz, "hint": _SIZE_HINTS[sz]}
+            known = _size_from_metadata(orjson.loads(raw), tableName)
         except Exception:
-            pass
+            known = None
+        if known is not None:
+            return known
     # Then this worker's own record, which outlives the table but not a replacement made elsewhere.
     shape = _DF_SHAPES.get(cache_key)
     if shape is not None:

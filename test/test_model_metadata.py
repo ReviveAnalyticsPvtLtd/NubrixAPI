@@ -73,3 +73,90 @@ def test_augmentWorksInPlaceLikeTheServiceCacheNeeds():
     with mock.patch("utils.initMethods.classify_table_size", _classify):
         assert modelMetadata.augmentWithSizeHints(metadata, "p1") is metadata
     assert "size_class" in metadata["orders"] and "size_class" not in metadata["_meta"]
+
+
+# The harness can hand the metadata it already read to the size classification (a warm served request gets it from Redis)
+
+PROJECT_ID = "p1"
+KNOWN = {"orders": {"shape": [36, 2], "columns": []}, "big": {"shape": [5_000_000, 2], "columns": []}}
+
+
+class _FakeRedis:
+    """Stands in for `redis.Redis`: answers GET `<project>::metadata` from `answer` and records every command."""
+
+    answer = None
+    commands = []
+
+    def __init__(self, *args, **kwargs):
+        pass
+
+    def get(self, key):
+        type(self).commands.append(("get", key))
+        if type(self).answer is None:
+            raise ConnectionError("no Redis")
+        return type(self).answer
+
+
+@pytest.fixture
+def fakeRedis(monkeypatch):
+    from utils import initMethods
+
+    _FakeRedis.answer, _FakeRedis.commands = None, []
+    monkeypatch.setattr(initMethods.redis, "Redis", _FakeRedis)
+    monkeypatch.setattr(initMethods, "_redis_pool", lambda: None)
+    monkeypatch.setattr(initMethods, "_DF_SHAPES", {})
+    monkeypatch.setattr(initMethods, "_cache_get", lambda key: None)
+    return _FakeRedis
+
+
+def test_aServedCallStillReadsRedisAsBefore(fakeRedis):
+    import orjson
+
+    from utils.initMethods import classify_table_size
+
+    fakeRedis.answer = orjson.dumps(KNOWN)
+    assert classify_table_size(PROJECT_ID, "orders")["size_class"] == "small"
+    assert classify_table_size(PROJECT_ID, "big")["size_class"] in ("large", "massive")
+    assert fakeRedis.commands == [("get", "p1::metadata")] * 2
+    fakeRedis.answer = None
+    assert classify_table_size(PROJECT_ID, "orders")["size_class"] == "unknown"
+
+
+def test_aServedAugmentCallPassesNothingExtraToTheClassification():
+    from utils import modelMetadata
+
+    calls = []
+
+    def spy(*args, **kwargs):
+        calls.append((args, kwargs))
+        return {"rows_estimate": None, "size_class": "unknown", "hint": ""}
+
+    with mock.patch("utils.initMethods.classify_table_size", spy):
+        modelMetadata.augmentWithSizeHints(copy.deepcopy(SAMPLE), "p1")
+        modelMetadata.metadataForModel(copy.deepcopy(SAMPLE), "p1")
+    assert calls and all(kwargs == {} and len(args) == 2 for args, kwargs in calls)
+
+
+def test_knownMetadataGivesTheWarmHintsWithoutAskingRedis(fakeRedis):
+    from utils import modelMetadata
+
+    fakeRedis.answer = None  # a Redis that is down: the cold-start value
+    cold = modelMetadata.metadataForModel(copy.deepcopy(KNOWN), PROJECT_ID)
+    assert cold["orders"]["size_class"] == "unknown" and "_size_check" not in cold["orders"]
+    fakeRedis.commands.clear()
+    warm = modelMetadata.metadataForModel(copy.deepcopy(KNOWN), PROJECT_ID, knownMetadata=KNOWN)
+    assert fakeRedis.commands == []
+    assert warm["orders"]["size_class"] == "small" and warm["orders"]["_size_check"] is True
+    assert warm["big"]["size_class"] in ("large", "massive")
+    # What a warm served request gives for the same metadata.
+    import orjson
+
+    fakeRedis.answer = orjson.dumps(KNOWN)
+    served = modelMetadata.metadataForModel(copy.deepcopy(KNOWN), PROJECT_ID)
+    assert served == warm
+
+
+def test_knownMetadataWithoutTheTableFallsBackLikeAServedCall(fakeRedis):
+    from utils.initMethods import classify_table_size
+
+    assert classify_table_size(PROJECT_ID, "missing", knownMetadata=KNOWN)["size_class"] == "unknown"
