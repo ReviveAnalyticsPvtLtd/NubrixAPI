@@ -20,15 +20,17 @@ fails leaves the widget as Python, with a reason:
      refused (`unstableOrder`, reason `aliasShadowsColumn`); a bare ORDER BY name binds to the alias and is not
      checked. For charts that show raw numbers (scatter, bubble, radar, geoMap), an unrounded sum, average, spread or
      quantile whose input is not proven exact through every scope is refused (`floatAggregate`).
-  3. The refresh-style run (unfiltered, lenient, through `renderChartRequest`) and the workflow's own run must both
-     strictly match the saved widget (`verdictOf`; a second render that differs is `nondeterministic`).
+  3. The refresh-style run (unfiltered, lenient, through `renderChartRequest`, over the tables a dashboard refresh
+     reads: every metadata table, active first and then inactive, `_metadataTableNames`) and the workflow's own run
+     must both strictly match the saved widget (`verdictOf`; a second render that differs is `nondeterministic`).
   4. The result must be whole (`resultRefusal`): no launcher or builder cap reached or met (`truncated`), and an outer
      ORDER BY that is unique by construction (`orderIsUnique`), with key values unique across today's rows as well
      when every key is an output column (`unstableOrder`), at any row count unless the query returns at most one row
      by construction (`singleRowByConstruction`).
   5. Under every filter set (`_filterSets`), the saved Python and the request re-run through the dashboard's own filter
-     path (`DashboardService._rerunWidgetProduced`) must strictly agree, and at least one set must be one both forms
-     ran (`filter`); no filter set at all is `filter`.
+     path (`DashboardService._rerunWidgetProduced`, given the same ordered table tuple as a refresh) must strictly
+     agree, and at least one set must be one both forms ran (`filter`); no filter set at all is `filter`.
+Generation, the SQL check, the schema reads and the filter probes see only the active tables, as the model does.
 Only a converted widget's `generatedCode` changes; its title, layout, id and saved data stay as they are.
 
 Candidates: a widget whose `decodeGeneratedCode` is None, that is not a `panelChart(...)` template, not a
@@ -78,6 +80,7 @@ import os
 import re
 import sys
 import time
+from collections.abc import Sequence
 from decimal import ROUND_HALF_UP, Decimal, localcontext
 from pathlib import Path
 from types import SimpleNamespace
@@ -969,12 +972,13 @@ def _generated(engine, metadata: dict, description: str, project: str) -> tuple[
     return request, output
 
 
-def _renderWithResult(manager, project: str, request: ChartRequest, activeTables: frozenset) -> tuple[dict, pa.Table, bool]:
+def _renderWithResult(manager, project: str, request: ChartRequest, rerunTables: Sequence[str]) -> tuple[dict, pa.Table, bool]:
     """
     The chart a dashboard refresh of the saved request would show, with the query result it was built from.
 
-    The run is `renderChartRequest` as a refresh calls it (unfiltered, lenient); the builder call is watched to keep the
-    rows and the launcher's `truncated` flag, which `resultRefusal` needs.
+    The run is `renderChartRequest` as a refresh calls it (unfiltered, lenient, over `rerunTables`: the ordered tuple of
+    every table, active first, that a refresh passes); the builder call is watched to keep the rows and the launcher's
+    `truncated` flag, which `resultRefusal` needs.
     """
     import nubrix.components.chartEngine as chartEngine
 
@@ -986,7 +990,7 @@ def _renderWithResult(manager, project: str, request: ChartRequest, activeTables
         return build(request, table, truncated, lenient)
 
     with mock.patch.object(chartEngine, "buildChart", watched):
-        chart = renderChartRequest(manager, project, request, activeTables, filters=None, lenient=True, waitForSlot=True)
+        chart = renderChartRequest(manager, project, request, rerunTables, filters=None, lenient=True, waitForSlot=True)
     return chart, seen["table"], seen["truncated"]
 
 
@@ -1113,11 +1117,12 @@ def _filterSets(job, pageId: str, widget: dict, request: ChartRequest) -> list[l
     return sets
 
 
-def _rerunUnderFilter(widget: dict, filters: list, projectId: str, activeTables: frozenset) -> tuple[dict, dict | None]:
-    """The dashboard's own filtered re-run of one saved widget (`getData` with filters), in the widget's own form."""
+def _rerunUnderFilter(widget: dict, filters: list, projectId: str, rerunTables: Sequence[str]) -> tuple[dict, dict | None]:
+    """The dashboard's own filtered re-run of one saved widget (`getData` with filters), in the widget's own form, over
+    the ordered table tuple `getData` passes."""
     from api.services.dashboardService import DashboardService
 
-    return DashboardService._rerunWidgetProduced(widget, filters, projectId, activeTables)
+    return DashboardService._rerunWidgetProduced(widget, filters, projectId, rerunTables)
 
 
 def _filterCheck(job, pageId: str, widget: dict, request: ChartRequest, entry: dict) -> None:
@@ -1138,8 +1143,8 @@ def _filterCheck(job, pageId: str, widget: dict, request: ChartRequest, entry: d
     for index, filters in enumerate(sets):
         entry["filtersChecked"] = index + 1
         try:
-            python, pythonProduced = _rerunUnderFilter(widget, filters, job.project, job.tables)
-            sql, sqlProduced = _rerunUnderFilter(converted, filters, job.project, job.tables)
+            python, pythonProduced = _rerunUnderFilter(widget, filters, job.project, job.rerunTables)
+            sql, sqlProduced = _rerunUnderFilter(converted, filters, job.project, job.rerunTables)
         except Exception as error:
             entry.update(verdict="failed", step="filter", filterIndex=index, **_failure(error))
             return
@@ -1207,7 +1212,7 @@ def _checkRequest(job, pageId: str, widget: dict, request: ChartRequest, finalOu
         entry.update(verdict="differ", field="floatAggregate")
         return
     try:
-        chart, table, truncated = _renderWithResult(job.manager, job.project, request, job.tables)
+        chart, table, truncated = _renderWithResult(job.manager, job.project, request, job.rerunTables)
     except Exception as error:
         entry.update(verdict="failed", step="render", **_failure(error))
         return
@@ -1426,6 +1431,7 @@ def _counts(report: dict) -> dict:
 
 
 def _convert(args, store, stub: dict | None, report: dict, save) -> None:
+    from api.services.dashboardService import _metadataTableNames
     from utils.codeExecutor import REPLManager
     from utils.modelMetadata import activeTables, metadataForModel
     from nubrix.workflows.sqlChartWorkflow import RUN_TIMEOUT_SECONDS
@@ -1444,7 +1450,11 @@ def _convert(args, store, stub: dict | None, report: dict, save) -> None:
     job = SimpleNamespace(
         project=args.project,
         metadata=metadataForModel(copy.deepcopy(raw), args.project, knownMetadata=raw),
+        # The active tables: generation, the SQL check, the schema reads and the filter probes.
         tables=frozenset(activeTables(raw)),
+        # What a dashboard refresh passes (`getData`): every table, active first, in a fixed order. Never a set: the
+        # SQL check keeps the first spelling of names that differ only in case.
+        rerunTables=_metadataTableNames(raw),
         engine=_Engine(chartEval._Replay(stub) if stub is not None else None),
         manager=REPLManager(timeoutSeconds=RUN_TIMEOUT_SECONDS),
         config=config,

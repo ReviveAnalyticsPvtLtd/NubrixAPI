@@ -165,6 +165,8 @@ class _Fakes:
         self.prompts: list[str] = []
         self.renders: list[dict] = []
         self.reruns: list[tuple] = []
+        self.rerunTables: list = []
+        self.metadatas: list[dict] = []
         self.configs: list = []
         fakes = self
 
@@ -175,6 +177,7 @@ class _Fakes:
 
             def invoke(self, metadata, prompt, project):
                 fakes.prompts.append(prompt)
+                fakes.metadatas.append(metadata)
                 self.failure = None
                 plan = fakes.plans[prompt]
                 if isinstance(plan, Exception):
@@ -190,17 +193,18 @@ class _Fakes:
                     return response
                 return plan
 
-        def render(manager, projectId, request, activeTables):
-            fakes.renders.append({"sql": request.sql, "title": request.title, "activeTables": set(activeTables), "projectId": projectId})
+        def render(manager, projectId, request, rerunTables):
+            fakes.renders.append({"sql": request.sql, "title": request.title, "rerunTables": rerunTables, "projectId": projectId})
             chart = fakes.charts[request.sql]
             if isinstance(chart, Exception):
                 raise chart
             table = pa.Table.from_pylist(fakes.rows.get(request.sql, _rowsOf(chart)))
             return {**copy.deepcopy(chart), "title": request.title}, table, fakes.truncated.get(request.sql, False)
 
-        def rerun(widget, filters, projectId, activeTables):
+        def rerun(widget, filters, projectId, rerunTables):
             form = "sql" if decodeGeneratedCode(widget.get("generatedCode")) is not None else "python"
             fakes.reruns.append((form, widget.get("id"), json.dumps(filters)))
+            fakes.rerunTables.append(rerunTables)
             shown = fakes.filtered(form, widget, filters)
             if shown is None:
                 return copy.deepcopy(widget), None
@@ -594,8 +598,8 @@ def test_theStoredQueryIsTheDescriptionElseTheCode(tmp_path, monkeypatch):
     store = _store(_config(_widget("w1", SAVED, query="Revenue by region"), _widget("w2", SAVED), _widget("w3", SAVED, query="  ")))
     assert _run(tmp_path, store) == 0
     assert fakes.prompts == ["Revenue by region", code, code]
-    # The run is against the project's active tables, like the refresh of a saved chart request.
-    assert fakes.renders[0]["activeTables"] == {"orders"} and fakes.renders[0]["projectId"] == PROJECT
+    # The run is against the tables a refresh of a saved chart request reads (here only the one active table).
+    assert fakes.renders[0]["rerunTables"] == ("orders",) and fakes.renders[0]["projectId"] == PROJECT
 
 
 def test_aDoubtAFailureAndAnExceptionAreReportedPerWidget(tmp_path, monkeypatch):
@@ -970,7 +974,7 @@ def test_theFilterSetsComeFromTheConfigAndTheTablesTheWidgetReads(monkeypatch):
     monkeypatch.setattr(conv, "_probe", probe)
     monkeypatch.setattr(conv, "_schemasOf", lambda job, tables: {name: schemas[name] for name in tables if name in schemas})
     job = SimpleNamespace(project=PROJECT, tables=frozenset({"orders", "stores", "products"}),
-                          config={"page-1": {"filters": [{"orders.region": ["East", "West"]}, "ignored"]}})
+                          rerunTables=("orders", "stores", "products"), config={"page-1": {"filters": [{"orders.region": ["East", "West"]}, "ignored"]}})
     request = _request("x", sql="SELECT region, SUM(revenue) AS s FROM orders GROUP BY region ORDER BY region")
     widget = {"id": "w1", "generatedCode": "df = fetch_data_pl(projectId, 'stores')\nother = 'products'"}
     sets = conv._filterSets(job, "page-1", widget, request)
@@ -1210,13 +1214,13 @@ def test_theRefreshRenderIsUnfilteredLenientAndWaitsForASlot(monkeypatch):
     table = pa.Table.from_pylist([{"region": "East", "revenue": 10.5}, {"region": "North", "revenue": 20}])
     calls = []
 
-    def render(manager, projectId, request_, activeTables, **kwargs):
-        calls.append((manager, projectId, request_, activeTables, kwargs))
+    def render(manager, projectId, request_, rerunTables, **kwargs):
+        calls.append((manager, projectId, request_, rerunTables, kwargs))
         # What the real render does last: build the chart from the launcher's rows.
         return chartEngine.buildChart(request_, table, True, True)
 
     monkeypatch.setattr(conv, "renderChartRequest", render)
-    manager, tables = object(), frozenset({"orders"})
+    manager, tables = object(), ("orders", "archive")
     chart, rows, truncated = conv._renderWithResult(manager, PROJECT, request, tables)
     assert calls == [(manager, PROJECT, request, tables, {"filters": None, "lenient": True, "waitForSlot": True})]
     assert rows is table and truncated is True and chart["data"]["labels"] == ["East", "North"]
@@ -1228,12 +1232,12 @@ def test_theFilteredRerunIsTheDashboardsOwn(monkeypatch):
     calls = []
     answer = ({"id": "w1"}, {"data": 1})
 
-    def rerun(widget, filters, projectId, activeTables):
-        calls.append((widget, filters, projectId, activeTables))
+    def rerun(widget, filters, projectId, rerunTables):
+        calls.append((widget, filters, projectId, rerunTables))
         return answer
 
     monkeypatch.setattr(DashboardService, "_rerunWidgetProduced", staticmethod(rerun))
-    widget, filters, tables = {"id": "w1"}, [{"orders.region": "East"}], frozenset({"orders"})
+    widget, filters, tables = {"id": "w1"}, [{"orders.region": "East"}], ("orders", "archive")
     assert conv._rerunUnderFilter(widget, filters, PROJECT, tables) is answer
     assert len(calls) == 1 and calls[0][0] is widget and calls[0][1] is filters and calls[0][2:] == (PROJECT, tables)
 
@@ -1540,6 +1544,52 @@ def test_thePromptExamplesPassEveryStaticRule(chartType, sql):
     assert conv.aliasShadowsColumn(sql, PROMPT_SCHEMAS) is False
     assert chartType not in conv.EXACT_FLOAT_TYPES or conv.floatAggregate(sql, PROMPT_SCHEMAS) is False
     assert conv.singleRowByConstruction(sql) or conv.orderIsUnique(sql, columns)
+
+
+# Round 5: the checks read the tables a dashboard refresh reads
+
+
+INACTIVE_METADATA = {
+    "orders": {"shape": [4, 2], "columns": [{"name": "region", "type": "object"}, {"name": "revenue", "type": "float64"}]},
+    "archive": {"shape": [2, 1], "columns": [{"name": "region", "type": "object"}], "isActive": False},
+    "stores": {"shape": [3, 1], "columns": [{"name": "region", "type": "object"}], "isActive": True},
+    "_meta": {"note": "not a table"},
+}
+
+
+def test_theRefreshAndTheFilterCheckReadInactiveTablesTooButTheModelDoesNot(tmp_path, monkeypatch):
+    import nubrix.components.sqlCheck as sqlCheck
+
+    fakes = _Fakes(monkeypatch, plans={"q": _request("one")}, charts={_sql("one"): SAVED})
+    checked = []
+    realCheck = sqlCheck.checkSql
+    monkeypatch.setattr(sqlCheck, "checkSql", lambda sql, tables: checked.append(tables) or realCheck(sql, tables))
+    store = FakeStore({CONFIG: _bytes(_config(_widget("w1", SAVED, query="q"))),
+                       "metadata.json": json.dumps(INACTIVE_METADATA).encode("utf-8")})
+    assert _run(tmp_path, store) == 0
+    assert _entries(tmp_path)["w1"]["verdict"] == "match"
+    # A refresh reads every table, active first and then inactive, each in metadata order (`_metadataTableNames`).
+    expected = ("orders", "stores", "archive")
+    assert [render["rerunTables"] for render in fakes.renders] == [expected]
+    assert fakes.rerunTables and all(tables == expected for tables in fakes.rerunTables)
+    # The model and the SQL check see only the active tables.
+    assert [sorted(metadata) for metadata in fakes.metadatas] == [["orders", "stores"]]
+    assert checked and all(set(tables) == {"orders", "stores"} for tables in checked)
+
+
+def test_theRerunTablesAreAnOrderedTupleNotASet(tmp_path, monkeypatch):
+    from api.services.dashboardService import _metadataTableNames
+
+    _Fakes(monkeypatch, plans={"q": _request("one")}, charts={_sql("one"): SAVED})
+    jobs = []
+    monkeypatch.setattr(conv, "_filterSets", lambda job, pageId, widget, request: jobs.append(job) or [[{"orders.region": "East"}]])
+    store = FakeStore({CONFIG: _bytes(_config(_widget("w1", SAVED, query="q"))),
+                       "metadata.json": json.dumps(INACTIVE_METADATA).encode("utf-8")})
+    assert _run(tmp_path, store) == 0
+    assert len(jobs) == 1
+    assert type(jobs[0].rerunTables) is tuple
+    assert jobs[0].rerunTables == _metadataTableNames(INACTIVE_METADATA) == ("orders", "stores", "archive")
+    assert jobs[0].tables == frozenset({"orders", "stores"})
 
 
 # The strict comparison
