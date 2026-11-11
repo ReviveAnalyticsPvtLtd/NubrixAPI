@@ -9,6 +9,7 @@ __author__ = "Rauhan Ahmed Siddiqui"
 __all__ = ["dashboardService"] 
 
 
+from collections.abc import Sequence
 from concurrent.futures import ThreadPoolExecutor
 from api.commons import updateProjectModifiedAt
 from utils.exceptionHandler import CustomException
@@ -82,22 +83,37 @@ def _exceptionClass(traceback: str) -> str:
     return "unknown exception"
 
 
-def _metadataTableNames(metadata: dict) -> frozenset[str]:
+def _metadataTableNames(metadata: dict) -> tuple[str, ...]:
     """
     Every table in a project's metadata.json, active or inactive: each key not starting with `_` whose value is a
     table entry (a dict). `isActive` is ignored on purpose: a saved widget re-runs on any table the project has,
     as a saved Python widget does. Only new chart generation is limited to active tables.
+
+    The order is fixed: the active tables in metadata order, then the inactive ones in metadata order. The SQL check
+    keeps the first name it is given for each case-folded name (DuckDB names ignore case), so a name that matches an
+    active and an inactive table resolves to the active one, the same on every worker.
     """
-    return frozenset(
-        name for name, entry in metadata.items()
+    tables = [
+        (name, entry) for name, entry in metadata.items()
         if isinstance(name, str) and not name.startswith("_") and isinstance(entry, dict)
-    )
+    ]
+    active = [name for name, entry in tables if entry.get("isActive", True) is not False]
+    inactive = [name for name, entry in tables if entry.get("isActive", True) is False]
+    return tuple(active + inactive)
 
 
-def _storedTableNames(files: list[dict]) -> frozenset[str]:
-    """The tables stored in a project folder: the name of each `<table>.parquet` file, the files a Python widget reads."""
-    names = (entry.get("name") for entry in files if isinstance(entry, dict))
-    return frozenset(name[:-len(".parquet")] for name in names if isinstance(name, str) and name.endswith(".parquet") and len(name) > len(".parquet"))
+def _storedTableNames(files: list[dict]) -> tuple[str, ...]:
+    """
+    The tables stored in a project folder: the name of each `<table>.parquet` file, the files a Python widget reads.
+
+    Sorted, so the SQL check resolves names that differ only in case to the same (first sorted) table on every worker.
+    """
+    suffix = ".parquet"
+    names = {entry.get("name") for entry in files if isinstance(entry, dict)}
+    return tuple(sorted(
+        name[:-len(suffix)] for name in names
+        if isinstance(name, str) and name.endswith(suffix) and len(name) > len(suffix)
+    ))
 
 
 def _pythonResult(output: str) -> dict:
@@ -135,13 +151,13 @@ class DashboardService:
         self.client = client
 
     @staticmethod
-    def _rerunWidget(widget: dict, filters: list | None, projectId: str, rerunTables: frozenset[str] | None) -> tuple[dict, bool]:
+    def _rerunWidget(widget: dict, filters: list | None, projectId: str, rerunTables: Sequence[str] | None) -> tuple[dict, bool]:
         """Re-run one saved widget; see `_rerunWidgetProduced`. Returns the widget copy and whether the run succeeded."""
         fresh, produced = DashboardService._rerunWidgetProduced(widget, filters, projectId, rerunTables)
         return fresh, produced is not None
 
     @staticmethod
-    def _rerunWidgetProduced(widget: dict, filters: list | None, projectId: str, rerunTables: frozenset[str] | None) -> tuple[dict, dict | None]:
+    def _rerunWidgetProduced(widget: dict, filters: list | None, projectId: str, rerunTables: Sequence[str] | None) -> tuple[dict, dict | None]:
         """
         Re-run one saved widget in its own form and return a copy with the new chart data.
 
@@ -152,9 +168,10 @@ class DashboardService:
             widget (dict): The saved widget.
             filters (list | None): The sidebar filters, if any.
             projectId (str): The project.
-            rerunTables (frozenset[str] | None): Names of every table of the project, active or inactive (the tables a
-                saved Python widget can read), for the SQL check; see `_rerunTables`. None means no list could be
-                read, so a ChartRequest widget fails (a Python widget does not need it).
+            rerunTables (Sequence[str] | None): Names of every table of the project, active or inactive (the tables a
+                saved Python widget can read), for the SQL check, in the order it should prefer a spelling; see
+                `_rerunTables`. None means no list could be read, so a ChartRequest widget fails (a Python widget
+                does not need it).
 
         Returns:
             tuple[dict, dict | None]: The widget copy, and the keys the run produced (None when it failed, and
@@ -242,14 +259,14 @@ class DashboardService:
     def _rerunProduced(self, widgets: list, filters: list | None, projectId: str) -> list[tuple[dict, dict | None]]:
         """Like `_rerunWidgets`, but each result carries the keys the run produced (None when it failed or didn't run)."""
         todo = [widget for widget in widgets if self._isRerunnable(widget)]
-        rerunTables = frozenset()
+        rerunTables: Sequence[str] | None = ()
         if any(self._usesChartRequest(widget) for widget in todo):
             rerunTables = self._rerunTables(projectId)
         with ThreadPoolExecutor(max_workers = 4) as executor:
             outcomes = iter(list(executor.map(lambda widget: self._rerunWidgetProduced(widget, filters, projectId, rerunTables), todo)))
         return [next(outcomes) if self._isRerunnable(widget) else (widget, None) for widget in widgets]
 
-    def _rerunTables(self, projectId: str) -> frozenset[str] | None:
+    def _rerunTables(self, projectId: str) -> tuple[str, ...] | None:
         """
         The tables a saved ChartRequest widget may name when it is re-run: every table of the project, active or
         inactive, exactly the set a saved Python widget can read. New chart generation is not affected: it still
@@ -259,6 +276,9 @@ class DashboardService:
         stored table files, the `<table>.parquet` files a Python widget reads. When neither can be read, None: the
         ChartRequest widgets are not re-run, while the Python ones still are. A busy sandbox error propagates.
         Never logs an error's message, which can hold table names.
+
+        The tuple's order is fixed (`_metadataTableNames`, `_storedTableNames`): the SQL check keeps the first
+        spelling it sees of names that differ only in case, so a set here would resolve them differently per worker.
         """
         try:
             metadata = readJson(projectId, "metadata.json")
