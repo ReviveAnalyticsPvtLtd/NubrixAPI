@@ -211,6 +211,7 @@ class _Fakes:
         monkeypatch.setattr(conv, "_filterSets", lambda job, pageId, widget, request: copy.deepcopy(fakes.filterSets))
         monkeypatch.setattr(conv, "_rerunUnderFilter", rerun)
         monkeypatch.setattr(conv, "_utcNow", lambda: NOW)
+        monkeypatch.setattr(conv, "_schemasOf", lambda job, tables: {"orders": FAKE_ORDERS})
 
 
 def _run(tmp_path, store, *extra):
@@ -234,6 +235,7 @@ def _stdout(capsys):
 
 
 SAVED = _bar(["East", "North"], [10.5, 20])
+FAKE_ORDERS = pa.schema([("region", pa.string()), ("revenue", pa.float64()), ("tag", pa.string())])
 
 
 # The brief's four
@@ -728,8 +730,8 @@ def test_theOuterOrderByKeysAreOutputColumns(sql, columns, keys):
     # Ties on the key: the order of the tied rows is not fixed.
     ("SELECT region, revenue FROM orders ORDER BY revenue",
      [{"region": "East", "revenue": 1.0}, {"region": "North", "revenue": 1.0}], "unstableOrder"),
-    # One row needs no order.
-    ("SELECT region, SUM(revenue) AS revenue FROM orders GROUP BY region", [{"region": "East", "revenue": 1.0}], None),
+    # One row today: a grouped query could return more on other data, so it needs the order too.
+    ("SELECT region, SUM(revenue) AS revenue FROM orders GROUP BY region", [{"region": "East", "revenue": 1.0}], "unstableOrder"),
     ("SELECT region, revenue FROM orders ORDER BY revenue, region",
      [{"region": "East", "revenue": 1.0}, {"region": "North", "revenue": 1.0}], None),
 ])
@@ -1256,7 +1258,7 @@ ORDER_SCHEMAS = {"orders": pa.schema([("region", pa.string()), ("revenue", pa.fl
     ("ROUND(SUM(revenue), 2)", False),
     ("ROUND((AVG(revenue)), 1)", False),
     ("SUM(quantity)", False),
-    ("AVG(quantity)", False),
+    ("AVG(quantity)", True),
     ("SUM(price)", False),
     ("SUM(quantity * 2 + 1)", False),
     ("SUM(CAST(revenue AS BIGINT))", False),
@@ -1280,10 +1282,136 @@ def test_aFloatSumIsRefusedForChartsThatShowRawNumbers(tmp_path, monkeypatch, ch
     assert _run(tmp_path, store) == 0
     entry = _entries(tmp_path)["w1"]
     if field is None:
-        # A bar shows three decimals: no schema read is needed, and the widget goes on to the render.
-        assert read == [] and len(fakes.renders) == 1
+        # A bar shows three decimals: the float rule does not apply, and the widget goes on to the render. The schema
+        # is still read once, for the alias check every chart type gets.
+        assert read == [["orders"]] and len(fakes.renders) == 1
     else:
         assert (entry["verdict"], entry["field"]) == ("differ", field) and fakes.renders == [] and read == [["orders"]]
+
+
+# Round 3, N1: the order rule holds at any row count
+
+
+def _cardCase(sql, rows, column):
+    request = ChartRequest.model_validate({"chartType": "card", "title": "t", "sql": sql, "encoding": {"value": column}})
+    value = rows[0][column] if rows else 0
+    return request, {"chartType": "card", "title": "t", "label": column, "data": value}, pa.Table.from_pylist(rows) if rows else \
+        pa.table({column: pa.array([], pa.float64())})
+
+
+@pytest.mark.parametrize("kind,sql,rows,reason", [
+    # One year of data today; a second year later has no order.
+    ("bar", "SELECT EXTRACT(year FROM order_date) AS y, SUM(quantity) AS total FROM orders GROUP BY 1",
+     [{"y": 2025, "total": 3}], "unstableOrder"),
+    ("bar", "SELECT region, SUM(revenue) AS total FROM orders GROUP BY region", [], "unstableOrder"),
+    ("bar", "SELECT region, SUM(revenue) AS total FROM orders GROUP BY region ORDER BY region", [{"region": "East", "total": 1.0}], None),
+    # DISTINCT ON picks an arbitrary row of each group.
+    ("card", "SELECT DISTINCT ON (region) revenue FROM orders WHERE region = 'EU'", [{"revenue": 1.0}], "unstableOrder"),
+    ("card", "SELECT revenue FROM orders WHERE order_id = 7", [{"revenue": 1.0}], "unstableOrder"),
+    ("card", "SELECT SUM(revenue) AS total FROM orders HAVING SUM(revenue) > 0", [{"total": 1.0}], "unstableOrder"),
+    # One row by construction: an aggregate with no GROUP BY.
+    ("card", "SELECT sum(revenue) AS total FROM orders", [{"total": 1.0}], None),
+    ("card", "SELECT COUNT(*) AS total FROM orders WHERE region = 'East'", [{"total": 9}], None),
+    ("card", "SELECT ROUND(SUM(revenue) / NULLIF(COUNT(*), 0), 2) AS total FROM orders", [{"total": 1.5}], None),
+])
+def test_theOrderRuleHoldsAtAnyRowCount(kind, sql, rows, reason):
+    if kind == "card":
+        request, chart, table = _cardCase(sql, rows, list(rows[0])[0] if rows else "total")
+    else:
+        names = list(rows[0]) if rows else ["region", "total"]
+        chart = _bar([row[names[0]] for row in rows], [row[names[1]] for row in rows])
+        request = _request("x", sql=sql)
+        table = pa.Table.from_pylist(rows) if rows else pa.table({names[0]: pa.array([], pa.string()), names[1]: pa.array([], pa.float64())})
+    assert conv.resultRefusal(request, chart, table, False) == reason
+
+
+# Round 3, N2: float aggregates resolved through every scope
+
+
+@pytest.mark.parametrize("sql,refused", [
+    # A CTE that casts to DOUBLE, then a SUM over it.
+    ("WITH s AS (SELECT region, CAST(price AS DOUBLE) AS price FROM orders) SELECT region, SUM(price) AS v FROM s GROUP BY region ORDER BY region", True),
+    # A subquery that renames a double column to an integer column's name.
+    ("SELECT region, SUM(quantity) AS v FROM (SELECT region, revenue AS quantity FROM orders) AS t GROUP BY region ORDER BY region", True),
+    # Welford in doubles, whatever the input.
+    ("SELECT region, STDDEV_SAMP(quantity) AS v FROM orders GROUP BY region ORDER BY region", True),
+    ("SELECT region, VARIANCE(price) AS v FROM orders GROUP BY region ORDER BY region", True),
+    # AVG is exact only over DECIMAL.
+    ("SELECT region, AVG(quantity) AS v FROM orders GROUP BY region ORDER BY region", True),
+    ("SELECT region, AVG(price) AS v FROM orders GROUP BY region ORDER BY region", False),
+    ("SELECT region, SUM(CAST(quantity AS DOUBLE)) AS v FROM orders GROUP BY region ORDER BY region", True),
+    # Integers through a CTE, a subquery and a table alias stay exact.
+    ("WITH s AS (SELECT region, quantity FROM orders) SELECT region, SUM(quantity) AS v FROM s GROUP BY region ORDER BY region", False),
+    ("SELECT region, SUM(q) AS v FROM (SELECT region, quantity * 2 AS q FROM orders) AS t GROUP BY region ORDER BY region", False),
+    ("SELECT o.region, SUM(o.quantity) AS v FROM orders AS o GROUP BY o.region ORDER BY o.region", False),
+    ("WITH s AS (SELECT region, SUM(quantity) AS q FROM orders GROUP BY region) SELECT region, SUM(q) AS v FROM s GROUP BY region ORDER BY region", False),
+    # Rounding stays the exemption.
+    ("WITH s AS (SELECT region, CAST(price AS DOUBLE) AS p FROM orders) SELECT region, round(SUM(p), 2) AS v FROM s GROUP BY region ORDER BY region", False),
+    ("SELECT region, round(SUM(revenue), 2) AS v FROM orders GROUP BY region ORDER BY region", False),
+    # A name nothing binds to.
+    ("WITH s AS (SELECT region FROM orders) SELECT region, SUM(quantity) AS v FROM s GROUP BY region ORDER BY region", True),
+    # No float aggregate at all.
+    ("SELECT region, COUNT(*) AS v FROM orders GROUP BY region ORDER BY region", False),
+])
+def test_floatAggregatesAreResolvedThroughEveryScope(sql, refused):
+    assert conv.floatAggregate(sql, ORDER_SCHEMAS) is refused
+
+
+# Round 3, N3: a GROUP BY or ORDER BY name that is both an alias and an input column
+
+
+@pytest.mark.parametrize("sql,shadows", [
+    ("SELECT upper(region) AS region, SUM(revenue) AS t FROM orders GROUP BY region ORDER BY region", True),
+    # The input column is not named anywhere else in the query: the table schema shows it.
+    ("SELECT upper(note) AS region, SUM(revenue) AS t FROM orders GROUP BY region ORDER BY region", True),
+    ("SELECT region AS region, SUM(revenue) AS t FROM orders GROUP BY region ORDER BY region", False),
+    ("SELECT region, SUM(revenue) AS t FROM orders GROUP BY region ORDER BY region", False),
+    ("SELECT EXTRACT(year FROM order_date) AS y, SUM(revenue) AS t FROM orders GROUP BY y ORDER BY y", False),
+    ("SELECT upper(region) AS r, SUM(revenue) AS t FROM orders GROUP BY r ORDER BY r", False),
+    # A CTE column of the same name is an input column too.
+    ("WITH s AS (SELECT region AS label, revenue FROM orders) SELECT upper(label) AS label, SUM(revenue) AS t FROM s GROUP BY label ORDER BY label", True),
+])
+def test_anAliasThatShadowsAnInputColumnIsFound(sql, shadows):
+    schemas = {"orders": pa.schema([("region", pa.string()), ("note", pa.string()), ("revenue", pa.float64()), ("order_date", pa.date32())])}
+    assert conv.aliasShadowsColumn(sql, schemas) is shadows
+
+
+def test_anAliasThatShadowsAColumnIsAnUnstableOrderWithoutARun(tmp_path, monkeypatch):
+    sql = "SELECT upper(region) AS region, SUM(revenue) AS revenue FROM orders GROUP BY region ORDER BY region"
+    fakes = _Fakes(monkeypatch, plans={"q": _request("x", sql=sql)}, charts={sql: SAVED})
+    store = _store(_config(_widget("w1", SAVED, query="q")))
+    assert _run(tmp_path, store) == 0
+    entry = _entries(tmp_path)["w1"]
+    assert (entry["verdict"], entry["field"], entry["reason"]) == ("differ", "unstableOrder", "aliasShadowsColumn")
+    assert fakes.renders == []
+
+
+# Round 3: the reviewer's ordinary shapes still pass (a representative handful)
+
+ORDINARY_SCHEMAS = {"orders": pa.schema([
+    ("category", pa.string()), ("region", pa.string()), ("status", pa.string()), ("customer", pa.string()),
+    ("order_date", pa.date32()), ("revenue", pa.float64()), ("quantity", pa.int64()),
+])}
+
+
+@pytest.mark.parametrize("sql,columns", [
+    ("SELECT category, SUM(revenue) AS total FROM orders GROUP BY category ORDER BY category", ["category", "total"]),
+    ("SELECT category, COUNT(*) AS n FROM orders GROUP BY 1 ORDER BY 1", ["category", "n"]),
+    ("SELECT date_trunc('month', order_date) AS month, SUM(revenue) AS total FROM orders GROUP BY 1 ORDER BY 1", ["month", "total"]),
+    ("SELECT EXTRACT(year FROM order_date) AS y, AVG(revenue) AS a FROM orders GROUP BY y ORDER BY y", ["y", "a"]),
+    ("SELECT region, status, SUM(revenue) AS total FROM orders GROUP BY region, status ORDER BY region, status", ["region", "status", "total"]),
+    ("SELECT region, SUM(revenue) AS total FROM orders GROUP BY region ORDER BY total DESC, region", ["region", "total"]),
+    ("SELECT region, COUNT(*) FILTER (WHERE status = 'paid') AS c FROM orders GROUP BY region ORDER BY region", ["region", "c"]),
+    ("SELECT CASE WHEN revenue > 100 THEN 'big' ELSE 'small' END AS b, COUNT(*) AS n FROM orders GROUP BY 1 ORDER BY 1", ["b", "n"]),
+    ("SELECT region, ROUND(AVG(TRY_CAST(revenue AS DOUBLE)), 2) AS a FROM orders GROUP BY region ORDER BY region", ["region", "a"]),
+    ("SELECT revenue, quantity FROM orders ORDER BY revenue, quantity", ["revenue", "quantity"]),
+    ("SELECT region, SUM(revenue) / SUM(SUM(revenue)) OVER () AS share FROM orders GROUP BY region ORDER BY region", ["region", "share"]),
+    ("WITH s AS (SELECT region, revenue FROM orders WHERE revenue > 0) SELECT region, SUM(revenue) AS t FROM s GROUP BY region ORDER BY region", ["region", "t"]),
+])
+def test_ordinaryShapesStillPass(sql, columns):
+    assert conv.sqlRefusal(sql) is None
+    assert conv.orderIsUnique(sql, columns) is True
+    assert conv.aliasShadowsColumn(sql, ORDINARY_SCHEMAS) is False
 
 
 # The strict comparison

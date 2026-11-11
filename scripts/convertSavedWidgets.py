@@ -15,14 +15,16 @@ fails leaves the widget as Python, with a reason:
      and the Python does not read the clock (`relativeTime`) or draw random numbers (`nondeterministic`).
   2. The SQL is refused (`sqlRefusal`) when it cuts the result (LIMIT, OFFSET, FETCH, a sample, QUALIFY, a compared
      ranking window, an 'Other' fold: `truncated`), moves with time (`relativeTime`), or uses a random function or an
-     aggregate or window function off the allow-list (`nondeterministic`). For charts that show raw numbers (scatter,
-     bubble, radar, geoMap), an unrounded sum, average, spread or quantile of float columns is refused
-     (`floatAggregate`).
+     aggregate or window function off the allow-list (`nondeterministic`). A GROUP BY, ORDER BY or window key that
+     names an alias of a different expression which is also an input column is refused (`unstableOrder`, reason
+     `aliasShadowsColumn`). For charts that show raw numbers (scatter, bubble, radar, geoMap), an unrounded sum,
+     average, spread or quantile whose input is not proven exact through every scope is refused (`floatAggregate`).
   3. The refresh-style run (unfiltered, lenient, through `renderChartRequest`) and the workflow's own run must both
      strictly match the saved widget (`verdictOf`; a second render that differs is `nondeterministic`).
-  4. The result must be whole (`resultRefusal`): no launcher or builder cap reached or met (`truncated`), and with more
-     than one row an outer ORDER BY on output columns that is unique by construction (`orderIsUnique`), with key
-     values unique across today's rows as well (`unstableOrder`).
+  4. The result must be whole (`resultRefusal`): no launcher or builder cap reached or met (`truncated`), and
+     an outer ORDER BY on output columns that is unique by construction (`orderIsUnique`), with key values unique
+     across today's rows as well (`unstableOrder`), at any row count unless the query returns at most one row by
+     construction (`singleRowByConstruction`).
   5. Under every filter set (`_filterSets`), the saved Python and the request re-run through the dashboard's own filter
      path (`DashboardService._rerunWidgetProduced`) must strictly agree, and at least one set must be one both forms
      ran (`filter`); no filter set at all is `filter`.
@@ -60,8 +62,8 @@ or when the write was verified but the project changed during the job; 2 for a u
 """
 
 __all__ = [
-    "floatAggregate", "main", "orderIsUnique", "orderKeys", "resultRefusal", "sqlRefusal", "verdictOf",
-    "visibleDifference",
+    "aliasShadowsColumn", "floatAggregate", "main", "orderIsUnique", "orderKeys", "resultRefusal",
+    "singleRowByConstruction", "sqlRefusal", "verdictOf", "visibleDifference",
 ]
 
 import argparse
@@ -85,6 +87,8 @@ import pyarrow as pa
 import sqlglot
 from pydantic import ValidationError
 from sqlglot import exp
+from sqlglot.optimizer.qualify import qualify
+from sqlglot.optimizer.scope import traverse_scope
 
 from nubrix.components.chartCompare import compareCharts
 from nubrix.components.chartEngine import ChartFailure, renderChartRequest
@@ -146,6 +150,8 @@ _FLOAT_AGGREGATES = (
     exp.Sum, exp.Avg, exp.Stddev, exp.StddevSamp, exp.StddevPop, exp.Variance, exp.VariancePop, exp.Median,
     exp.PercentileCont, exp.PercentileDisc, exp.Quantile,
 )
+# Spreads: Welford's update runs in doubles whatever the input type, so they always count as float.
+_SPREADS = (exp.Stddev, exp.StddevSamp, exp.StddevPop, exp.Variance, exp.VariancePop)
 _EXACT_CAST_TYPES = frozenset(
     getattr(exp.DataType.Type, name) for name in
     ("TINYINT", "SMALLINT", "INT", "BIGINT", "HUGEINT", "UTINYINT", "USMALLINT", "UINT", "UBIGINT", "UHUGEINT", "DECIMAL")
@@ -450,30 +456,76 @@ def _isExactType(dataType: pa.DataType) -> bool:
     return pa.types.is_integer(dataType) or pa.types.is_decimal(dataType)
 
 
+def _sqlType(dataType: pa.DataType) -> str:
+    """A table column's type as sqlglot reads a schema, for `qualify`."""
+    if pa.types.is_integer(dataType):
+        return "BIGINT"
+    if pa.types.is_decimal(dataType):
+        return f"DECIMAL({dataType.precision}, {dataType.scale})"
+    if pa.types.is_floating(dataType):
+        return "DOUBLE"
+    if pa.types.is_boolean(dataType):
+        return "BOOLEAN"
+    if pa.types.is_date(dataType):
+        return "DATE"
+    if pa.types.is_timestamp(dataType):
+        return "TIMESTAMP"
+    return "VARCHAR"
+
+
 def _castIsExact(node: exp.Expression) -> bool:
     target = node.args.get("to")
     return isinstance(target, exp.DataType) and target.this in _EXACT_CAST_TYPES
 
 
-def _exactInput(expression: exp.Expression, types: dict[str, list]) -> bool:
+def _castType(node: exp.Expression) -> pa.DataType:
+    target = node.args.get("to")
+    return pa.decimal128(38, 0) if target.this == exp.DataType.Type.DECIMAL else pa.int64()
+
+
+def _baseTypes(expression: exp.Expression, scope, tables: dict[str, dict[str, pa.DataType]], depth: int = 0) -> list | None:
     """
-    An aggregate's input is integer or DECIMAL by construction: such columns, integer literals, + - *, and casts to an
-    integer or DECIMAL type (whatever they cast). Anything else (a division, a function, a float literal) is not.
+    The exact (integer or DECIMAL) types an expression of a qualified query can take, or None when it can be anything
+    else. A column is followed to what it binds to: a base-table column, or the definition of a CTE or subquery column
+    (through any number of scopes). Integer literals, + - *, casts to an integer or DECIMAL type (whatever they cast),
+    and SUM, MIN, MAX and COUNT over exact values stay exact. Anything else (a division, another function, a float
+    literal, a name nothing binds to, a cast to another type) is None.
     """
+    if depth > 20:
+        return None
     if isinstance(expression, (exp.Cast, exp.TryCast)):
-        return _castIsExact(expression)
+        return [_castType(expression)] if _castIsExact(expression) else None
     if isinstance(expression, exp.Column):
-        found = types.get(expression.name)
-        return bool(found) and all(_isExactType(dataType) for dataType in found)
+        source = scope.sources.get(expression.table) if scope is not None else None
+        name = expression.name.lower()
+        if isinstance(source, exp.Table):
+            found = tables.get(source.name.lower(), {}).get(name)
+            return [found] if found is not None and _isExactType(found) else None
+        inner = getattr(source, "expression", None)
+        if not isinstance(inner, exp.Select):
+            return None
+        items = [item for item in inner.selects if item.alias_or_name.lower() == name]
+        if len(items) != 1:
+            return None
+        return _baseTypes(items[0].unalias(), source, tables, depth + 1)
     if isinstance(expression, exp.Literal):
-        return not expression.is_string and re.fullmatch(r"-?\d+", str(expression.this)) is not None
+        if not expression.is_string and re.fullmatch(r"-?\d+", str(expression.this)) is not None:
+            return [pa.int64()]
+        return None
     if isinstance(expression, (exp.Add, exp.Sub, exp.Mul)):
-        return _exactInput(expression.this, types) and _exactInput(expression.expression, types)
+        left = _baseTypes(expression.this, scope, tables, depth + 1)
+        right = _baseTypes(expression.expression, scope, tables, depth + 1)
+        return left + right if left is not None and right is not None else None
     if isinstance(expression, (exp.Paren, exp.Neg)):
-        return _exactInput(expression.this, types)
+        return _baseTypes(expression.this, scope, tables, depth + 1)
     if isinstance(expression, exp.Distinct):
-        return bool(expression.expressions) and all(_exactInput(item, types) for item in expression.expressions)
-    return isinstance(expression, exp.Star)
+        found = [_baseTypes(item, scope, tables, depth + 1) for item in expression.expressions]
+        return [dataType for types in found for dataType in types] if found and None not in found else None
+    if isinstance(expression, exp.Count):
+        return [pa.int64()]
+    if isinstance(expression, (exp.Sum, exp.Min, exp.Max)) and not expression.args.get("count"):
+        return _baseTypes(expression.this, scope, tables, depth + 1)
+    return None
 
 
 def _rounded(node: exp.Expression) -> bool:
@@ -484,33 +536,60 @@ def _rounded(node: exp.Expression) -> bool:
     return isinstance(parent, exp.Round) and parent.this is child
 
 
+def _floatInput(node: exp.Expression, scope, tables: dict[str, dict[str, pa.DataType]]) -> bool:
+    """One unrounded float-prone aggregate of a qualified query: is its input anything but exact?"""
+    if isinstance(node, _SPREADS):
+        # Welford's update runs in doubles whatever the input type.
+        return True
+    value = node.this
+    if isinstance(node, (exp.PercentileCont, exp.PercentileDisc)) and isinstance(value, exp.Literal):
+        # The WITHIN GROUP form keeps the fraction in `this`; the values are its ORDER BY.
+        group = node.find_ancestor(exp.WithinGroup)
+        order = group.expression if group is not None else None
+        value = order.expressions[0].this if isinstance(order, exp.Order) and len(order.expressions) == 1 else order
+    if value is None:
+        return True
+    types = _baseTypes(value, scope, tables)
+    if types is None or not types:
+        return True
+    if isinstance(node, exp.Avg):
+        # AVG of integers divides in doubles; only DECIMAL keeps it exact.
+        return not all(pa.types.is_decimal(dataType) for dataType in types)
+    return False
+
+
 def floatAggregate(sql: str, schemas: dict[str, pa.Schema]) -> bool:
     """
-    R6: the SQL sums, averages or takes a spread or quantile of DOUBLE or FLOAT values without rounding the result.
+    R6: the SQL sums, averages or takes a spread or quantile of values that are not exact, without rounding the result.
 
     DuckDB adds rows in parallel, so such a result can change in its last bits from one run to the next, and charts
-    that show raw numbers (scatter, bubble, radar, geoMap) would show it. An input counts as exact only when every
-    column it uses is an integer or DECIMAL column of the tables read (looked up by name in `schemas`, the job's
-    memoised schema reads); a column found nowhere, a float literal, a division or a function counts as a float.
+    that show raw numbers (scatter, bubble, radar, geoMap) would show it. Every aggregate argument is resolved through
+    the query's scopes (`sqlglot`'s `qualify` against `schemas`, the job's memoised schema reads): it counts as exact
+    only when it binds to an integer or DECIMAL base-table column, or to a CTE or subquery column whose own definition
+    is exact (`_baseTypes`). A cast to DOUBLE, FLOAT or REAL, a name nothing binds to, or a query `qualify` cannot read
+    counts as a float. STDDEV, VARIANCE and their variants always count as float; AVG counts as exact only over
+    DECIMAL. An aggregate that `round(..., n)` rounds is exempt.
     """
     tree = _parsed(sql)
     if tree is None:
         return True
-    types: dict[str, list] = {}
-    for schema in schemas.values():
-        for field in schema:
-            types.setdefault(field.name, []).append(field.type)
-    for node in tree.find_all(*_FLOAT_AGGREGATES):
-        if _rounded(node):
-            continue
-        value = node.this
-        if isinstance(node, (exp.PercentileCont, exp.PercentileDisc)) and isinstance(value, exp.Literal):
-            # The WITHIN GROUP form keeps the fraction in `this`; the values are its ORDER BY.
-            value = node.find_ancestor(exp.WithinGroup)
-            value = value.expression if value is not None else None
-        if value is None or not _exactInput(value, types):
-            return True
-    return False
+    tables = {name.lower(): {field.name.lower(): field.type for field in schema} for name, schema in schemas.items()}
+    schema = {name: {field: _sqlType(dataType) for field, dataType in fields.items()} for name, fields in tables.items()}
+    try:
+        qualified = qualify(tree.copy(), schema=schema, dialect="duckdb", validate_qualify_columns=True)
+        scopes = list(traverse_scope(qualified))
+    except Exception:
+        return tree.find(*_FLOAT_AGGREGATES) is not None
+    checked = set()
+    for scope in scopes:
+        for node in scope.expression.find_all(*_FLOAT_AGGREGATES):
+            if node.find_ancestor(exp.Select) is not scope.expression or id(node) in checked:
+                continue
+            checked.add(id(node))
+            if not _rounded(node) and _floatInput(node, scope, tables):
+                return True
+    # An aggregate no scope owns (a shape `traverse_scope` does not reach) is not proven exact.
+    return any(id(node) not in checked and not _rounded(node) for node in qualified.find_all(*_FLOAT_AGGREGATES))
 
 
 def orderKeys(sql: str, columns: list[str]) -> list[str] | None:
@@ -580,6 +659,97 @@ def orderIsUnique(sql: str, columns: list[str]) -> bool:
     return isinstance(tree, exp.Select) and _coversGroup(tree, [ordered.this for ordered in order.expressions])
 
 
+def singleRowByConstruction(sql: str) -> bool:
+    """
+    N1: the outer query returns at most one row on any data: a SELECT with an aggregate of its own and no GROUP BY,
+    HAVING, DISTINCT (or DISTINCT ON), QUALIFY, window, or UNNEST in its select list. Anything else (a plain SELECT, a
+    grouped or distinct query, a set operation) could return several rows on other data, whatever it returns today.
+    """
+    tree = _parsed(sql)
+    while isinstance(tree, exp.Subquery) and not tree.alias:
+        tree = tree.this
+    if not isinstance(tree, exp.Select):
+        return False
+    if any(tree.args.get(name) for name in ("group", "having", "distinct", "qualify")):
+        return False
+    items = list(tree.selects)
+    if not items or any(item.find(exp.Window, exp.Unnest, exp.Explode) for item in items):
+        return False
+    return any(
+        aggregate.find_ancestor(exp.Select) is tree
+        for item in items for aggregate in item.find_all(exp.AggFunc)
+    )
+
+
+def _outputNames(source) -> set[str] | None:
+    """The column names a FROM source gives its query, or None when they are not known (a star, an unknown shape)."""
+    inner = getattr(source, "expression", None)
+    if not isinstance(inner, exp.Select) or any(isinstance(item, exp.Star) or item.find(exp.Star) for item in inner.selects):
+        return None
+    return {item.alias_or_name.lower() for item in inner.selects}
+
+
+def _isInputColumn(name: str, scope, tables: dict[str, set[str]]) -> bool:
+    """`name` is (or may be) a column of one of the scope's FROM sources. An unknown table or source counts as yes."""
+    if not scope.sources:
+        return False
+    for source in scope.sources.values():
+        if isinstance(source, exp.Table):
+            columns = tables.get(source.name.lower())
+            if columns is None or name in columns:
+                return True
+            continue
+        names = _outputNames(source)
+        if names is None or name in names:
+            return True
+    return False
+
+
+def aliasShadowsColumn(sql: str, schemas: dict[str, pa.Schema]) -> bool:
+    """
+    N3: a GROUP BY, ORDER BY or window key names a select-list alias that is also an input column, and the alias is a
+    different expression (`upper(region) AS region ... GROUP BY region`). DuckDB groups by the input column but orders
+    by the alias, so rows the GROUP BY keeps apart can show the same key and tie. Input columns are the base tables'
+    columns (from `schemas`), the output columns of CTEs and subqueries, and any column the select list names; a table
+    whose schema is not known counts as having the column. A query that cannot be read counts as shadowing.
+    """
+    tree = _parsed(sql)
+    if tree is None:
+        return True
+    tables = {name.lower(): {field.name.lower() for field in schema} for name, schema in schemas.items()}
+    try:
+        scopes = list(traverse_scope(tree))
+    except Exception:
+        return True
+    for scope in scopes:
+        select = scope.expression
+        if not isinstance(select, exp.Select):
+            continue
+        aliased: dict[str, list[exp.Expression]] = {}
+        for item in select.selects:
+            if isinstance(item, exp.Alias):
+                aliased.setdefault(item.alias.lower(), []).append(item.this)
+        if not aliased:
+            continue
+        keys = [node for node in (select.args.get("group"), select.args.get("order")) if node is not None]
+        for window in select.find_all(exp.Window):
+            if _selectOf(window) is select:
+                keys += list(window.args.get("partition_by") or [])
+                if window.args.get("order") is not None:
+                    keys.append(window.args["order"])
+        named = {column.name.lower() for item in select.selects for column in item.find_all(exp.Column)}
+        for key in keys:
+            for column in key.find_all(exp.Column):
+                name = column.name.lower()
+                if column.table or name not in aliased:
+                    continue
+                if all(isinstance(value, exp.Column) and value.name.lower() == name for value in aliased[name]):
+                    continue
+                if name in named or _isInputColumn(name, scope, tables):
+                    return True
+    return False
+
+
 _MISSING = object()
 
 
@@ -602,8 +772,9 @@ def resultRefusal(request: ChartRequest, chart: dict, table: pa.Table, truncated
       category charts, table 1000, geoMap 2000, scatter and bubble 5000, pivot 10000, card 2), a category chart meets
       the builder's label cap (`LABEL_CAP`, 500; lenient keeps the first 500), or the builder dropped rows (scatter and
       bubble points with an empty value, map points with an empty or out-of-range coordinate).
-    - `unstableOrder`: more than one row, and the outer ORDER BY is not unique by construction (`orderIsUnique`), or,
-      as an extra guard, two rows share their key values today (NaN and None count as equal).
+    - `unstableOrder`: the outer ORDER BY is not unique by construction (`orderIsUnique`), or, as an extra guard, two
+      rows share their key values today (NaN and None count as equal). This holds at any row count, 0 and 1 included:
+      only a query that returns at most one row by construction (`singleRowByConstruction`) needs no order.
     """
     chartType = request.chartType
     rows = table.num_rows
@@ -622,7 +793,7 @@ def resultRefusal(request: ChartRequest, chart: dict, table: pa.Table, truncated
         points = ((chart.get("map") or {}).get("data") or {}).get("points")
         if not isinstance(points, list) or len(points) != rows:
             return "truncated"
-    if rows > 1:
+    if rows > 1 or not singleRowByConstruction(request.sql):
         columns = list(table.column_names)
         if not orderIsUnique(request.sql, columns):
             return "unstableOrder"
@@ -991,17 +1162,19 @@ def _checkRequest(job, pageId: str, widget: dict, request: ChartRequest, finalOu
     if refusal is not None:
         entry.update(verdict="differ", field=refusal)
         return
-    if request.chartType in EXACT_FLOAT_TYPES:
-        try:
-            from nubrix.components.sqlCheck import checkSql
+    try:
+        from nubrix.components.sqlCheck import checkSql
 
-            schemas = _schemasOf(job, list(checkSql(request.sql, job.tables).tables))
-        except Exception as error:
-            entry.update(verdict="failed", step="schema", **_failure(error))
-            return
-        if floatAggregate(request.sql, schemas):
-            entry.update(verdict="differ", field="floatAggregate")
-            return
+        schemas = _schemasOf(job, list(checkSql(request.sql, job.tables).tables))
+    except Exception as error:
+        entry.update(verdict="failed", step="schema", **_failure(error))
+        return
+    if aliasShadowsColumn(request.sql, schemas):
+        entry.update(verdict="differ", field="unstableOrder", reason="aliasShadowsColumn")
+        return
+    if request.chartType in EXACT_FLOAT_TYPES and floatAggregate(request.sql, schemas):
+        entry.update(verdict="differ", field="floatAggregate")
+        return
     try:
         chart, table, truncated = _renderWithResult(job.manager, job.project, request, job.tables)
     except Exception as error:
