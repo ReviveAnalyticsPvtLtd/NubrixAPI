@@ -17,6 +17,7 @@ from types import SimpleNamespace
 import httpx
 import pyarrow as pa
 import pytest
+import sqlglot
 
 from nubrix.components.chartEngine import ChartFailure
 from nubrix.components.chartRequest import LABEL_CAP, ChartRequest, decodeGeneratedCode, encodeGeneratedCode
@@ -1412,6 +1413,133 @@ def test_ordinaryShapesStillPass(sql, columns):
     assert conv.sqlRefusal(sql) is None
     assert conv.orderIsUnique(sql, columns) is True
     assert conv.aliasShadowsColumn(sql, ORDINARY_SCHEMAS) is False
+
+
+# Round 4: three narrowings that keep every false match out
+
+# The generator prompt's example schema (synthetic): the tables its example SQLs read.
+PROMPT_SCHEMAS = {
+    "orders": pa.schema([("order_id", pa.int64()), ("order_date", pa.date32()), ("total_amount", pa.float64()),
+                         ("status", pa.string()), ("channel", pa.string()), ("store_id", pa.int64()),
+                         ("customer_id", pa.int64()), ("discount_amount", pa.float64())]),
+    "order_items": pa.schema([("order_id", pa.int64()), ("product_id", pa.int64()), ("quantity", pa.int64()),
+                              ("unit_price", pa.decimal128(10, 2))]),
+    "products": pa.schema([("product_id", pa.int64()), ("product_name", pa.string()), ("category", pa.string()),
+                           ("list_price", pa.decimal128(10, 2))]),
+    "stores": pa.schema([("store_id", pa.int64()), ("region", pa.string()), ("floor_area_sqm", pa.float64()),
+                         ("latitude", pa.float64()), ("longitude", pa.float64()), ("store_name", pa.string())]),
+    "customers": pa.schema([("customer_id", pa.int64()), ("full_name", pa.string()), ("city", pa.string())]),
+}
+PROMPT_PIE = '''SELECT COALESCE("status", 'Unknown') AS status, COUNT(*) AS order_count FROM "orders" GROUP BY ALL ORDER BY order_count DESC, status'''
+PROMPT_HISTOGRAM = '''WITH binned AS (SELECT CAST(floor("total_amount" / 50) AS INTEGER) AS bin FROM "orders" WHERE "total_amount" IS NOT NULL) SELECT CAST(bin * 50 AS VARCHAR) || '-' || CAST((bin + 1) * 50 AS VARCHAR) AS value_range, COUNT(*) AS order_count FROM binned GROUP BY bin ORDER BY bin'''
+PROMPT_SCATTER = '''SELECT p."list_price" AS list_price, COALESCE(SUM(oi."quantity"), 0) AS units_sold, p."category" AS category FROM "products" AS p LEFT JOIN "order_items" AS oi ON oi."product_id" = p."product_id" WHERE p."list_price" IS NOT NULL GROUP BY p."product_id", p."list_price", p."category" ORDER BY category, list_price, p."product_id"'''
+PROMPT_RADAR = '''SELECT p."category" AS category, round(COALESCE(SUM(oi."quantity" * oi."unit_price") FILTER (WHERE o."channel" ILIKE 'online'), 0), 2) AS online_revenue, round(COALESCE(SUM(oi."quantity" * oi."unit_price") FILTER (WHERE o."channel" ILIKE 'in-store'), 0), 2) AS in_store_revenue FROM "order_items" AS oi JOIN "orders" AS o ON o."order_id" = oi."order_id" JOIN "products" AS p ON p."product_id" = oi."product_id" GROUP BY ALL ORDER BY category'''
+PROMPT_CARD = '''SELECT round(100.0 * COUNT(*) FILTER (WHERE "discount_amount" > 0) / NULLIF(COUNT(*), 0), 1) AS discounted_order_pct FROM "orders"'''
+PROMPT_PIVOT = '''SELECT s."region" AS region, 'Q' || CAST(quarter(o."order_date") AS VARCHAR) AS order_quarter, SUM(o."total_amount") AS revenue FROM "orders" AS o JOIN "stores" AS s ON s."store_id" = o."store_id" WHERE o."order_date" >= DATE '2024-01-01' AND o."order_date" < DATE '2025-01-01' GROUP BY ALL ORDER BY order_quarter, region'''
+PROMPT_POLAR = '''SELECT dayname("order_date") AS weekday, COUNT(*) AS order_count FROM "orders" GROUP BY ALL ORDER BY MIN(isodow("order_date"))'''
+
+
+# Round 4, ruling 1: a bare ORDER BY name binds to the alias
+
+
+@pytest.mark.parametrize("sql,shadows", [
+    # The generator prompt's pie: GROUP BY ALL groups by the alias's expression, and a bare ORDER BY name sorts the alias.
+    (PROMPT_PIE, False),
+    ("SELECT region, SUM(revenue) AS revenue FROM orders GROUP BY region ORDER BY revenue DESC, region", False),
+    ("SELECT upper(region) AS region, SUM(revenue) AS t FROM orders GROUP BY ALL ORDER BY region", False),
+    # A GROUP BY name binds to the input column.
+    ("SELECT upper(region) AS region, SUM(revenue) AS t FROM orders GROUP BY region", True),
+    # A name inside an ORDER BY expression binds to the input column.
+    ("SELECT upper(region) AS region, SUM(revenue) AS t FROM orders GROUP BY ALL ORDER BY lower(region)", True),
+    # Window keys bind to the input column.
+    ("SELECT upper(region) AS region, revenue, rank() OVER (PARTITION BY region ORDER BY revenue) AS r FROM orders "
+     "ORDER BY region, revenue, r", True),
+    ("SELECT upper(region) AS region, revenue, SUM(revenue) OVER (ORDER BY region) AS s FROM orders ORDER BY 1, 2, 3", True),
+])
+def test_aBareOrderByNameIsTheAlias(sql, shadows):
+    schemas = {**PROMPT_SCHEMAS, "orders": pa.schema([("region", pa.string()), ("revenue", pa.float64()),
+                                                      ("status", pa.string())])}
+    assert conv.aliasShadowsColumn(sql, schemas) is shadows
+
+
+# Round 4, ruling 2: CASE and COALESCE inside a float-prone aggregate
+
+
+@pytest.mark.parametrize("expression,refused", [
+    ("SUM(CASE WHEN region = 'East' THEN 1 ELSE 0 END)", False),
+    ("SUM(CASE WHEN region = 'East' THEN quantity END)", False),
+    ("SUM(CASE WHEN region = 'East' THEN price ELSE 0 END)", False),
+    ("SUM(CASE region WHEN 'East' THEN 1 WHEN 'North' THEN 2 ELSE NULL END)", False),
+    ("SUM(COALESCE(quantity, 0))", False),
+    ("SUM(CASE WHEN region = 'East' THEN revenue ELSE 0 END)", True),
+    ("SUM(CASE WHEN region = 'East' THEN quantity ELSE weight END)", True),
+    ("SUM(CASE WHEN region = 'East' THEN 1 ELSE 0.5 END)", True),
+    ("SUM(CASE WHEN region = 'East' THEN NULL END)", True),
+    ("SUM(COALESCE(quantity, revenue))", True),
+    ("AVG(CASE WHEN region = 'East' THEN 1 ELSE 0 END)", True),
+])
+def test_caseAndCoalesceAreExactOnlyWhenEveryBranchIs(expression, refused):
+    sql = f"SELECT region, {expression} AS v FROM orders GROUP BY region ORDER BY region"
+    assert conv.floatAggregate(sql, ORDER_SCHEMAS) is refused
+
+
+# Round 4, ruling 3: an ORDER BY key that is not an output column
+
+
+@pytest.mark.parametrize("sql,columns,unique", [
+    # Rule (a): every GROUP BY key is in the ORDER BY, though one is not shown.
+    (PROMPT_HISTOGRAM, ["value_range", "order_count"], True),
+    (PROMPT_SCATTER, ["list_price", "units_sold", "category"], True),
+    ("SELECT region, SUM(revenue) AS t FROM orders GROUP BY region, product_id ORDER BY region, product_id", ["region", "t"], True),
+    # Rule (b): every output column is in the ORDER BY, with a hidden key as well.
+    ("SELECT region, revenue FROM orders ORDER BY order_id, region, revenue", ["region", "revenue"], True),
+    # Neither rule: refused as before.
+    (PROMPT_POLAR, ["weekday", "order_count"], False),
+    ("SELECT region, SUM(revenue) AS t FROM orders GROUP BY region ORDER BY MIN(order_date)", ["region", "t"], False),
+    ("SELECT region, revenue FROM orders ORDER BY order_id", ["region", "revenue"], False),
+    ("SELECT region, SUM(revenue) AS t FROM orders GROUP BY region, product_id ORDER BY product_id", ["region", "t"], False),
+])
+def test_aHiddenOrderKeyCountsWhenTheOrderIsUniqueByConstruction(sql, columns, unique):
+    assert conv.orderIsUnique(sql, columns) is unique
+
+
+@pytest.mark.parametrize("sql,rows,reason", [
+    # A hidden key: the order is unique by construction, so today's rows are not checked (and cannot be).
+    (PROMPT_HISTOGRAM, [{"value_range": "0-50", "order_count": 3}, {"value_range": "50-100", "order_count": 3}], None),
+    ("SELECT region, SUM(revenue) AS t FROM orders GROUP BY region, product_id ORDER BY region, product_id",
+     [{"region": "East", "t": 1.0}, {"region": "East", "t": 2.0}], None),
+    # Every key shown: the guard still reads today's rows.
+    ("SELECT region, SUM(revenue) AS t FROM orders GROUP BY region ORDER BY region",
+     [{"region": math.nan, "t": 2.0}, {"region": None, "t": 1.0}], "unstableOrder"),
+    # A hidden key that is not unique by construction.
+    ("SELECT region, SUM(revenue) AS t FROM orders GROUP BY region ORDER BY MIN(order_date)",
+     [{"region": "East", "t": 2.0}, {"region": "North", "t": 1.0}], "unstableOrder"),
+    ("SELECT region, SUM(revenue) AS t FROM orders GROUP BY region ORDER BY MIN(order_date)",
+     [{"region": "East", "t": 2.0}], "unstableOrder"),
+])
+def test_theGuardReadsOnlyShownKeys(sql, rows, reason):
+    request, chart, table = _keyed(sql, rows)
+    assert conv.resultRefusal(request, chart, table, False) == reason
+
+
+# Round 4: the generator prompt's example SQLs that now pass every static rule
+
+
+@pytest.mark.parametrize("chartType,sql", [
+    ("pie", PROMPT_PIE),
+    ("histogram", PROMPT_HISTOGRAM),
+    ("scatter", PROMPT_SCATTER),
+    ("radar", PROMPT_RADAR),
+    ("card", PROMPT_CARD),
+    ("pivot", PROMPT_PIVOT),
+])
+def test_thePromptExamplesPassEveryStaticRule(chartType, sql):
+    tree = sqlglot.parse_one(sql, read="duckdb")
+    columns = [item.alias_or_name for item in tree.selects]
+    assert conv.sqlRefusal(sql) is None
+    assert conv.aliasShadowsColumn(sql, PROMPT_SCHEMAS) is False
+    assert chartType not in conv.EXACT_FLOAT_TYPES or conv.floatAggregate(sql, PROMPT_SCHEMAS) is False
+    assert conv.singleRowByConstruction(sql) or conv.orderIsUnique(sql, columns)
 
 
 # The strict comparison

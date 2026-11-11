@@ -15,16 +15,17 @@ fails leaves the widget as Python, with a reason:
      and the Python does not read the clock (`relativeTime`) or draw random numbers (`nondeterministic`).
   2. The SQL is refused (`sqlRefusal`) when it cuts the result (LIMIT, OFFSET, FETCH, a sample, QUALIFY, a compared
      ranking window, an 'Other' fold: `truncated`), moves with time (`relativeTime`), or uses a random function or an
-     aggregate or window function off the allow-list (`nondeterministic`). A GROUP BY, ORDER BY or window key that
-     names an alias of a different expression which is also an input column is refused (`unstableOrder`, reason
-     `aliasShadowsColumn`). For charts that show raw numbers (scatter, bubble, radar, geoMap), an unrounded sum,
-     average, spread or quantile whose input is not proven exact through every scope is refused (`floatAggregate`).
+     aggregate or window function off the allow-list (`nondeterministic`). A GROUP BY key, a name inside an ORDER BY
+     expression or a window key that names an alias of a different expression which is also an input column is
+     refused (`unstableOrder`, reason `aliasShadowsColumn`); a bare ORDER BY name binds to the alias and is not
+     checked. For charts that show raw numbers (scatter, bubble, radar, geoMap), an unrounded sum, average, spread or
+     quantile whose input is not proven exact through every scope is refused (`floatAggregate`).
   3. The refresh-style run (unfiltered, lenient, through `renderChartRequest`) and the workflow's own run must both
      strictly match the saved widget (`verdictOf`; a second render that differs is `nondeterministic`).
-  4. The result must be whole (`resultRefusal`): no launcher or builder cap reached or met (`truncated`), and
-     an outer ORDER BY on output columns that is unique by construction (`orderIsUnique`), with key values unique
-     across today's rows as well (`unstableOrder`), at any row count unless the query returns at most one row by
-     construction (`singleRowByConstruction`).
+  4. The result must be whole (`resultRefusal`): no launcher or builder cap reached or met (`truncated`), and an outer
+     ORDER BY that is unique by construction (`orderIsUnique`), with key values unique across today's rows as well
+     when every key is an output column (`unstableOrder`), at any row count unless the query returns at most one row
+     by construction (`singleRowByConstruction`).
   5. Under every filter set (`_filterSets`), the saved Python and the request re-run through the dashboard's own filter
      path (`DashboardService._rerunWidgetProduced`) must strictly agree, and at least one set must be one both forms
      ran (`filter`); no filter set at all is `filter`.
@@ -487,9 +488,10 @@ def _baseTypes(expression: exp.Expression, scope, tables: dict[str, dict[str, pa
     """
     The exact (integer or DECIMAL) types an expression of a qualified query can take, or None when it can be anything
     else. A column is followed to what it binds to: a base-table column, or the definition of a CTE or subquery column
-    (through any number of scopes). Integer literals, + - *, casts to an integer or DECIMAL type (whatever they cast),
-    and SUM, MIN, MAX and COUNT over exact values stay exact. Anything else (a division, another function, a float
-    literal, a name nothing binds to, a cast to another type) is None.
+    (through any number of scopes). Integer literals, NULL, + - *, casts to an integer or DECIMAL type (whatever they
+    cast), CASE and COALESCE whose every branch is exact, and SUM, MIN, MAX and COUNT over exact values stay exact.
+    Anything else (a division, another function, a float literal, a name nothing binds to, a cast to another type) is
+    None.
     """
     if depth > 20:
         return None
@@ -521,6 +523,17 @@ def _baseTypes(expression: exp.Expression, scope, tables: dict[str, dict[str, pa
     if isinstance(expression, exp.Distinct):
         found = [_baseTypes(item, scope, tables, depth + 1) for item in expression.expressions]
         return [dataType for types in found for dataType in types] if found and None not in found else None
+    if isinstance(expression, exp.Null):
+        return []
+    if isinstance(expression, (exp.Case, exp.Coalesce)):
+        # Every THEN, the ELSE and every COALESCE argument must be exact; a missing ELSE (NULL) adds nothing.
+        if isinstance(expression, exp.Case):
+            branches = [branch.args.get("true") for branch in expression.args.get("ifs") or []]
+            branches.append(expression.args.get("default"))
+        else:
+            branches = [expression.this, *expression.expressions]
+        found = [_baseTypes(branch, scope, tables, depth + 1) for branch in branches if branch is not None]
+        return [dataType for types in found for dataType in types] if None not in found else None
     if isinstance(expression, exp.Count):
         return [pa.int64()]
     if isinstance(expression, (exp.Sum, exp.Min, exp.Max)) and not expression.args.get("count"):
@@ -600,6 +613,15 @@ def orderKeys(sql: str, columns: list[str]) -> list[str] | None:
     expression as an unaliased select-list item (`ORDER BY SUM(x)` with `SUM(x) AS total` gives `total`). Anything
     else (an expression of other columns, a position out of range, a name two output columns share) gives None.
     """
+    names = _orderKeyNames(sql, columns)
+    if names is None or None in names:
+        return None
+    return names
+
+
+def _orderKeyNames(sql: str, columns: list[str]) -> list[str | None] | None:
+    """The outer ORDER BY's keys as output column names (`orderKeys`), None for a key that is not one; None without an
+    outer ORDER BY."""
     found = _outerOrder(sql)
     if found is None:
         return None
@@ -614,7 +636,7 @@ def orderKeys(sql: str, columns: list[str]) -> list[str] | None:
             try:
                 position = int(key.this)
             except ValueError:
-                return None
+                position = 0
             if 1 <= position <= len(columns):
                 name = columns[position - 1]
         elif isinstance(key, exp.Column) and not key.table and key.name in columns:
@@ -623,9 +645,7 @@ def orderKeys(sql: str, columns: list[str]) -> list[str] | None:
             matches = [index for index, item in enumerate(selects) if item.unalias() == key]
             if len(matches) == 1:
                 name = columns[matches[0]]
-        if name is None or columns.count(name) != 1:
-            return None
-        keys.append(name)
+        keys.append(name if name is not None and columns.count(name) == 1 else None)
     return keys
 
 
@@ -648,12 +668,13 @@ def orderIsUnique(sql: str, columns: list[str]) -> bool:
           a position), so no two rows have equal keys; or
       (b) the ORDER BY covers every output column, so rows that tie are identical and the order shown is the same
           (a DISTINCT output ordered by all its columns is one such case).
-    Its keys must also be output columns (`orderKeys`), for the check on the rows.
+    A key that is not an output column (a hidden tie-breaker such as an id, or a GROUP BY key that is not shown) takes
+    part in (a) and (b) like any other; only the check on today's rows (`resultRefusal`) needs every key shown.
     """
-    keys = orderKeys(sql, columns)
-    if not keys:
+    names = _orderKeyNames(sql, columns)
+    if not names:
         return False
-    if set(keys) == set(columns):
+    if set(columns) <= {name for name in names if name is not None}:
         return True
     tree, order = _outerOrder(sql)
     return isinstance(tree, exp.Select) and _coversGroup(tree, [ordered.this for ordered in order.expressions])
@@ -707,11 +728,13 @@ def _isInputColumn(name: str, scope, tables: dict[str, set[str]]) -> bool:
 
 def aliasShadowsColumn(sql: str, schemas: dict[str, pa.Schema]) -> bool:
     """
-    N3: a GROUP BY, ORDER BY or window key names a select-list alias that is also an input column, and the alias is a
-    different expression (`upper(region) AS region ... GROUP BY region`). DuckDB groups by the input column but orders
-    by the alias, so rows the GROUP BY keeps apart can show the same key and tie. Input columns are the base tables'
-    columns (from `schemas`), the output columns of CTEs and subqueries, and any column the select list names; a table
-    whose schema is not known counts as having the column. A query that cannot be read counts as shadowing.
+    N3: a GROUP BY key, a name inside an ORDER BY expression, or a window key names a select-list alias that is also an
+    input column, and the alias is a different expression (`upper(region) AS region ... GROUP BY region`). A bare
+    ORDER BY name is not checked: DuckDB binds it to the alias, as `orderIsUnique` reads it. DuckDB groups by the
+    input column but orders by the alias, so rows the GROUP BY keeps apart can show the same key and tie. Input
+    columns are the base tables' columns (from `schemas`), the output columns of CTEs and subqueries, and any column
+    the select list names; a table whose schema is not known counts as having the column. A query that cannot be read
+    counts as shadowing.
     """
     tree = _parsed(sql)
     if tree is None:
@@ -731,7 +754,12 @@ def aliasShadowsColumn(sql: str, schemas: dict[str, pa.Schema]) -> bool:
                 aliased.setdefault(item.alias.lower(), []).append(item.this)
         if not aliased:
             continue
-        keys = [node for node in (select.args.get("group"), select.args.get("order")) if node is not None]
+        keys = [select.args["group"]] if select.args.get("group") is not None else []
+        if select.args.get("order") is not None:
+            # DuckDB binds a bare ORDER BY name to the select alias; a name inside an ORDER BY expression binds to the
+            # input column.
+            keys += [ordered for ordered in select.args["order"].expressions
+                     if not (isinstance(ordered.this, exp.Column) and not ordered.this.table)]
         for window in select.find_all(exp.Window):
             if _selectOf(window) is select:
                 keys += list(window.args.get("partition_by") or [])
@@ -772,9 +800,10 @@ def resultRefusal(request: ChartRequest, chart: dict, table: pa.Table, truncated
       category charts, table 1000, geoMap 2000, scatter and bubble 5000, pivot 10000, card 2), a category chart meets
       the builder's label cap (`LABEL_CAP`, 500; lenient keeps the first 500), or the builder dropped rows (scatter and
       bubble points with an empty value, map points with an empty or out-of-range coordinate).
-    - `unstableOrder`: the outer ORDER BY is not unique by construction (`orderIsUnique`), or, as an extra guard, two
-      rows share their key values today (NaN and None count as equal). This holds at any row count, 0 and 1 included:
-      only a query that returns at most one row by construction (`singleRowByConstruction`) needs no order.
+    - `unstableOrder`: the outer ORDER BY is not unique by construction (`orderIsUnique`), or, as an extra guard when
+      every ORDER BY key is an output column, two rows share their key values today (NaN and None count as equal).
+      This holds at any row count, 0 and 1 included: only a query that returns at most one row by construction
+      (`singleRowByConstruction`) needs no order.
     """
     chartType = request.chartType
     rows = table.num_rows
@@ -798,10 +827,12 @@ def resultRefusal(request: ChartRequest, chart: dict, table: pa.Table, truncated
         if not orderIsUnique(request.sql, columns):
             return "unstableOrder"
         keys = orderKeys(request.sql, columns)
-        values = [table.column(columns.index(key)).to_pylist() for key in keys]
-        seen = {tuple(_hashable(value) for value in row) for row in zip(*values)}
-        if len(seen) != rows:
-            return "unstableOrder"
+        if keys is not None:
+            # Only shown keys can be read today; a hidden key's order is fixed by construction alone.
+            values = [table.column(columns.index(key)).to_pylist() for key in keys]
+            seen = {tuple(_hashable(value) for value in row) for row in zip(*values)}
+            if len(seen) != rows:
+                return "unstableOrder"
     return None
 
 
