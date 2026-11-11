@@ -486,6 +486,9 @@ def _expectedFromSql(sql: str, chartType: str, sources: dict) -> dict:
         for index, row in enumerate(rows):
             record = dict(zip(columns, row))
             lat, long = _number(record["lat"]), _number(record["long"])
+            # The rows the builder drops (`_buildGeoMap`): a missing or non-finite coordinate, or one out of range.
+            if lat is None or long is None or not -90 <= lat <= 90 or not -180 <= long <= 180:
+                continue
             point = {"lat": lat, "long": long}
             if "id" in record:
                 point["id"] = _text(record["id"]) or str(index)
@@ -693,6 +696,7 @@ class _Engine:
         self.engine = engine
         self.replay = replay
         self.failure: dict | None = None
+        self.knownMetadata: dict | None = None
         if engine == "sql":
             from nubrix.workflows import sqlChartWorkflow
 
@@ -723,6 +727,10 @@ class _Engine:
                 trace_name="ReportingWorkflow", projectId=project, tags=["reporting", "evaluation"], perRequestHandler=True,
             ) or None
         state = {"metadata": metadata, "inputQuery": prompt, "projectId": project}
+        if self.engine == "python" and self.knownMetadata is not None:
+            # The Python workflow routes eager reads of large tables to lazy scans by the row counts it finds; a served
+            # request finds them in Redis, so the harness hands it the metadata it read.
+            state["knownMetadata"] = self.knownMetadata
         if self.engine == "sql":
             with mock.patch.object(self.module, "logChartFailure", self._recordFailure):
                 return self.workflow.invoke(state, config=config)
@@ -895,6 +903,7 @@ def main(argv: list[str] | None = None) -> int:
             # The row counts come from the metadata just read, as a served request's come from its Redis copy.
             metadata = metadataForModel(copy.deepcopy(raw), args.project, knownMetadata=raw)
             engine = _Engine(args.engine, _Replay(stub) if stub is not None else None)
+            engine.knownMetadata = raw
             for number in range(1, args.runs + 1):
                 began = _today()
                 runCases = _resolveCases(cases, lines, folder)

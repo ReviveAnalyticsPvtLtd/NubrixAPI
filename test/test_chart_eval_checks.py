@@ -756,3 +756,55 @@ def test_theDocsSayTheStorageKeyIsForSyntheticFixturesOnly():
     for text in (chartEval.__doc__, chartEval._parser().format_help()):
         text = " ".join(text.lower().split())
         assert "chart_eval_storage_key" in text and "synthetic" in text and "must never be a real key" in text
+
+
+# N7: an expectSql geoMap drops the rows the builder drops
+
+
+def test_aGeoMapExpectSqlSkipsTheRowsTheBuilderSkips():
+    sql = (
+        "SELECT * FROM (VALUES "
+        "(CAST(40.5 AS DOUBLE), CAST(-74.0 AS DOUBLE), 'a', CAST(NULL AS VARCHAR)), "
+        "(CAST(NULL AS DOUBLE), CAST(1.0 AS DOUBLE), 'null lat', CAST(NULL AS VARCHAR)), "
+        "(CAST(2.0 AS DOUBLE), CAST(NULL AS DOUBLE), 'null long', CAST(NULL AS VARCHAR)), "
+        "(CAST(91.0 AS DOUBLE), CAST(1.0 AS DOUBLE), 'lat too big', CAST(NULL AS VARCHAR)), "
+        "(CAST(-90.5 AS DOUBLE), CAST(1.0 AS DOUBLE), 'lat too small', CAST(NULL AS VARCHAR)), "
+        "(CAST(1.0 AS DOUBLE), CAST(180.5 AS DOUBLE), 'long too big', CAST(NULL AS VARCHAR)), "
+        "(CAST(1.0 AS DOUBLE), CAST(-181.0 AS DOUBLE), 'long too small', CAST(NULL AS VARCHAR)), "
+        "(CAST('nan' AS DOUBLE), CAST(1.0 AS DOUBLE), 'nan', CAST(NULL AS VARCHAR)), "
+        "(CAST('inf' AS DOUBLE), CAST(1.0 AS DOUBLE), 'inf', CAST(NULL AS VARCHAR)), "
+        "(CAST(90.0 AS DOUBLE), CAST(180.0 AS DOUBLE), 'edge', CAST(NULL AS VARCHAR)), "
+        "(CAST(-90.0 AS DOUBLE), CAST(-180.0 AS DOUBLE), NULL, 'named')"
+        ") AS t(lat, long, label, id)"
+    )
+    chart = _realChart(sql, "geoMap", {"lat": "lat", "long": "long", "label": "label", "id": "id"})
+    built = chart["map"]["data"]["points"]
+    assert [point["label"] for point in built] == ["a", "edge", "-90.0, -180.0"]
+    result, expect = _matches(sql, "geoMap", {"lat": "lat", "long": "long", "label": "label", "id": "id"})
+    assert result["ok"] is True, result
+    # The id of a row without one is its position in the result, dropped rows included, as the builder has it.
+    assert expect["points"] == built
+    assert [point["id"] for point in built] == ["0", "9", "named"]
+
+
+# N6: the Python engine's state carries the metadata the harness read
+
+
+import types
+
+
+def test_thePythonEnginesStateCarriesTheKnownMetadataAndTheSqlEnginesDoesNot():
+    seen = []
+
+    class Fake:
+        def invoke(self, state, config=None):
+            seen.append(state)
+            return {"finalOutput": {"response": "x"}}
+
+    for name in ("python", "sql"):
+        engine = chartEval._Engine.__new__(chartEval._Engine)
+        engine.engine, engine.replay, engine.failure, engine.workflow, engine.module = name, object(), None, Fake(), types.SimpleNamespace(logChartFailure=None)
+        engine.knownMetadata = {"t": {"shape": [1, 1]}}
+        engine.invoke({"t": {}}, "prompt", "p1")
+    assert seen[0]["knownMetadata"] == {"t": {"shape": [1, 1]}} and seen[0]["projectId"] == "p1"
+    assert "knownMetadata" not in seen[1]
