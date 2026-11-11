@@ -10,6 +10,7 @@ import copy
 import datetime as dt
 import json
 import math
+import os
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -744,7 +745,7 @@ def test_anUnstableOrderIsRefused(sql, rows, reason):
      "SELECT region, SUM(revenue) AS s FROM orders WHERE region IN (SELECT region FROM top_x) GROUP BY region ORDER BY region", "truncated"),
     ("SELECT CASE WHEN rn <= 9 THEN region ELSE 'Other' END AS label, SUM(s) AS s FROM r GROUP BY ALL ORDER BY label", "truncated"),
     ("SELECT region, revenue FROM orders QUALIFY row_number() OVER (PARTITION BY region ORDER BY revenue) = 1 ORDER BY region", "truncated"),
-    ("SELECT region, rank() OVER (ORDER BY revenue) AS r FROM orders ORDER BY r, region", "truncated"),
+    ("SELECT region, rank() OVER (ORDER BY revenue) AS r FROM orders ORDER BY r, region", "nondeterministic"),
     ("SELECT region, revenue FROM orders USING SAMPLE 10 ORDER BY region", "truncated"),
     ("SELECT region, revenue FROM orders ORDER BY region OFFSET 2", "truncated"),
     ("SELECT region FROM orders WHERE order_date >= CURRENT_DATE - 29 ORDER BY region", "relativeTime"),
@@ -812,6 +813,83 @@ def test_aRefusedResultIsADifferAndNothingIsWritten(tmp_path, monkeypatch):
     assert store.writes() == []
 
 
+# Round 2, R1: only aggregates and windows on the allow-list
+
+
+@pytest.mark.parametrize("sql,reason", [
+    # Each of these returns an arbitrary member of a tie.
+    ("SELECT region, mode(product_id) AS m FROM orders GROUP BY region ORDER BY region", "nondeterministic"),
+    ("SELECT region, arg_max(product_id, revenue) AS p FROM orders GROUP BY region ORDER BY region", "nondeterministic"),
+    ("SELECT region, max_by(product_id, revenue) AS p FROM orders GROUP BY region ORDER BY region", "nondeterministic"),
+    ("SELECT region, approx_top_k(product_id, 3) AS p FROM orders GROUP BY region ORDER BY region", "nondeterministic"),
+    ("SELECT region, my_unknown_fn(revenue) AS p FROM orders GROUP BY region ORDER BY region", "nondeterministic"),
+    # DuckDB's max(x, n) is a top-n list.
+    ("SELECT region, max(revenue, 3) AS p FROM orders GROUP BY region ORDER BY region", "nondeterministic"),
+    ("SELECT order_id, lag(revenue) OVER (ORDER BY order_id) AS p FROM orders ORDER BY order_id", "nondeterministic"),
+    # A ranking over an order that can tie, and a row frame over one.
+    ("SELECT region, row_number() OVER (PARTITION BY region ORDER BY revenue) AS n FROM orders ORDER BY region, n", "nondeterministic"),
+    ("SELECT order_date, SUM(revenue) OVER (ORDER BY order_date ROWS BETWEEN 2 PRECEDING AND CURRENT ROW) AS s "
+     "FROM orders ORDER BY order_date", "nondeterministic"),
+    # A ranking used to cut is a top-N.
+    ("WITH r AS (SELECT region, row_number() OVER (ORDER BY region) AS rn FROM orders GROUP BY region) "
+     "SELECT region FROM r WHERE rn <= 2 ORDER BY region", "truncated"),
+    # On the list.
+    ("SELECT region, COUNT(*) AS n, COUNT(DISTINCT product_id) AS p, SUM(quantity) AS q, AVG(revenue) AS a, MIN(revenue) AS lo, "
+     "MAX(revenue) AS hi, median(revenue) AS md, quantile_cont(revenue, 0.5) AS qc, quantile_disc(revenue, 0.5) AS qd, "
+     "stddev(revenue) AS sd, stddev_pop(revenue) AS sp, var_samp(revenue) AS vs, var_pop(revenue) AS vp, "
+     "bool_and(quantity > 1) AS ba, bool_or(quantity > 1) AS bo FROM orders GROUP BY region ORDER BY region", None),
+    ("SELECT region, SUM(revenue) AS s, rank() OVER (ORDER BY SUM(revenue) DESC, region) AS r FROM orders GROUP BY region ORDER BY region", None),
+    ("SELECT region, dense_rank() OVER (ORDER BY region) AS r FROM orders GROUP BY region ORDER BY region", None),
+    ("SELECT date_part('year', order_date) AS y, COUNT(*) AS n FROM orders GROUP BY 1 ORDER BY 1", None),
+    ("SELECT region, SUM(revenue) OVER (PARTITION BY region) AS s FROM orders GROUP BY region, revenue ORDER BY region, s", None),
+])
+def test_onlyAggregatesOnTheAllowListConvert(sql, reason):
+    assert conv.sqlRefusal(sql) == reason
+
+
+# Round 2, R2: the order must be unique by construction, not only in today's rows
+
+
+def _keyed(sql, rows):
+    """A request, its bar chart and its result, for rows whose first column is the label and second the value."""
+    names = list(rows[0])
+    chart = _bar([row[names[0]] for row in rows], [row[names[1]] for row in rows])
+    return _request("x", sql=sql), chart, pa.Table.from_pylist(rows)
+
+
+@pytest.mark.parametrize("sql,rows,reason", [
+    # The totals are distinct today, and can tie tomorrow.
+    ("SELECT region, SUM(revenue) AS total FROM orders GROUP BY region ORDER BY total DESC",
+     [{"region": "East", "total": 2.0}, {"region": "North", "total": 1.0}], "unstableOrder"),
+    # Every group key is in the ORDER BY: by name, by position, by alias.
+    ("SELECT region, SUM(revenue) AS total FROM orders GROUP BY region ORDER BY total DESC, region",
+     [{"region": "East", "total": 2.0}, {"region": "North", "total": 1.0}], None),
+    ("SELECT region, SUM(revenue) AS total FROM orders GROUP BY 1 ORDER BY 2 DESC, 1",
+     [{"region": "East", "total": 2.0}, {"region": "North", "total": 1.0}], None),
+    ("SELECT upper(region) AS r, SUM(revenue) AS total FROM orders GROUP BY r ORDER BY r",
+     [{"r": "EAST", "total": 2.0}, {"r": "NORTH", "total": 1.0}], None),
+    ("SELECT region, SUM(revenue) AS total FROM orders GROUP BY ALL ORDER BY region",
+     [{"region": "East", "total": 2.0}, {"region": "North", "total": 1.0}], None),
+    # One group key missing from the ORDER BY.
+    ("SELECT region, SUM(revenue) AS total FROM orders GROUP BY region, product_id ORDER BY region",
+     [{"region": "East", "total": 2.0}, {"region": "North", "total": 1.0}], "unstableOrder"),
+    # ROLLUP adds rows whose keys are NULL.
+    ("SELECT region, SUM(revenue) AS total FROM orders GROUP BY ROLLUP (region) ORDER BY region",
+     [{"region": "East", "total": 2.0}, {"region": "North", "total": 1.0}], "unstableOrder"),
+    # Every output column in the ORDER BY: tied rows are the same row.
+    ("SELECT region, revenue FROM orders ORDER BY region, revenue",
+     [{"region": "East", "revenue": 2.0}, {"region": "North", "revenue": 1.0}], None),
+    ("SELECT DISTINCT region, revenue FROM orders ORDER BY revenue, region",
+     [{"region": "North", "revenue": 1.0}, {"region": "East", "revenue": 2.0}], None),
+    # NaN and NULL are separate groups and sort apart, but count as one key value for the guard.
+    ("SELECT region, SUM(revenue) AS total FROM orders GROUP BY region ORDER BY region",
+     [{"region": math.nan, "total": 2.0}, {"region": None, "total": 1.0}], "unstableOrder"),
+])
+def test_theOrderMustBeUniqueByConstruction(sql, rows, reason):
+    request, chart, table = _keyed(sql, rows)
+    assert conv.resultRefusal(request, chart, table, False) == reason
+
+
 # I1(e): filter spot checks
 
 
@@ -820,7 +898,7 @@ def test_aRefusedResultIsADifferAndNothingIsWritten(tmp_path, monkeypatch):
     ("other", "same", ("differ", "filter")),
     ("fails", "same", ("differ", "filter")),
     ("same", "fails", ("differ", "filter")),
-    ("fails", "fails", ("match", None)),
+    ("fails", "fails", ("differ", "filter")),
 ])
 def test_everyFilteredPairMustAgree(tmp_path, monkeypatch, python, sql, expected):
     def filtered(form, widget, filters):
@@ -840,7 +918,11 @@ def test_everyFilteredPairMustAgree(tmp_path, monkeypatch, python, sql, expected
     if expected[0] == "match":
         assert entry["filtersChecked"] == 2 and len(fakes.reruns) == 4
     else:
-        assert store.writes() == [] and entry["filterIndex"] == (1 if python == "other" else 0)
+        assert store.writes() == []
+        if python == sql == "fails":
+            assert entry["filterDetail"] == "noComparableSet" and entry["filtersCompared"] == 0 and entry["filtersChecked"] == 2
+        else:
+            assert entry["filterIndex"] == (1 if python == "other" else 0)
 
 
 def test_noFilterToCheckIsADiffer(tmp_path, monkeypatch):
@@ -1044,6 +1126,164 @@ def test_theStorageStoreSendsXUpsertFalseForTheBackupAndTrueForTheConfig():
         ("POST", f"/storage/v1/object/AnalyticsHub/{PROJECT}/dashboardConfig.backup-x.json", "false"),
         ("POST", f"/storage/v1/object/AnalyticsHub/{PROJECT}/{CONFIG}", "true"),
     ]
+
+
+# Round 2, R3: a match needs one filtered comparison that both forms ran
+
+
+def test_aMatchNeedsOneFilterSetWhereBothFormsRan(tmp_path, monkeypatch):
+    def filtered(form, widget, filters):
+        # The first set empties both forms (both fail); the second is compared.
+        return None if filters == [{"orders.region": "Nowhere"}] else _visible(widget)
+
+    _Fakes(monkeypatch, plans={"q": _request("one")}, charts={_sql("one"): SAVED},
+           filterSets=[[{"orders.region": "Nowhere"}], [{"orders.region": "East"}]], filtered=filtered)
+    store = _store(_config(_widget("w1", SAVED, query="q")))
+    assert _run(tmp_path, store) == 0
+    entry = _entries(tmp_path)["w1"]
+    assert (entry["verdict"], entry["filtersChecked"], entry["filtersCompared"]) == ("match", 2, 1)
+
+
+# Round 2, R4: no LangSmith tracing either
+
+
+def test_noLangSmithTracingForTheWholeJob(tmp_path, monkeypatch):
+    import langsmith.utils
+    from langchain_core.tracers import context as tracerContext
+
+    for name in ("LANGSMITH_TRACING", "LANGCHAIN_TRACING_V2", "LANGCHAIN_TRACING"):
+        monkeypatch.setenv(name, "true")
+    monkeypatch.setenv("LANGSMITH_API_KEY", "ls-test-only")
+    monkeypatch.setenv("LANGCHAIN_API_KEY", "ls-test-only")
+    langsmith.utils.get_env_var.cache_clear()
+    # LangSmith caches what it read: prime the cache with tracing on, as a process that traced before would have.
+    assert langsmith.utils.tracing_is_enabled() is True
+    seen = []
+
+    class Workflow:
+        def invoke(self, state, config=None):
+            seen.append({
+                "switches": {name: os.environ.get(name) for name in ("LANGSMITH_TRACING", "LANGCHAIN_TRACING_V2", "LANGCHAIN_TRACING")},
+                "keys": [name for name in ("LANGSMITH_API_KEY", "LANGCHAIN_API_KEY") if name in os.environ],
+                "langsmith": langsmith.utils.tracing_is_enabled(),
+                "langchain": tracerContext._tracing_v2_is_enabled(),
+                "config": config,
+            })
+            return {"finalOutput": {"response": "?"}}
+
+    real = conv._Engine
+
+    def engine(replay):
+        built = real.__new__(real)
+        built.engine, built.replay, built.failure, built.knownMetadata = "sql", replay, None, None
+        from nubrix.workflows import sqlChartWorkflow
+
+        built.module, built.workflow = sqlChartWorkflow, Workflow()
+        return built
+
+    _Fakes(monkeypatch)
+    monkeypatch.setattr(conv, "_Engine", engine)
+    try:
+        for mode in ([], ["--write"]):
+            assert _run(tmp_path, _store(_config(_widget("w1", SAVED, query="q"))), *mode) == 0
+        inside = {"switches": {"LANGSMITH_TRACING": "false", "LANGCHAIN_TRACING_V2": "false", "LANGCHAIN_TRACING": "false"},
+                  "keys": [], "langsmith": False, "langchain": False, "config": None}
+        assert seen == [inside, inside]
+        # Put back afterwards, and read afresh.
+        assert os.environ["LANGSMITH_TRACING"] == "true" and os.environ["LANGSMITH_API_KEY"] == "ls-test-only"
+        assert langsmith.utils.tracing_is_enabled() is True
+    finally:
+        monkeypatch.undo()
+        langsmith.utils.get_env_var.cache_clear()
+
+
+# Round 2, R5: the real render and the real filtered re-run
+
+
+def test_theRefreshRenderIsUnfilteredLenientAndWaitsForASlot(monkeypatch):
+    import nubrix.components.chartEngine as chartEngine
+
+    request = _request("one")
+    table = pa.Table.from_pylist([{"region": "East", "revenue": 10.5}, {"region": "North", "revenue": 20}])
+    calls = []
+
+    def render(manager, projectId, request_, activeTables, **kwargs):
+        calls.append((manager, projectId, request_, activeTables, kwargs))
+        # What the real render does last: build the chart from the launcher's rows.
+        return chartEngine.buildChart(request_, table, True, True)
+
+    monkeypatch.setattr(conv, "renderChartRequest", render)
+    manager, tables = object(), frozenset({"orders"})
+    chart, rows, truncated = conv._renderWithResult(manager, PROJECT, request, tables)
+    assert calls == [(manager, PROJECT, request, tables, {"filters": None, "lenient": True, "waitForSlot": True})]
+    assert rows is table and truncated is True and chart["data"]["labels"] == ["East", "North"]
+
+
+def test_theFilteredRerunIsTheDashboardsOwn(monkeypatch):
+    from api.services.dashboardService import DashboardService
+
+    calls = []
+    answer = ({"id": "w1"}, {"data": 1})
+
+    def rerun(widget, filters, projectId, activeTables):
+        calls.append((widget, filters, projectId, activeTables))
+        return answer
+
+    monkeypatch.setattr(DashboardService, "_rerunWidgetProduced", staticmethod(rerun))
+    widget, filters, tables = {"id": "w1"}, [{"orders.region": "East"}], frozenset({"orders"})
+    assert conv._rerunUnderFilter(widget, filters, PROJECT, tables) is answer
+    assert len(calls) == 1 and calls[0][0] is widget and calls[0][1] is filters and calls[0][2:] == (PROJECT, tables)
+
+
+# Round 2, R6: float sums for charts that show raw numbers
+
+
+ORDER_SCHEMAS = {"orders": pa.schema([("region", pa.string()), ("revenue", pa.float64()), ("quantity", pa.int64()),
+                                      ("price", pa.decimal128(10, 2)), ("weight", pa.float32())])}
+
+
+@pytest.mark.parametrize("expression,refused", [
+    ("SUM(revenue)", True),
+    ("AVG(revenue)", True),
+    ("STDDEV(revenue)", True),
+    ("VAR_POP(revenue)", True),
+    ("MEDIAN(revenue)", True),
+    ("quantile_cont(revenue, 0.5)", True),
+    ("SUM(weight)", True),
+    ("SUM(quantity * 1.5)", True),
+    ("SUM(quantity / 2)", True),
+    ("SUM(not_a_column)", True),
+    ("ROUND(SUM(revenue), 2)", False),
+    ("ROUND((AVG(revenue)), 1)", False),
+    ("SUM(quantity)", False),
+    ("AVG(quantity)", False),
+    ("SUM(price)", False),
+    ("SUM(quantity * 2 + 1)", False),
+    ("SUM(CAST(revenue AS BIGINT))", False),
+    ("quantile_disc(quantity, 0.5)", False),
+    ("MIN(revenue)", False),
+    ("COUNT(revenue)", False),
+])
+def test_floatAggregatesAreFound(expression, refused):
+    sql = f"SELECT region, {expression} AS v FROM orders GROUP BY region ORDER BY region"
+    assert conv.floatAggregate(sql, ORDER_SCHEMAS) is refused
+
+
+@pytest.mark.parametrize("chartType,field", [("scatter", "floatAggregate"), ("radar", "floatAggregate"), ("bar", None)])
+def test_aFloatSumIsRefusedForChartsThatShowRawNumbers(tmp_path, monkeypatch, chartType, field):
+    sql = "SELECT region, SUM(revenue) AS revenue FROM orders GROUP BY region ORDER BY region"
+    request = _request("x", chartType=chartType, sql=sql)
+    fakes = _Fakes(monkeypatch, plans={"q": request}, charts={sql: SAVED})
+    read = []
+    monkeypatch.setattr(conv, "_schemasOf", lambda job, tables: read.append(tables) or ORDER_SCHEMAS)
+    store = _store(_config(_widget("w1", SAVED, query="q")))
+    assert _run(tmp_path, store) == 0
+    entry = _entries(tmp_path)["w1"]
+    if field is None:
+        # A bar shows three decimals: no schema read is needed, and the widget goes on to the render.
+        assert read == [] and len(fakes.renders) == 1
+    else:
+        assert (entry["verdict"], entry["field"]) == ("differ", field) and fakes.renders == [] and read == [["orders"]]
 
 
 # The strict comparison

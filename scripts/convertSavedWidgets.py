@@ -13,14 +13,19 @@ A widget is converted only when the job can show that users would see no change,
 fails leaves the widget as Python, with a reason:
   1. Before any model call: the saved title fits a request (`title`) and is a literal in the Python (`dynamicTitle`),
      and the Python does not read the clock (`relativeTime`) or draw random numbers (`nondeterministic`).
-  2. The SQL is refused (`sqlRefusal`) when it cuts the result (LIMIT, OFFSET, FETCH, a sample, QUALIFY, a ranking
-     window, an 'Other' fold: `truncated`), moves with time (`relativeTime`) or is not repeatable (`nondeterministic`).
+  2. The SQL is refused (`sqlRefusal`) when it cuts the result (LIMIT, OFFSET, FETCH, a sample, QUALIFY, a compared
+     ranking window, an 'Other' fold: `truncated`), moves with time (`relativeTime`), or uses a random function or an
+     aggregate or window function off the allow-list (`nondeterministic`). For charts that show raw numbers (scatter,
+     bubble, radar, geoMap), an unrounded sum, average, spread or quantile of float columns is refused
+     (`floatAggregate`).
   3. The refresh-style run (unfiltered, lenient, through `renderChartRequest`) and the workflow's own run must both
      strictly match the saved widget (`verdictOf`; a second render that differs is `nondeterministic`).
   4. The result must be whole (`resultRefusal`): no launcher or builder cap reached or met (`truncated`), and with more
-     than one row an outer ORDER BY on output columns whose key values are unique across the rows (`unstableOrder`).
+     than one row an outer ORDER BY on output columns that is unique by construction (`orderIsUnique`), with key
+     values unique across today's rows as well (`unstableOrder`).
   5. Under every filter set (`_filterSets`), the saved Python and the request re-run through the dashboard's own filter
-     path (`DashboardService._rerunWidgetProduced`) must strictly agree (`filter`); no filter set at all is `filter`.
+     path (`DashboardService._rerunWidgetProduced`) must strictly agree, and at least one set must be one both forms
+     ran (`filter`); no filter set at all is `filter`.
 Only a converted widget's `generatedCode` changes; its title, layout, id and saved data stay as they are.
 
 Candidates: a widget whose `decodeGeneratedCode` is None, that is not a `panelChart(...)` template, not a
@@ -39,10 +44,10 @@ request waits.
 A failure at 3 or 4 aborts with the live config untouched. A failure at 5 is never restored automatically: the live
 config is read once more and reported as `writeLanded`, `writeNotApplied`, `changedBySomeoneElse` or `unreadable`.
 
-Nothing is charged and nothing is traced: the workflow runs with no callbacks, and Langfuse is off for the whole job
-even when its keys are set. No `.env` file is read. Redis is cut off for the run (`scripts.chartEval._noRedis`): table
-and schema reads go to storage, and each table's schema is read once per job (`_memoisedSchemas`). A dry run uploads
-nothing.
+Nothing is charged and nothing is traced: the workflow runs with no callbacks, and Langfuse and LangSmith are off for
+the whole job even when their keys are set (`_noTracing`). No `.env` file is read. Redis is cut off for the run
+(`scripts.chartEval._noRedis`): table and schema reads go to storage, and each table's schema is read once per job
+(`_memoisedSchemas`). A dry run uploads nothing.
 
 Standard output holds only the counts and the backup name. The report (`--out`, a local JSON file) holds every
 widget's page, id and verdict: `match` with the new chart request, `differ` with the first differing field or the
@@ -54,7 +59,10 @@ not be read, the backup could not be verified, the dashboard was edited meanwhil
 or when the write was verified but the project changed during the job; 2 for a usage error (nothing was read).
 """
 
-__all__ = ["main", "orderKeys", "resultRefusal", "sqlRefusal", "verdictOf", "visibleDifference"]
+__all__ = [
+    "floatAggregate", "main", "orderIsUnique", "orderKeys", "resultRefusal", "sqlRefusal", "verdictOf",
+    "visibleDifference",
+]
 
 import argparse
 import ast
@@ -116,12 +124,33 @@ _SQL_CLOCK = frozenset({
     "localtime", "localtimestamp", "get_current_time", "get_current_timestamp", "transaction_timestamp",
     "statement_timestamp", "clock_timestamp", "sysdate", "getdate", "current_datetime",
 })
-_SQL_RANKING = frozenset({"row_number", "rank", "dense_rank", "ntile", "percent_rank", "cume_dist"})
-_SQL_NONDETERMINISTIC = frozenset({
-    "rand", "random", "uuid", "gen_random_uuid", "setseed", "any_value", "arbitrary", "first", "last", "string_agg",
-    "group_concat", "listagg", "list", "array_agg", "approx_count_distinct", "approx_distinct", "approx_quantile",
-    "reservoir_quantile", "histogram",
+_SQL_RANDOM = frozenset({"rand", "random", "uuid", "gen_random_uuid", "setseed"})
+# R1: the only aggregates whose answer does not depend on row order or on which of tied rows is met first. Anything
+# else (mode, arg_max/max_by, any_value, first/last, string_agg, list/array_agg, approximations, an unknown function)
+# is refused. `min`/`max` with a second argument (DuckDB's top-n list) are refused too.
+_ALLOWED_AGGREGATES = (
+    exp.Count, exp.Sum, exp.Avg, exp.Min, exp.Max, exp.Median, exp.PercentileCont, exp.PercentileDisc, exp.Quantile,
+    exp.Stddev, exp.StddevSamp, exp.StddevPop, exp.Variance, exp.VariancePop, exp.LogicalAnd, exp.LogicalOr,
+)
+# Ranking window functions: allowed only over an ORDER BY that is unique by construction, and never as a cut.
+_RANKING = (exp.RowNumber, exp.Rank, exp.DenseRank)
+# DuckDB scalar functions sqlglot reads as Anonymous; any other Anonymous function could be an aggregate it doesn't know.
+_SAFE_ANONYMOUS = frozenset({
+    "date_part", "datepart", "date_diff", "datediff", "date_sub", "date_add", "isodow", "dayofweek", "dayofyear",
+    "weekofyear", "week", "quarter", "yearweek", "last_day", "concat_ws", "split_part", "lpad", "rpad", "regexp_extract",
+    "regexp_matches", "starts_with", "ends_with", "contains", "trunc", "ln", "log", "log2", "log10", "pow", "power", "exp",
+    "sign", "least", "greatest", "printf", "format", "to_date", "strftime",
 })
+# R6: aggregates whose double result depends on the order rows are added in (parallel summation).
+_FLOAT_AGGREGATES = (
+    exp.Sum, exp.Avg, exp.Stddev, exp.StddevSamp, exp.StddevPop, exp.Variance, exp.VariancePop, exp.Median,
+    exp.PercentileCont, exp.PercentileDisc, exp.Quantile,
+)
+_EXACT_CAST_TYPES = frozenset(
+    getattr(exp.DataType.Type, name) for name in
+    ("TINYINT", "SMALLINT", "INT", "BIGINT", "HUGEINT", "UTINYINT", "USMALLINT", "UINT", "UBIGINT", "UHUGEINT", "DECIMAL")
+    if hasattr(exp.DataType.Type, name)
+)
 _FOLD_LABELS = frozenset({"other", "others"})
 _COMPARISONS = (exp.GT, exp.GTE, exp.LT, exp.LTE, exp.EQ, exp.NEQ, exp.Between)
 _TEXT_COLUMNS_PROBED = 20
@@ -284,16 +313,110 @@ def _functionName(node: exp.Expression) -> str:
     return (node.name if isinstance(node, exp.Anonymous) else node.sql_name()).lower()
 
 
+def _selectOf(node: exp.Expression) -> exp.Select | None:
+    return node if isinstance(node, exp.Select) else node.find_ancestor(exp.Select)
+
+
+def _canonical(key: exp.Expression, select: exp.Select) -> exp.Expression:
+    """A GROUP BY or ORDER BY key as the select-list expression it names: a position or an alias is resolved."""
+    items = list(select.selects)
+    if isinstance(key, exp.Literal) and not key.is_string:
+        try:
+            position = int(key.this)
+        except ValueError:
+            return key
+        return items[position - 1].unalias() if 1 <= position <= len(items) else key
+    if isinstance(key, exp.Column) and not key.table:
+        aliased = [item for item in items if isinstance(item, exp.Alias) and item.alias == key.name]
+        if len(aliased) == 1:
+            return aliased[0].unalias()
+    return key
+
+
+def _groupKeys(select: exp.Select) -> list[exp.Expression] | None:
+    """The GROUP BY keys as select-list expressions, or None without a plain GROUP BY (ROLLUP and the like)."""
+    group = select.args.get("group")
+    if group is None or any(group.args.get(name) for name in ("rollup", "cube", "grouping_sets", "totals")):
+        return None
+    if group.args.get("all"):
+        return [item.unalias() for item in select.selects if not item.find(exp.AggFunc, exp.Window)]
+    keys = [_canonical(key, select) for key in group.expressions]
+    if not keys or any(key.find(exp.Rollup, exp.Cube, exp.GroupingSets) for key in keys):
+        return None
+    return keys
+
+
+def _coversGroup(select: exp.Select, keys: list[exp.Expression]) -> bool:
+    """Every GROUP BY key of `select` is among `keys` (as an expression, an alias or a position)."""
+    groups = _groupKeys(select)
+    if not groups or any(item.find(exp.Unnest, exp.Explode) for item in select.selects):
+        return False
+    covered = [_canonical(key, select) for key in keys]
+    return all(any(group == key for key in covered) for group in groups)
+
+
+def _windowIsUnique(window: exp.Window) -> bool:
+    """The window's PARTITION BY and ORDER BY together hold every GROUP BY key of its query: no two rows tie."""
+    select = _selectOf(window)
+    order = window.args.get("order")
+    keys = list(window.args.get("partition_by") or []) + [ordered.this for ordered in (order.expressions if order else [])]
+    return select is not None and bool(keys) and _coversGroup(select, keys)
+
+
+def _rankingCut(tree: exp.Expression) -> bool:
+    """A ranking window compared against something: a top-N or an 'Other' fold (`rn <= 10`, `CASE WHEN rn > 9`)."""
+    aliases = {window.parent.alias for window in tree.find_all(exp.Window)
+               if isinstance(window.this, _RANKING) and isinstance(window.parent, exp.Alias)}
+    for comparison in tree.find_all(*_COMPARISONS, exp.In):
+        if any(isinstance(node, exp.Window) and isinstance(node.this, _RANKING) for node in comparison.walk()):
+            return True
+        if any(column.name in aliases for column in comparison.find_all(exp.Column)):
+            return True
+    return False
+
+
+def _nondeterministic(tree: exp.Expression) -> bool:
+    """R1: some function's answer can change between runs: random, or not on the aggregate and window allow-list."""
+    for node in tree.find_all(exp.Func):
+        if isinstance(node, exp.Window):
+            continue
+        if _functionName(node) in _SQL_RANDOM:
+            return True
+        window = node.parent if isinstance(node.parent, exp.Window) and node.parent.this is node else None
+        if isinstance(node, _RANKING):
+            if window is None or not _windowIsUnique(window):
+                return True
+        elif isinstance(node, exp.AggFunc):
+            if not isinstance(node, _ALLOWED_AGGREGATES):
+                return True
+            if isinstance(node, (exp.Min, exp.Max)) and node.args.get("count") is not None:
+                return True
+        elif window is not None:
+            # lag, lead, first_value, ntile, ...: not on the list.
+            return True
+        elif isinstance(node, exp.Anonymous) and _functionName(node) not in _SAFE_ANONYMOUS:
+            return True
+    for window in tree.find_all(exp.Window):
+        spec = window.args.get("spec")
+        kind = str(spec.args.get("kind") or "").upper() if spec is not None else ""
+        if kind in ("ROWS", "GROUPS") and window.args.get("order") is not None and not _windowIsUnique(window):
+            # A row-based frame over tied rows takes in a different set of rows on another run.
+            return True
+    return False
+
+
 def sqlRefusal(sql: str) -> str | None:
     """
     Why a request's SQL cannot be trusted to show the same chart later, or None.
 
     - `relativeTime`: it calls a clock function (`current_date`, `now()`, `today()`, ...), or compares against an
       expression with an INTERVAL in it: the window moves.
-    - `truncated`: it cuts the result (LIMIT, OFFSET, FETCH, a sample, QUALIFY, a ranking window function) or folds
-      labels into an 'Other' bucket: the cut moves when the data changes, and Python may not cut the same way.
-    - `nondeterministic`: it calls a function whose answer can change between runs (random, any_value, string_agg,
-      array_agg, approximations, ...).
+    - `truncated`: it cuts the result (LIMIT, OFFSET, FETCH, a sample, QUALIFY, a ranking window that is compared, as a
+      top-N filter is) or folds labels into an 'Other' bucket: the cut moves when the data changes.
+    - `nondeterministic`: a random function; an aggregate or window function not on the allow-list (`count`, `sum`,
+      `avg`, `min`, `max`, `median`, `quantile_cont`/`quantile_disc`, `stddev*`, `var*`, `bool_and`/`bool_or`); a
+      ranking function (`row_number`, `rank`, `dense_rank`) or a row frame over an ORDER BY that is not unique by
+      construction; or a function sqlglot does not know.
     - `unparsable`: it is not one statement sqlglot can read.
     """
     tree = _parsed(sql)
@@ -306,27 +429,88 @@ def sqlRefusal(sql: str) -> str | None:
     plain = (sqlglot.TokenType.STRING, sqlglot.TokenType.IDENTIFIER)
     if any(token.token_type not in plain and token.text.lower() in _SQL_CLOCK for token in tokens):
         return "relativeTime"
-    functions = list(tree.find_all(exp.Func))
-    if any(_functionName(node) in _SQL_CLOCK for node in functions) or tree.find(
+    if any(_functionName(node) in _SQL_CLOCK for node in tree.find_all(exp.Func)) or tree.find(
         exp.CurrentDate, exp.CurrentTimestamp, exp.CurrentTime
     ):
         return "relativeTime"
     for interval in tree.find_all(exp.Interval):
         if interval.find_ancestor(*_COMPARISONS) is not None:
             return "relativeTime"
-    if tree.find(exp.Limit, exp.Fetch, exp.Offset, exp.TableSample, exp.Qualify):
-        return "truncated"
-    for window in tree.find_all(exp.Window):
-        if isinstance(window.this, exp.Func) and _functionName(window.this) in _SQL_RANKING:
-            return "truncated"
-    if any(_functionName(node) in _SQL_RANKING for node in functions):
+    if tree.find(exp.Limit, exp.Fetch, exp.Offset, exp.TableSample, exp.Qualify) or _rankingCut(tree):
         return "truncated"
     for literal in tree.find_all(exp.Literal):
         if literal.is_string and literal.this.strip().lower() in _FOLD_LABELS:
             return "truncated"
-    if any(_functionName(node) in _SQL_NONDETERMINISTIC for node in functions):
+    if _nondeterministic(tree):
         return "nondeterministic"
     return None
+
+
+def _isExactType(dataType: pa.DataType) -> bool:
+    return pa.types.is_integer(dataType) or pa.types.is_decimal(dataType)
+
+
+def _castIsExact(node: exp.Expression) -> bool:
+    target = node.args.get("to")
+    return isinstance(target, exp.DataType) and target.this in _EXACT_CAST_TYPES
+
+
+def _exactInput(expression: exp.Expression, types: dict[str, list]) -> bool:
+    """
+    An aggregate's input is integer or DECIMAL by construction: such columns, integer literals, + - *, and casts to an
+    integer or DECIMAL type (whatever they cast). Anything else (a division, a function, a float literal) is not.
+    """
+    if isinstance(expression, (exp.Cast, exp.TryCast)):
+        return _castIsExact(expression)
+    if isinstance(expression, exp.Column):
+        found = types.get(expression.name)
+        return bool(found) and all(_isExactType(dataType) for dataType in found)
+    if isinstance(expression, exp.Literal):
+        return not expression.is_string and re.fullmatch(r"-?\d+", str(expression.this)) is not None
+    if isinstance(expression, (exp.Add, exp.Sub, exp.Mul)):
+        return _exactInput(expression.this, types) and _exactInput(expression.expression, types)
+    if isinstance(expression, (exp.Paren, exp.Neg)):
+        return _exactInput(expression.this, types)
+    if isinstance(expression, exp.Distinct):
+        return bool(expression.expressions) and all(_exactInput(item, types) for item in expression.expressions)
+    return isinstance(expression, exp.Star)
+
+
+def _rounded(node: exp.Expression) -> bool:
+    """The aggregate is the value `round(..., n)` rounds (directly, or through parentheses)."""
+    child, parent = node, node.parent
+    while isinstance(parent, exp.Paren):
+        child, parent = parent, parent.parent
+    return isinstance(parent, exp.Round) and parent.this is child
+
+
+def floatAggregate(sql: str, schemas: dict[str, pa.Schema]) -> bool:
+    """
+    R6: the SQL sums, averages or takes a spread or quantile of DOUBLE or FLOAT values without rounding the result.
+
+    DuckDB adds rows in parallel, so such a result can change in its last bits from one run to the next, and charts
+    that show raw numbers (scatter, bubble, radar, geoMap) would show it. An input counts as exact only when every
+    column it uses is an integer or DECIMAL column of the tables read (looked up by name in `schemas`, the job's
+    memoised schema reads); a column found nowhere, a float literal, a division or a function counts as a float.
+    """
+    tree = _parsed(sql)
+    if tree is None:
+        return True
+    types: dict[str, list] = {}
+    for schema in schemas.values():
+        for field in schema:
+            types.setdefault(field.name, []).append(field.type)
+    for node in tree.find_all(*_FLOAT_AGGREGATES):
+        if _rounded(node):
+            continue
+        value = node.this
+        if isinstance(node, (exp.PercentileCont, exp.PercentileDisc)) and isinstance(value, exp.Literal):
+            # The WITHIN GROUP form keeps the fraction in `this`; the values are its ORDER BY.
+            value = node.find_ancestor(exp.WithinGroup)
+            value = value.expression if value is not None else None
+        if value is None or not _exactInput(value, types):
+            return True
+    return False
 
 
 def orderKeys(sql: str, columns: list[str]) -> list[str] | None:
@@ -337,14 +521,10 @@ def orderKeys(sql: str, columns: list[str]) -> list[str] | None:
     expression as an unaliased select-list item (`ORDER BY SUM(x)` with `SUM(x) AS total` gives `total`). Anything
     else (an expression of other columns, a position out of range, a name two output columns share) gives None.
     """
-    tree = _parsed(sql)
-    while isinstance(tree, exp.Subquery) and not tree.alias:
-        tree = tree.this
-    if tree is None:
+    found = _outerOrder(sql)
+    if found is None:
         return None
-    order = tree.args.get("order")
-    if order is None or not order.expressions:
-        return None
+    tree, order = found
     selects = list(tree.selects) if hasattr(tree, "selects") else []
     comparable = len(selects) == len(columns) and not any(isinstance(item, exp.Star) or item.find(exp.Star) for item in selects)
     keys = []
@@ -370,7 +550,43 @@ def orderKeys(sql: str, columns: list[str]) -> list[str] | None:
     return keys
 
 
+def _outerOrder(sql: str) -> tuple[exp.Expression, exp.Order] | None:
+    tree = _parsed(sql)
+    while isinstance(tree, exp.Subquery) and not tree.alias:
+        tree = tree.this
+    if tree is None:
+        return None
+    order = tree.args.get("order")
+    if order is None or not order.expressions:
+        return None
+    return tree, order
+
+
+def orderIsUnique(sql: str, columns: list[str]) -> bool:
+    """
+    R2: the outer ORDER BY leaves no tie that could show, whatever the data. Either:
+      (a) the outer query has a plain GROUP BY and the ORDER BY holds every GROUP BY key (as an expression, an alias or
+          a position), so no two rows have equal keys; or
+      (b) the ORDER BY covers every output column, so rows that tie are identical and the order shown is the same
+          (a DISTINCT output ordered by all its columns is one such case).
+    Its keys must also be output columns (`orderKeys`), for the check on the rows.
+    """
+    keys = orderKeys(sql, columns)
+    if not keys:
+        return False
+    if set(keys) == set(columns):
+        return True
+    tree, order = _outerOrder(sql)
+    return isinstance(tree, exp.Select) and _coversGroup(tree, [ordered.this for ordered in order.expressions])
+
+
+_MISSING = object()
+
+
 def _hashable(value: Any) -> Any:
+    """A key value for the uniqueness guard: NaN and None are the same value."""
+    if value is None or (isinstance(value, float) and math.isnan(value)):
+        return _MISSING
     try:
         hash(value)
         return value
@@ -386,7 +602,8 @@ def resultRefusal(request: ChartRequest, chart: dict, table: pa.Table, truncated
       category charts, table 1000, geoMap 2000, scatter and bubble 5000, pivot 10000, card 2), a category chart meets
       the builder's label cap (`LABEL_CAP`, 500; lenient keeps the first 500), or the builder dropped rows (scatter and
       bubble points with an empty value, map points with an empty or out-of-range coordinate).
-    - `unstableOrder`: more than one row, and no outer ORDER BY whose keys are output columns with unique values.
+    - `unstableOrder`: more than one row, and the outer ORDER BY is not unique by construction (`orderIsUnique`), or,
+      as an extra guard, two rows share their key values today (NaN and None count as equal).
     """
     chartType = request.chartType
     rows = table.num_rows
@@ -406,10 +623,11 @@ def resultRefusal(request: ChartRequest, chart: dict, table: pa.Table, truncated
         if not isinstance(points, list) or len(points) != rows:
             return "truncated"
     if rows > 1:
-        keys = orderKeys(request.sql, list(table.column_names))
-        if not keys:
+        columns = list(table.column_names)
+        if not orderIsUnique(request.sql, columns):
             return "unstableOrder"
-        values = [table.column(table.column_names.index(key)).to_pylist() for key in keys]
+        keys = orderKeys(request.sql, columns)
+        values = [table.column(columns.index(key)).to_pylist() for key in keys]
         seen = {tuple(_hashable(value) for value in row) for row in zip(*values)}
         if len(seen) != rows:
             return "unstableOrder"
@@ -566,7 +784,7 @@ def _renderWithResult(manager, project: str, request: ChartRequest, activeTables
         return build(request, table, truncated, lenient)
 
     with mock.patch.object(chartEngine, "buildChart", watched):
-        chart = renderChartRequest(manager, project, request, activeTables, filters=None, lenient=True)
+        chart = renderChartRequest(manager, project, request, activeTables, filters=None, lenient=True, waitForSlot=True)
     return chart, seen["table"], seen["truncated"]
 
 
@@ -714,6 +932,7 @@ def _filterCheck(job, pageId: str, widget: dict, request: ChartRequest, entry: d
         entry.update(verdict="differ", field="filter")
         return
     converted = {**widget, "generatedCode": encodeGeneratedCode(request)}
+    compared = 0
     for index, filters in enumerate(sets):
         entry["filtersChecked"] = index + 1
         try:
@@ -735,6 +954,12 @@ def _filterCheck(job, pageId: str, widget: dict, request: ChartRequest, entry: d
         if verdict != "match":
             entry.update(verdict="differ", field="filter", filterIndex=index, filterDetail=field)
             return
+        compared += 1
+    entry["filtersCompared"] = compared
+    if not compared:
+        # R3: every set failed on both sides, so no filtered chart was ever compared.
+        entry.update(verdict="differ", field="filter", filterDetail="noComparableSet")
+        return
     entry["verdict"] = "match"
 
 
@@ -766,6 +991,17 @@ def _checkRequest(job, pageId: str, widget: dict, request: ChartRequest, finalOu
     if refusal is not None:
         entry.update(verdict="differ", field=refusal)
         return
+    if request.chartType in EXACT_FLOAT_TYPES:
+        try:
+            from nubrix.components.sqlCheck import checkSql
+
+            schemas = _schemasOf(job, list(checkSql(request.sql, job.tables).tables))
+        except Exception as error:
+            entry.update(verdict="failed", step="schema", **_failure(error))
+            return
+        if floatAggregate(request.sql, schemas):
+            entry.update(verdict="differ", field="floatAggregate")
+            return
     try:
         chart, table, truncated = _renderWithResult(job.manager, job.project, request, job.tables)
     except Exception as error:
@@ -789,18 +1025,56 @@ def _checkRequest(job, pageId: str, widget: dict, request: ChartRequest, finalOu
 # The job's process state, put back afterwards
 
 
+_TRACING_SWITCHES = ("LANGSMITH_TRACING", "LANGCHAIN_TRACING_V2", "LANGCHAIN_TRACING", "LANGSMITH_TRACING_V2")
+_TRACING_KEYS = ("LANGFUSE_PUBLIC_KEY", "LANGFUSE_SECRET_KEY", "LANGSMITH_API_KEY", "LANGCHAIN_API_KEY")
+
+
 @contextlib.contextmanager
-def _noLangfuse():
-    """No Langfuse for the whole job: every handler lookup answers None and the keys are hidden, then all is put back."""
+def _noTracing():
+    """
+    No tracing for the whole job, then everything is put back.
+
+    - Langfuse: every handler lookup answers None.
+    - LangSmith: the tracing switches are "false", and the keys are hidden.
+      - LangSmith caches what it read from the environment, so its cache is cleared on the way in and out.
+      - `tracing_context(enabled=False)` holds for the run, and LangChain's tracer context variables are cleared,
+        so no tracer callback is attached.
+    """
+    import contextvars
+
+    import langsmith
+    import langsmith.utils as langsmithUtils
+    from langchain_core.tracers import context as tracerContext
+
     import utils.llm as llm
 
-    with mock.patch.dict(os.environ), \
-            mock.patch.object(llm, "_langfuseConfigured", lambda: False), \
-            mock.patch.object(llm, "getLangfuseHandler", lambda: None), \
-            mock.patch.object(llm, "newLangfuseHandler", lambda: None):
-        for name in ("LANGFUSE_PUBLIC_KEY", "LANGFUSE_SECRET_KEY"):
-            os.environ.pop(name, None)
-        yield
+    def clearCache() -> None:
+        clear = getattr(langsmithUtils.get_env_var, "cache_clear", None)
+        if clear is not None:
+            clear()
+
+    variables = [getattr(tracerContext, name, None) for name in ("tracing_v2_callback_var", "tracing_callback_var")]
+    variables = [variable for variable in variables if isinstance(variable, contextvars.ContextVar)]
+    try:
+        with mock.patch.dict(os.environ), \
+                mock.patch.object(llm, "_langfuseConfigured", lambda: False), \
+                mock.patch.object(llm, "getLangfuseHandler", lambda: None), \
+                mock.patch.object(llm, "newLangfuseHandler", lambda: None):
+            for name in _TRACING_KEYS:
+                os.environ.pop(name, None)
+            for name in _TRACING_SWITCHES:
+                os.environ[name] = "false"
+            clearCache()
+            tokens = [(variable, variable.set(None)) for variable in variables]
+            try:
+                with langsmith.tracing_context(enabled=False):
+                    yield
+            finally:
+                for variable, token in reversed(tokens):
+                    variable.reset(token)
+    finally:
+        # The environment is back: LangSmith reads it afresh.
+        clearCache()
 
 
 @contextlib.contextmanager
@@ -1067,7 +1341,7 @@ def main(argv: list[str] | None = None, store=None) -> int:
 
     code = 0
     try:
-        with chartEval._quietLogs(), chartEval._noRedis(), _noLangfuse(), _memoisedSchemas():
+        with chartEval._quietLogs(), chartEval._noRedis(), _noTracing(), _memoisedSchemas():
             target = store if store is not None else StorageStore(args.project)
             _convert(args, target if args.write else _ReadOnly(target), stub, report, save)
     except _Abort as abort:
