@@ -125,6 +125,8 @@ NubrixAI Analytics Hub API — FastAPI + Celery + LangChain monolith.
   - `blendService.getDataSources` / `getFieldsFromSources` (raw tables only)
   - `reportGenerator.getAllTables` (only active tables)
   - `insightContextBuilder.build` (filters metadata)
+  - `sqlChartWorkflow._ground` (a second, separate guard: `activeTableNames` gives the grounding and the generation-time SQL check only the active tables, so new SQL charts can't name an inactive one)
+- Dashboard re-runs (`getData` with filters or refresh) deliberately ignore `isActive`: saved Python and ChartRequest widgets keep reading inactive tables. `dashboardService._rerunTables` passes every metadata table to the SQL check (active ones first, then inactive, each in metadata order, so a name that differs only in case resolves to the active table), or the stored `<table>.parquet` files, sorted, when metadata.json can't be read. Only new chart generation is limited to active tables. Don't switch it to `filterActiveTables`.
 - `getMetadata` endpoint returns ALL tables with `isActive` flag (frontend shows active/inactive status).
 - New tables get `isActive: true` automatically. Metadata regeneration preserves existing `isActive` for unchanged tables.
 
