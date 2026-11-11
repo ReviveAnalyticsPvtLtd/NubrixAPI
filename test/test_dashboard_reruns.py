@@ -73,7 +73,7 @@ def test_filterRunsChartRequestWidgetLeniently(monkeypatch):
     page = service.getData(GetData(projectId="p1", page="pg", filters=FILTERS))
 
     args, kwargs = renderer.call_args
-    assert args[1] == "p1" and args[3] == frozenset({"orders", "old"})
+    assert args[1] == "p1" and args[3] == ("orders", "old")
     assert kwargs["lenient"] is True and kwargs["filters"] == FILTERS
     manager.run.assert_not_called()
     widget = page["widgets"][0]
@@ -324,7 +324,7 @@ def test_unreadableMetadataRerunsChartRequestWidgetsFromTheStoredTablesUnderAFil
     assert chartRequest["data"] == "new" and chartRequest["generatedCode"] == code and chartRequest["id"] == "R"
     assert python["data"] == "new"
     args, kwargs = renderer.call_args
-    assert args[3] == frozenset({"orders", "old"}) and kwargs["filters"] == FILTERS
+    assert args[3] == ("old", "orders") and kwargs["filters"] == FILTERS
     assert asked == ["p1"]
     manager.run.assert_called_once()
     assert any("table list" in line for line in logLines)
@@ -341,7 +341,7 @@ def test_unreadableMetadataRefreshSavesChartRequestDataFromTheStoredTables(monke
 
     assert [w["data"] for w in page["widgets"]] == ["new", "new"]
     assert [w["data"] for w in _uploaded(service)["pg"]["widgets"]] == ["new", "new"]
-    assert renderer.call_args.args[3] == frozenset({"orders", "old"})
+    assert renderer.call_args.args[3] == ("old", "orders")
 
 
 @pytest.mark.parametrize("metadata", [["orders"], "orders", None])
@@ -356,7 +356,7 @@ def test_metadataThatIsNotAnObjectFallsBackToTheStoredTables(monkeypatch, metada
     page = service.getData(GetData(projectId="p1", page="pg", filters=FILTERS))
 
     assert page["widgets"][0]["data"] == "new"
-    assert renderer.call_args.args[3] == frozenset({"orders", "old"})
+    assert renderer.call_args.args[3] == ("old", "orders")
 
 
 def test_unreadableMetadataAndListingFailsOnlyTheChartRequestWidgetsUnderAFilter(monkeypatch, logLines):
@@ -752,7 +752,7 @@ def test_rerunTablesAreEveryTableEntryActiveOrNot(monkeypatch):
 
     service.getData(GetData(projectId="p1", page="pg", filters=FILTERS))
 
-    assert renderer.call_args.args[3] == frozenset({"orders", "old", "legacy"})
+    assert renderer.call_args.args[3] == ("orders", "legacy", "old")
 
 
 @pytest.mark.parametrize("sql", [
@@ -804,3 +804,77 @@ def test_generationStillHidesAndRefusesAnInactiveTable():
     checkSql("select a from orders", shown)
     with pytest.raises(SqlCheckError, match="not available"):
         checkSql("select a from old", shown)
+
+
+# Names that differ only in case: DuckDB folds them together, and the SQL check keeps the first spelling it is given
+# for each folded name. The re-run set is ordered (active tables first, in metadata order, then inactive ones; the
+# fallback listing sorted), so a name resolves to the same table on every worker, and to the active one on a clash.
+
+CASE_METADATA = {"Sales": {"isActive": False}, "sales": {"isActive": True}}
+
+
+@pytest.mark.parametrize("named", ['"sales"', '"Sales"', "SALES"])
+def test_aCaseCollidingNameResolvesToTheActiveTable(monkeypatch, named):
+    saved = [_widget("R", _requestOn(f"select a from {named}"), "bar")]
+    service, _, _ = _setup(monkeypatch, saved, metadata=CASE_METADATA)
+    ran = _realCheck(monkeypatch)
+
+    page = service.getData(GetData(projectId="p1", page="pg", filters=FILTERS))
+
+    assert page["widgets"][0]["data"] == "new"
+    assert ran == [(("sales",), FILTERS)]
+
+
+@pytest.mark.parametrize("named", ['"sales"', '"Sales"'])
+def test_aCaseCollidingNameInTheStoredTablesResolvesToTheFirstSortedName(monkeypatch, named):
+    saved = [_widget("R", _requestOn(f"select a from {named}"), "bar")]
+    service, _, _ = _setup(monkeypatch, saved)
+    _unreadableMetadata(monkeypatch)
+    _storedFiles(monkeypatch, files=[{"name": "sales.parquet"}, {"name": "Sales.parquet"}])
+    ran = _realCheck(monkeypatch)
+
+    service.getData(GetData(projectId="p1", page="pg", refresh=True))
+
+    assert ran == [(("Sales",), None)]
+
+
+_CASE_PROBE = """
+import json
+from unittest.mock import MagicMock
+from api.services import dashboardService as module
+from nubrix.components.sqlCheck import checkSql
+
+service = module.DashboardService.__new__(module.DashboardService)
+service.client = MagicMock()
+out = {}
+module.readJson = lambda projectId, name: {"Sales": {"isActive": False}, "sales": {"isActive": True}}
+tables = service._rerunTables("p1")
+out["metadata"] = [list(checkSql(f"select a from {name}", tables).tables) for name in ('"sales"', '"Sales"')]
+
+def unreadable(projectId, name):
+    raise RuntimeError("unreadable")
+
+module.readJson = unreadable
+module.listProjectFiles = lambda client, projectId: [{"name": "sales.parquet"}, {"name": "Sales.parquet"}]
+tables = service._rerunTables("p1")
+out["listing"] = [list(checkSql(f"select a from {name}", tables).tables) for name in ('"sales"', '"Sales"')]
+print("RESULT " + json.dumps(out))
+"""
+
+
+@pytest.mark.parametrize("seed", ["0", "4", "7"])
+def test_aCaseCollidingNameResolvesTheSameUnderEveryHashSeed(seed):
+    """String hashing is randomised per process; seeds 0 and 4 iterate a set of the two spellings in opposite orders."""
+    import os
+    import subprocess
+    import sys
+    from pathlib import Path
+
+    done = subprocess.run(
+        [sys.executable, "-c", _CASE_PROBE], cwd=Path(__file__).resolve().parents[1],
+        env={**os.environ, "PYTHONHASHSEED": seed}, capture_output=True, text=True, timeout=300,
+    )
+
+    assert done.returncode == 0, done.stderr[-2000:]
+    (line,) = [line for line in done.stdout.splitlines() if line.startswith("RESULT ")]
+    assert json.loads(line[len("RESULT "):]) == {"metadata": [["sales"], ["sales"]], "listing": [["Sales"], ["Sales"]]}
