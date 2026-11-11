@@ -38,6 +38,31 @@ _redisUrl = f'redis://default:{os.environ.get("REDIS_PASSWORD")}@{os.environ.get
 celeryApp = Celery(APP_NAME, broker=_redisUrl, backend=_redisUrl)
 
 
+@celeryApp.task(name=f"{APP_NAME}.apiIngestionRun", acks_late=True, time_limit=330, rate_limit="4/m")
+def runApiIngestion(runId):
+    if os.environ.get("API_INGESTION_ENABLED") == "1":
+        from nubrix.triggers.tasks.apiIngestionTask import executeRun
+
+        executeRun(runId)
+
+
+@celeryApp.task(name=f"{APP_NAME}.apiIngestionDispatch")
+def dispatchApiIngestion():
+    if os.environ.get("API_INGESTION_ENABLED") == "1":
+        from api.services.ingestion.repository import dueRunIds
+
+        for runId in dueRunIds():
+            runApiIngestion.delay(runId)
+
+
+@celeryApp.task(name=f"{APP_NAME}.apiIngestionCleanup", time_limit=120)
+def cleanupApiIngestion():
+    if os.environ.get("API_INGESTION_ENABLED") == "1":
+        from nubrix.triggers.tasks.apiIngestionTask import collectSnapshots
+
+        collectSnapshots()
+
+
 @celeryApp.task(name=f"{APP_NAME}.generateForecasts")
 def sendForecasts():
     return GenerateForecasts().generateAndSendForecasts()
@@ -117,6 +142,8 @@ def runNotificationCleanup():
 
 
 celeryApp.conf.beat_schedule = {
+    "api-ingestion-dispatch": {"task": f"{APP_NAME}.apiIngestionDispatch", "schedule": 30.0},
+    "api-ingestion-cleanup": {"task": f"{APP_NAME}.apiIngestionCleanup", "schedule": 3600.0},
     "payment-operations-every-minute": {"task": f"{APP_NAME}.paymentOperations", "schedule": crontab(minute="*")},
     "monthly-renewal-hourly": {"task": f"{APP_NAME}.monthlyRenewal", "schedule": crontab(minute=0)},
     "annual-renewal-daily": {"task": f"{APP_NAME}.annualRenewal", "schedule": crontab(minute=30, hour=0)},

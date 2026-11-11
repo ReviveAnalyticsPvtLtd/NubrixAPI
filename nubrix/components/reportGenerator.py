@@ -11,7 +11,8 @@ __all__ = ["ReportGenerator"]
 
 
 from ydata_profiling import ProfileReport
-from utils.projectStorage import readJson, readTableBytes
+from utils.projectStorage import readTableBytes
+from api.services.ingestion.catalog import readProjectCatalog
 from utils.storedTables import decodeStoredTable
 from bs4 import BeautifulSoup
 
@@ -35,7 +36,7 @@ class ReportGenerator:
         Returns:
             list: A list of table names available in the project.
         """
-        metadata = readJson(projectId, "metadata.json")
+        metadata = readProjectCatalog(projectId)
         tables = [k for k, v in metadata.items() if not k.startswith("_") and v.get("isActive", True) is not False]
         return tables
 

@@ -32,6 +32,10 @@ from api.services.subscriptions.paymentValidationService import (
 )
 from concurrent.futures import ProcessPoolExecutor
 from utils.projectStorage import readJson, readTableBytes
+from api.services.ingestion.catalog import (
+    catalogEnabled, editManagedMetadata, isManagedAlias, managedTableEntries,
+    readProjectCatalog, toggleManagedActive,
+)
 from utils.sandboxSlots import isBusy
 from utils.storedTables import storedTableInfo, tableReadException
 from utils.logger import logger
@@ -505,6 +509,11 @@ class ManagementService:
         try:
             files = self.client.storage.from_("AnalyticsHub").list(projectId, {"search": "metadata.json"})
             filenames = [x.get("name") for x in files]
+            if catalogEnabled() and isManagedAlias(tableName):
+                raise CustomException(
+                    ValueError("Table name belongs to the API dataset namespace."),
+                    statusCode=409, uiMessage="Please choose a different table name."
+                )
             if "metadata.json" not in filenames:
                 return
             metadata = readJson(projectId, "metadata.json")
@@ -648,7 +657,7 @@ class ManagementService:
         and return a flat list of {"query": str} dicts without id or isCharted fields.
         """
         domainFile = self.client.table("Projects").select("domainExpert").eq("projectId", projectId).execute().data[0].get("domainExpert") + ".json"
-        metadata = readJson(projectId, "metadata.json")
+        metadata = readProjectCatalog(projectId)
         metadata = self.filterActiveTables(metadata)
 
         if domainFile in [x.get("name") for x in self.client.storage.from_("DomainSpecificKpis").list()]:
@@ -857,21 +866,24 @@ class ManagementService:
         try:
             files = self.client.storage.from_("AnalyticsHub").list(projectId, {"search": "metadata.json"})
             filenames = [x.get("name") for x in files]
-            if "metadata.json" not in filenames:
+            managed = managedTableEntries(projectId)
+            if "metadata.json" not in filenames and not managed:
                 return dict()
-            else:
-                jsonData = readJson(projectId, "metadata.json")
-                newJson = {"tables": []}
-                for key in jsonData:
-                    tableJson = {
-                        "tableName": key,
-                        "tableDesc": jsonData.get(key).get("description"),
-                        "shape": jsonData.get(key).get("shape"),
-                        "columns": jsonData.get(key).get("columns"),
-                        "isActive": jsonData.get(key).get("isActive", True)
-                    }
-                    newJson.get("tables").append(tableJson)
-                return newJson
+            legacy = readJson(projectId, "metadata.json") if "metadata.json" in filenames else {}
+            tables = []
+            for name, metadata in {**legacy, **managed}.items():
+                entry = {
+                    "tableName": name,
+                    "tableDesc": metadata.get("description"),
+                    "shape": metadata.get("shape"),
+                    "columns": metadata.get("columns"),
+                    "isActive": metadata.get("isActive", True),
+                }
+                if name in managed:
+                    for key in ("displayName", "sourceKind", "versionId"):
+                        entry[key] = metadata[key]
+                tables.append(entry)
+            return {"tables": tables}
         except Exception as e:
             exception = CustomException(e)
             logger.error(exception)
@@ -891,6 +903,12 @@ class ManagementService:
             CustomException: For any errors during update.
         """
         try:
+            if editManagedMetadata(
+                modifiedMetadata.projectId, modifiedMetadata.tableName, modifiedMetadata.tableDescription,
+                modifiedMetadata.columnName, modifiedMetadata.columnDescription,
+            ):
+                updateProjectModifiedAt(modifiedMetadata.projectId)
+                return readProjectCatalog(modifiedMetadata.projectId)
             jsonData = readJson(modifiedMetadata.projectId, "metadata.json")
             if modifiedMetadata.tableDescription and not (modifiedMetadata.columnName and modifiedMetadata.columnDescription):
                 jsonData[modifiedMetadata.tableName]["description"] = modifiedMetadata.tableDescription
@@ -929,6 +947,10 @@ class ManagementService:
             CustomException: If metadata.json or the table is not found, or update fails.
         """
         try:
+            active = toggleManagedActive(projectId, tableName)
+            if active is not None:
+                updateProjectModifiedAt(projectId)
+                return {"tableName": tableName, "isActive": active}
             jsonData = readJson(projectId, "metadata.json")
             if tableName not in jsonData:
                 raise CustomException(
@@ -962,12 +984,15 @@ class ManagementService:
             CustomException: For any errors during deletion.
         """
         try:
-            _ = self.client.table("Projects").delete().eq("projectId", projectId).execute()
-            allFiles = listProjectFiles(self.client, projectId)
-            fileNames = [os.path.join(projectId, x.get("name")) for x in allFiles]
-            # Storage refuses more than 1000 paths in one remove.
-            for start in range(0, len(fileNames), 1000):
-                _ = self.client.storage.from_("AnalyticsHub").remove(fileNames[start : start + 1000])
+            from api.services.ingestion.repository import projectStorageLock
+
+            with projectStorageLock(projectId):
+                _ = self.client.table("Projects").delete().eq("projectId", projectId).execute()
+                allFiles = listProjectFiles(self.client, projectId)
+                fileNames = [os.path.join(projectId, x.get("name")) for x in allFiles]
+                # Storage refuses more than 1000 paths in one remove.
+                for start in range(0, len(fileNames), 1000):
+                    _ = self.client.storage.from_("AnalyticsHub").remove(fileNames[start : start + 1000])
             return
         except Exception as e:
             exception = CustomException(e)

@@ -19,6 +19,7 @@ from api.routers import (
     credits,
     dashboard,
     dataLoader,
+    ingestion,
     manager,
     reporting,
     subscriptions,
@@ -152,6 +153,7 @@ async def sweepSandboxRuns():
 app.include_router(authentication.router, prefix = "/auth", tags = ["Authentication"])
 app.include_router(manager.router, prefix = "/projects", tags = ["Project Management"])
 app.include_router(dataLoader.router, prefix = "/loaders", tags = ["Data Loader"])
+app.include_router(ingestion.router, prefix="/ingestion", tags=["API Ingestion"])
 app.include_router(blends.router, prefix = "/blends", tags = ["Blends"])
 app.include_router(reporting.router, prefix = "/reportingTool", tags = ["Reporting Tool"])
 app.include_router(dashboard.router, prefix = "/dashboard", tags = ["Dashboard"])

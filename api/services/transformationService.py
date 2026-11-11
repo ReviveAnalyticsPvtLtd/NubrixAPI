@@ -15,6 +15,7 @@ from utils.initMethods import forget_table
 from api.models import TransformationAgentResponse
 from api.commons import client, tableFileState, updateProjectModifiedAt
 from utils.projectStorage import authHeaders, objectUrl, readJson
+from api.services.ingestion.catalog import catalogEnabled, isManagedAlias, readProjectCatalog
 from utils.logger import logger
 from utils.sandboxSlots import BUSY_MESSAGE, isBusy
 from typing import TYPE_CHECKING
@@ -23,6 +24,7 @@ import httpx
 import orjson
 import json
 import os
+import asyncio
 from api.commons import giveTableNameBack
 
 if TYPE_CHECKING:
@@ -98,6 +100,8 @@ class TransformationService:
     async def _get_metadata(self, projectId: str) -> dict:
         """Fetch project metadata with a short Redis cache.
         Returns only active tables (isActive != False)."""
+        if catalogEnabled():
+            return self._filterActive(await asyncio.to_thread(readProjectCatalog, projectId))
         cacheKey = f"{projectId}::metadata.json"
         redisClient = None
         try:
@@ -159,6 +163,11 @@ class TransformationService:
 
         ignoreOwnClaim: the caller has just claimed the name, so its own artifact proves nothing.
         """
+        if catalogEnabled() and isManagedAlias(targetTableName):
+            raise CustomException(
+                ValueError("Table name belongs to the API dataset namespace."),
+                statusCode=409, uiMessage="Please choose a different transformation name."
+            )
         sanitizedTarget = self._sanitizeTableName(targetTableName)
 
         # 1. Fetch all transformations in the project excluding current

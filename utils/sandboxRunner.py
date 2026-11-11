@@ -31,6 +31,7 @@ __all__ = ["runSandbox", "runTrustedSandbox", "sweepOrphanedRuns", "serveTables"
 
 import base64
 import contextlib
+from contextvars import copy_context
 import ctypes
 import glob
 import itertools
@@ -471,7 +472,8 @@ def _runChild(launcherName: str, projectId: str, code: str, timeoutSeconds: int 
                 **(kind.payload or {}),
                 "channel": {**_channelFor(proc, childEnd), "tablesFolder": tablesFolder, "parentPid": os.getpid(), "limits": limits.toChannel()},
             })
-        server = threading.Thread(target=serveTables if kind.servesTables else _refuseTables, args=(projectId, requests, replies, tablesFolder, runEnded), daemon=True)
+        serve = serveTables if kind.servesTables else _refuseTables
+        server = threading.Thread(target=copy_context().run, args=(serve, projectId, requests, replies, tablesFolder, runEnded), daemon=True)
         server.start()
         watchdog = None
         try:
