@@ -9,6 +9,7 @@ __author__ = "Rauhan Ahmed Siddiqui"
 __all__ = ["dashboardService"] 
 
 
+from collections import Counter
 from collections.abc import Sequence
 from concurrent.futures import ThreadPoolExecutor
 from api.commons import updateProjectModifiedAt
@@ -25,6 +26,7 @@ from api.commons import client
 from nubrix.components.chartBuilder import emptyChart
 from nubrix.components.chartEngine import renderChartRequest
 from nubrix.components.chartRequest import decodeGeneratedCode
+from nubrix.components.sqlCheck import _foldName
 from api.models import (
     DeleteDashboardElement,
     ExportToDashboard,
@@ -104,16 +106,21 @@ def _metadataTableNames(metadata: dict) -> tuple[str, ...]:
 
 def _storedTableNames(files: list[dict]) -> tuple[str, ...]:
     """
-    The tables stored in a project folder: the name of each `<table>.parquet` file, the files a Python widget reads.
+    The tables stored in a project folder: the name of each `<table>.parquet` file, the files a Python widget reads,
+    sorted.
 
-    Sorted, so the SQL check resolves names that differ only in case to the same (first sorted) table on every worker.
+    Names that differ only in case (folded as the SQL check and DuckDB fold them) are all left out: the listing can't
+    tell which of them is active, and showing the wrong table's numbers is worse than not refreshing. A widget naming
+    one of them is refused by the check and keeps its saved data.
     """
     suffix = ".parquet"
     names = {entry.get("name") for entry in files if isinstance(entry, dict)}
-    return tuple(sorted(
+    tables = sorted(
         name[:-len(suffix)] for name in names
         if isinstance(name, str) and name.endswith(suffix) and len(name) > len(suffix)
-    ))
+    )
+    spellings = Counter(_foldName(name) for name in tables)
+    return tuple(name for name in tables if spellings[_foldName(name)] == 1)
 
 
 def _pythonResult(output: str) -> dict:
@@ -279,6 +286,7 @@ class DashboardService:
 
         The tuple's order is fixed (`_metadataTableNames`, `_storedTableNames`): the SQL check keeps the first
         spelling it sees of names that differ only in case, so a set here would resolve them differently per worker.
+        From metadata a clash resolves to the active table; the fallback leaves every clashing name out.
         """
         try:
             metadata = readJson(projectId, "metadata.json")

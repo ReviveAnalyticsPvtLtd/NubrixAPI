@@ -911,8 +911,9 @@ def test_generationStillHidesAndRefusesAnInactiveTable():
 
 
 # Names that differ only in case: DuckDB folds them together, and the SQL check keeps the first spelling it is given
-# for each folded name. The re-run set is ordered (active tables first, in metadata order, then inactive ones; the
-# fallback listing sorted), so a name resolves to the same table on every worker, and to the active one on a clash.
+# for each folded name. The re-run set from metadata is ordered (active tables first, in metadata order, then inactive
+# ones), so a name resolves to the same table on every worker, and to the active one on a clash. The fallback listing
+# can't tell which table is active, so it leaves out every name that clashes and keeps the others, sorted.
 
 CASE_METADATA = {"Sales": {"isActive": False}, "sales": {"isActive": True}}
 
@@ -929,39 +930,72 @@ def test_aCaseCollidingNameResolvesToTheActiveTable(monkeypatch, named):
     assert ran == [(("sales",), FILTERS)]
 
 
-@pytest.mark.parametrize("named", ['"sales"', '"Sales"'])
-def test_aCaseCollidingNameInTheStoredTablesResolvesToTheFirstSortedName(monkeypatch, named):
-    saved = [_widget("R", _requestOn(f"select a from {named}"), "bar")]
+CASE_FILES = [{"name": "sales.parquet"}, {"name": "orders.parquet"}, {"name": "Sales.parquet"}]
+
+
+@pytest.mark.parametrize("refresh", [False, True])
+def test_caseCollidingNamesInTheStoredTablesAreLeftOutAndTheOthersStillRun(monkeypatch, refresh):
+    saved = [
+        _widget("L", _requestOn('select a from "sales"'), "bar", data={"datasets": [{"data": [1]}]}),
+        _widget("U", _requestOn('select a from "Sales"'), "bar", data={"datasets": [{"data": [2]}]}),
+        _widget("O", _requestOn("select a from ORDERS"), "bar", data={"datasets": [{"data": [3]}]}),
+    ]
     service, _, _ = _setup(monkeypatch, saved)
     _unreadableMetadata(monkeypatch)
-    _storedFiles(monkeypatch, files=[{"name": "sales.parquet"}, {"name": "Sales.parquet"}])
+    _storedFiles(monkeypatch, files=CASE_FILES)
     ran = _realCheck(monkeypatch)
 
-    service.getData(GetData(projectId="p1", page="pg", refresh=True))
+    page = service.getData(GetData(projectId="p1", page="pg", filters=None if refresh else FILTERS, refresh=refresh))
 
-    assert ran == [(("Sales",), None)]
+    assert ran == [(("orders",), None if refresh else FILTERS)]
+    lower, upper, orders = page["widgets"]
+    assert orders["data"] == "new"
+    if refresh:
+        # Refused, so the widgets keep their saved data and only the one that ran is saved.
+        assert (lower["data"], upper["data"]) == ({"datasets": [{"data": [1]}]}, {"datasets": [{"data": [2]}]})
+        assert [w["data"] for w in _uploaded(service)["pg"]["widgets"]] == [lower["data"], upper["data"], "new"]
+    else:
+        assert lower["data"] == upper["data"] == {"labels": [], "datasets": []}
+
+
+def test_storedTableNamesLeaveOutEveryNameInACaseCollidingGroup():
+    from api.services.dashboardService import _storedTableNames
+
+    files = [{"name": f"{name}.parquet"} for name in ("sales", "SALES", "Sales", "orders", "Old", "b", "x\u212a", "xk")]
+
+    # ASCII letters fold together as DuckDB folds them; the Kelvin sign is not ASCII, so it does not clash with "k".
+    assert _storedTableNames(files) == ("Old", "b", "orders", "xk", "x\u212a")
 
 
 _CASE_PROBE = """
 import json
 from unittest.mock import MagicMock
 from api.services import dashboardService as module
-from nubrix.components.sqlCheck import checkSql
+from nubrix.components.sqlCheck import SqlCheckError, checkSql
 
-service = module.DashboardService.__new__(module.DashboardService)
+
+def resolved(tables):
+    out = []
+    for name in ('"sales"', '"Sales"', "orders"):
+        try:
+            out.append(list(checkSql(f"select a from {name}", tables).tables))
+        except SqlCheckError:
+            out.append("refused")
+    return out
+
+
+service =module.DashboardService.__new__(module.DashboardService)
 service.client = MagicMock()
 out = {}
-module.readJson = lambda projectId, name: {"Sales": {"isActive": False}, "sales": {"isActive": True}}
-tables = service._rerunTables("p1")
-out["metadata"] = [list(checkSql(f"select a from {name}", tables).tables) for name in ('"sales"', '"Sales"')]
+module.readJson = lambda projectId, name: {"Sales": {"isActive": False}, "sales": {"isActive": True}, "orders": {}}
+out["metadata"] = resolved(service._rerunTables("p1"))
 
 def unreadable(projectId, name):
     raise RuntimeError("unreadable")
 
 module.readJson = unreadable
-module.listProjectFiles = lambda client, projectId: [{"name": "sales.parquet"}, {"name": "Sales.parquet"}]
-tables = service._rerunTables("p1")
-out["listing"] = [list(checkSql(f"select a from {name}", tables).tables) for name in ('"sales"', '"Sales"')]
+module.listProjectFiles = lambda client, projectId: [{"name": n + ".parquet"} for n in ("sales", "orders", "Sales")]
+out["listing"] = resolved(service._rerunTables("p1"))
 print("RESULT " + json.dumps(out))
 """
 
@@ -981,4 +1015,7 @@ def test_aCaseCollidingNameResolvesTheSameUnderEveryHashSeed(seed):
 
     assert done.returncode == 0, done.stderr[-2000:]
     (line,) = [line for line in done.stdout.splitlines() if line.startswith("RESULT ")]
-    assert json.loads(line[len("RESULT "):]) == {"metadata": [["sales"], ["sales"]], "listing": [["Sales"], ["Sales"]]}
+    assert json.loads(line[len("RESULT "):]) == {
+        "metadata": [["sales"], ["sales"], ["orders"]],
+        "listing": ["refused", "refused", ["orders"]],
+    }
