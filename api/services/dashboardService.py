@@ -21,7 +21,6 @@ from utils.storedTables import decodeStoredTable, tableReadException, tableWrite
 from utils.logger import logger
 from utils.mapPointLabels import ensureScatterMapPointLabels
 from api.commons import client
-from api.services.reportingService import ReportingService
 from nubrix.components.chartBuilder import emptyChart
 from nubrix.components.chartEngine import renderChartRequest
 from nubrix.components.chartRequest import decodeGeneratedCode
@@ -83,6 +82,24 @@ def _exceptionClass(traceback: str) -> str:
     return "unknown exception"
 
 
+def _metadataTableNames(metadata: dict) -> frozenset[str]:
+    """
+    Every table in a project's metadata.json, active or inactive: each key not starting with `_` whose value is a
+    table entry (a dict). `isActive` is ignored on purpose: a saved widget re-runs on any table the project has,
+    as a saved Python widget does. Only new chart generation is limited to active tables.
+    """
+    return frozenset(
+        name for name, entry in metadata.items()
+        if isinstance(name, str) and not name.startswith("_") and isinstance(entry, dict)
+    )
+
+
+def _storedTableNames(files: list[dict]) -> frozenset[str]:
+    """The tables stored in a project folder: the name of each `<table>.parquet` file, the files a Python widget reads."""
+    names = (entry.get("name") for entry in files if isinstance(entry, dict))
+    return frozenset(name[:-len(".parquet")] for name in names if isinstance(name, str) and name.endswith(".parquet") and len(name) > len(".parquet"))
+
+
 def _pythonResult(output: str) -> dict:
     """The chart dict a saved Python widget printed, or `_RerunFailure` naming only the kind of failure."""
     try:
@@ -118,13 +135,13 @@ class DashboardService:
         self.client = client
 
     @staticmethod
-    def _rerunWidget(widget: dict, filters: list | None, projectId: str, activeTables: frozenset[str] | None) -> tuple[dict, bool]:
+    def _rerunWidget(widget: dict, filters: list | None, projectId: str, rerunTables: frozenset[str] | None) -> tuple[dict, bool]:
         """Re-run one saved widget; see `_rerunWidgetProduced`. Returns the widget copy and whether the run succeeded."""
-        fresh, produced = DashboardService._rerunWidgetProduced(widget, filters, projectId, activeTables)
+        fresh, produced = DashboardService._rerunWidgetProduced(widget, filters, projectId, rerunTables)
         return fresh, produced is not None
 
     @staticmethod
-    def _rerunWidgetProduced(widget: dict, filters: list | None, projectId: str, activeTables: frozenset[str] | None) -> tuple[dict, dict | None]:
+    def _rerunWidgetProduced(widget: dict, filters: list | None, projectId: str, rerunTables: frozenset[str] | None) -> tuple[dict, dict | None]:
         """
         Re-run one saved widget in its own form and return a copy with the new chart data.
 
@@ -135,8 +152,9 @@ class DashboardService:
             widget (dict): The saved widget.
             filters (list | None): The sidebar filters, if any.
             projectId (str): The project.
-            activeTables (frozenset[str] | None): Names of the project's active tables, for the SQL check. None means the
-                list could not be read, so a ChartRequest widget fails (a Python widget does not need it).
+            rerunTables (frozenset[str] | None): Names of every table of the project, active or inactive (the tables a
+                saved Python widget can read), for the SQL check; see `_rerunTables`. None means no list could be
+                read, so a ChartRequest widget fails (a Python widget does not need it).
 
         Returns:
             tuple[dict, dict | None]: The widget copy, and the keys the run produced (None when it failed, and
@@ -152,9 +170,9 @@ class DashboardService:
         try:
             request = decodeGeneratedCode(widget.get("generatedCode"))
             if request is not None:
-                if activeTables is None:
+                if rerunTables is None:
                     raise ValueError("the project's table list could not be read")
-                result = renderChartRequest(replManager, projectId, request, activeTables, filters=filters, lenient=True)
+                result = renderChartRequest(replManager, projectId, request, rerunTables, filters=filters, lenient=True)
             else:
                 form = "python"
                 code = widget.get("generatedCode")
@@ -224,19 +242,41 @@ class DashboardService:
     def _rerunProduced(self, widgets: list, filters: list | None, projectId: str) -> list[tuple[dict, dict | None]]:
         """Like `_rerunWidgets`, but each result carries the keys the run produced (None when it failed or didn't run)."""
         todo = [widget for widget in widgets if self._isRerunnable(widget)]
-        activeTables = frozenset()
+        rerunTables = frozenset()
         if any(self._usesChartRequest(widget) for widget in todo):
-            try:
-                activeTables = frozenset(ReportingService._filterActive(readJson(projectId, "metadata.json")))
-            except Exception as error:
-                if isBusy(error):
-                    raise
-                # Only the new chart widgets need the list; the Python ones still run. Never log the message.
-                logger.warning(f"The table list of project {projectId} could not be read ({type(error).__name__}); its chart widgets are not re-run.")
-                activeTables = None
+            rerunTables = self._rerunTables(projectId)
         with ThreadPoolExecutor(max_workers = 4) as executor:
-            outcomes = iter(list(executor.map(lambda widget: self._rerunWidgetProduced(widget, filters, projectId, activeTables), todo)))
+            outcomes = iter(list(executor.map(lambda widget: self._rerunWidgetProduced(widget, filters, projectId, rerunTables), todo)))
         return [next(outcomes) if self._isRerunnable(widget) else (widget, None) for widget in widgets]
+
+    def _rerunTables(self, projectId: str) -> frozenset[str] | None:
+        """
+        The tables a saved ChartRequest widget may name when it is re-run: every table of the project, active or
+        inactive, exactly the set a saved Python widget can read. New chart generation is not affected: it still
+        sees and accepts only active tables.
+
+        The list comes from metadata.json. When that can't be read (or isn't an object), it comes from the project's
+        stored table files, the `<table>.parquet` files a Python widget reads. When neither can be read, None: the
+        ChartRequest widgets are not re-run, while the Python ones still are. A busy sandbox error propagates.
+        Never logs an error's message, which can hold table names.
+        """
+        try:
+            metadata = readJson(projectId, "metadata.json")
+            if not isinstance(metadata, dict):
+                raise ValueError("metadata.json is not an object")
+            return _metadataTableNames(metadata)
+        except Exception as error:
+            if isBusy(error):
+                raise
+            logger.warning(f"The table list of project {projectId} could not be read from its metadata ({type(error).__name__}); its chart widgets use the stored table files.")
+        try:
+            return _storedTableNames(listProjectFiles(self.client, projectId))
+        except Exception as error:
+            if isBusy(error):
+                raise
+            # Only the new chart widgets need the list; the Python ones still run.
+            logger.warning(f"The stored table list of project {projectId} could not be read either ({type(error).__name__}); its chart widgets are not re-run.")
+            return None
 
     @staticmethod
     def _getDataTypes(projectId: str, tableName: str) -> list[dict]:   
