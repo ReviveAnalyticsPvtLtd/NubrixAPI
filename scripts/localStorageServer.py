@@ -36,25 +36,40 @@ def _segments(path: str) -> tuple[str, str] | None:
     return parts[0], parts[1]
 
 
-def _byteRange(header: str, size: int) -> tuple[int, int] | None:
-    """The inclusive `(start, end)` a single-range header names, or None when it is unsatisfiable."""
+_IGNORE = "ignore"
+_UNSATISFIABLE = "unsatisfiable"
+
+
+def _byteRange(header: str, size: int) -> "tuple[int, int] | str":
+    """What a `Range` header asks for, as RFC 7233 has it for a single range of bytes.
+
+    Returns the inclusive `(start, end)` to send (206), `_UNSATISFIABLE` (416), or `_IGNORE` to send the whole file
+    (200): a header that is not a single valid `bytes` range is ignored, as is one with several ranges. A suffix
+    (`-n`) is the last n bytes, and an open range (`a-`) runs to the end.
+    """
     match = _RANGE.match(header.strip())
-    if match is None or (not match.group(1) and not match.group(2)):
-        return None
+    if match is None:
+        return _IGNORE
     first, last = match.groups()
+    if not first and not last:
+        return _IGNORE
     if not first:
         length = int(last)
-        return (max(size - length, 0), size - 1) if length and size else None
+        return (max(size - length, 0), size - 1) if length and size else _UNSATISFIABLE
     start = int(first)
+    if last and int(last) < start:
+        return _IGNORE
     end = min(int(last), size - 1) if last else size - 1
-    return (start, end) if start < size and start <= end else None
+    return (start, end) if start < size else _UNSATISFIABLE
 
 
-def serveFolder(folder: str, key: str | None = None) -> tuple[str, Callable[[], None]]:
+def serveFolder(folder: str, key: str | None = None, requestLog: list | None = None) -> tuple[str, Callable[[], None]]:
     """Serve `folder` on 127.0.0.1 and return `(url, stop)`.
 
     Requests must carry `Authorization: Bearer <key>`; `key` defaults to the SUPABASE_KEY of the environment.
-    `stop()` ends the server and its thread, and may be called again.
+    When `requestLog` is a list, every response adds `{"method", "file", "range", "status"}` to it (`file` is the file
+    name of an object route, else None), so a caller can count what was read and how. `stop()` ends the server and its
+    thread, and may be called again.
     """
     key = os.environ.get("SUPABASE_KEY") if key is None else key
     if not key:
@@ -75,6 +90,12 @@ def serveFolder(folder: str, key: str | None = None) -> tuple[str, Callable[[], 
 
         def log_message(self, *_args):
             pass
+
+        def send_response(self, code, message=None):
+            if requestLog is not None:
+                segments = _segments(urlsplit(self.path).path)
+                requestLog.append({"method": self.command, "file": segments[1] if segments else None, "range": self.headers.get("Range"), "status": code})
+            super().send_response(code, message)
 
         def do_GET(self):
             self._serve(sendBody=True)
@@ -112,14 +133,14 @@ def serveFolder(folder: str, key: str | None = None) -> tuple[str, Callable[[], 
             size = os.path.getsize(path)
             start, end, status = 0, size - 1, 200
             requested = self.headers.get("Range")
-            if requested and sendBody:
-                span = _byteRange(requested, size)
-                if span is None:
-                    self.send_response(416)
-                    self.send_header("Content-Range", f"bytes */{size}")
-                    self.send_header("Content-Length", "0")
-                    self.end_headers()
-                    return
+            span = _byteRange(requested, size) if requested else _IGNORE
+            if span == _UNSATISFIABLE:
+                self.send_response(416)
+                self.send_header("Content-Range", f"bytes */{size}")
+                self.send_header("Content-Length", "0")
+                self.end_headers()
+                return
+            if span != _IGNORE:
                 (start, end), status = span, 206
             self.send_response(status)
             self.send_header("Accept-Ranges", "bytes")

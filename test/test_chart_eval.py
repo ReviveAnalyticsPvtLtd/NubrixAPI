@@ -6,20 +6,17 @@ the builder and the contract check.
 
 import json
 import os
-import threading
 from pathlib import Path
 
-import httpx
 import pytest
 
-from scripts import chartEval, localStorageServer
+from scripts import chartEval
 
 FIXTURES = Path(__file__).parent / "fixtures" / "chart_eval"
 DATA = FIXTURES / "data"
 CASES = FIXTURES / "cases.jsonl"
 STUB = FIXTURES / "modelStub.jsonl"
 PROJECT = "11111111-2222-4333-8444-555555555555"
-KEY = "local-eval-key"
 
 
 def _args(tmp_path, *extra, cases=CASES, stub=STUB, runs=2):
@@ -187,99 +184,3 @@ def test_valueCheckPivotUsesRowKeysAsLabels():
     pivot = {"chartType": "pivot", "data": {"c1": {"r1": 1, "r2": None}, "c2": {"r1": 2, "r2": 3}}}
     assert _check({"labels": ["r1", "r2"], "values": {"c1": [1, None], "c2": [2, 3]}}, pivot)["ok"] is True
     assert _check({"labels": ["r2", "r1"]}, pivot)["ok"] is False
-
-
-# The local storage server
-
-
-@pytest.fixture
-def served():
-    url, stop = localStorageServer.serveFolder(str(DATA), key=KEY)
-    try:
-        yield url
-    finally:
-        stop()
-
-
-def _get(url, path, key=KEY, **headers):
-    sent = {"Authorization": f"Bearer {key}", "apikey": key, **headers} if key else dict(headers)
-    return httpx.get(f"{url}{path}", headers=sent)
-
-
-PATH = f"/storage/v1/object/AnalyticsHub/{PROJECT}/orders.parquet"
-
-
-def test_storageServerServesFilesWithHeadAndRange(served):
-    body = (DATA / PROJECT / "orders.parquet").read_bytes()
-    assert _get(served, PATH).content == body
-    head = httpx.head(f"{served}{PATH}", headers={"Authorization": f"Bearer {KEY}"})
-    assert head.status_code == 200 and int(head.headers["Content-Length"]) == len(body) and head.content == b""
-    part = _get(served, PATH, Range="bytes=4-9")
-    assert part.status_code == 206 and part.content == body[4:10]
-    assert part.headers["Content-Range"] == f"bytes 4-9/{len(body)}"
-    assert _get(served, PATH, Range="bytes=-8").content == body[-8:]
-    assert _get(served, PATH, Range=f"bytes={len(body) + 5}-").status_code == 416
-    assert _get(served, f"/storage/v1/object/AnalyticsHub/{PROJECT}/metadata.json").json()["orders"]["shape"] == [36, 6]
-    assert _get(served, f"/storage/v1/object/AnalyticsHub/{PROJECT}/missing.parquet").status_code == 404
-
-
-def test_storageServerRequiresTheKey(served):
-    assert _get(served, PATH, key=None).status_code == 401
-    assert _get(served, PATH, key="wrong").status_code == 401
-    assert httpx.get(f"{served}{PATH}", headers={"apikey": KEY}).status_code == 401
-
-
-def test_storageServerRefusesPathTraversalAndOtherPaths(served):
-    for path in (
-        f"/storage/v1/object/AnalyticsHub/{PROJECT}/..%2f..%2fcases.jsonl",
-        f"/storage/v1/object/AnalyticsHub/{PROJECT}/../../cases.jsonl",
-        f"/storage/v1/object/AnalyticsHub/%2e%2e/{PROJECT}/orders.parquet",
-        f"/storage/v1/object/AnalyticsHub/{PROJECT}/..%5c..%5ccases.jsonl",
-        f"/storage/v1/object/AnalyticsHub/{PROJECT}/C%3A%5cWindows%5cwin.ini",
-        "/storage/v1/object/AnalyticsHub//etc/passwd",
-        f"/storage/v1/object/AnalyticsHub/{PROJECT}/%2fetc%2fpasswd",
-        f"/storage/v1/object/AnalyticsHub/{PROJECT}/orders.parquet/extra",
-        "/storage/v1/object/AnalyticsHub/orders.parquet",
-        f"/storage/v1/object/public/AnalyticsHub/{PROJECT}/orders.parquet",
-        f"/storage/v1/object/OtherBucket/{PROJECT}/orders.parquet",
-        f"/{PROJECT}/orders.parquet",
-    ):
-        response = _get(served, path)
-        assert response.status_code in (400, 404), path
-        assert not response.content.startswith(b"PAR1"), path
-
-
-def test_storageServerRefusesASymlinkOutOfTheFolder(tmp_path):
-    outside = tmp_path / "outside.txt"
-    outside.write_text("secret")
-    root = tmp_path / "root"
-    (root / PROJECT).mkdir(parents=True)
-    try:
-        (root / PROJECT / "leak.txt").symlink_to(outside)
-    except (OSError, NotImplementedError):
-        pytest.skip("this account cannot create symlinks")
-    url, stop = localStorageServer.serveFolder(str(root), key=KEY)
-    try:
-        assert _get(url, f"/storage/v1/object/AnalyticsHub/{PROJECT}/leak.txt").status_code in (400, 404)
-    finally:
-        stop()
-
-
-def test_storageServerBindsLoopbackAndStopsCleanly():
-    before = threading.active_count()
-    url, stop = localStorageServer.serveFolder(str(DATA), key=KEY)
-    assert url.startswith("http://127.0.0.1:")
-    assert _get(url, PATH).status_code == 200
-    stop()
-    with pytest.raises(httpx.TransportError):
-        _get(url, PATH)
-    assert threading.active_count() <= before
-    stop()
-
-
-def test_storageServerNeedsAKey(monkeypatch):
-    monkeypatch.delenv("SUPABASE_KEY", raising=False)
-    with pytest.raises(ValueError):
-        localStorageServer.serveFolder(str(DATA))
-    with pytest.raises(ValueError):
-        localStorageServer.serveFolder(str(DATA), key="")

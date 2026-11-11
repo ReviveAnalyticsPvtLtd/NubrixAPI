@@ -1,18 +1,31 @@
 """Writes the synthetic evaluation tables and metadata.json next to this file.
 
-Invented names and values, no randomness: running it again gives the same rows.
+Invented names and values, no randomness: running it again gives the same bytes.
+
+The tables are written by the API's own writer (`utils.storedTables.writeStoredTable`), so each carries the marker the
+API gives a table it stored, and a marked table's footer is read by HEAD and Range requests. The marker is derived
+from a key, so the harness has to serve these files with the same key: `--storage-key` takes FIXTURE_KEY. It is a
+made-up value that protects nothing.
+
 Usage (from the repo root): python test/fixtures/chart_eval/buildFixtures.py
 """
 
 import datetime as dt
 import json
+import os
+import sys
 from pathlib import Path
 
 import pyarrow as pa
-import pyarrow.parquet as pq
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[3]))
 
 PROJECT = "11111111-2222-4333-8444-555555555555"
+FIXTURE_KEY = "chart-eval-fixture-key"
 OUT = Path(__file__).resolve().parent / "data" / PROJECT
+# One row per day, so "the last 12 months" has data whatever today is, until the last day here.
+VISITS_FIRST_DAY = dt.date(2020, 1, 1)
+VISITS_LAST_DAY = dt.date(2040, 12, 31)
 
 REGIONS = ["North", "South", "East", "West"]
 PRODUCTS = [
@@ -46,21 +59,20 @@ def orders() -> dict:
     return columns
 
 
+def visits() -> dict:
+    days = (VISITS_LAST_DAY - VISITS_FIRST_DAY).days + 1
+    return {
+        "visit_date": pa.array([VISITS_FIRST_DAY + dt.timedelta(days=i) for i in range(days)], pa.date32()),
+        "visits": [i * 7 % 11 + 1 for i in range(days)],
+    }
+
+
 def column(name, kind, text):
     return {"name": name, "type": kind, "description": text}
 
 
-def main() -> None:
-    OUT.mkdir(parents=True, exist_ok=True)
-    ordersData = orders()
-    pq.write_table(pa.table({**ordersData, "order_date": pa.array(ordersData["order_date"], pa.date32())}), OUT / "orders.parquet")
-    products = list(zip(*PRODUCTS))
-    productData = dict(zip(("product_id", "product_name", "category", "unit_price"), map(list, products)))
-    pq.write_table(pa.table(productData), OUT / "products.parquet")
-    stores = list(zip(*STORES))
-    storeData = dict(zip(("store_id", "store_name", "city", "latitude", "longitude", "employees"), map(list, stores)))
-    pq.write_table(pa.table(storeData), OUT / "stores.parquet")
-    metadata = {
+def metadata() -> dict:
+    return {
         "orders": {
             "description": "One row per order.",
             "shape": [36, 6],
@@ -98,8 +110,53 @@ def main() -> None:
             ],
             "sample_row": {"store_id": 1, "store_name": "Harbor Store", "city": "Northport", "latitude": 40.5, "longitude": -74.0, "employees": 12},
         },
+        "visits": {
+            "description": "Website visits, one row per day from 2020-01-01 to 2040-12-31.",
+            "shape": [(VISITS_LAST_DAY - VISITS_FIRST_DAY).days + 1, 2],
+            "columns": [
+                column("visit_date", "datetime64[ns]", "Day of the visits."),
+                column("visits", "int64", "Number of visits that day."),
+            ],
+            "sample_row": {"visit_date": "2020-01-01", "visits": 1},
+        },
+        # Not shown to the model: an inactive table with no file, and a key that is not a table.
+        "archived_orders": {
+            "description": "Orders of a retired shop.",
+            "isActive": False,
+            "shape": [10, 1],
+            "columns": [column("order_id", "int64", "Order number.")],
+        },
+        "_meta": {"note": "Bookkeeping, not a table."},
     }
-    (OUT / "metadata.json").write_text(json.dumps(metadata, indent=2) + "\n", encoding="utf-8")
+
+
+def build(out: Path = OUT) -> None:
+    """Write the tables and metadata.json into `out`."""
+    from utils.storedTables import writeStoredTable
+
+    saved = os.environ.get("SUPABASE_KEY")
+    os.environ["SUPABASE_KEY"] = FIXTURE_KEY
+    try:
+        out.mkdir(parents=True, exist_ok=True)
+        ordersData = orders()
+        tables = {
+            "orders": pa.table({**ordersData, "order_date": pa.array(ordersData["order_date"], pa.date32())}),
+            "products": pa.table(dict(zip(("product_id", "product_name", "category", "unit_price"), map(list, zip(*PRODUCTS))))),
+            "stores": pa.table(dict(zip(("store_id", "store_name", "city", "latitude", "longitude", "employees"), map(list, zip(*STORES))))),
+            "visits": pa.table(visits()),
+        }
+        for name, table in tables.items():
+            (out / f"{name}.parquet").write_bytes(writeStoredTable(table, PROJECT, name))
+        (out / "metadata.json").write_text(json.dumps(metadata(), indent=2) + "\n", encoding="utf-8")
+    finally:
+        if saved is None:
+            os.environ.pop("SUPABASE_KEY", None)
+        else:
+            os.environ["SUPABASE_KEY"] = saved
+
+
+def main() -> None:
+    build()
 
 
 if __name__ == "__main__":

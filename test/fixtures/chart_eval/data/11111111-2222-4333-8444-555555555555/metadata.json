@@ -127,5 +127,46 @@
       "longitude": -74.0,
       "employees": 12
     }
+  },
+  "visits": {
+    "description": "Website visits, one row per day from 2020-01-01 to 2040-12-31.",
+    "shape": [
+      7671,
+      2
+    ],
+    "columns": [
+      {
+        "name": "visit_date",
+        "type": "datetime64[ns]",
+        "description": "Day of the visits."
+      },
+      {
+        "name": "visits",
+        "type": "int64",
+        "description": "Number of visits that day."
+      }
+    ],
+    "sample_row": {
+      "visit_date": "2020-01-01",
+      "visits": 1
+    }
+  },
+  "archived_orders": {
+    "description": "Orders of a retired shop.",
+    "isActive": false,
+    "shape": [
+      10,
+      1
+    ],
+    "columns": [
+      {
+        "name": "order_id",
+        "type": "int64",
+        "description": "Order number."
+      }
+    ]
+  },
+  "_meta": {
+    "note": "Bookkeeping, not a table."
   }
 }
