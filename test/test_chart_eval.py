@@ -22,11 +22,17 @@ PROJECT = "11111111-2222-4333-8444-555555555555"
 FIXTURE_KEY = "chart-eval-fixture-key"
 
 
+@pytest.fixture(autouse=True)
+def fixtureKey(monkeypatch):
+    """The synthetic tables carry markers made from this made-up key; the harness takes it from the environment."""
+    monkeypatch.setenv("CHART_EVAL_STORAGE_KEY", FIXTURE_KEY)
+
+
 def _args(tmp_path, *extra, cases=CASES, stub=STUB, runs=2):
     return [
         "--cases", str(cases), "--data", str(DATA), "--project", PROJECT, "--engine", "sql",
         "--runs", str(runs), "--out", str(tmp_path / "report.json"), "--model-stub", str(stub),
-        "--storage-key", FIXTURE_KEY, *extra,
+        *extra,
     ]
 
 
@@ -76,7 +82,7 @@ def test_harnessPassesOnSyntheticSetWithStubbedModel(tmp_path, capsys, monkeypat
 
     report = _report(tmp_path)
     assert [run["passed"] for run in report["runs"]] == [7, 7] and report["engine"] == "sql" and report["allRunsPass"] is True
-    assert report["expectedOn"]
+    assert all(run["date"] and run["stale"] is False for run in report["runs"])
     stages = {
         "bar-region": "ok", "line-last-12-months": "ok", "card-order-count": "ok", "table-top-products": "ok",
         "pivot-region-category": "ok", "geo-store-locations": "ok", "doubt-unclear": "doubt",
@@ -96,6 +102,8 @@ def test_harnessPassesOnSyntheticSetWithStubbedModel(tmp_path, capsys, monkeypat
     assert first["card-order-count"]["got"] == {"card": 36}
     # The relative period was computed by expectSql from today's date, and the chart agrees.
     assert len(first["line-last-12-months"]["expected"]["labels"]) == 12
+    # A DATE label: the expected text is the builder's ISO date, not a strftime month.
+    assert len(first["line-last-12-months"]["expected"]["labels"][0]) == 10
     assert first["line-last-12-months"]["got"]["labels"] == first["line-last-12-months"]["expected"]["labels"]
     # The marked tables' footers were read by HEAD and Range requests, not by downloads for the schema read.
     storage = report["storage"]
@@ -122,7 +130,9 @@ def test_theModelIsShownTheMetadataAServedRequestGives(tmp_path):
     metadata = inputs["metadata"]
     assert set(metadata) == {"orders", "products", "stores", "visits"}
     assert "archived_orders" not in metadata and "_meta" not in metadata
-    assert all("size_class" in entry and "size_hint" in entry for entry in metadata.values())
+    # The hints are those of a warm served request (the row count comes from the metadata read), not the cold "unknown".
+    assert metadata["orders"]["size_class"] == "small" and metadata["orders"]["_size_check"] is True
+    assert all(entry["size_class"] == "small" and "unknown" not in entry["size_hint"] for entry in metadata.values())
 
 
 def test_wrongValueFailsTheCase(tmp_path, capsys, monkeypatch):

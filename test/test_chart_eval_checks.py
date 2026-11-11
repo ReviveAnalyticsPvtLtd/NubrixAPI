@@ -373,9 +373,8 @@ LAST_12_MONTHS = (
 
 
 def test_aRelativePeriodCountsBackFromToday():
-    cases, asOf = chartEval._resolveCases([_visitsCase(LAST_12_MONTHS)], {"rel": 1}, DATA / PROJECT)
+    cases = chartEval._resolveCases([_visitsCase(LAST_12_MONTHS)], {"rel": 1}, DATA / PROJECT)
     today = dt.date.today()
-    assert asOf == today.isoformat()
     expect = cases[0]["expect"]
     assert len(expect["labels"]) == 12 and list(expect["values"]) == ["monthly_visits"]
     previousMonth = (today.replace(day=1) - dt.timedelta(days=1))
@@ -387,8 +386,7 @@ def test_expectSqlIsResolvedOnceBeforeTheRunsAndNamesItsLineWhenWrong():
     cases = [{"id": "a", "prompt": "p", "expect": {"doubt": False, "chartType": "card", "card": 1}}, _visitsCase("SELECT 1; SELECT 2")]
     with pytest.raises(chartEval._UsageError, match="Cases line 2: expectSql must be a single"):
         chartEval._resolveCases(cases, {"a": 1, "rel": 2}, DATA / PROJECT)
-    plain, asOf = chartEval._resolveCases(cases[:1], {"a": 1}, DATA / PROJECT)
-    assert plain == cases[:1] and asOf is None
+    assert chartEval._resolveCases(cases[:1], {"a": 1}, DATA / PROJECT) == cases[:1]
 
 
 def test_aBadExpectSqlInTheCasesFileExitsTwoBeforeAnyRun(tmp_path, capsys, monkeypatch):
@@ -568,3 +566,193 @@ def test_theLogSwitchPutsBackExactlyWhatWasThere():
     finally:
         logger.remove(handler)
         logger.enable("someOtherLibrary")
+
+
+# N1: expectSql values are converted the way the chart builder converts them, so a correct chart matches
+
+
+def _realChart(sql, chartType, encoding):
+    """The chart the real builder makes from the result of `sql` over the fixture tables."""
+    import duckdb
+
+    from nubrix.components.chartBuilder import buildChart
+    from nubrix.components.chartRequest import ChartRequest
+
+    connection = duckdb.connect(":memory:")
+    for name, source in _sources().items():
+        connection.register(name, source)
+    table = connection.execute(sql).fetch_arrow_table()
+    return buildChart(ChartRequest.model_validate({"chartType": chartType, "title": "T", "sql": sql, "encoding": encoding}), table)
+
+
+def _matches(sql, chartType, encoding):
+    expect = {"relTol": 0, **chartEval._expectedFromSql(sql, chartType, _sources())}
+    return chartEval.checkValues(expect, _realChart(sql, chartType, encoding)), expect
+
+
+def test_aDateLabelMatchesTheChartsIsoText():
+    sql = ("SELECT CAST(date_trunc('month', visit_date) AS DATE) AS month, SUM(visits) AS v FROM visits "
+           "WHERE visit_date < DATE '2020-04-01' GROUP BY 1 ORDER BY 1")
+    result, expect = _matches(sql, "line", {"x": "month", "y": ["v"]})
+    assert result["ok"] is True, result
+    assert expect["labels"] == ["2020-01-01", "2020-02-01", "2020-03-01"]
+
+
+def test_anIntegerLabelMatchesTheChartsText():
+    sql = "SELECT year(visit_date) AS y, SUM(visits) AS v FROM visits GROUP BY 1 ORDER BY 1"
+    result, expect = _matches(sql, "bar", {"x": "y", "y": ["v"]})
+    assert result["ok"] is True, result
+    assert expect["labels"][0] == "2020"
+
+
+def test_aTableWithADateColumnMatches():
+    sql = "SELECT order_id, order_date, revenue FROM orders ORDER BY order_id LIMIT 3"
+    result, expect = _matches(sql, "table", {"columns": ["order_id", "order_date", "revenue"]})
+    assert result["ok"] is True, result
+    assert expect["rows"][0]["order_date"] == "2025-01-05"
+
+
+def test_aDateCardAndABoolCardMatch():
+    result, expect = _matches("SELECT max(order_date) AS d FROM orders", "card", {"value": "d"})
+    assert result["ok"] is True, result
+    assert expect["card"] == "2025-11-16"
+    result, expect = _matches("SELECT count(*) > 3 AS big FROM orders", "card", {"value": "big"})
+    assert result["ok"] is True and expect["card"] == "true"
+
+
+def test_decimalCoordinatesAndNumbersMatch():
+    sql = "SELECT CAST(latitude AS DECIMAL(9, 2)) AS lat, CAST(longitude AS DECIMAL(9, 2)) AS long, store_name AS label FROM stores ORDER BY store_id"
+    result, expect = _matches(sql, "geoMap", {"lat": "lat", "long": "long", "label": "label"})
+    assert result["ok"] is True, result
+    sql = "SELECT region, CAST(SUM(revenue) AS DECIMAL(18, 2)) AS total FROM orders GROUP BY region ORDER BY region"
+    assert _matches(sql, "bar", {"x": "region", "y": ["total"]})[0]["ok"] is True
+
+
+def test_aPivotsKeysAreTheBuildersLevelText():
+    sql = "SELECT year(order_date) AS y, region, SUM(revenue) AS v FROM orders GROUP BY 1, 2 ORDER BY 1, 2"
+    chart = _realChart(sql, "pivot", {"rows": ["y"], "columns": ["region"], "value": "v"})
+    wide = ("SELECT year(order_date) AS y, SUM(revenue) FILTER (region = 'East') AS East, SUM(revenue) FILTER (region = 'North') AS North, "
+            "SUM(revenue) FILTER (region = 'South') AS South, SUM(revenue) FILTER (region = 'West') AS West FROM orders GROUP BY 1 ORDER BY 1")
+    expect = {"relTol": 0, **chartEval._expectedFromSql(wide, "pivot", _sources())}
+    assert chartEval.checkValues(expect, chart)["ok"] is True
+    assert expect["labels"] == ["2025"]
+
+
+# N2: the date of an expectSql is read for every run, and a run in which it changed is stale
+
+
+def _datesFrom(monkeypatch, *dates):
+    queue = list(dates)
+    current = []
+
+    def today():
+        if queue:
+            current[:] = [queue.pop(0)]
+        return current[0]
+
+    monkeypatch.setattr(chartEval, "_today", today)
+
+
+def _doubtArgv(tmp_path):
+    return ["--cases", str(CASES), "--data", str(DATA), "--project", PROJECT, "--out", str(tmp_path / "r.json"),
+            "--model-stub", str(STUB), "--only", "doubt-unclear", "--runs", "2"]
+
+
+def test_aRunInWhichTheDateChangedIsStaleAndFails(tmp_path, capsys, monkeypatch):
+    first, second = dt.date(2026, 11, 11), dt.date(2026, 11, 12)
+    # Run 1 begins and ends on different days; run 2 begins and ends on the second.
+    _datesFrom(monkeypatch, first, second, second, second)
+    assert chartEval.main(_doubtArgv(tmp_path)) == 1
+    captured = capsys.readouterr()
+    assert captured.out.splitlines() == ["PASS 1/1", "PASS 1/1"]
+    assert captured.err.strip().splitlines() == ["python -m scripts.chartEval: the date changed during run 1."]
+    report = json.loads((tmp_path / "r.json").read_text(encoding="utf-8"))
+    assert [(run["date"], run["stale"]) for run in report["runs"]] == [("2026-11-11", True), ("2026-11-12", False)]
+    assert report["allRunsPass"] is False and "expectedOn" not in report
+
+
+def test_aSteadyDateLeavesRunsFresh(tmp_path, capsys, monkeypatch):
+    _datesFrom(monkeypatch, dt.date(2026, 11, 11))
+    assert chartEval.main(_doubtArgv(tmp_path)) == 0
+    report = json.loads((tmp_path / "r.json").read_text(encoding="utf-8"))
+    assert [(run["date"], run["stale"]) for run in report["runs"]] == [("2026-11-11", False)] * 2
+
+
+def test_expectSqlIsResolvedAgainForEveryRun(tmp_path, monkeypatch):
+    seen = []
+    original = chartEval._resolveCases
+    monkeypatch.setattr(chartEval, "_resolveCases", lambda *a, **k: seen.append(1) or original(*a, **k))
+    # Preparation resolves once (to fail fast), then each of the two runs resolves again.
+    assert chartEval.main(_doubtArgv(tmp_path)) == 0
+    assert len(seen) == 3
+
+
+# N4: no Redis connection can be made during a run, whatever client makes it
+
+
+def test_aFreshRedisClientFailsAtOnceWithoutASocket(monkeypatch):
+    import asyncio
+    import socket
+    import time
+
+    import redis
+    import redis.asyncio
+    import redis.connection
+
+    original = redis.connection.AbstractConnection.connect
+    monkeypatch.setattr(socket, "create_connection", lambda *a, **k: pytest.fail("a socket was opened"))
+    began = time.monotonic()
+    with chartEval._noRedis():
+        with pytest.raises(redis.exceptions.ConnectionError):
+            redis.Redis(host="203.0.113.1", socket_connect_timeout=5).ping()
+        with pytest.raises(redis.exceptions.ConnectionError):
+            redis.Redis.from_url("redis://203.0.113.1:6379/0").get("k")
+        with pytest.raises(redis.exceptions.ConnectionError):
+            asyncio.run(redis.asyncio.Redis(host="203.0.113.1").ping())
+    assert time.monotonic() - began < 2
+    assert redis.connection.AbstractConnection.connect is original
+
+
+def test_theConnectPatchIsRestoredWhenTheRunFails():
+    import redis.asyncio.connection
+    import redis.connection
+
+    def state():
+        return (redis.connection.AbstractConnection.connect, redis.connection.AbstractConnection.connect_check_health,
+                redis.asyncio.connection.AbstractConnection.connect)
+
+    before = state()
+    with pytest.raises(RuntimeError):
+        with chartEval._noRedis():
+            assert redis.connection.AbstractConnection.connect is not before[0]
+            raise RuntimeError("boom")
+    assert state() == before
+
+
+# N5: the storage key comes from the environment, never argv
+
+
+def test_theStorageKeyFlagIsGone(tmp_path, capsys):
+    argv = ["--cases", str(CASES), "--data", str(DATA), "--project", PROJECT, "--out", str(tmp_path / "r.json"), "--storage-key", "k"]
+    assert chartEval.main(argv) == 2
+    assert "unrecognized arguments" in capsys.readouterr().err
+
+
+def test_theStorageKeyComesFromTheEnvironmentOrIsRandom(monkeypatch):
+    import os
+
+    monkeypatch.delenv("CHART_EVAL_STORAGE_KEY", raising=False)
+    keys = []
+    for _ in range(2):
+        with chartEval._environment(True, str(DATA)):
+            keys.append(os.environ["SUPABASE_KEY"])
+    assert keys[0] != keys[1] and all(len(key) > 20 for key in keys)
+    monkeypatch.setenv("CHART_EVAL_STORAGE_KEY", "chart-eval-fixture-key")
+    with chartEval._environment(True, str(DATA)):
+        assert os.environ["SUPABASE_KEY"] == "chart-eval-fixture-key"
+
+
+def test_theDocsSayTheStorageKeyIsForSyntheticFixturesOnly():
+    for text in (chartEval.__doc__, chartEval._parser().format_help()):
+        text = " ".join(text.lower().split())
+        assert "chart_eval_storage_key" in text and "synthetic" in text and "must never be a real key" in text

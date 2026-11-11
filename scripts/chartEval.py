@@ -9,9 +9,12 @@ CHART_ENGINE is `off` (`--engine python`), in this process, and compares each ch
 `DATA` is a folder holding `<projectId>/<table>.parquet` and `<projectId>/metadata.json`. It is served through a local
 storage server (`scripts/localStorageServer.py`), so the real sandbox path runs: schema reads, spool, channel, launcher.
 A table the API wrote carries a marker made from the storage key, and its footer is then read by HEAD and Range
-requests; `--storage-key` sets that key (the synthetic fixtures use the one in `buildFixtures.py`), and tables without
-a valid marker, such as a copy of production tables, are read through the reader child as the API reads them.
-The workflow gets the metadata the service gives it (`utils.modelMetadata`: active tables, size hints).
+requests, and tables without a valid marker, such as a copy of production tables, are read through the reader child as
+the API reads them. The marker derives from the storage key, which is random for every invocation. The environment
+variable CHART_EVAL_STORAGE_KEY sets it instead: it exists for the synthetic fixtures, whose markers were made with the
+made-up key in `buildFixtures.py`, and must never be a real key (not the service key): it is for synthetic data only.
+The workflow gets the metadata the service gives it (`utils.modelMetadata`: active tables, size hints). The hints are
+those of a served request with a warm cache: the row counts come from the metadata the harness read.
 The harness never reads `.env` files: the Gemini key comes from the process environment, and Langfuse is used only when
 its keys are already there. It charges no credits, writes to no database, talks to no storage but the local one, and
 reaches no Redis: for the length of a run every Redis pool of the process refuses at once, and is restored afterwards.
@@ -43,12 +46,14 @@ How values are compared:
   - A pivot's row keys are its labels and its column keys its datasets.
 
 Relative periods ("the last 12 months") count back from today, so they have no fixed answer. `expectSql` computes it:
-one read-only DuckDB SELECT or WITH statement, run in this process at the start of the harness (once, so every run
-of an invocation shares a date) against the case's own data. Every table file in `<data>/<project>/` is a table of that
+one read-only DuckDB SELECT or WITH statement, run in this process at the start of every run against the case's own
+data. The report records each run's date. If the date changed while a run was going (a run that crosses midnight), the
+run is marked `stale`, counts as failed, and the exit code is 1 with a line on standard error. Every table file in `<data>/<project>/` is a table of that
 name; external access is switched off, so the statement reads nothing else. The result fills the expected fields by
 the case's chartType: for a table the rows; for a card the first row's first column; for a geoMap the points (columns
 named lat, long, and optionally label and id); otherwise the first column is the labels and every other column a
-dataset named by its alias. `expectSql` cannot be combined with labels, values, rows, card or points, and it has no
+dataset named by its alias. Values are converted by the chart builder's own helpers, so a DATE label or an integer
+label is the text the chart has, and a table cell or a card is the builder's value. `expectSql` cannot be combined with labels, values, rows, card or points, and it has no
 form for scatter or bubble charts.
 
 Model stub line (JSONL, one per case id): {"id": str, "rephrased": {"rephrasedOutput": str | null, "doubt": str | null},
@@ -70,6 +75,7 @@ __all__ = ["main", "checkValues"]
 
 import argparse
 import contextlib
+import copy
 import datetime as dt
 import decimal
 import json
@@ -83,6 +89,7 @@ from pathlib import Path
 from typing import Any
 from unittest import mock
 
+from nubrix.components.chartBuilder import _cell, _levelText, _number, _text
 from nubrix.components.chartContract import contractErrors
 
 _REPO = Path(__file__).resolve().parent.parent
@@ -432,10 +439,6 @@ def _loadStub(path: str, cases: list[dict]) -> dict[str, dict]:
 # The expected answer of a relative period
 
 
-def _plain(value: Any) -> Any:
-    return float(value) if isinstance(value, decimal.Decimal) else value
-
-
 def _tableSources(folder: Path):
     """A pyarrow dataset for every table file of the folder, by file name. They are read lazily, and by pyarrow."""
     import pyarrow.dataset as ds
@@ -459,32 +462,55 @@ def _expectedFromSql(sql: str, chartType: str, sources: dict) -> dict:
         connection.execute("SET lock_configuration=true")
         cursor = connection.execute(sql)
         columns = [description[0] for description in cursor.description]
-        rows = [[_plain(value) for value in row] for row in cursor.fetchall()]
+        rows = [list(row) for row in cursor.fetchall()]
     except _UsageError:
         raise
     except Exception as error:
         raise _UsageError(f"expectSql failed ({type(error).__name__}).")
     finally:
         connection.close()
+    # The values are converted by the chart builder's own helpers, so a correct chart matches: dates and integers
+    # become the text a label has, numbers are the builder's numbers, and a table or card cell is its `_cell`.
     if chartType == "table":
-        return {"rows": [dict(zip(columns, row)) for row in rows]}
+        return {"rows": [dict(zip(columns, [_cell(value) for value in row])) for row in rows]}
     if chartType == "card":
         if not rows or not columns:
             raise _UsageError("expectSql for a card returned no row.")
-        return {"card": rows[0][0]}
+        raw = rows[0][0]
+        value = "true" if raw is True else "false" if raw is False else _cell(raw)
+        return {"card": 0 if value is None else value}
     if chartType == "geoMap":
         if not {"lat", "long"} <= set(columns) or not set(columns) <= _POINT_KEYS:
             raise _UsageError("expectSql for a geoMap needs the columns lat and long, and may add label and id.")
-        return {"points": [dict(zip(columns, row)) for row in rows]}
+        points = []
+        for index, row in enumerate(rows):
+            record = dict(zip(columns, row))
+            lat, long = _number(record["lat"]), _number(record["long"])
+            point = {"lat": lat, "long": long}
+            if "id" in record:
+                point["id"] = _text(record["id"]) or str(index)
+            if "label" in record:
+                point["label"] = _text(record["label"]) or f"{lat}, {long}"
+            points.append(point)
+        return {"points": points}
     if len(columns) < 2:
         raise _UsageError("expectSql needs a label column and at least one value column.")
-    return {"labels": [row[0] for row in rows], "values": {name: [row[index] for row in rows] for index, name in enumerate(columns) if index}}
+    labelText = _levelText if chartType == "pivot" else _text
+    return {
+        "labels": [labelText(row[0]) for row in rows],
+        "values": {name: [_number(row[index]) for row in rows] for index, name in enumerate(columns) if index},
+    }
 
 
-def _resolveCases(cases: list[dict], lines: dict[str, int], folder: Path) -> tuple[list[dict], str | None]:
-    """The cases with every `expectSql` replaced by the expected fields it computes; and the date it was computed on."""
+def _today() -> dt.date:
+    """The date relative periods count back from. The harness reads it at the start and the end of every run."""
+    return dt.date.today()
+
+
+def _resolveCases(cases: list[dict], lines: dict[str, int], folder: Path) -> list[dict]:
+    """The cases with every `expectSql` replaced by the expected fields it computes (as of now)."""
     if not any(case["expect"].get("expectSql") for case in cases):
-        return cases, None
+        return cases
     sources = _tableSources(folder)
     resolved = []
     for case in cases:
@@ -497,7 +523,7 @@ def _resolveCases(cases: list[dict], lines: dict[str, int], folder: Path) -> tup
         except _UsageError as error:
             raise _UsageError(f"Cases line {lines[case['id']]}: {error}")
         resolved.append({**case, "expect": {**case["expect"], **filled}})
-    return resolved, dt.date.today().isoformat()
+    return resolved
 
 
 class _Replay:
@@ -538,26 +564,48 @@ class _Replay:
 
 @contextlib.contextmanager
 def _noRedis():
-    """Every Redis pool of the process refuses at once, and is put back afterwards.
+    """No Redis can be reached for the length of a run, and everything is put back afterwards.
 
-    The pools are made lazily and kept for the life of the process, so an environment variable cannot be relied on to
-    point them anywhere: a pool that exists already would keep its host. Each pool slot is swapped for one that raises
-    `redis.exceptions.ConnectionError` without connecting, which every caller of a run already tolerates (the project
-    slots count it as taken, the table and schema caches read storage instead), so nothing waits on a connect and
-    nothing reaches a real Redis. The slots are restored to what they held, in a `finally`.
+    Two layers, both restored in a `finally`:
+      - Every Redis pool slot the run path uses is swapped for a pool that raises `redis.exceptions.ConnectionError`
+        without connecting (the pools are made lazily and kept for the life of the process, so an environment variable
+        could not be relied on: a pool that exists already keeps its host). Every caller of a run already tolerates the
+        error: the project slots count it as taken, the table and schema caches read storage instead.
+      - `connect` (and `connect_check_health`) of redis-py's connection classes, sync and asyncio, raise the same
+        error. A client made during the run, by any code, such as `redis.Redis(host=...)`, or a pool module first
+        imported during the run, therefore fails at once without opening a socket.
     """
     import importlib
 
     import redis
+    import redis.connection
+
+    error = "Redis is switched off during an evaluation run."
 
     class DeadPool(redis.ConnectionPool):
         def get_connection(self, *args, **kwargs):
-            raise redis.exceptions.ConnectionError("Redis is switched off during an evaluation run.")
+            raise redis.exceptions.ConnectionError(error)
+
+    def refuse(self, *args, **kwargs):
+        raise redis.exceptions.ConnectionError(error)
+
+    async def refuseAsync(self, *args, **kwargs):
+        raise redis.exceptions.ConnectionError(error)
 
     slots = [("utils.initMethods", "_REDIS_POOL", True), ("api.services.credits.creditService", "_redis_pool", True),
              ("nubrix.components.transformationExecutor", "_redis_pool", False), ("api.services.reportingService", "_REPORTING_REDIS_POOL", False)]
+    patches = [(redis.connection.AbstractConnection, "connect", refuse), (redis.connection.AbstractConnection, "connect_check_health", refuse)]
+    try:
+        import redis.asyncio.connection
+
+        patches += [(redis.asyncio.connection.AbstractConnection, "connect", refuseAsync)]
+    except ImportError:
+        pass
     swapped = []
     try:
+        for owner, attribute, replacement in patches:
+            swapped.append((owner, attribute, owner.__dict__[attribute]))
+            setattr(owner, attribute, replacement)
         for moduleName, attribute, required in slots:
             if required:
                 importlib.import_module(moduleName)
@@ -567,8 +615,8 @@ def _noRedis():
                 setattr(module, attribute, DeadPool())
         yield
     finally:
-        for module, attribute, original in reversed(swapped):
-            setattr(module, attribute, original)
+        for owner, attribute, original in reversed(swapped):
+            setattr(owner, attribute, original)
 
 
 @contextlib.contextmanager
@@ -593,14 +641,14 @@ def _quietLogs():
 
 
 @contextlib.contextmanager
-def _environment(stubbed: bool, dataFolder: str, storageKey: str | None = None):
+def _environment(stubbed: bool, dataFolder: str):
     """The process environment of a run, restored afterwards: the local storage server and nothing else to reach.
 
     Yields the server's request log, a list of `{"method", "file", "range", "status"}`.
     """
     from scripts.localStorageServer import serveFolder
 
-    key = storageKey or secrets.token_urlsafe(24)
+    key = os.environ.get("CHART_EVAL_STORAGE_KEY") or secrets.token_urlsafe(24)
     changed = ["SUPABASE_KEY", "SUPABASE_URL"]
     # Left alone when already set. SANDBOX_ALLOW_SAME_UID is the local-development switch; an image that sets
     # SANDBOX_RUN_ROOT gets its own uids as always. A stubbed model needs no key, only a value for modules that read one.
@@ -773,7 +821,11 @@ def _runCase(engine: _Engine, metadata: dict, case: dict, project: str) -> dict:
 
 
 def _parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(prog="python -m scripts.chartEval", description=__doc__.split("\n\n")[0])
+    parser = argparse.ArgumentParser(
+        prog="python -m scripts.chartEval", description=__doc__.split("\n\n")[0],
+        epilog="Environment: CHART_EVAL_STORAGE_KEY sets the key of the local storage server and so the table markers. "
+               "It is for the synthetic fixtures only and must never be a real key; unset, a random key is used.",
+    )
     parser.add_argument("--cases", required=True, help="JSONL file of cases")
     parser.add_argument("--data", required=True, help="folder holding <projectId>/<table>.parquet and metadata.json")
     parser.add_argument("--project", required=True, help="project id: the folder under --data")
@@ -782,8 +834,6 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--out", required=True, help="path of the JSON report")
     parser.add_argument("--model-stub", help="JSONL of recorded model replies by case id (sql engine only)")
     parser.add_argument("--only", action="append", metavar="ID", help="run only this case id (repeatable)")
-    parser.add_argument("--storage-key", help="the key the local storage server asks for, and the table markers derive from "
-                                              "(default: a random one; the synthetic fixtures need the one in buildFixtures.py)")
     return parser
 
 
@@ -798,8 +848,11 @@ def _storageSummary(log: list) -> dict:
     }
 
 
-def _prepare(args: argparse.Namespace) -> tuple[list[dict], dict | None, str | None]:
-    """The cases to run, the stub and the expectation date; every mistake in the input is a `_UsageError`."""
+def _prepare(args: argparse.Namespace) -> tuple[list[dict], dict[str, int], dict | None, Path]:
+    """The cases to run, their lines, the stub and the data folder; every mistake in the input is a `_UsageError`.
+
+    `expectSql` is resolved once here to fail fast; every run resolves it again.
+    """
     if args.model_stub and args.engine != "sql":
         raise _UsageError("--model-stub works with --engine sql only")
     if args.runs < 1:
@@ -814,8 +867,8 @@ def _prepare(args: argparse.Namespace) -> tuple[list[dict], dict | None, str | N
             raise _UsageError("unknown case id: " + ", ".join(unknown))
         cases = [case for case in cases if case["id"] in args.only]
     stub = _loadStub(args.model_stub, cases) if args.model_stub else None
-    cases, asOf = _resolveCases(cases, lines, folder)
-    return cases, stub, asOf
+    _resolveCases(cases, lines, folder)
+    return cases, lines, stub, folder
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -826,24 +879,31 @@ def main(argv: list[str] | None = None) -> int:
     except SystemExit as exit_:
         return exit_.code if isinstance(exit_.code, int) else 2
     try:
-        cases, stub, asOf = _prepare(args)
+        cases, lines, stub, folder = _prepare(args)
     except _UsageError as error:
         print(f"{parser.prog}: error: {error}", file=sys.stderr)
         return 2
 
     runs = []
     try:
-        with _quietLogs(), _environment(stub is not None, args.data, args.storage_key) as storageLog:
+        with _quietLogs(), _environment(stub is not None, args.data) as storageLog:
             from utils import projectStorage
             from utils.modelMetadata import metadataForModel
 
             # The metadata of a served request: active tables only, with the size hints.
-            metadata = metadataForModel(projectStorage.readJson(args.project, "metadata.json"), args.project)
+            raw = projectStorage.readJson(args.project, "metadata.json")
+            # The row counts come from the metadata just read, as a served request's come from its Redis copy.
+            metadata = metadataForModel(copy.deepcopy(raw), args.project, knownMetadata=raw)
             engine = _Engine(args.engine, _Replay(stub) if stub is not None else None)
             for number in range(1, args.runs + 1):
-                results = [_runCase(engine, metadata, case, args.project) for case in cases]
+                began = _today()
+                runCases = _resolveCases(cases, lines, folder)
+                results = [_runCase(engine, metadata, case, args.project) for case in runCases]
                 passed = sum(result["ok"] for result in results)
-                runs.append({"run": number, "passed": passed, "total": len(results), "cases": results})
+                stale = _today() != began
+                runs.append({"run": number, "date": began.isoformat(), "stale": stale, "passed": passed, "total": len(results), "cases": results})
+                if stale:
+                    print(f"{parser.prog}: the date changed during run {number}.", file=sys.stderr)
                 print(f"PASS {passed}/{len(results)}")
                 for result in results:
                     if not result["ok"]:
@@ -852,13 +912,12 @@ def main(argv: list[str] | None = None) -> int:
     except Exception as error:
         print(f"{parser.prog}: error: the run could not start or continue ({type(error).__name__}).", file=sys.stderr)
         return 2
-    allPass = all(run["passed"] == run["total"] for run in runs)
+    allPass = all(run["passed"] == run["total"] and not run["stale"] for run in runs)
     report = {
         "gitSha": _gitSha(),
         "engine": args.engine,
         "project": args.project,
         "modelStub": bool(stub),
-        "expectedOn": asOf,
         "runCount": args.runs,
         "allRunsPass": allPass,
         "storage": storage,
