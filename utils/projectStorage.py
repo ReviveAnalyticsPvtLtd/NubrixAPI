@@ -61,7 +61,17 @@ def authHeaders() -> dict:
 
 def _requireSuccess(response: httpx.Response) -> None:
     if not response.is_success:
-        raise StorageReadError(f"Storage answered {response.status_code} for {response.url.path}.")
+        error = StorageReadError(f"Storage answered {response.status_code} for {response.url.path}.")
+        error.statusCode = response.status_code
+        if response.status_code == 400 and not response.is_stream_consumed:
+            raise error
+        if response.status_code == 400:
+            try:
+                if str(response.json().get("statusCode")) == "404":
+                    error.statusCode = 404
+            except (ValueError, AttributeError):
+                pass
+        raise error
 
 
 def readBytes(projectId: str, fileName: str) -> bytes:
@@ -81,19 +91,26 @@ def readJson(projectId: str, fileName: str) -> dict | list:
     return json.loads(readBytes(projectId, fileName))
 
 
-def readTableBytes(projectId: str, tableName: str) -> bytes:
+def _tableObject(projectId: str, tableName: str, reference=None) -> str:
+    from api.services.ingestion.catalog import resolveTableVersion
+
+    reference = reference or resolveTableVersion(projectId, tableName)
+    return reference.objectName if reference else f"{tableName}.parquet"
+
+
+def readTableBytes(projectId: str, tableName: str, *, reference=None) -> bytes:
     """Read a table's whole parquet file."""
-    return readBytes(projectId, f"{tableName}.parquet")
+    return readBytes(projectId, _tableObject(projectId, tableName, reference))
 
 
-def downloadTable(projectId: str, tableName: str, path: str, cancelled: threading.Event | None = None) -> None:
+def downloadTable(projectId: str, tableName: str, path: str, cancelled: threading.Event | None = None, *, reference=None) -> None:
     """Stream a table's parquet file to a new file, so a big table is never held in memory.
 
     Setting `cancelled` stops it at the next chunk.
     """
     with httpx.stream(
         "GET",
-        objectUrl(projectId, f"{tableName}.parquet"),
+        objectUrl(projectId, _tableObject(projectId, tableName, reference)),
         headers=authHeaders(),
         timeout=_READ_TIMEOUT_SECONDS,
         verify=_sslContext(),
@@ -173,11 +190,13 @@ def openTableFile(projectId: str, tableName: str):
     """
     headers = {**authHeaders(), "Accept-Encoding": "identity"}
     with httpx.Client(headers=headers, timeout=_READ_TIMEOUT_SECONDS, verify=_sslContext()) as client:
-        yield _TableFile(client, objectUrl(projectId, f"{tableName}.parquet"))
+        yield _TableFile(client, objectUrl(projectId, _tableObject(projectId, tableName)))
 
 
 def readTablePage(projectId: str, tableName: str, offset: int, limit: int) -> tuple:
     """Return `(rows, totalRows)` for one page. See `storedTables.readStoredTablePage`, which decodes it."""
+    from api.services.ingestion.catalog import pinTableVersions
     from utils.storedTables import readStoredTablePage
 
-    return readStoredTablePage(projectId, tableName, offset, limit)
+    with pinTableVersions(projectId):
+        return readStoredTablePage(projectId, tableName, offset, limit)

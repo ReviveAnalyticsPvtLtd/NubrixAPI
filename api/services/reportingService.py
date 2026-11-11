@@ -20,6 +20,7 @@ from utils.storedTables import tableReadException
 from concurrent.futures import ThreadPoolExecutor
 from utils.initMethods import fetch_data, scan_data
 from utils.projectStorage import authHeaders, objectUrl
+from api.services.ingestion.catalog import catalogEnabled, readProjectCatalog, resolveTableVersion
 from nubrix.utils import readYaml
 from utils.logger import logger
 from api.commons import client
@@ -130,6 +131,10 @@ class ReportingService:
     async def _getProjectMetadata(self, projectId: str) -> dict:
         """Fetch project metadata with a two-layer cache + per-table size hint annotation.
         Returns only active tables (isActive != False)."""
+        if catalogEnabled():
+            metadata = await asyncio.to_thread(readProjectCatalog, projectId)
+            self._augment_with_size_hints(metadata, projectId)
+            return self._filterActive(metadata)
         cached = self._metadataCache.get(projectId)
         if cached and (time.time() - cached[0]) < self._metadataCacheTtl:
             return self._filterActive(cached[1])
@@ -752,7 +757,8 @@ class ReportingService:
         """
         try:
             dataFile = "".join([panelChartDetails.dataSource, ".parquet"])
-            if dataFile in [x.get("name") for x in self.client.storage.from_("AnalyticsHub").list(path = panelChartDetails.projectId, options = {"search": dataFile})]:
+            published = await asyncio.to_thread(resolveTableVersion, panelChartDetails.projectId, panelChartDetails.dataSource)
+            if published or dataFile in [x.get("name") for x in self.client.storage.from_("AnalyticsHub").list(path = panelChartDetails.projectId, options = {"search": dataFile})]:
                 response = await asyncio.to_thread(
                     self._generatePanelChart,
                     projectId=panelChartDetails.projectId,

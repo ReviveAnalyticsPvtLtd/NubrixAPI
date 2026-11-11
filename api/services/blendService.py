@@ -12,6 +12,7 @@ __all__ = ["blendService"]
 from api.commons import updateProjectModifiedAt
 from utils.exceptionHandler import CustomException
 from utils.projectStorage import readJson
+from api.services.ingestion.catalog import readProjectCatalog
 from utils.logger import logger
 from api.commons import client
 from api.models import (
@@ -89,7 +90,7 @@ class BlendService:
                 ]
             else:
                 blends, blendedTables = list(), list()
-            metadata = readJson(projectId, "metadata.json")
+            metadata = readProjectCatalog(projectId, readLegacy=readJson)
             rawTables = [k for k, v in metadata.items() if not k.startswith("_") and v.get("isActive", True) is not False]
             dataSources = {
                 "blends": blends,
@@ -116,7 +117,7 @@ class BlendService:
             CustomException: For any errors during extraction.
         """
         try:
-            metadata = readJson(details.projectId, "metadata.json")
+            metadata = readProjectCatalog(details.projectId, readLegacy=readJson)
             if details.tableName in metadata.keys():
                 if metadata[details.tableName].get("isActive", True) is False:
                     raise CustomException(

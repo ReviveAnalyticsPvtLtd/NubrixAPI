@@ -32,6 +32,7 @@ from collections import OrderedDict
 from utils.logger import logger
 from utils.projectStorage import downloadTable, objectUrl, readTableBytes
 from utils.storedTables import decodeStoredTable
+from api.services.ingestion.catalog import resolveTableVersion
 from typing import Callable, Iterable
 
 try:
@@ -373,6 +374,9 @@ def _store_file_in_redis(redis_key: str, path: str) -> None:
 
 def _load_table(projectId: str, tableName: str) -> "pa.Table":
     """Arrow LRU → table source in a sandbox child, Redis → Supabase everywhere else."""
+    if _TABLE_SOURCE is None and (reference := resolveTableVersion(projectId, tableName)):
+        # API snapshots are bounded; bypass alias caches so a publish is visible to every worker.
+        return decodeStoredTable(projectId, tableName, readTableBytes(projectId, tableName, reference=reference))
     cache_key = (projectId, tableName)
     table = _cache_get(cache_key)
     if table is None:
@@ -401,6 +405,11 @@ def spool_table(projectId: str, tableName: str, pathStem: str, cancelled: thread
     worker can leave stale.
     """
     objectUrl(projectId, f"{tableName}.parquet")  # Refuses a bad name before it reaches Redis or the disk.
+    reference = resolveTableVersion(projectId, tableName)
+    if reference is not None:
+        path = f"{pathStem}.parquet"
+        downloadTable(projectId, tableName, path, cancelled, reference=reference)
+        return path
     redis_key = f"{projectId}::{tableName}"
     blob = _read_redis_bytes(redis_key)
     if blob:
@@ -502,6 +511,11 @@ def classify_table_size(projectId: str, tableName: str) -> dict:
     table isn't in the in-process LRU, then to this worker's last seen shape,
     then to ``None`` if no signal exists.
     """
+    reference = resolveTableVersion(projectId, tableName)
+    if reference is not None:
+        sizeClass = _classify_rows(reference.rowCount)
+        return {"rows_estimate": reference.rowCount, "columns": reference.columnCount,
+                "size_class": sizeClass, "hint": _SIZE_HINTS[sizeClass]}
     cache_key = (projectId, tableName)
     table = _cache_get(cache_key)
     if table is not None:

@@ -19,6 +19,7 @@ from pymongo.server_api import ServerApi
 from fastapi import Form, UploadFile
 from sqlalchemy import URL, create_engine
 from utils.projectStorage import readJson
+from api.services.ingestion.catalog import isRegisteredTable
 from utils.logger import logger
 from utils.sandboxSlots import isBusy
 from utils.storedTables import tableWriteException, writeStoredTableToPath
@@ -643,6 +644,11 @@ class DataLoadService:
             CustomException: If deletion or metadata update fails.
         """
         try:
+            if isRegisteredTable(tableDetails.projectId, tableDetails.tableName):
+                raise CustomException(
+                    ValueError("This table is managed by an API source."),
+                    statusCode=409, uiMessage="Manage this dataset from its API source."
+                )
             _ = self.client.storage.from_("AnalyticsHub").remove(f"{tableDetails.projectId}/{tableDetails.tableName}" + ".parquet")
             jsonData = readJson(tableDetails.projectId, "metadata.json")
             jsonData.pop(tableDetails.tableName)
@@ -661,6 +667,8 @@ class DataLoadService:
                 logger.warning(f"Could not clear caches for deleted table {tableDetails.tableName}: {e}")
             updateProjectModifiedAt(tableDetails.projectId)
             return
+        except CustomException:
+            raise
         except Exception as e:
             exception  = CustomException(e)
             logger.error(exception)

@@ -11,6 +11,7 @@ __all__ = ["dashboardService"]
 
 from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor
 from api.commons import updateProjectModifiedAt
+from api.services.ingestion.catalog import catalogEnabled, currentTableVersions, isManagedAlias, pinTableVersions
 from utils.exceptionHandler import CustomException
 from utils.storageListing import listProjectFiles
 from utils.codeExecutor import replManager, _remove_code_fences
@@ -67,7 +68,8 @@ class DashboardService:
         return "```python\n" + code.strip() + "\n```"
 
     @staticmethod
-    def _applyFilterToAWidget(widget: dict, filters: list, codeExecutor: callable, projectId: str) -> dict:
+    def _applyFilterToAWidget(widget: dict, filters: list, codeExecutor: callable, projectId: str,
+                              references: dict | None = None) -> dict:
         """
         Apply filters to a widget's generated code and update its data accordingly.
         """
@@ -80,12 +82,18 @@ class DashboardService:
         ast.fix_missing_locations(tree)
         code = ast.unparse(tree)
         code = DashboardService._addCodeFences(code)
-        result = codeExecutor.run(code, projectId=projectId)
+        with pinTableVersions(projectId, references) as used:
+            result = codeExecutor.run(code, projectId=projectId)
         widget["generatedCode"] = code
+        managedWidget = bool(used or widget.get("dataVersions")) or any(name in code for name in (references or {}))
         try:
             resultDict = json.loads(result)
+            if managedWidget and (not isinstance(resultDict, dict) or "data" not in resultDict):
+                raise ValueError("The chart did not return data.")
             widget.update(resultDict)
-        except:
+        except (ValueError, TypeError):
+            if managedWidget:
+                raise ValueError("A chart using an API dataset could not be refreshed.") from None
             widgetChartType = widget.get("chartType")
             if widgetChartType == "card":
                 widget["data"] = None
@@ -94,6 +102,8 @@ class DashboardService:
                 datasets = dataKey.get("datasets")
                 for dataset in datasets:
                     dataset["data"] = list()
+        if managedWidget:
+            widget["dataVersions"] = used
         return widget
     
     @staticmethod
@@ -252,19 +262,20 @@ class DashboardService:
             dashboardConfig = readJson(details.projectId, "dashboardConfig.json")
             pageInfo = dashboardConfig.get(details.page)
             pageInfo["id"] = details.page
+            references = currentTableVersions(details.projectId)
             if (not details.filters) and (not details.refresh):
                 pass
             elif (details.filters) and (not details.refresh):
                 widgets = pageInfo.get("widgets")
                 numWidgets = len(widgets)
                 with ProcessPoolExecutor(max_workers = 4) as executor:
-                    results = executor.map(self._applyFilterToAWidget, widgets, [details.filters] * numWidgets, [replManager] * numWidgets, [details.projectId] * numWidgets)
+                    results = executor.map(self._applyFilterToAWidget, widgets, [details.filters] * numWidgets, [replManager] * numWidgets, [details.projectId] * numWidgets, [references] * numWidgets)
                 pageInfo["widgets"] = [x for x in results]
             elif (not details.filters) and (details.refresh):
                 widgets = pageInfo.get("widgets")
                 numWidgets = len(widgets)
                 with ProcessPoolExecutor(max_workers = 4) as executor:
-                    results = executor.map(self._applyFilterToAWidget, widgets, [details.filters] * numWidgets, [replManager] * numWidgets, [details.projectId] * numWidgets)
+                    results = executor.map(self._applyFilterToAWidget, widgets, [details.filters] * numWidgets, [replManager] * numWidgets, [details.projectId] * numWidgets, [references] * numWidgets)
                 pageInfo["widgets"] = [x for x in results] 
                 prevPageInfo = dashboardConfig.get(details.page)
                 for prevWidget in prevPageInfo.get("widgets"):
@@ -281,6 +292,16 @@ class DashboardService:
             else:
                 raise ValueError("Filters and Refresh cannot be implemented simultaneously.")
             widgets = pageInfo.get("widgets")
+            if references or (catalogEnabled() and any(widget.get("dataVersions") for widget in widgets or [])):
+                if details.filters or details.refresh:
+                    references = currentTableVersions(details.projectId)
+                current = {name: reference.versionId for name, reference in references.items()}
+                pageInfo["currentDataVersions"] = current
+                for widget in widgets or []:
+                    used = widget.get("dataVersions") or {}
+                    code = widget.get("generatedCode") or ""
+                    widget["dataStale"] = (any(current.get(name) != version for name, version in used.items()) or
+                                          any(name in code and name not in used for name in current))
             if isinstance(widgets, list):
                 for widget in widgets:
                     ensureScatterMapPointLabels(widget)
@@ -443,6 +464,7 @@ class DashboardService:
         """
         try:
             dataTables = ["".join(os.path.splitext(x.get("name"))[:-1]) for x in listProjectFiles(client, projectId) if x.get("name").endswith(".parquet")]
+            dataTables.extend(name for name in currentTableVersions(projectId) if name not in dataTables)
             with ThreadPoolExecutor(max_workers = 5) as executor:
                 results = executor.map(self._getDataTypes, [projectId] * len(dataTables), dataTables)
             results = list(results)
@@ -532,6 +554,8 @@ class DashboardService:
             else:
                 return {"status": "SUCCESS"}
             connections = databaseConnections.values()
+            if catalogEnabled() and any(isManagedAlias(connection.get("table")) for connection in connections):
+                raise ValueError("This table is managed by an API source.")
             with ThreadPoolExecutor(max_workers = 4) as executor:
                 futures = [executor.submit(self._pullData, connection) for connection in connections]
                 results = [x.result() for x in futures]

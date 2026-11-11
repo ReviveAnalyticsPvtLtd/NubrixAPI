@@ -13,6 +13,7 @@ __all__ = ["InsightContextBuilder"]
 
 from utils.exceptionHandler import CustomException
 from utils.projectStorage import readJson
+from api.services.ingestion.catalog import managedTableEntries
 from urllib.request import urlopen
 from utils.logger import logger
 from api.commons import client
@@ -149,6 +150,7 @@ class InsightContextBuilder:
             logger.info(f"Building insight context for project {projectId}.")
 
             metadata = self._loadJsonFromStorage(projectId, "metadata.json") or {}
+            metadata = {**metadata, **managedTableEntries(projectId)}
             metadata = {k: v for k, v in metadata.items() if not k.startswith("_") and v.get("isActive", True) is not False}
             dashboardConfig = self._loadJsonFromStorage(projectId, "dashboardConfig.json") or {}
             existingInsights = self._loadJsonFromStorage(projectId, "insights.json") or {}
