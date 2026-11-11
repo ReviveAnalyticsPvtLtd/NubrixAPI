@@ -151,7 +151,7 @@ class _Fakes:
       own run returned (default: the same chart); `rows[sql]` and `truncated[sql]` the query result behind it.
     - `filterSets`: the filter sets the spot check uses; `filtered(form, widget, filters)` what a filtered re-run of
       the saved Python ("python") or of the request ("sql") shows: a chart, or None for a failed run. By default both
-      show the saved chart.
+      show the saved chart. A form that still fails after the retry is diagnosed as deterministic (`_whyRerunFailed`).
     """
 
     def __init__(self, monkeypatch, plans=None, charts=None, finals=None, rows=None, truncated=None, filterSets=None, filtered=None):
@@ -217,6 +217,9 @@ class _Fakes:
         monkeypatch.setattr(conv, "_rerunUnderFilter", rerun)
         monkeypatch.setattr(conv, "_utcNow", lambda: NOW)
         monkeypatch.setattr(conv, "_schemasOf", lambda job, tables: {"orders": FAKE_ORDERS})
+        # Why a form failed under a filter: never a real run in these tests.
+        monkeypatch.setattr(conv, "_whyRerunFailed", lambda job, form, widget, request, filters: {"cause": "error key", "transient": False},
+                            raising=False)
 
 
 def _run(tmp_path, store, *extra):
@@ -1590,6 +1593,202 @@ def test_theRerunTablesAreAnOrderedTupleNotASet(tmp_path, monkeypatch):
     assert type(jobs[0].rerunTables) is tuple
     assert jobs[0].rerunTables == _metadataTableNames(INACTIVE_METADATA) == ("orders", "stores", "archive")
     assert jobs[0].tables == frozenset({"orders", "stores"})
+
+
+# Round 6, I1: the tables the saved Python reads
+
+
+def test_pythonThatReadsATableTheRequestDoesNotIsRefused(tmp_path, monkeypatch):
+    code = _python("t") + "\nold = fetch_data_pl('" + PROJECT + "', 'archive')"
+    fakes = _Fakes(monkeypatch, plans={"q": _request("one")}, charts={_sql("one"): SAVED})
+    store = FakeStore({CONFIG: _bytes(_config(_widget("w1", SAVED, code=code, query="q"))),
+                       "metadata.json": json.dumps(INACTIVE_METADATA).encode("utf-8")})
+    assert _run(tmp_path, store) == 0
+    entry = _entries(tmp_path)["w1"]
+    # A filter on `archive` (the dashboard offers every stored table's columns) narrows the Python and never the SQL.
+    assert (entry["verdict"], entry["field"], entry["reason"]) == ("differ", "filter", "pythonReadsOtherTable")
+    assert fakes.reruns == []
+    # The model still saw only the active tables.
+    assert [sorted(metadata) for metadata in fakes.metadatas] == [["orders", "stores"]]
+
+
+def test_pythonThatReadsOnlyTheRequestsTablesGoesOnToTheFilterCheck(tmp_path, monkeypatch):
+    fakes = _Fakes(monkeypatch, plans={"q": _request("one")}, charts={_sql("one"): SAVED})
+    store = FakeStore({CONFIG: _bytes(_config(_widget("w1", SAVED, query="q"))),
+                       "metadata.json": json.dumps(INACTIVE_METADATA).encode("utf-8")})
+    assert _run(tmp_path, store) == 0
+    assert _entries(tmp_path)["w1"]["verdict"] == "match" and fakes.reruns
+
+
+def test_theFilterProbesCoverEveryTableThePythonReadsInactiveOnesToo(monkeypatch):
+    probes, read = [], []
+    schemas = {
+        "orders": pa.schema([("region", pa.string()), ("revenue", pa.float64())]),
+        "archive": pa.schema([("status", pa.string()), ("closed", pa.date32())]),
+    }
+
+    def probe(job, sql):
+        probes.append(sql)
+        if "quantile_disc" in sql:
+            return [{"d0": 3, "lo": "2024-01-01", "hi": "2024-06-01"}]
+        if sql.startswith("SELECT COUNT"):
+            return [{"d0": 3}]
+        return [{"v": "Closed" if "archive" in sql else "East", "n": 2}]
+
+    monkeypatch.setattr(conv, "_probe", probe)
+    monkeypatch.setattr(conv, "_schemasOf", lambda job, tables: read.append(list(tables)) or {t: schemas[t] for t in tables if t in schemas})
+    job = SimpleNamespace(project=PROJECT, tables=frozenset({"orders"}), rerunTables=("orders", "archive"), config={})
+    request = _request("x", sql="SELECT region, SUM(revenue) AS s FROM orders GROUP BY region ORDER BY region")
+    widget = {"id": "w1", "generatedCode": "a = fetch_data_pl(p, 'orders')\nb = fetch_data_pl(p, 'archive')"}
+    sets = conv._filterSets(job, "page-1", widget, request)
+    assert read == [["orders", "archive"]]
+    assert any('FROM "archive"' in sql for sql in probes)
+    assert [{"archive.status": "Closed"}] in sets and [{"archive.closed": {"min": "2024-01-01", "max": "2024-06-01"}}] in sets
+
+
+def test_theProbeRunsOverTheTablesARefreshReads(monkeypatch):
+    calls = []
+    monkeypatch.setattr(conv, "renderChartRequest", lambda manager, project, request, tables, **kwargs: calls.append(tables) or {"data": [{"n": 1}]})
+    job = SimpleNamespace(project=PROJECT, manager=object(), tables=frozenset({"orders"}), rerunTables=("orders", "archive"))
+    assert conv._probe(job, 'SELECT COUNT(*) AS n FROM "archive"') == [{"n": 1}]
+    assert calls == [("orders", "archive")]
+
+
+# Round 6, M1: one side failing under a filter
+
+
+def _flaky(failures):
+    """`filtered` for _Fakes: `failures[form]` is how many times that form's filtered run fails before it works."""
+    seen = {"python": 0, "sql": 0}
+
+    def filtered(form, widget, filters):
+        seen[form] += 1
+        return None if seen[form] <= failures.get(form, 0) else _visible(widget)
+
+    return filtered
+
+
+@pytest.mark.parametrize("form,side", [("python", "python"), ("sql", "request")])
+def test_aTransientOneSidedFailureIsAFailedVerdict(tmp_path, monkeypatch, form, side):
+    fakes = _Fakes(monkeypatch, plans={"q": _request("one")}, charts={_sql("one"): SAVED}, filtered=_flaky({form: 9}))
+    asked = []
+    monkeypatch.setattr(conv, "_whyRerunFailed", lambda job, form_, widget, request, filters: asked.append(form_) or
+                        {"cause": "timed out", "transient": True})
+    store = _store(_config(_widget("w1", SAVED, query="q")))
+    assert _run(tmp_path, store) == 0
+    entry = _entries(tmp_path)["w1"]
+    assert (entry["verdict"], entry["step"], entry["stage"], entry["transient"]) == ("failed", "filter", "timed out", True)
+    assert entry["failedSides"] == {side: "timed out"} and entry["filterIndex"] == 0
+    # The pair ran twice (the retry), then the failing form once more on its own to learn why.
+    assert len(fakes.reruns) == 4 and asked == [form]
+
+
+def test_aDeterministicOneSidedFailureStaysADifference(tmp_path, monkeypatch, capsys):
+    _Fakes(monkeypatch, plans={"q": _request("one")}, charts={_sql("one"): SAVED}, filtered=_flaky({"sql": 9}))
+    monkeypatch.setattr(conv, "_whyRerunFailed", lambda job, form, widget, request, filters: {"cause": "check", "transient": False})
+    store = _store(_config(_widget("w1", SAVED, query="q")))
+    assert _run(tmp_path, store) == 0
+    entry = _entries(tmp_path)["w1"]
+    assert (entry["verdict"], entry["field"], entry["filterDetail"]) == ("differ", "filter", "request failed")
+    assert entry["failedSides"] == {"request": "check"} and "transient" not in entry
+    # Standard output holds counts only.
+    assert all(line.split()[0] in {"widgets", "candidates", "match", "differ", "failed", "skipped", "filters", "written", "backup"}
+               for line in _stdout(capsys))
+
+
+def test_aOneSidedFailureThatWorksOnTheRetryIsCompared(tmp_path, monkeypatch):
+    fakes = _Fakes(monkeypatch, plans={"q": _request("one")}, charts={_sql("one"): SAVED}, filtered=_flaky({"python": 1}))
+    monkeypatch.setattr(conv, "_whyRerunFailed", lambda *args: pytest.fail("no diagnosis after a retry that worked"))
+    store = _store(_config(_widget("w1", SAVED, query="q")))
+    assert _run(tmp_path, store) == 0
+    entry = _entries(tmp_path)["w1"]
+    assert (entry["verdict"], entry["filtersCompared"], entry["filterRetries"]) == ("match", 1, 1)
+    assert len(fakes.reruns) == 4
+
+
+def test_aRetryWhereBothFailIsNeverTakenAsBothEmpty(tmp_path, monkeypatch):
+    # First try: only the request fails; the retry: both fail. Not the "both empty" case of a filter that empties both.
+    calls = {"n": 0}
+
+    def filtered(form, widget, filters):
+        calls["n"] += 1
+        return _visible(widget) if calls["n"] == 1 else None
+
+    _Fakes(monkeypatch, plans={"q": _request("one")}, charts={_sql("one"): SAVED}, filtered=filtered)
+    monkeypatch.setattr(conv, "_whyRerunFailed", lambda job, form, widget, request, filters: {"cause": "error key", "transient": False})
+    store = _store(_config(_widget("w1", SAVED, query="q")))
+    assert _run(tmp_path, store) == 0
+    entry = _entries(tmp_path)["w1"]
+    assert (entry["verdict"], entry["filterDetail"]) == ("differ", "both failed")
+    assert entry["failedSides"] == {"python": "error key", "request": "error key"}
+
+
+def _stoppedOutput(text):
+    return "partial output\n" + text
+
+
+@pytest.mark.parametrize("output,cause,transient", [
+    ("Execution timed out after 300 seconds.", "timed out", True),
+    (_stoppedOutput("Execution timed out after 300 seconds."), "timed out", True),
+    ("Concurrency limit reached: Too many running code execution tasks.", "concurrency limit", True),
+    ("The run was stopped: the server ran out of memory.", "stopped", True),
+    (_stoppedOutput("The run was stopped: it used more than 60 CPU-seconds."), "stopped", True),
+    ("Traceback (most recent call last):\n  File \"<run>\", line 1, in <module>\nMemoryError", "MemoryError", True),
+    ("Traceback (most recent call last):\n  File \"<run>\", line 1, in <module>\nKeyError: 'x'", "KeyError", False),
+    ('{"error": "no such column"}', "error key", False),
+    ("not json at all", "not JSON", False),
+    ('{"title": "t"}', "ranOnDiagnosis", True),
+])
+def test_whyThePythonFailedUnderAFilter(monkeypatch, output, cause, transient):
+    from utils import codeExecutor
+
+    calls = []
+    monkeypatch.setattr(codeExecutor.replManager, "run", lambda code, projectId=None, filters=None: calls.append((code, projectId, filters)) or output)
+    job = SimpleNamespace(project=PROJECT, rerunTables=("orders",))
+    widget = {"id": "w1", "generatedCode": "```python\nprint(1)\n```"}
+    filters = [{"orders.region": "East"}]
+    assert conv._whyRerunFailed(job, "python", widget, None, filters) == {"cause": cause, "transient": transient}
+    assert calls == [("print(1)", PROJECT, filters)]
+
+
+def test_aBusySandboxIsATransientPythonFailure(monkeypatch):
+    from utils import codeExecutor
+
+    def run(code, projectId=None, filters=None):
+        raise SandboxBusyError(BUSY_MESSAGE)
+
+    monkeypatch.setattr(codeExecutor.replManager, "run", run)
+    job = SimpleNamespace(project=PROJECT, rerunTables=("orders",))
+    assert conv._whyRerunFailed(job, "python", {"generatedCode": "print(1)"}, None, []) == {"cause": "busy", "transient": True}
+
+
+@pytest.mark.parametrize("error,cause,transient", [
+    (ChartFailure("timeout", "The query timed out."), "timeout", True),
+    (ChartFailure("run", "The run was stopped: the server ran out of memory."), "stopped", True),
+    (SandboxBusyError(BUSY_MESSAGE), "busy", True),
+    (ChartFailure("check", "no such table"), "check", False),
+    (ChartFailure("build", "bad column"), "build", False),
+    (ChartFailure("bind", "Binder Error"), "bind", False),
+    (ChartFailure("run", "The query run exited with code 1."), "run", False),
+    (None, "ranOnDiagnosis", True),
+])
+def test_whyTheRequestFailedUnderAFilter(monkeypatch, error, cause, transient):
+    from utils import codeExecutor
+
+    calls = []
+
+    def render(manager, project, request, tables, **kwargs):
+        calls.append((manager, project, request, tables, kwargs))
+        if error is not None:
+            raise error
+        return {"chartType": "bar"}
+
+    monkeypatch.setattr(conv, "renderChartRequest", render)
+    job = SimpleNamespace(project=PROJECT, rerunTables=("orders", "archive"))
+    request, filters = _request("one"), [{"orders.region": "East"}]
+    assert conv._whyRerunFailed(job, "sql", {"id": "w1"}, request, filters) == {"cause": cause, "transient": transient}
+    # The run a refresh makes: the service's manager, the refresh tables, the filters, lenient.
+    assert calls == [(codeExecutor.replManager, PROJECT, request, ("orders", "archive"), {"filters": filters, "lenient": True})]
 
 
 # The strict comparison

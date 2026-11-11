@@ -27,10 +27,16 @@ fails leaves the widget as Python, with a reason:
      ORDER BY that is unique by construction (`orderIsUnique`), with key values unique across today's rows as well
      when every key is an output column (`unstableOrder`), at any row count unless the query returns at most one row
      by construction (`singleRowByConstruction`).
-  5. Under every filter set (`_filterSets`), the saved Python and the request re-run through the dashboard's own filter
-     path (`DashboardService._rerunWidgetProduced`, given the same ordered table tuple as a refresh) must strictly
-     agree, and at least one set must be one both forms ran (`filter`); no filter set at all is `filter`.
-Generation, the SQL check, the schema reads and the filter probes see only the active tables, as the model does.
+  5. The saved Python must read no table the request does not read (`filter`, reason `pythonReadsOtherTable`): the
+     dashboard offers filters on every stored table, and a filter on such a table narrows only the Python. Then under
+     every filter set (`_filterSets`), the saved Python and the request re-run through the dashboard's own filter path
+     (`DashboardService._rerunWidgetProduced`, given the same ordered table tuple as a refresh) must strictly agree,
+     and at least one set must be one both forms ran (`filter`); no filter set at all is `filter`. When only one form
+     fails under a set, the pair is re-run once; if one still fails, that form runs once more on its own to learn why
+     (`_whyRerunFailed`): a timeout, a busy sandbox or a run stopped by a limit is `failed` (step `filter`,
+     `transient`), so the job can be run again; any other cause stays `filter`. Neither is ever a match.
+Generation, the SQL check and the schema reads of the request see only the active tables, as the model does. The
+job's own filter probes run over the refresh tuple, so they reach every table the Python names.
 Only a converted widget's `generatedCode` changes; its title, layout, id and saved data stay as they are.
 
 Candidates: a widget whose `decodeGeneratedCode` is None, that is not a `panelChart(...)` template, not a
@@ -1028,9 +1034,14 @@ def _isDateLike(dataType: pa.DataType) -> bool:
 
 
 def _probe(job, sql: str) -> list[dict]:
-    """The rows of a small read-only query over the project's tables, run like a chart query (sandbox, SQL check)."""
+    """
+    The rows of a small read-only query over the project's tables, run like a chart query (sandbox, SQL check).
+
+    The query is the job's own fixed SQL, never model output, so it is checked against the tables a refresh reads
+    (`job.rerunTables`, inactive ones included): it must reach every table the saved Python can read.
+    """
     request = ChartRequest.model_validate({"chartType": "table", "title": "probe", "sql": sql, "encoding": {}})
-    return renderChartRequest(job.manager, job.project, request, job.tables, filters=None, lenient=True)["data"]
+    return renderChartRequest(job.manager, job.project, request, job.rerunTables, filters=None, lenient=True)["data"]
 
 
 def _schemasOf(job, tables: list[str]) -> dict[str, pa.Schema]:
@@ -1062,7 +1073,8 @@ def _filterSets(job, pageId: str, widget: dict, request: ChartRequest) -> list[l
     The filter sets a widget is checked under, one set per re-run.
 
     Every filter list the config defines, then for each table the widget reads (the tables the request's SQL reads,
-    then active tables the Python names in a string literal, in name order): one text column at its most frequent
+    then the tables the Python names in a string literal among every table a refresh reads, inactive ones included,
+    in name order): one text column at its most frequent
     value, the column with the fewest distinct values (at least two) among the first 20 text columns, columns the
     request or the Python name first; and one date or timestamp column (named ones first) over the middle half of its
     values (the 25th to the 75th percentile). A table with neither costs no query.
@@ -1083,7 +1095,7 @@ def _filterSets(job, pageId: str, widget: dict, request: ChartRequest) -> list[l
 
     code = widget.get("generatedCode") or ""
     tables = list(checkSql(request.sql, job.tables).tables)
-    tables += [name for name in sorted(job.tables) if name not in tables and re.search(r"(['\"])" + re.escape(name) + r"\1", code)]
+    tables += [name for name in sorted(job.rerunTables) if name not in tables and _namesTable(code, name)]
     tree = _parsed(request.sql)
     named = {column.name for column in tree.find_all(exp.Column)} if tree is not None else set()
     schemas = _schemasOf(job, tables)
@@ -1117,6 +1129,79 @@ def _filterSets(job, pageId: str, widget: dict, request: ChartRequest) -> list[l
     return sets
 
 
+def _namesTable(code: str, name: str) -> bool:
+    """The code names the table in a string literal, as `fetch_data_pl(projectId, 'orders')` does."""
+    return re.search(r"(['\"])" + re.escape(name) + r"\1", code) is not None
+
+
+def _pythonOnlyTables(job, widget: dict, request: ChartRequest) -> list[str]:
+    """
+    I1: the tables the saved Python names (among every table a refresh reads, inactive ones included) that the request
+    does not read. The dashboard offers filters on every stored table, so a filter on one of these would narrow the
+    Python and never the request. Names compare exactly: a case-only match is a different stored table.
+    """
+    from nubrix.components.sqlCheck import checkSql
+
+    code = widget.get("generatedCode")
+    code = code if isinstance(code, str) else ""
+    read = set(checkSql(request.sql, job.tables).tables)
+    return [name for name in job.rerunTables if name not in read and _namesTable(code, name)]
+
+
+# M1: why a form failed under a filter. Transient causes make the widget `failed`, so the job can be run again.
+_TRANSIENT_CAUSES = {
+    "python": frozenset({"timed out", "concurrency limit", "stopped", "busy", "MemoryError", "ranOnDiagnosis"}),
+    "sql": frozenset({"timeout", "stopped", "busy", "ranOnDiagnosis"}),
+}
+
+
+def _whyRerunFailed(job, form: str, widget: dict, request: ChartRequest | None, filters: list) -> dict:
+    """
+    Run a form that failed under a filter once more, on its own and as the dashboard runs it, to learn why.
+
+    - `sql`: `renderChartRequest` with the service's manager, the refresh tables, the filters, lenient. The cause is
+      the `ChartFailure` stage, or `stopped` for a run a limit stopped (memory, CPU).
+    - `python`: the service's `replManager.run`, then `_pythonResult`. The cause is the `_RerunFailure` kind (`timed
+      out`, `concurrency limit`, an exception class, `not JSON`, `error key`), or `stopped`/`timed out` when the
+      output ends with the sandbox's stop sentence.
+    A busy sandbox is `busy`; a run that now works is `ranOnDiagnosis`. Transient (`_TRANSIENT_CAUSES`): a timeout,
+    a busy sandbox, a run stopped by a limit or out of memory, or one that now works. Anything else (check, bind,
+    build, run, not JSON, error key, another exception) is deterministic. The cause is a fixed word, never output.
+    """
+    from utils.codeExecutor import _remove_code_fences, replManager
+    from utils.sandboxSlots import SandboxBusyError, isBusy
+
+    try:
+        if form == "sql":
+            renderChartRequest(replManager, job.project, request, job.rerunTables, filters=filters, lenient=True)
+            cause = "ranOnDiagnosis"
+        else:
+            from api.services.dashboardService import _pythonResult, _RerunFailure
+
+            code = widget.get("generatedCode")
+            if isinstance(code, str) and "```" in code:
+                code = _remove_code_fences(code)
+            output = replManager.run(code, projectId=job.project, filters=filters)
+            lines = [line.strip() for line in output.splitlines() if line.strip()] if isinstance(output, str) else []
+            last = lines[-1] if lines else ""
+            if last.startswith("Execution timed out"):
+                cause = "timed out"
+            elif last.startswith("The run was stopped"):
+                cause = "stopped"
+            else:
+                try:
+                    _pythonResult(output)
+                    cause = "ranOnDiagnosis"
+                except _RerunFailure as failure:
+                    cause = failure.kind
+    except ChartFailure as failure:
+        stopped = failure.stage == "run" and str(failure.message).startswith("The run was stopped")
+        cause = "stopped" if stopped else failure.stage
+    except Exception as error:
+        cause = "busy" if isinstance(error, SandboxBusyError) or isBusy(error) else type(error).__name__
+    return {"cause": cause, "transient": cause in _TRANSIENT_CAUSES.get(form, frozenset())}
+
+
 def _rerunUnderFilter(widget: dict, filters: list, projectId: str, rerunTables: Sequence[str]) -> tuple[dict, dict | None]:
     """The dashboard's own filtered re-run of one saved widget (`getData` with filters), in the widget's own form, over
     the ordered table tuple `getData` passes."""
@@ -1128,9 +1213,14 @@ def _rerunUnderFilter(widget: dict, filters: list, projectId: str, rerunTables: 
 def _filterCheck(job, pageId: str, widget: dict, request: ChartRequest, entry: dict) -> None:
     """Re-run the Python and the request under each filter set; every pair must show the same chart."""
     try:
-        sets = _filterSets(job, pageId, widget, request)
+        others = _pythonOnlyTables(job, widget, request)
+        sets = [] if others else _filterSets(job, pageId, widget, request)
     except Exception as error:
         entry.update(verdict="failed", step="filter", **_failure(error))
+        return
+    if others:
+        # A filter on such a table narrows the Python and never the request. The names stay out of the report.
+        entry.update(verdict="differ", field="filter", reason="pythonReadsOtherTable")
         return
     entry["filters"] = sets
     entry["filtersChecked"] = 0
@@ -1145,15 +1235,35 @@ def _filterCheck(job, pageId: str, widget: dict, request: ChartRequest, entry: d
         try:
             python, pythonProduced = _rerunUnderFilter(widget, filters, job.project, job.rerunTables)
             sql, sqlProduced = _rerunUnderFilter(converted, filters, job.project, job.rerunTables)
+            failing = None
+            if (pythonProduced is None) != (sqlProduced is None):
+                # M1: one form failed. The pair runs once more before anything is concluded.
+                entry["filterRetries"] = entry.get("filterRetries", 0) + 1
+                python, pythonProduced = _rerunUnderFilter(widget, filters, job.project, job.rerunTables)
+                sql, sqlProduced = _rerunUnderFilter(converted, filters, job.project, job.rerunTables)
+                if pythonProduced is None or sqlProduced is None:
+                    # Still failing (both now count too: the first try showed one form works).
+                    failing = {}
+                    if pythonProduced is None:
+                        failing["python"] = _whyRerunFailed(job, "python", widget, request, filters)
+                    if sqlProduced is None:
+                        failing["request"] = _whyRerunFailed(job, "sql", converted, request, filters)
+            elif pythonProduced is None:
+                # Both fail, and the dashboard shows the same empty chart for both.
+                continue
         except Exception as error:
             entry.update(verdict="failed", step="filter", filterIndex=index, **_failure(error))
             return
-        if pythonProduced is None and sqlProduced is None:
-            # Both fail, and the dashboard shows the same empty chart for both.
-            continue
-        if pythonProduced is None or sqlProduced is None:
-            entry.update(verdict="differ", field="filter", filterIndex=index,
-                         filterDetail="python failed" if pythonProduced is None else "request failed")
+        if failing is not None:
+            causes = {side: why["cause"] for side, why in failing.items()}
+            transient = [why["cause"] for why in failing.values() if why["transient"]]
+            if transient:
+                entry.update(verdict="failed", step="filter", filterIndex=index, stage=transient[0], transient=True,
+                             failedSides=causes)
+            else:
+                detail = "both failed" if len(failing) == 2 else f"{next(iter(failing))} failed"
+                entry.update(verdict="differ", field="filter", filterIndex=index, filterDetail=detail,
+                             failedSides=causes)
             return
         verdict, field = verdictOf(python, sql)
         if verdict == "match" and python.get("title") != sql.get("title"):
