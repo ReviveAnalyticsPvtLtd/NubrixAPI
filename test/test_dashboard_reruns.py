@@ -29,11 +29,14 @@ def _widget(widgetId, code=PYTHON, chartType="card", **extra) -> dict:
     return widget
 
 
-def _setup(monkeypatch, widgets, run=None, render=None):
+METADATA = {"orders": {}, "old": {"isActive": False}}
+
+
+def _setup(monkeypatch, widgets, run=None, render=None, metadata=None):
     from api.services import dashboardService as module
 
     store = {"pg": {"name": "n", "widgets": copy.deepcopy(widgets)}}
-    files = {"dashboardConfig.json": store, "metadata.json": {"orders": {}, "old": {"isActive": False}}}
+    files = {"dashboardConfig.json": store, "metadata.json": METADATA if metadata is None else metadata}
     monkeypatch.setattr(module, "readJson", lambda projectId, name: files[name])
     manager = MagicMock()
     manager.run.side_effect = run or (lambda code, projectId=None, filters=None: json.dumps({"data": "new"}))
@@ -70,7 +73,7 @@ def test_filterRunsChartRequestWidgetLeniently(monkeypatch):
     page = service.getData(GetData(projectId="p1", page="pg", filters=FILTERS))
 
     args, kwargs = renderer.call_args
-    assert args[1] == "p1" and args[3] == frozenset({"orders"})
+    assert args[1] == "p1" and args[3] == ("orders", "old")
     assert kwargs["lenient"] is True and kwargs["filters"] == FILTERS
     manager.run.assert_not_called()
     widget = page["widgets"][0]
@@ -286,11 +289,82 @@ def logLines(monkeypatch):
     return recorder.lines
 
 
-def test_unreadableMetadataFailsOnlyTheChartRequestWidgetsUnderAFilter(monkeypatch, logLines):
+STORED_FILES = [
+    {"name": "orders.parquet"}, {"name": "old.parquet"}, {"name": "metadata.json"},
+    {"name": "dashboardConfig.json"}, {"name": "someFolder"}, {"name": None},
+]
+
+
+def _storedFiles(monkeypatch, files=STORED_FILES, error=None):
+    """Replace the project folder listing; returns the projects it was asked for."""
+    from api.services import dashboardService as module
+
+    asked = []
+
+    def listing(client, projectId):
+        asked.append(projectId)
+        if error is not None:
+            raise error
+        return copy.deepcopy(files)
+
+    monkeypatch.setattr(module, "listProjectFiles", listing)
+    return asked
+
+
+def test_unreadableMetadataRerunsChartRequestWidgetsFromTheStoredTablesUnderAFilter(monkeypatch, logLines):
     code = _request()
     saved = [_widget("R", code, "bar", data={"datasets": [{"data": [1]}]}), _widget("P")]
     service, manager, renderer = _setup(monkeypatch, saved)
     _unreadableMetadata(monkeypatch)
+    asked = _storedFiles(monkeypatch)
+
+    page = service.getData(GetData(projectId="p1", page="pg", filters=FILTERS))
+
+    chartRequest, python = page["widgets"]
+    assert chartRequest["data"] == "new" and chartRequest["generatedCode"] == code and chartRequest["id"] == "R"
+    assert python["data"] == "new"
+    args, kwargs = renderer.call_args
+    assert args[3] == ("old", "orders") and kwargs["filters"] == FILTERS
+    assert asked == ["p1"]
+    manager.run.assert_called_once()
+    assert any("table list" in line for line in logLines)
+    assert not any("secret-table-name" in line for line in logLines)
+
+
+def test_unreadableMetadataRefreshSavesChartRequestDataFromTheStoredTables(monkeypatch):
+    saved = [_widget("R", _request(), "bar"), _widget("P")]
+    service, _, renderer = _setup(monkeypatch, saved)
+    _unreadableMetadata(monkeypatch)
+    _storedFiles(monkeypatch)
+
+    page = service.getData(GetData(projectId="p1", page="pg", refresh=True))
+
+    assert [w["data"] for w in page["widgets"]] == ["new", "new"]
+    assert [w["data"] for w in _uploaded(service)["pg"]["widgets"]] == ["new", "new"]
+    assert renderer.call_args.args[3] == ("old", "orders")
+
+
+@pytest.mark.parametrize("metadata", [["orders"], "orders", None])
+def test_metadataThatIsNotAnObjectFallsBackToTheStoredTables(monkeypatch, metadata):
+    from api.services import dashboardService as module
+
+    service, _, renderer = _setup(monkeypatch, [_widget("R", _request(), "bar")])
+    original = module.readJson
+    monkeypatch.setattr(module, "readJson", lambda projectId, name: metadata if name == "metadata.json" else original(projectId, name))
+    _storedFiles(monkeypatch)
+
+    page = service.getData(GetData(projectId="p1", page="pg", filters=FILTERS))
+
+    assert page["widgets"][0]["data"] == "new"
+    assert renderer.call_args.args[3] == ("old", "orders")
+
+
+def test_unreadableMetadataAndListingFailsOnlyTheChartRequestWidgetsUnderAFilter(monkeypatch, logLines):
+    code = _request()
+    saved = [_widget("R", code, "bar", data={"datasets": [{"data": [1]}]}), _widget("P")]
+    service, manager, renderer = _setup(monkeypatch, saved)
+    _unreadableMetadata(monkeypatch)
+    _storedFiles(monkeypatch, error=RuntimeError("listing said no secret-table-name"))
 
     page = service.getData(GetData(projectId="p1", page="pg", filters=FILTERS))
 
@@ -304,10 +378,11 @@ def test_unreadableMetadataFailsOnlyTheChartRequestWidgetsUnderAFilter(monkeypat
     assert not any("secret-table-name" in line for line in logLines)
 
 
-def test_unreadableMetadataKeepsSavedChartRequestDataOnRefresh(monkeypatch):
+def test_unreadableMetadataAndListingKeepsSavedChartRequestDataOnRefresh(monkeypatch):
     saved = [_widget("R", _request(), "bar"), _widget("P")]
-    service, manager, renderer = _setup(monkeypatch, saved)
+    service, _, renderer = _setup(monkeypatch, saved)
     _unreadableMetadata(monkeypatch)
+    _storedFiles(monkeypatch, error=RuntimeError("listing said no"))
 
     page = service.getData(GetData(projectId="p1", page="pg", refresh=True))
 
@@ -316,13 +391,35 @@ def test_unreadableMetadataKeepsSavedChartRequestDataOnRefresh(monkeypatch):
     renderer.assert_not_called()
 
 
+def test_busyWhileListingTheStoredTablesStillGives503(monkeypatch):
+    service, _, _ = _setup(monkeypatch, [_widget("R", _request(), "bar")])
+    _unreadableMetadata(monkeypatch)
+    _storedFiles(monkeypatch, error=SandboxBusyError())
+
+    with pytest.raises(CustomException) as caught:
+        service.getData(GetData(projectId="p1", page="pg", filters=FILTERS))
+
+    assert caught.value.statusCode == 503
+
+
+def test_readableMetadataNeverListsTheStoredTables(monkeypatch):
+    service, _, _ = _setup(monkeypatch, [_widget("R", _request(), "bar")])
+    asked = _storedFiles(monkeypatch)
+
+    service.getData(GetData(projectId="p1", page="pg", filters=FILTERS))
+
+    assert asked == []
+
+
 def test_unreadableMetadataWithOnlyPythonWidgetsIsNeverRead(monkeypatch):
     service, _, _ = _setup(monkeypatch, [_widget("P")])
     _unreadableMetadata(monkeypatch)
+    asked = _storedFiles(monkeypatch)
 
     page = service.getData(GetData(projectId="p1", page="pg", filters=FILTERS))
 
     assert page["widgets"][0]["data"] == "new"
+    assert asked == []
 
 
 def test_busyWhileReadingMetadataStillGives503(monkeypatch):
@@ -635,7 +732,7 @@ def test_aSavedSqlChartReRunsThroughTheSqlPathAndGivesTheSameChart(monkeypatch):
 
     filtered = service.getData(GetData(projectId="p1", page="pg", filters=FILTERS))["widgets"][0]
     args, kwargs = renderer.call_args
-    assert args[2] == servedRequest and args[3] == frozenset({"orders"})
+    assert args[2] == servedRequest and args[3] == ("orders", "old_table")
     assert kwargs == {"filters": FILTERS, "lenient": True}
     assert filtered["id"] == widgetId and filtered["generatedCode"] == served["generatedCode"]
     assert filtered["data"] == _sqlRender(None, "p1", servedRequest, None, filters=FILTERS)["data"]
@@ -691,3 +788,234 @@ def test_aFailedSqlChartSavedWithItsRawTextIsAFailedReRunThatChangesNothing(monk
     lines = _failureLines(logLines, "F1")
     assert len(lines) == 2 and all("(python)" in line for line in lines)
     assert not any("orders" in line or "SELECT" in line for line in lines)
+
+
+# A table switched to inactive: saved widgets on it keep working, in both forms. The SQL check is the real one.
+
+INACTIVE_PYTHON = "df = fetch_data('p1', 'old')\nprint(1)"
+
+
+def _requestOn(sql: str) -> str:
+    return encodeGeneratedCode(ChartRequest.model_validate({
+        "chartType": "bar", "title": "t", "sql": sql, "encoding": {"x": "a", "y": ["a"]},
+    }))
+
+
+def _realCheck(monkeypatch) -> list:
+    """Re-run ChartRequest widgets through the real `renderChartRequest` and SQL check; only the run and build are fakes.
+
+    Returns the (tables, filters) of every query that passed the check and reached the run.
+    """
+    from api.services import dashboardService as module
+    from nubrix.components import chartEngine
+
+    ran = []
+
+    def run(manager, projectId, checked, request, filters, waitForSlot=True):
+        ran.append((checked.tables, filters))
+        return MagicMock(table="rows", truncated=False)
+
+    monkeypatch.setattr(chartEngine, "runChartQuery", run)
+    monkeypatch.setattr(chartEngine, "buildChart", lambda request, table, truncated, lenient: {"chartType": "bar", "title": "t", "data": "new"})
+    monkeypatch.setattr(module, "renderChartRequest", chartEngine.renderChartRequest)
+    return ran
+
+
+def test_chartRequestOnAnInactiveTableRerunsLikeAPythonWidgetUnderAFilter(monkeypatch):
+    saved = [_widget("R", _requestOn("select a from old"), "bar"), _widget("P", INACTIVE_PYTHON)]
+    service, manager, _ = _setup(monkeypatch, saved)
+    ran = _realCheck(monkeypatch)
+
+    page = service.getData(GetData(projectId="p1", page="pg", filters=FILTERS))
+
+    assert [w["data"] for w in page["widgets"]] == ["new", "new"]
+    assert ran == [(("old",), FILTERS)]
+    assert manager.run.call_args.kwargs["filters"] == FILTERS
+    service.client.storage.from_.assert_not_called()
+
+
+def test_chartRequestOnAnInactiveTableRerunsLikeAPythonWidgetOnRefresh(monkeypatch):
+    saved = [_widget("R", _requestOn("select a from OLD join orders using (a)"), "bar"), _widget("P", INACTIVE_PYTHON)]
+    service, manager, _ = _setup(monkeypatch, saved)
+    ran = _realCheck(monkeypatch)
+
+    page = service.getData(GetData(projectId="p1", page="pg", refresh=True))
+
+    assert [w["data"] for w in page["widgets"]] == ["new", "new"]
+    assert [w["data"] for w in _uploaded(service)["pg"]["widgets"]] == ["new", "new"]
+    assert ran == [(("old", "orders"), None)]
+    assert manager.run.call_args.kwargs["filters"] is None
+
+
+def test_rerunTablesAreEveryTableEntryActiveOrNot(monkeypatch):
+    metadata = {
+        "orders": {"isActive": True}, "old": {"isActive": False}, "legacy": {},
+        "_settings": {"isActive": True}, "notATable": "text", "alsoNot": ["x"],
+    }
+    service, _, renderer = _setup(monkeypatch, [_widget("R", _request(), "bar")], metadata=metadata)
+
+    service.getData(GetData(projectId="p1", page="pg", filters=FILTERS))
+
+    assert renderer.call_args.args[3] == ("orders", "legacy", "old")
+
+
+@pytest.mark.parametrize("sql", [
+    "select a from ghost",
+    "select a from _settings",
+    "select a from 'old.parquet'",
+    "select a from main.old",
+    "select a from memory.main.old",
+    "select a from read_parquet('old.parquet')",
+])
+@pytest.mark.parametrize("refresh", [False, True])
+def test_rerunStillRefusesUnknownTablesFilesAndQualifiedNames(monkeypatch, sql, refresh):
+    metadata = {"orders": {}, "old": {"isActive": False}, "_settings": {}}
+    saved = _widget("R", _requestOn(sql), "bar", data={"datasets": [{"data": [1]}]})
+    service, _, _ = _setup(monkeypatch, [saved], metadata=metadata)
+    _storedFiles(monkeypatch, files=[{"name": "ghost.parquet"}])
+    ran = _realCheck(monkeypatch)
+
+    page = service.getData(GetData(projectId="p1", page="pg", filters=None if refresh else FILTERS, refresh=refresh))
+
+    assert ran == []
+    if refresh:
+        assert page["widgets"][0]["data"] == {"datasets": [{"data": [1]}]}
+        service.client.storage.from_.assert_not_called()
+    else:
+        assert page["widgets"][0]["data"] == {"labels": [], "datasets": []}
+
+
+def test_unreadableMetadataRerunsOnlyTheStoredTablesThroughTheRealCheck(monkeypatch):
+    saved = [_widget("R", _requestOn("select a from old"), "bar"), _widget("G", _requestOn("select a from ghost"), "bar")]
+    service, _, _ = _setup(monkeypatch, saved)
+    _unreadableMetadata(monkeypatch)
+    _storedFiles(monkeypatch)
+    ran = _realCheck(monkeypatch)
+
+    page = service.getData(GetData(projectId="p1", page="pg", refresh=True))
+
+    assert [w["data"] for w in page["widgets"]] == ["new", "old"]
+    assert ran == [(("old",), None)]
+
+
+def test_generationStillHidesAndRefusesAnInactiveTable():
+    from api.services.reportingService import ReportingService
+    from nubrix.components.sqlCheck import SqlCheckError, checkSql
+
+    shown = ReportingService._filterActive(METADATA)
+
+    assert set(shown) == {"orders"}
+    checkSql("select a from orders", shown)
+    with pytest.raises(SqlCheckError, match="not available"):
+        checkSql("select a from old", shown)
+
+
+# Names that differ only in case: DuckDB folds them together, and the SQL check keeps the first spelling it is given
+# for each folded name. The re-run set from metadata is ordered (active tables first, in metadata order, then inactive
+# ones), so a name resolves to the same table on every worker, and to the active one on a clash. The fallback listing
+# can't tell which table is active, so it leaves out every name that clashes and keeps the others, sorted.
+
+CASE_METADATA = {"Sales": {"isActive": False}, "sales": {"isActive": True}}
+
+
+@pytest.mark.parametrize("named", ['"sales"', '"Sales"', "SALES"])
+def test_aCaseCollidingNameResolvesToTheActiveTable(monkeypatch, named):
+    saved = [_widget("R", _requestOn(f"select a from {named}"), "bar")]
+    service, _, _ = _setup(monkeypatch, saved, metadata=CASE_METADATA)
+    ran = _realCheck(monkeypatch)
+
+    page = service.getData(GetData(projectId="p1", page="pg", filters=FILTERS))
+
+    assert page["widgets"][0]["data"] == "new"
+    assert ran == [(("sales",), FILTERS)]
+
+
+CASE_FILES = [{"name": "sales.parquet"}, {"name": "orders.parquet"}, {"name": "Sales.parquet"}]
+
+
+@pytest.mark.parametrize("refresh", [False, True])
+def test_caseCollidingNamesInTheStoredTablesAreLeftOutAndTheOthersStillRun(monkeypatch, refresh):
+    saved = [
+        _widget("L", _requestOn('select a from "sales"'), "bar", data={"datasets": [{"data": [1]}]}),
+        _widget("U", _requestOn('select a from "Sales"'), "bar", data={"datasets": [{"data": [2]}]}),
+        _widget("O", _requestOn("select a from ORDERS"), "bar", data={"datasets": [{"data": [3]}]}),
+    ]
+    service, _, _ = _setup(monkeypatch, saved)
+    _unreadableMetadata(monkeypatch)
+    _storedFiles(monkeypatch, files=CASE_FILES)
+    ran = _realCheck(monkeypatch)
+
+    page = service.getData(GetData(projectId="p1", page="pg", filters=None if refresh else FILTERS, refresh=refresh))
+
+    assert ran == [(("orders",), None if refresh else FILTERS)]
+    lower, upper, orders = page["widgets"]
+    assert orders["data"] == "new"
+    if refresh:
+        # Refused, so the widgets keep their saved data and only the one that ran is saved.
+        assert (lower["data"], upper["data"]) == ({"datasets": [{"data": [1]}]}, {"datasets": [{"data": [2]}]})
+        assert [w["data"] for w in _uploaded(service)["pg"]["widgets"]] == [lower["data"], upper["data"], "new"]
+    else:
+        assert lower["data"] == upper["data"] == {"labels": [], "datasets": []}
+
+
+def test_storedTableNamesLeaveOutEveryNameInACaseCollidingGroup():
+    from api.services.dashboardService import _storedTableNames
+
+    files = [{"name": f"{name}.parquet"} for name in ("sales", "SALES", "Sales", "orders", "Old", "b", "x\u212a", "xk")]
+
+    # ASCII letters fold together as DuckDB folds them; the Kelvin sign is not ASCII, so it does not clash with "k".
+    assert _storedTableNames(files) == ("Old", "b", "orders", "xk", "x\u212a")
+
+
+_CASE_PROBE = """
+import json
+from unittest.mock import MagicMock
+from api.services import dashboardService as module
+from nubrix.components.sqlCheck import SqlCheckError, checkSql
+
+
+def resolved(tables):
+    out = []
+    for name in ('"sales"', '"Sales"', "orders"):
+        try:
+            out.append(list(checkSql(f"select a from {name}", tables).tables))
+        except SqlCheckError:
+            out.append("refused")
+    return out
+
+
+service =module.DashboardService.__new__(module.DashboardService)
+service.client = MagicMock()
+out = {}
+module.readJson = lambda projectId, name: {"Sales": {"isActive": False}, "sales": {"isActive": True}, "orders": {}}
+out["metadata"] = resolved(service._rerunTables("p1"))
+
+def unreadable(projectId, name):
+    raise RuntimeError("unreadable")
+
+module.readJson = unreadable
+module.listProjectFiles = lambda client, projectId: [{"name": n + ".parquet"} for n in ("sales", "orders", "Sales")]
+out["listing"] = resolved(service._rerunTables("p1"))
+print("RESULT " + json.dumps(out))
+"""
+
+
+@pytest.mark.parametrize("seed", ["0", "4", "7"])
+def test_aCaseCollidingNameResolvesTheSameUnderEveryHashSeed(seed):
+    """String hashing is randomised per process; seeds 0 and 4 iterate a set of the two spellings in opposite orders."""
+    import os
+    import subprocess
+    import sys
+    from pathlib import Path
+
+    done = subprocess.run(
+        [sys.executable, "-c", _CASE_PROBE], cwd=Path(__file__).resolve().parents[1],
+        env={**os.environ, "PYTHONHASHSEED": seed}, capture_output=True, text=True, timeout=300,
+    )
+
+    assert done.returncode == 0, done.stderr[-2000:]
+    (line,) = [line for line in done.stdout.splitlines() if line.startswith("RESULT ")]
+    assert json.loads(line[len("RESULT "):]) == {
+        "metadata": [["sales"], ["sales"], ["orders"]],
+        "listing": ["refused", "refused", ["orders"]],
+    }

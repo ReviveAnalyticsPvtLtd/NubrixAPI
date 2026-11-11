@@ -507,3 +507,24 @@ def test_nonSliceRequestIsNeverRetyped(harness):
     state = harness.run()
     assert harness.render.call_args.args[2].chartType == "bar"
     assert decodeGeneratedCode(state["generatedCode"]).chartType == "bar"
+
+
+def test_generationStillRefusesAnInactiveTable(harness, monkeypatch):
+    """Saved widgets re-run on inactive tables, but a new chart still sees and may name only the active ones."""
+    from nubrix.components import chartEngine
+
+    reply = json.dumps(dict(REQUEST, sql='SELECT "z" AS "a", COUNT(*) AS total FROM "old_table" GROUP BY ALL'))
+    harness.generator.invoke.return_value = reply
+    harness.repair.invoke.return_value = reply
+    ran = []
+    monkeypatch.setattr(chartEngine, "runChartQuery", lambda *args, **kwargs: ran.append(args))
+    harness.render.side_effect = chartEngine.renderChartRequest
+
+    state = harness.run()
+
+    assert ran == []
+    assert harness.render.call_count == 3
+    assert all(list(call.args[3]) == ["orders"] for call in harness.render.call_args_list)
+    assert "old_table" not in harness.generator.invoke.call_args.args[0]["grounding"]
+    assert "Table 'old_table' is not available" in state["finalOutput"]["error"]
+    assert harness.failureRecords()[0]["stage"] == "check"
