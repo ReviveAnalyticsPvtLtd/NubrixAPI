@@ -102,12 +102,16 @@ class UserErasureExternalCleanup:
                 raise
 
     def deleteStorage(self, userId: str, projectIds: list[str]) -> dict:
+        from api.services.ingestion.repository import fenceProjectSources, projectStorageLock
+
         deleted = 0
         for projectId in projectIds:
-            paths = self._listPaths("AnalyticsHub", projectId)
-            deleted += self._removePaths("AnalyticsHub", paths)
-            if self._listPaths("AnalyticsHub", projectId):
-                raise RuntimeError("project storage remains")
+            with projectStorageLock(projectId):
+                fenceProjectSources(projectId)
+                paths = self._listPaths("AnalyticsHub", projectId)
+                deleted += self._removePaths("AnalyticsHub", paths)
+                if self._listPaths("AnalyticsHub", projectId):
+                    raise RuntimeError("project storage remains")
 
         profilePaths = [
             path
