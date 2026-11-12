@@ -1791,6 +1791,111 @@ def test_whyTheRequestFailedUnderAFilter(monkeypatch, error, cause, transient):
     assert calls == [(codeExecutor.replManager, PROJECT, request, ("orders", "archive"), {"filters": filters, "lenient": True})]
 
 
+# Round 7, N1: every table the saved Python reads must be known for certain
+
+
+@pytest.mark.parametrize("code,found", [
+    # Passes: string constants, a variable set only from constants, a loop over a literal list or tuple.
+    ("a = fetch_data_pl(projectId, 'orders')", ["orders"]),
+    ("a = fetch_data(projectId, tableName='orders')\nb = scan_data(projectId, \"stores\")", ["orders", "stores"]),
+    ("name = 'archive'\nb = fetch_data_pl(projectId, name)", ["archive"]),
+    ("name = 'orders'\nif x:\n    name = 'archive'\nb = fetch_data_pl(projectId, name)", ["archive", "orders"]),
+    ("for t in ['orders', 'archive']:\n    fetch_data_pl(projectId, t)", ["archive", "orders"]),
+    ("frames = [fetch_data_pl(projectId, t) for t in ('orders', 'stores')]", ["orders", "stores"]),
+    ("```python\na = fetch_data_pl(projectId, 'orders')\n```", ["orders"]),
+    ("import json\nprint(json.dumps({'title': 'orders'}))", []),
+    # Refused: a name the job cannot read for certain.
+    ("year = 'ive'\nb = fetch_data_pl(projectId, f'arch{year}')", "unresolvedTable"),
+    ("b = fetch_data_pl(projectId, 'arch' + 'ive')", "unresolvedTable"),
+    ("b = fetch_data_pl(projectId, ''.join(['arch', 'ive']))", "unresolvedTable"),
+    ("b = fetch_data_pl(projectId, '_'.join(parts))", "unresolvedTable"),
+    ("name = 'orders'\nname = other()\nb = fetch_data_pl(projectId, name)", "unresolvedTable"),
+    ("name = 'orders'\nname += 's'\nb = fetch_data_pl(projectId, name)", "unresolvedTable"),
+    ("b = fetch_data_pl(projectId, names[0])", "unresolvedTable"),
+    ("b = fetch_data_pl(projectId, config.table)", "unresolvedTable"),
+    ("b = fetch_data_pl(projectId, pick())", "unresolvedTable"),
+    ("b = fetch_data_pl(projectId, undefined_name)", "unresolvedTable"),
+    ("b = fetch_data_pl(projectId)", "unresolvedTable"),
+    ("b = fetch_data_pl(*arguments)", "unresolvedTable"),
+    ("b = fetch_data_pl(projectId, **options)", "unresolvedTable"),
+    ("def load(table):\n    return fetch_data_pl(projectId, table)\nb = load('orders')", "unresolvedTable"),
+    ("table = 'orders'\ndef load(table):\n    return fetch_data_pl(projectId, table)", "unresolvedTable"),
+    ("for t in tables:\n    fetch_data_pl(projectId, t)", "unresolvedTable"),
+    ("for t in ['orders', other]:\n    fetch_data_pl(projectId, t)", "unresolvedTable"),
+    # Refused: a call the job cannot follow.
+    ("f = fetch_data_pl\nb = f(projectId, 'orders')", "unresolvedTable"),
+    ("b = getattr(module, 'fetch_data_pl')(projectId, 'orders')", "unresolvedTable"),
+    ("b = helpers.fetch_data_pl(projectId, 'orders')", "unresolvedTable"),
+    ("from utils.initMethods import fetch_data_pl as load\nb = load(projectId, 'orders')", "unresolvedTable"),
+    ("b = eval(\"fetch_data_pl(projectId, 'orders')\")", "unresolvedTable"),
+    # Code that does not parse.
+    ("b = fetch_data_pl(projectId, 'orders'", "unparsable"),
+])
+def test_theTablesThePythonReadsAreKnownForCertain(code, found):
+    assert conv._pythonTables(code) == found
+
+
+@pytest.mark.parametrize("code,field,reason", [
+    ("import json\nyear = 'ive'\ndf = fetch_data_pl('" + PROJECT + "', f'arch{year}')\nprint(json.dumps({'title': 't'}))",
+     "filter", "unresolvedTable"),
+    ("import json\ndf = fetch_data_pl('" + PROJECT + "', 'orders'\nprint(json.dumps({'title': 't'}))", "unparsable", None),
+])
+def test_aTableNameTheJobCannotReadKeepsThePythonWithoutAModelCall(tmp_path, monkeypatch, code, field, reason):
+    fakes = _Fakes(monkeypatch, plans={"q": _request("one")}, charts={_sql("one"): SAVED})
+    store = _store(_config(_widget("w1", SAVED, code=code, query="q")))
+    assert _run(tmp_path, store) == 0
+    entry = _entries(tmp_path)["w1"]
+    assert (entry["verdict"], entry["field"], entry.get("reason")) == ("differ", field, reason)
+    assert fakes.prompts == [] and fakes.renders == []
+
+
+def test_aStringConstantThatIsNotATableArgumentIsNotATable(tmp_path, monkeypatch):
+    # The old string-literal scan took any constant equal to a table name as a read of that table.
+    code = _python("t") + "\nlabel = 'archive'"
+    fakes = _Fakes(monkeypatch, plans={"q": _request("one")}, charts={_sql("one"): SAVED})
+    store = FakeStore({CONFIG: _bytes(_config(_widget("w1", SAVED, code=code, query="q"))),
+                       "metadata.json": json.dumps(INACTIVE_METADATA).encode("utf-8")})
+    assert _run(tmp_path, store) == 0
+    assert _entries(tmp_path)["w1"]["verdict"] == "match" and fakes.reruns
+
+
+# Round 7, N2: DuckDB running out of memory is transient
+
+
+def test_aDuckDBMemoryErrorIsATransientRequestFailure(monkeypatch):
+    def render(manager, project, request, tables, **kwargs):
+        raise ChartFailure("run", "Out of Memory Error: failed to allocate data of size 64.0 MiB (3.1 GiB/3.2 GiB used)")
+
+    monkeypatch.setattr(conv, "renderChartRequest", render)
+    job = SimpleNamespace(project=PROJECT, rerunTables=("orders",))
+    assert conv._whyRerunFailed(job, "sql", {"id": "w1"}, _request("one"), []) == {"cause": "memory", "transient": True}
+
+
+# Round 7, N3: a busy sandbox during the pair runs carries the rerun flag too
+
+
+def test_aBusySandboxDuringThePairRunsIsTransient(tmp_path, monkeypatch):
+    def filtered(form, widget, filters):
+        raise SandboxBusyError(BUSY_MESSAGE)
+
+    _Fakes(monkeypatch, plans={"q": _request("one")}, charts={_sql("one"): SAVED}, filtered=filtered)
+    store = _store(_config(_widget("w1", SAVED, query="q")))
+    assert _run(tmp_path, store) == 0
+    entry = _entries(tmp_path)["w1"]
+    assert (entry["verdict"], entry["step"], entry["stage"], entry["transient"]) == ("failed", "filter", "busy", True)
+
+
+def test_anotherErrorDuringThePairRunsIsNotMarkedTransient(tmp_path, monkeypatch):
+    def filtered(form, widget, filters):
+        raise RuntimeError("launcher broke")
+
+    _Fakes(monkeypatch, plans={"q": _request("one")}, charts={_sql("one"): SAVED}, filtered=filtered)
+    store = _store(_config(_widget("w1", SAVED, query="q")))
+    assert _run(tmp_path, store) == 0
+    entry = _entries(tmp_path)["w1"]
+    assert (entry["verdict"], entry["step"], entry["stage"]) == ("failed", "filter", "run") and "transient" not in entry
+
+
 # The strict comparison
 
 

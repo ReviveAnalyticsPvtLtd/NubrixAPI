@@ -27,14 +27,17 @@ fails leaves the widget as Python, with a reason:
      ORDER BY that is unique by construction (`orderIsUnique`), with key values unique across today's rows as well
      when every key is an output column (`unstableOrder`), at any row count unless the query returns at most one row
      by construction (`singleRowByConstruction`).
-  5. The saved Python must read no table the request does not read (`filter`, reason `pythonReadsOtherTable`): the
-     dashboard offers filters on every stored table, and a filter on such a table narrows only the Python. Then under
+  5. Before any model call, every table the saved Python reads must be known for certain (`_pythonTables`: string
+     constants, or names bound only to string constants), else `filter` with reason `unresolvedTable` (`unparsable`
+     when the code does not parse). The saved Python must read no table the request does not read (`filter`, reason
+     `pythonReadsOtherTable`): the dashboard offers filters on every stored table, and a filter on such a table
+     narrows only the Python. Then under
      every filter set (`_filterSets`), the saved Python and the request re-run through the dashboard's own filter path
      (`DashboardService._rerunWidgetProduced`, given the same ordered table tuple as a refresh) must strictly agree,
      and at least one set must be one both forms ran (`filter`); no filter set at all is `filter`. When only one form
      fails under a set, the pair is re-run once; if one still fails, that form runs once more on its own to learn why
-     (`_whyRerunFailed`): a timeout, a busy sandbox or a run stopped by a limit is `failed` (step `filter`,
-     `transient`), so the job can be run again; any other cause stays `filter`. Neither is ever a match.
+     (`_whyRerunFailed`): a timeout, a busy sandbox, a run stopped by a limit or out of memory is `failed` (step
+     `filter`, `transient`), so the job can be run again; any other cause stays `filter`. Neither is ever a match.
 Generation, the SQL check and the schema reads of the request see only the active tables, as the model does. The
 job's own filter probes run over the refresh tuple, so they reach every table the Python names.
 Only a converted widget's `generatedCode` changes; its title, layout, id and saved data stay as they are.
@@ -878,6 +881,132 @@ def _pythonRefusal(widget: dict) -> str | None:
     return None
 
 
+# N1: the sandbox's table readers. Each takes the project, then the table name (`tableName`).
+_TABLE_READERS = frozenset({"fetch_data", "fetch_data_pl", "scan_data"})
+
+
+def _constantStrings(node: ast.AST) -> list[str] | None:
+    """The values of a literal list, tuple or set of string constants, else None."""
+    if isinstance(node, (ast.List, ast.Tuple, ast.Set)) and all(
+        isinstance(item, ast.Constant) and isinstance(item.value, str) for item in node.elts
+    ):
+        return [item.value for item in node.elts]
+    return None
+
+
+def _bindings(tree: ast.AST) -> dict[str, list[str] | None]:
+    """
+    Every name the module binds anywhere, with the string constants it can hold, or None when one binding is anything
+    else. Scopes are not told apart: a name bound once in any way the job cannot read is unknown everywhere.
+    """
+    bound: dict[str, list[str] | None] = {}
+
+    def add(name: str, values: list[str] | None) -> None:
+        if name in bound and bound[name] is None:
+            return
+        bound[name] = None if values is None else bound.get(name, []) + values
+
+    def target(node: ast.AST, values: list[str] | None) -> None:
+        if isinstance(node, ast.Name):
+            add(node.id, values)
+        else:
+            # Unpacking, a subscript or an attribute: every name in it is unknown.
+            for name in ast.walk(node):
+                if isinstance(name, ast.Name):
+                    add(name.id, None)
+
+    def constant(node: ast.AST | None) -> list[str] | None:
+        return [node.value] if isinstance(node, ast.Constant) and isinstance(node.value, str) else None
+
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Assign):
+            for each in node.targets:
+                target(each, constant(node.value))
+        elif isinstance(node, ast.AnnAssign) and node.value is not None:
+            target(node.target, constant(node.value))
+        elif isinstance(node, (ast.AugAssign, ast.NamedExpr)):
+            target(node.target, None if isinstance(node, ast.AugAssign) else constant(node.value))
+        elif isinstance(node, (ast.For, ast.AsyncFor, ast.comprehension)):
+            target(node.target, _constantStrings(node.iter))
+        elif isinstance(node, ast.withitem) and node.optional_vars is not None:
+            target(node.optional_vars, None)
+        elif isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda)):
+            arguments = node.args
+            for argument in arguments.posonlyargs + arguments.args + arguments.kwonlyargs:
+                add(argument.arg, None)
+            for argument in (arguments.vararg, arguments.kwarg):
+                if argument is not None:
+                    add(argument.arg, None)
+        elif isinstance(node, (ast.Import, ast.ImportFrom)):
+            for alias in node.names:
+                add((alias.asname or alias.name).split(".")[0], None)
+        elif isinstance(node, ast.ExceptHandler) and node.name:
+            add(node.name, None)
+        elif isinstance(node, (ast.MatchAs, ast.MatchStar)) and node.name:
+            add(node.name, None)
+        elif isinstance(node, ast.MatchMapping) and node.rest:
+            add(node.rest, None)
+    return bound
+
+
+def _pythonTables(code: str) -> list[str] | str:
+    """
+    N1: the tables the saved Python reads, known for certain, in name order; or why they are not.
+
+    Every call to a table reader (`fetch_data`, `fetch_data_pl`, `scan_data`) must name its table (the second
+    positional argument, or `tableName=`) with a string constant, or with a name whose every binding in the module is
+    a string constant (a `for` over a literal list or tuple of string constants included). Anything else is
+    `unresolvedTable`: an f-string, a concatenation, a join, a call, a subscript, an attribute, a function parameter,
+    `*args` or `**kwargs`, a missing table argument; and so is a reader the job cannot follow (an alias, an attribute
+    call such as `module.fetch_data_pl`, an import of one, or a string holding a reader's name, as `getattr` or `eval`
+    would use). Code that does not parse is `unparsable`.
+    """
+    body = _withoutFences(code) if isinstance(code, str) else ""
+    try:
+        tree = ast.parse(body)
+    except (SyntaxError, ValueError):
+        return "unparsable"
+    calls = {id(node.func) for node in ast.walk(tree) if isinstance(node, ast.Call)}
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Name) and node.id in _TABLE_READERS and (
+            id(node) not in calls or not isinstance(node.ctx, ast.Load)
+        ):
+            return "unresolvedTable"
+        if isinstance(node, ast.Attribute) and node.attr in _TABLE_READERS:
+            return "unresolvedTable"
+        if isinstance(node, ast.Constant) and isinstance(node.value, str) and any(
+            reader in node.value for reader in _TABLE_READERS
+        ):
+            return "unresolvedTable"
+        if isinstance(node, ast.alias) and node.name.split(".")[-1] in _TABLE_READERS:
+            return "unresolvedTable"
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)) and node.name in _TABLE_READERS:
+            return "unresolvedTable"
+    bound = _bindings(tree)
+    if any(name in bound for name in _TABLE_READERS):
+        return "unresolvedTable"
+    tables: set[str] = set()
+    for node in ast.walk(tree):
+        if not (isinstance(node, ast.Call) and isinstance(node.func, ast.Name) and node.func.id in _TABLE_READERS):
+            continue
+        if any(isinstance(argument, ast.Starred) for argument in node.args) or any(
+            keyword.arg is None for keyword in node.keywords
+        ):
+            return "unresolvedTable"
+        named = [keyword.value for keyword in node.keywords if keyword.arg == "tableName"]
+        arguments = node.args[1:2] + named
+        if len(arguments) != 1:
+            return "unresolvedTable"
+        argument = arguments[0]
+        if isinstance(argument, ast.Constant) and isinstance(argument.value, str):
+            tables.add(argument.value)
+        elif isinstance(argument, ast.Name) and bound.get(argument.id):
+            tables.update(bound[argument.id])
+        else:
+            return "unresolvedTable"
+    return sorted(tables)
+
+
 # Candidates
 
 
@@ -1073,7 +1202,7 @@ def _filterSets(job, pageId: str, widget: dict, request: ChartRequest) -> list[l
     The filter sets a widget is checked under, one set per re-run.
 
     Every filter list the config defines, then for each table the widget reads (the tables the request's SQL reads,
-    then the tables the Python names in a string literal among every table a refresh reads, inactive ones included,
+    then the tables the Python reads (`_pythonTables`) among every table a refresh reads, inactive ones included,
     in name order): one text column at its most frequent
     value, the column with the fewest distinct values (at least two) among the first 20 text columns, columns the
     request or the Python name first; and one date or timestamp column (named ones first) over the middle half of its
@@ -1095,7 +1224,9 @@ def _filterSets(job, pageId: str, widget: dict, request: ChartRequest) -> list[l
 
     code = widget.get("generatedCode") or ""
     tables = list(checkSql(request.sql, job.tables).tables)
-    tables += [name for name in sorted(job.rerunTables) if name not in tables and _namesTable(code, name)]
+    found = _pythonTables(code)
+    pythonTables = set(found) if isinstance(found, list) else set()
+    tables += [name for name in sorted(job.rerunTables) if name not in tables and name in pythonTables]
     tree = _parsed(request.sql)
     named = {column.name for column in tree.find_all(exp.Column)} if tree is not None else set()
     schemas = _schemasOf(job, tables)
@@ -1129,29 +1260,26 @@ def _filterSets(job, pageId: str, widget: dict, request: ChartRequest) -> list[l
     return sets
 
 
-def _namesTable(code: str, name: str) -> bool:
-    """The code names the table in a string literal, as `fetch_data_pl(projectId, 'orders')` does."""
-    return re.search(r"(['\"])" + re.escape(name) + r"\1", code) is not None
-
-
 def _pythonOnlyTables(job, widget: dict, request: ChartRequest) -> list[str]:
     """
-    I1: the tables the saved Python names (among every table a refresh reads, inactive ones included) that the request
-    does not read. The dashboard offers filters on every stored table, so a filter on one of these would narrow the
-    Python and never the request. Names compare exactly: a case-only match is a different stored table.
+    I1: the tables the saved Python reads (`_pythonTables`, inactive ones included) that the request does not read.
+    The dashboard offers filters on every stored table, so a filter on one of these would narrow the Python and never
+    the request. Names compare exactly: a case-only match is a different stored table. Tables that are not known for
+    certain count as another table (`_convertWidget` refuses those before any model call).
     """
     from nubrix.components.sqlCheck import checkSql
 
-    code = widget.get("generatedCode")
-    code = code if isinstance(code, str) else ""
+    found = _pythonTables(widget.get("generatedCode"))
+    if isinstance(found, str):
+        return [found]
     read = set(checkSql(request.sql, job.tables).tables)
-    return [name for name in job.rerunTables if name not in read and _namesTable(code, name)]
+    return [name for name in found if name not in read]
 
 
 # M1: why a form failed under a filter. Transient causes make the widget `failed`, so the job can be run again.
 _TRANSIENT_CAUSES = {
     "python": frozenset({"timed out", "concurrency limit", "stopped", "busy", "MemoryError", "ranOnDiagnosis"}),
-    "sql": frozenset({"timeout", "stopped", "busy", "ranOnDiagnosis"}),
+    "sql": frozenset({"timeout", "stopped", "memory", "busy", "ranOnDiagnosis"}),
 }
 
 
@@ -1160,7 +1288,8 @@ def _whyRerunFailed(job, form: str, widget: dict, request: ChartRequest | None, 
     Run a form that failed under a filter once more, on its own and as the dashboard runs it, to learn why.
 
     - `sql`: `renderChartRequest` with the service's manager, the refresh tables, the filters, lenient. The cause is
-      the `ChartFailure` stage, or `stopped` for a run a limit stopped (memory, CPU).
+      the `ChartFailure` stage, `stopped` for a run a limit stopped (memory, CPU), or `memory` for DuckDB's own
+      "Out of Memory Error".
     - `python`: the service's `replManager.run`, then `_pythonResult`. The cause is the `_RerunFailure` kind (`timed
       out`, `concurrency limit`, an exception class, `not JSON`, `error key`), or `stopped`/`timed out` when the
       output ends with the sandbox's stop sentence.
@@ -1195,8 +1324,14 @@ def _whyRerunFailed(job, form: str, widget: dict, request: ChartRequest | None, 
                 except _RerunFailure as failure:
                     cause = failure.kind
     except ChartFailure as failure:
-        stopped = failure.stage == "run" and str(failure.message).startswith("The run was stopped")
-        cause = "stopped" if stopped else failure.stage
+        message = str(failure.message)
+        if failure.stage == "run" and message.startswith("The run was stopped"):
+            cause = "stopped"
+        elif failure.stage == "run" and message.startswith("Out of Memory Error"):
+            # DuckDB hit its memory_limit inside the launcher (below the sandbox limit, so no stop sentence).
+            cause = "memory"
+        else:
+            cause = failure.stage
     except Exception as error:
         cause = "busy" if isinstance(error, SandboxBusyError) or isBusy(error) else type(error).__name__
     return {"cause": cause, "transient": cause in _TRANSIENT_CAUSES.get(form, frozenset())}
@@ -1210,13 +1345,21 @@ def _rerunUnderFilter(widget: dict, filters: list, projectId: str, rerunTables: 
     return DashboardService._rerunWidgetProduced(widget, filters, projectId, rerunTables)
 
 
+def _filterFailure(error: BaseException) -> dict:
+    """A filter-check error as `_failure` gives it, with `transient: true` for a busy sandbox, as a diagnosis has."""
+    failure = _failure(error)
+    if failure["stage"] == "busy":
+        failure["transient"] = True
+    return failure
+
+
 def _filterCheck(job, pageId: str, widget: dict, request: ChartRequest, entry: dict) -> None:
     """Re-run the Python and the request under each filter set; every pair must show the same chart."""
     try:
         others = _pythonOnlyTables(job, widget, request)
         sets = [] if others else _filterSets(job, pageId, widget, request)
     except Exception as error:
-        entry.update(verdict="failed", step="filter", **_failure(error))
+        entry.update(verdict="failed", step="filter", **_filterFailure(error))
         return
     if others:
         # A filter on such a table narrows the Python and never the request. The names stay out of the report.
@@ -1252,7 +1395,7 @@ def _filterCheck(job, pageId: str, widget: dict, request: ChartRequest, entry: d
                 # Both fail, and the dashboard shows the same empty chart for both.
                 continue
         except Exception as error:
-            entry.update(verdict="failed", step="filter", filterIndex=index, **_failure(error))
+            entry.update(verdict="failed", step="filter", filterIndex=index, **_filterFailure(error))
             return
         if failing is not None:
             causes = {side: why["cause"] for side, why in failing.items()}
@@ -1285,8 +1428,14 @@ def _convertWidget(job, pageId: str, widget: dict) -> dict:
     began = time.monotonic()
     entry: dict = {}
     refusal = _pythonRefusal(widget)
+    tables = _pythonTables(widget["generatedCode"]) if refusal is None else None
     if refusal is not None:
         entry.update(verdict="differ", field=refusal)
+    elif tables == "unparsable":
+        entry.update(verdict="differ", field="unparsable")
+    elif tables == "unresolvedTable":
+        # A filter on a table the job cannot name could narrow the Python and never the request.
+        entry.update(verdict="differ", field="filter", reason="unresolvedTable")
     else:
         replay = getattr(job.engine, "replay", None)
         if replay is not None:
