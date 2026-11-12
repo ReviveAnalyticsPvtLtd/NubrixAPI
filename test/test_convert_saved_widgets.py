@@ -6,11 +6,14 @@ recorded model replies and saved Python that really runs: one dry run (which als
 a widget that only agrees unfiltered) and one write. Everything is synthetic.
 """
 
+import contextlib
 import copy
 import datetime as dt
 import json
+import io
 import math
 import os
+import threading
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -23,6 +26,7 @@ from nubrix.components.chartEngine import ChartFailure
 from nubrix.components.chartRequest import LABEL_CAP, ChartRequest, decodeGeneratedCode, encodeGeneratedCode
 from scripts import chartEval
 from scripts import convertSavedWidgets as conv
+from utils import sandboxRunner
 from utils.sandboxSlots import BUSY_MESSAGE, SandboxBusyError
 
 FIXTURES = Path(__file__).parent / "fixtures" / "chart_eval"
@@ -152,9 +156,13 @@ class _Fakes:
     - `filterSets`: the filter sets the spot check uses; `filtered(form, widget, filters)` what a filtered re-run of
       the saved Python ("python") or of the request ("sql") shows: a chart, or None for a failed run. By default both
       show the saved chart. A form that still fails after the retry is diagnosed as deterministic (`_whyRerunFailed`).
+    - `served(form, phase)`: the table names a fake child asks the parent for during the unfiltered render ("render",
+      form "sql") or a filtered re-run ("rerun"). They go through the real `utils.sandboxRunner.serveTables` (as the
+      module global, so a hook on it sees them), with `spool_table` writing empty files under `folder`.
     """
 
-    def __init__(self, monkeypatch, plans=None, charts=None, finals=None, rows=None, truncated=None, filterSets=None, filtered=None):
+    def __init__(self, monkeypatch, plans=None, charts=None, finals=None, rows=None, truncated=None, filterSets=None, filtered=None,
+                 served=None, folder=None):
         self.plans = plans or {}
         self.charts = charts or {}
         self.finals = finals or {}
@@ -162,6 +170,8 @@ class _Fakes:
         self.truncated = truncated or {}
         self.filterSets = [[{"orders.region": "East"}]] if filterSets is None else filterSets
         self.filtered = filtered or (lambda form, widget, filters: _visible(widget))
+        self.served = served
+        self.folder = folder
         self.prompts: list[str] = []
         self.renders: list[dict] = []
         self.reruns: list[tuple] = []
@@ -193,8 +203,15 @@ class _Fakes:
                     return response
                 return plan
 
+        def serve(form, phase):
+            if fakes.served is not None:
+                names = fakes.served(form, phase)
+                requests = io.BytesIO(b"".join(json.dumps(name).encode("utf-8") + b"\n" for name in names))
+                sandboxRunner.serveTables(PROJECT, requests, io.BytesIO(), str(fakes.folder), threading.Event())
+
         def render(manager, projectId, request, rerunTables):
             fakes.renders.append({"sql": request.sql, "title": request.title, "rerunTables": rerunTables, "projectId": projectId})
+            serve("sql", "render")
             chart = fakes.charts[request.sql]
             if isinstance(chart, Exception):
                 raise chart
@@ -205,6 +222,7 @@ class _Fakes:
             form = "sql" if decodeGeneratedCode(widget.get("generatedCode")) is not None else "python"
             fakes.reruns.append((form, widget.get("id"), json.dumps(filters)))
             fakes.rerunTables.append(rerunTables)
+            serve(form, "rerun")
             shown = fakes.filtered(form, widget, filters)
             if shown is None:
                 return copy.deepcopy(widget), None
@@ -217,9 +235,17 @@ class _Fakes:
         monkeypatch.setattr(conv, "_rerunUnderFilter", rerun)
         monkeypatch.setattr(conv, "_utcNow", lambda: NOW)
         monkeypatch.setattr(conv, "_schemasOf", lambda job, tables: {"orders": FAKE_ORDERS})
+        if served is not None:
+            monkeypatch.setattr(sandboxRunner, "spool_table", _emptySpool)
         # Why a form failed under a filter: never a real run in these tests.
         monkeypatch.setattr(conv, "_whyRerunFailed", lambda job, form, widget, request, filters: {"cause": "error key", "transient": False},
                             raising=False)
+
+
+def _emptySpool(projectId, tableName, path, runEnded):
+    """A table spooled as an empty file: what the parent hands over does not matter to these tests."""
+    Path(path).write_bytes(b"")
+    return path
 
 
 def _run(tmp_path, store, *extra):
@@ -1896,6 +1922,199 @@ def test_anotherErrorDuringThePairRunsIsNotMarkedTransient(tmp_path, monkeypatch
     assert (entry["verdict"], entry["step"], entry["stage"]) == ("failed", "filter", "run") and "transient" not in entry
 
 
+# Round 8, R1 static layer: code that can reach a reader or a name by reflection
+
+
+@pytest.mark.parametrize("code", [
+    # The reviewer's bypass shapes (re-review 6).
+    "x = locals()['fetch_' + 'data_pl'](projectId, 'archive')",
+    "t = 'orders'\nlocals()['t'] = 'archive'\nx = fetch_data_pl(projectId, t)",
+    "x = (lambda: 0).__globals__['fetch_' + 'data_pl'](projectId, 'archive')",
+    "x = (i for i in [0]).gi_frame.f_globals['fetch_' + 'data_pl'](projectId, 'archive')",
+    "x = [locals()[k] for k in dir() if k.startswith('fetch_d') and k.endswith('_pl')][0](projectId, 'archive')",
+    "exec('fet' + \"ch_data_pl('pid', 'archive')\")",
+    "m = __import__('utils.init' + 'Methods')",
+    "x = globals()['fetch_' + 'data_pl'](projectId, 'archive')",
+    # Every other name the ruling lists.
+    "x = vars()['fetch_' + 'data_pl'](projectId, 'archive')",
+    "setattr(holder, 'table', 'archive')\nx = fetch_data_pl(projectId, 'orders')",
+    "delattr(holder, 'table')",
+    "x = getattr(holder, 'fetch_' + 'data_pl')(projectId, 'archive')",
+    "code = compile(source, 'run', 'exec')",
+    "x = eval(source)",
+    "b = __builtins__",
+    "import builtins\nx = builtins.getattr(holder, name)",
+    "from builtins import getattr as reach\nx = reach(holder, name)",
+    # Any attribute starting with two underscores, and the frame attributes.
+    "x = df.__class__",
+    "x = holder.__dict__[name]",
+    "import sys\nx = sys._getframe(0).f_back.f_locals[name]",
+    "x = frame.f_builtins",
+    "x = error.__traceback__",
+    "x = trace.tb_frame",
+    "x = trace.tb_next",
+    "x = coroutine.cr_frame",
+    "x = generator.ag_frame",
+    # Beyond the ruling: the same reach through the standard library's own helpers, and the launcher's module.
+    "import operator\nx = operator.attrgetter('fetch_' + 'data_pl')(holder)",
+    "from operator import methodcaller\nx = methodcaller(name)(holder)",
+    "import inspect\nx = dict(inspect.getmembers(holder))",
+    "import sys\nx = sys.modules[name]",
+    "import __main__",
+    # A pandas or polars expression that is not a string constant.
+    "df = fetch_data(projectId, 'orders')\nx = df.query(condition)",
+    "df = fetch_data(projectId, 'orders')\nx = df.query(f'revenue > {limit}')",
+    "df = fetch_data(projectId, 'orders')\nx = df.eval('rev' + 'enue * 2')",
+    "df = fetch_data(projectId, 'orders')\nx = df.eval(expr=expression)",
+    "df = fetch_data(projectId, 'orders')\nx = df.query(**options)",
+    "df = fetch_data(projectId, 'orders')\nx = df.query()",
+    "df = fetch_data(projectId, 'orders')\nask = df.query\nx = ask('revenue > 1')",
+    "import pandas as pd\nx = pd.eval(expression)",
+])
+def test_codeThatReachesByReflectionIsRefused(code):
+    assert conv._pythonTables(code) == "reflection"
+
+
+@pytest.mark.parametrize("code,found", [
+    ("df = fetch_data(projectId, 'orders')\nx = df.query('revenue > 1')", ["orders"]),
+    ("df = fetch_data(projectId, 'orders')\nx = df.eval(expr='revenue * 2')", ["orders"]),
+    ("import re\npattern = re.compile('[0-9]+')\ndf = fetch_data_pl(projectId, 'orders')", ["orders"]),
+    ("df = fetch_data_pl(projectId, 'orders')\nlabels = sorted(df['region'].unique())", ["orders"]),
+])
+def test_ordinaryCodeIsNotTakenForReflection(code, found):
+    assert conv._pythonTables(code) == found
+
+
+def test_reflectionKeepsThePythonWithoutAModelCall(tmp_path, monkeypatch):
+    code = (f"import json\nt = 'orders'\nlocals()['t'] = 'archive'\ndf = fetch_data_pl('{PROJECT}', t)\n"
+            "print(json.dumps({'title': 't'}))")
+    fakes = _Fakes(monkeypatch, plans={"q": _request("one")}, charts={_sql("one"): SAVED})
+    store = _store(_config(_widget("w1", SAVED, code=code, query="q")))
+    assert _run(tmp_path, store) == 0
+    entry = _entries(tmp_path)["w1"]
+    assert (entry["verdict"], entry["field"], entry["reason"], entry["reasonDetail"]) == (
+        "differ", "filter", "unresolvedTable", "reflection")
+    assert fakes.prompts == [] and fakes.renders == []
+
+
+# Round 8, R1 dynamic layer: every table the parent serves during the job's runs
+
+
+def test_theServeHookRecordsEveryTableNameAndPutsTheOriginalBack(tmp_path, monkeypatch):
+    monkeypatch.setattr(sandboxRunner, "spool_table", _emptySpool)
+    original = sandboxRunner.serveTables
+    requests = io.BytesIO(b'"orders"\n"archive"\n{"table": "stores"}\nnot json\n"orders"\n')
+    replies = io.BytesIO()
+    with conv._servedTables() as served:
+        assert sandboxRunner.serveTables is not original
+        sandboxRunner.serveTables(PROJECT, requests, replies, str(tmp_path), threading.Event())
+    assert served == {"orders", "archive"}
+    assert sandboxRunner.serveTables is original
+    # The original still answered every request.
+    answers = [json.loads(line) for line in replies.getvalue().splitlines()]
+    assert ["file" in answer for answer in answers] == [True, True, False, False, True]
+
+
+def test_theServeHookIsPutBackAfterAnException():
+    original = sandboxRunner.serveTables
+    with pytest.raises(RuntimeError):
+        with conv._servedTables():
+            raise RuntimeError("the run broke")
+    assert sandboxRunner.serveTables is original
+
+
+def test_theServeHookIsInstalledOnlyForTheJobsOwnRuns(tmp_path, monkeypatch):
+    original = sandboxRunner.serveTables
+    seen = []
+    fakes = _Fakes(monkeypatch, plans={"q": _request("one")}, charts={_sql("one"): SAVED})
+    invoke, render, rerun = conv._Engine.invoke, conv._renderWithResult, conv._rerunUnderFilter
+
+    def watchedInvoke(self, *args):
+        seen.append(("model", sandboxRunner.serveTables is original))
+        return invoke(self, *args)
+
+    def watchedRender(*args):
+        seen.append(("render", sandboxRunner.serveTables is original))
+        return render(*args)
+
+    def watchedRerun(*args):
+        seen.append(("rerun", sandboxRunner.serveTables is original))
+        return rerun(*args)
+
+    monkeypatch.setattr(conv._Engine, "invoke", watchedInvoke)
+    monkeypatch.setattr(conv, "_renderWithResult", watchedRender)
+    monkeypatch.setattr(conv, "_rerunUnderFilter", watchedRerun)
+    store = _store(_config(_widget("w1", SAVED, query="q")))
+    assert _run(tmp_path, store) == 0
+    assert _entries(tmp_path)["w1"]["verdict"] == "match"
+    assert seen == [("model", True), ("render", False), ("rerun", False), ("rerun", False)]
+    assert sandboxRunner.serveTables is original and fakes.prompts == ["q"]
+
+
+def test_servedTablesThatAreTheResolvedTablesPass(tmp_path, monkeypatch):
+    fakes = _Fakes(monkeypatch, plans={"q": _request("one")}, charts={_sql("one"): SAVED},
+                   served=lambda form, phase: ["orders", "orders"], folder=tmp_path)
+    store = _store(_config(_widget("w1", SAVED, query="q")))
+    assert _run(tmp_path, store) == 0
+    entry = _entries(tmp_path)["w1"]
+    assert entry["verdict"] == "match" and "reasonDetail" not in entry
+    assert [form for form, _, _ in fakes.reruns] == ["python", "sql"]
+
+
+@pytest.mark.parametrize("form,phase,sides", [
+    ("sql", "render", None),
+    ("python", "rerun", ["python"]),
+    ("sql", "rerun", ["request"]),
+])
+def test_aRunServedATableTheJobDidNotResolveIsRefused(tmp_path, monkeypatch, form, phase, sides):
+    def served(runForm, runPhase):
+        return ["orders", "archive"] if (runForm, runPhase) == (form, phase) else ["orders"]
+
+    fakes = _Fakes(monkeypatch, plans={"q": _request("one")}, charts={_sql("one"): SAVED}, served=served,
+                   folder=tmp_path)
+    store = FakeStore({CONFIG: _bytes(_config(_widget("w1", SAVED, query="q"))),
+                       "metadata.json": json.dumps(INACTIVE_METADATA).encode("utf-8")})
+    assert _run(tmp_path, store) == 0
+    entry = _entries(tmp_path)["w1"]
+    assert (entry["verdict"], entry["field"], entry["reason"], entry["reasonDetail"]) == (
+        "differ", "filter", "unresolvedTable", "servedOtherTable")
+    assert entry.get("servedSides") == sides
+    if phase == "render":
+        assert fakes.reruns == []
+    else:
+        assert entry["filterIndex"] == 0
+    # The names stay out of the report.
+    assert "archive" not in json.dumps(entry)
+
+
+def test_aServedOtherTableIsRefusedEvenWhenTheRunFailed(tmp_path, monkeypatch):
+    def filtered(form, widget, filters):
+        return None if form == "python" else _visible(widget)
+
+    _Fakes(monkeypatch, plans={"q": _request("one")}, charts={_sql("one"): SAVED}, filtered=filtered,
+           served=lambda form, phase: ["orders", "archive"] if form == "python" and phase == "rerun" else ["orders"],
+           folder=tmp_path)
+    store = _store(_config(_widget("w1", SAVED, query="q")))
+    assert _run(tmp_path, store) == 0
+    entry = _entries(tmp_path)["w1"]
+    assert (entry["verdict"], entry["reason"], entry["reasonDetail"]) == (
+        "differ", "unresolvedTable", "servedOtherTable")
+
+
+def test_theServeHookIsPutBackWhenARerunRaises(tmp_path, monkeypatch):
+    original = sandboxRunner.serveTables
+
+    def filtered(form, widget, filters):
+        raise RuntimeError("launcher broke")
+
+    _Fakes(monkeypatch, plans={"q": _request("one")}, charts={_sql("one"): SAVED}, filtered=filtered,
+           served=lambda form, phase: ["orders"], folder=tmp_path)
+    store = _store(_config(_widget("w1", SAVED, query="q")))
+    assert _run(tmp_path, store) == 0
+    assert _entries(tmp_path)["w1"]["verdict"] == "failed"
+    assert sandboxRunner.serveTables is original
+
+
 # The strict comparison
 
 
@@ -2080,7 +2299,18 @@ def synthetic(monkeypatch):
         yield
 
 
-def test_endToEndDryRunOnTheSyntheticTables(tmp_path, synthetic, capsys):
+def test_endToEndDryRunOnTheSyntheticTables(tmp_path, synthetic, capsys, monkeypatch):
+    # R1: what the parent really served during each of the job's runs, recorded through the job's own hook.
+    recorded = []
+    hook = conv._servedTables
+
+    @contextlib.contextmanager
+    def watched():
+        with hook() as served:
+            yield served
+        recorded.append(set(served))
+
+    monkeypatch.setattr(conv, "_servedTables", watched)
     store, _ = _syntheticStore("w-bar", "w-wrong", "w-hardcoded", "w-panel", "w-failed")
     before = dict(store.files)
     stub = _stubFor(tmp_path, {"w-bar": "bar-region", "w-wrong": "bar-region", "w-hardcoded": "bar-region"})
@@ -2098,6 +2328,9 @@ def test_endToEndDryRunOnTheSyntheticTables(tmp_path, synthetic, capsys):
     assert (entries["w-hardcoded"]["field"], entries["w-hardcoded"]["filterIndex"]) == ("filter", 0)
     assert _stdout(capsys) == ["widgets 5", "candidates 3", "match 1", "differ 2", "failed 0", "skipped 2",
                                "filters 3", "written 0", "backup none"]
+    # Every run served exactly the tables the job resolved: `orders`, for the saved Python and for the request alike.
+    # Three renders, then a Python and a request re-run per filter set: two sets for w-bar, one for w-hardcoded.
+    assert len(recorded) == 3 + 2 * 3 and all(served == {"orders"} for served in recorded)
 
 
 def test_endToEndWriteOnTheSyntheticTables(tmp_path, synthetic):
