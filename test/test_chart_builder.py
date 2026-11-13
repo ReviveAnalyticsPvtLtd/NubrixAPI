@@ -1,4 +1,5 @@
 import datetime
+import json
 import logging
 from decimal import Decimal
 
@@ -539,3 +540,109 @@ def test_lenientTruncatedWithinCapSaysDataIsIncomplete(caplog):
         buildChart(request, pa.table({"x": ["a"], "y": [1]}), truncated=True, lenient=True)
     assert "incomplete" in caplog.text
     assert "keeping the first" not in caplog.text
+
+
+def pivotLong(rowName, columnName, pairs):
+    return pa.table(
+        {
+            rowName: [pair[0] for pair in pairs],
+            columnName: [pair[1] for pair in pairs],
+            "n": list(range(1, len(pairs) + 1)),
+        }
+    )
+
+
+def test_pivotRowsMissingFromFirstColumnAreStillSorted():
+    request = makeRequest("pivot", {"rows": ["status"], "columns": ["year"], "value": "n"})
+    pairs = [("canceled", "2016"), ("delivered", "2016"), ("approved", "2017"), ("canceled", "2017"),
+             ("created", "2017"), ("delivered", "2017")]
+    chart = build(request, pivotLong("status", "year", pairs))
+    assert list(chart["data"]) == ["2016", "2017"]
+    assert list(chart["data"]["2016"]) == ["approved", "canceled", "created", "delivered"]
+    assert chart["data"]["2016"] == {"approved": None, "canceled": 1, "created": None, "delivered": 2}
+    assert chart["data"]["2017"] == {"approved": 3, "canceled": 4, "created": 5, "delivered": 6}
+
+
+def test_pivotColumnsMissingFromFirstRowAreStillSorted():
+    request = makeRequest("pivot", {"rows": ["year"], "columns": ["status"], "value": "n"})
+    pairs = [("2016", "canceled"), ("2016", "delivered"), ("2017", "approved"), ("2017", "canceled"),
+             ("2017", "created"), ("2017", "delivered")]
+    chart = build(request, pivotLong("year", "status", pairs))
+    assert list(chart["data"]) == ["approved", "canceled", "created", "delivered"]
+    assert chart["data"]["canceled"] == {"2016": 1, "2017": 4}
+    assert chart["data"]["approved"] == {"2016": None, "2017": 3}
+
+
+def test_pivotConsistentInputKeepsFirstAppearanceOutput():
+    request = makeRequest("pivot", {"rows": ["s"], "columns": ["q"], "value": "n"})
+    pairs = [("a", "x"), ("b", "x"), ("c", "x"), ("a", "y"), ("b", "y"), ("c", "y")]
+    data = build(request, pivotLong("s", "q", pairs))["data"]
+    assert data == {"x": {"a": 1, "b": 2, "c": 3}, "y": {"a": 4, "b": 5, "c": 6}}
+    assert list(data) == ["x", "y"]
+    assert [list(column) for column in data.values()] == [["a", "b", "c"], ["a", "b", "c"]]
+    assert json.dumps(data) == '{"x": {"a": 1, "b": 2, "c": 3}, "y": {"a": 4, "b": 5, "c": 6}}'
+
+
+def test_pivotConflictingGroupsFallBackToFirstAppearance():
+    request = makeRequest("pivot", {"rows": ["s"], "columns": ["q"], "value": "n"})
+    pairs = [("a", "x"), ("b", "x"), ("b", "y"), ("a", "y"), ("c", "y")]
+    data = build(request, pivotLong("s", "q", pairs))["data"]
+    assert list(data) == ["x", "y"]
+    assert [list(column) for column in data.values()] == [["a", "b", "c"], ["a", "b", "c"]]
+
+
+def test_pivotMultiLevelKeysUseTheSameMerge():
+    request = makeRequest("pivot", {"rows": ["state", "city"], "columns": ["year"], "value": "n"})
+    table = pa.table(
+        {
+            "state": ["SP", "SP", "RJ", "SP", "SP"],
+            "city": ["Campinas", "Santos", "Niteroi", "Bauru", "Campinas"],
+            "year": ["2016", "2016", "2017", "2017", "2017"],
+            "n": [1, 2, 3, 4, 5],
+        }
+    )
+    data = build(request, table)["data"]
+    # 2016 gives Campinas then Santos; 2017 gives Niteroi, Bauru, Campinas.
+    order = ["('RJ', 'Niteroi')", "('SP', 'Bauru')", "('SP', 'Campinas')", "('SP', 'Santos')"]
+    assert list(data) == ["2016", "2017"]
+    assert list(data["2016"]) == order
+    assert list(data["2017"]) == order
+    assert data["2016"] == {order[0]: None, order[1]: None, order[2]: 1, order[3]: 2}
+    assert data["2017"] == {order[0]: 3, order[1]: 4, order[2]: 5, order[3]: None}
+
+
+def test_pivotOutputIsDeterministic():
+    request = makeRequest("pivot", {"rows": ["status"], "columns": ["year"], "value": "n"})
+    pairs = [("canceled", "2016"), ("delivered", "2016"), ("approved", "2017"), ("canceled", "2017"),
+             ("created", "2017"), ("delivered", "2017")]
+    first = json.dumps(build(request, pivotLong("status", "year", pairs)))
+    second = json.dumps(build(request, pivotLong("status", "year", pairs)))
+    assert first == second
+    assert first.index('"approved"') < first.index('"canceled"') < first.index('"created"')
+
+
+def test_pivotCycleInOneDimensionStillMergesTheOther():
+    request = makeRequest("pivot", {"rows": ["s"], "columns": ["q"], "value": "n"})
+    # Rows conflict (a,b in column y; b,a in column x), so rows keep first appearance.
+    # Columns: row a gives y,x; row c gives z,y -> merged z,y,x although y appeared first.
+    pairs = [("a", "y"), ("b", "y"), ("b", "x"), ("a", "x"), ("c", "z"), ("c", "y")]
+    data = build(request, pivotLong("s", "q", pairs))["data"]
+    assert list(data) == ["z", "y", "x"]
+    assert [list(column) for column in data.values()] == [["a", "b", "c"]] * 3
+
+
+def test_pivotDisjointGroupsKeepFirstAppearance():
+    request = makeRequest("pivot", {"rows": ["s"], "columns": ["q"], "value": "n"})
+    pairs = [("b", "x"), ("a", "x"), ("d", "y"), ("c", "y")]
+    data = build(request, pivotLong("s", "q", pairs))["data"]
+    assert list(data) == ["x", "y"]
+    assert [list(column) for column in data.values()] == [["b", "a", "d", "c"]] * 2
+
+
+def test_pivotSingleColumnAndEmptyResult():
+    request = makeRequest("pivot", {"rows": ["s"], "columns": ["q"], "value": "n"})
+    data = build(request, pivotLong("s", "q", [("b", "x"), ("a", "x"), ("c", "x")]))["data"]
+    assert data == {"x": {"b": 1, "a": 2, "c": 3}}
+    assert list(data["x"]) == ["b", "a", "c"]
+    empty = pa.table({"s": pa.array([], pa.string()), "q": pa.array([], pa.string()), "n": pa.array([], pa.int64())})
+    assert buildChart(request, empty)["data"] == {}
