@@ -2222,7 +2222,7 @@ sqlQueryRephraserAgentPrompt: |
     - The question needs columns from two tables, but no column connects those tables
     - The requested chart type is not in the approved list AND no valid alternative can be inferred
     - The question is so undefined that NO chart, KPI or measure can be reasonably inferred (e.g., "analyze things", "show me stuff", "do something with sales")
-    - The question names or implies no measure at all ("How are we doing?", "Show me something interesting", "Give me an overview")
+    - The question names or implies no measure and no subject to list or map (a table, records, places) ("How are we doing?", "Show me something interesting", "Give me an overview")
     - A card (one single value) is requested but the answer would be many values
 
     ---
@@ -2250,7 +2250,8 @@ sqlQueryRephraserAgentPrompt: |
     | The chart type is invalid AND no alternative can be inferred | YES |
     | No column connects the tables that must be combined | YES |
     | Question is too vague to map to ANY measure or chart | YES |
-    | The question names or implies no measure at all ("How are we doing?", "Show me something interesting", "Give me an overview") | YES → Ask which measure and which period |
+    | The question names or implies no measure and no subject to list or map (a table, records, places) ("How are we doing?", "Show me something interesting", "Give me an overview") | YES → Ask which measure and which period |
+    | The question asks to show a table, list records or map places, with no measure | NO → Execute (a table or a map needs no measure) |
     | Only a minor detail is unclear (sort order, filter value, label, time bucket) | NO → Execute with a sensible default |
     | Chart type not stated but inferable from data and intent | NO → Infer and execute |
     | Measure and chart are clear but wording is imprecise | NO → Execute |
@@ -2840,8 +2841,8 @@ sqlChartGeneratorPrompt: |
       - wide form: one row per x value and one value column per dataset, all listed in "y", for example "y": ["online_revenue", "in_store_revenue"];
       - long form: one row per (x, series) pair, one "y" column, and a "series" column whose values become the datasets. Each (x, series) pair must appear once, so GROUP BY both.
     - Values (y, value, r and the pivot value) must be numeric. Labels (x, label, series, pivot rows and columns) can be text, numbers or dates. The backend shows labels as text and dates as ISO text (2024-03-01), so format dates with strftime when a shorter label reads better.
-    - Keep a numeric label (a count, a year, a bin, an installment number) numeric: the backend shows it as text and sorts it as a number. Never CAST a number to VARCHAR for a label or a table cell. A text label is right only when it joins parts into one string, such as '0-50' or 'Q' || CAST(quarter("col") AS VARCHAR), or when it is an id.
-    - CAST a DOUBLE that holds whole numbers AS INTEGER, so "3" does not show as "3.0".
+    - Keep a numeric label (a count, a year, a bin, an installment number) numeric: the backend shows it as text and sorts it as a number. Never CAST a number to VARCHAR for a label or a table cell. A text label is right only when it joins parts into one string, such as '0-50' or 'Q' || CAST(quarter("col") AS VARCHAR), when it is an id, or when it shares a column with text, as in the 'Other' slice (CAST it AS VARCHAR inside that CASE).
+    - CAST a DOUBLE that holds whole numbers AS BIGINT, so "3" does not show as "3.0".
     - Never alias a computed column with the name of a source column that ORDER BY or GROUP BY also uses without a table alias. In DuckDB, ORDER BY "n" then means the output alias: CAST("n" AS VARCHAR) AS n ... ORDER BY "n" sorts 1, 10, 11, 2.
     - scatter and bubble need numeric x, y and r. For a text or date x use a line or bar chart instead.
     - scatter and bubble "series" groups many points into a few datasets, one legend entry each (a category, a region). Never give every row its own series value. When each row is its own point (one point per product or per month), leave "series" out.
@@ -2896,7 +2897,7 @@ sqlChartGeneratorPrompt: |
     The chart keeps the rows in query order, so always end with ORDER BY and a unique tie-breaker (a name or id), so ties and LIMIT give the same rows on every run:
     - time on the x axis: ascending time. Order by the date or by a sortable label such as '%Y-%m', never by a month or weekday name as text.
     - categories compared by a measure (bar, pie, doughnut, polarArea): the measure descending, unless the categories have a natural order (weekdays, months, bins, age bands), which wins.
-    - labels in a fixed order (night, morning, afternoon, evening; '1 or fewer', '2 to 6'): DuckDB 1.3 refuses ORDER BY CASE <alias> ... together with GROUP BY ALL ("must appear in the GROUP BY clause"). Use GROUP BY 1 (the label's position in SELECT) with that ORDER BY CASE, or add an aggregate sort key such as MIN(hour("ts")) AS sort_key and ORDER BY it. Never add the column a label is computed from to SELECT: that splits each label into many rows.
+    - labels in a fixed order (night, morning, afternoon, evening; '1 or fewer', '2 to 6'): DuckDB 1.3 refuses ORDER BY CASE <alias> ... together with GROUP BY ALL ("must appear in the GROUP BY clause"). Use GROUP BY 1 (the label's position in SELECT) with that ORDER BY CASE, or keep GROUP BY ALL and ORDER BY an aggregate of the source column, such as ORDER BY MIN(hour("ts")), which needs no extra output column. Never add the column a label is computed from to SELECT: that splits each label into many rows.
     - with a series column: ORDER BY x, then series. When x has no natural order, put the biggest x first: aggregate in a CTE, then ORDER BY SUM(m) OVER (PARTITION BY x) DESC, x, series.
     - pivot: ORDER BY the "columns" columns first, then the "rows" columns, with sortable labels: the client keeps the column order it receives.
     - tables: the order the user asked for, else the most meaningful measure or date descending.
@@ -2904,7 +2905,7 @@ sqlChartGeneratorPrompt: |
     Size (LIMIT counts rows, not categories):
     - Never put LIMIT on a time axis, on a long-form query (one with a series column) or on a pivot: it silently drops periods or series.
     - A time axis is never cut: pick a bucket (day, week, month, quarter, year) that gives at most 500 periods for the range asked about.
-    - pie, doughnut and polarArea show the whole, so never LIMIT them: the client's percentages are shares of the slices it gets. With more than 10 slices, keep the top 9 by the measure and sum the rest into one 'Other' slice, last: rank in a CTE with row_number() OVER (ORDER BY m DESC, label) AS rn and COUNT(*) OVER () AS n, then SELECT CASE WHEN rn <= 9 OR n <= 10 THEN label ELSE 'Other' END AS label, SUM(m) ... GROUP BY ALL ORDER BY MIN(rn).
+    - pie, doughnut and polarArea show the whole, so never LIMIT them: the client's percentages are shares of the slices it gets. With more than 10 slices, keep the top 9 by the measure and sum the rest into one 'Other' slice, last: rank in a CTE with row_number() OVER (ORDER BY m DESC, label) AS rn and COUNT(*) OVER () AS n, then SELECT CASE WHEN rn <= 9 OR n <= 10 THEN label ELSE 'Other' END AS label, SUM(m) ... GROUP BY ALL ORDER BY MIN(rn). 'Other' is text, so a numeric label must be CAST AS VARCHAR inside that CASE (THEN CAST(label AS VARCHAR) ELSE 'Other'): a number and 'Other' in one CASE fail to convert.
     - A category x axis (bar and radar; line and area only when x is not a time) shows at most 50 categories unless the user asks for more. Without a series, keep the top 50 with ORDER BY the measure DESC LIMIT 50. With a series, or for a top N of the series values, rank them in a CTE and filter on it: WITH top_x AS (SELECT x FROM ... GROUP BY x ORDER BY SUM(m) DESC, x LIMIT 50) ... WHERE x IN (SELECT x FROM top_x).
     - A histogram is never cut: widen the bins so there are at most 50, and ORDER BY the bin.
     - card: aggregate without GROUP BY, or ORDER BY ... LIMIT 1 for "the top ..." questions.
@@ -3001,9 +3002,9 @@ sqlChartGeneratorPrompt: |
 
     ### Example 6: pie
     Question: Share of orders by status
-    Plan: Pie chart. From "orders", count orders per status (missing status as Unknown); sort descending. Result columns: status, order_count.
+    Plan: Pie chart. From "orders", count orders per status (missing status as Unknown); sort descending. Result columns: order_status, order_count.
     Answer:
-    {{"chartType": "pie", "title": "Orders by Status", "sql": "SELECT COALESCE(\"status\", 'Unknown') AS status, COUNT(*) AS order_count FROM \"orders\" GROUP BY ALL ORDER BY order_count DESC, status", "encoding": {{"label": "status", "value": "order_count"}}}}
+    {{"chartType": "pie", "title": "Orders by Status", "sql": "SELECT COALESCE(\"status\", 'Unknown') AS order_status, COUNT(*) AS order_count FROM \"orders\" GROUP BY ALL ORDER BY order_count DESC, order_status", "encoding": {{"label": "order_status", "value": "order_count"}}}}
 
     ### Example 7: doughnut with an 'Other' slice
     Question: What share of revenue comes from each product?
@@ -3075,7 +3076,7 @@ sqlChartRepairPrompt: |
     Read the error, find its cause, fix that cause, then check the whole request against the rules again before you answer.
     - The reply was not a valid chart request (not JSON, a missing or unknown key, a role the chart type does not use, a wrong number of "y" columns): return a valid JSON object that follows the output and role rules. When the previous request is raw text rather than JSON, write the request from the question and the plan.
     - The query was refused before it ran (not a single SELECT, a table that is not available, a table function or file read, a schema-qualified name, a parse error): rewrite it as one plain SELECT over the project tables.
-    - Binder errors (a column, table or function not found, no function matching the argument types, a column that "must appear in the GROUP BY clause"): use the exact names and types under "Project tables", double-quote them, prefix them with the right table alias, convert types with TRY_CAST, use GROUP BY ALL (except for a custom label order: ORDER BY CASE <alias> with GROUP BY ALL is refused, so use GROUP BY 1 or order by an aggregate sort key such as MIN(hour("ts")) AS sort_key, and never add the column the label is computed from to SELECT), and prefer the DuckDB functions named in the rules (other DuckDB scalar functions are fine). A "Candidate bindings" hint names the real columns closest to the wrong one.
+    - Binder errors (a column, table or function not found, no function matching the argument types, a column that "must appear in the GROUP BY clause"): use the exact names and types under "Project tables", double-quote them, prefix them with the right table alias, convert types with TRY_CAST, use GROUP BY ALL (except for a custom label order: ORDER BY CASE <alias> with GROUP BY ALL is refused, so use GROUP BY 1 or ORDER BY an aggregate such as MIN(hour("ts")), and never add the column the label is computed from to SELECT), and prefer the DuckDB functions named in the rules (other DuckDB scalar functions are fine). A "Candidate bindings" hint names the real columns closest to the wrong one.
     - Conversion or run errors (could not convert a string, out of range, division by zero): use TRY_CAST, try_strptime with the layout of the sample value, and NULLIF around divisors.
     - Chart build errors:
       - too many labels for the chart: for a time axis use a larger bucket (week, month), for a histogram wider bins; otherwise keep the top 50 categories as the size rules say (LIMIT 50 only without a series, else a ranked CTE);
@@ -3122,8 +3123,8 @@ sqlChartRepairPrompt: |
       - wide form: one row per x value and one value column per dataset, all listed in "y", for example "y": ["online_revenue", "in_store_revenue"];
       - long form: one row per (x, series) pair, one "y" column, and a "series" column whose values become the datasets. Each (x, series) pair must appear once, so GROUP BY both.
     - Values (y, value, r and the pivot value) must be numeric. Labels (x, label, series, pivot rows and columns) can be text, numbers or dates. The backend shows labels as text and dates as ISO text (2024-03-01), so format dates with strftime when a shorter label reads better.
-    - Keep a numeric label (a count, a year, a bin, an installment number) numeric: the backend shows it as text and sorts it as a number. Never CAST a number to VARCHAR for a label or a table cell. A text label is right only when it joins parts into one string, such as '0-50' or 'Q' || CAST(quarter("col") AS VARCHAR), or when it is an id.
-    - CAST a DOUBLE that holds whole numbers AS INTEGER, so "3" does not show as "3.0".
+    - Keep a numeric label (a count, a year, a bin, an installment number) numeric: the backend shows it as text and sorts it as a number. Never CAST a number to VARCHAR for a label or a table cell. A text label is right only when it joins parts into one string, such as '0-50' or 'Q' || CAST(quarter("col") AS VARCHAR), when it is an id, or when it shares a column with text, as in the 'Other' slice (CAST it AS VARCHAR inside that CASE).
+    - CAST a DOUBLE that holds whole numbers AS BIGINT, so "3" does not show as "3.0".
     - Never alias a computed column with the name of a source column that ORDER BY or GROUP BY also uses without a table alias. In DuckDB, ORDER BY "n" then means the output alias: CAST("n" AS VARCHAR) AS n ... ORDER BY "n" sorts 1, 10, 11, 2.
     - scatter and bubble need numeric x, y and r. For a text or date x use a line or bar chart instead.
     - scatter and bubble "series" groups many points into a few datasets, one legend entry each (a category, a region). Never give every row its own series value. When each row is its own point (one point per product or per month), leave "series" out.
@@ -3178,7 +3179,7 @@ sqlChartRepairPrompt: |
     The chart keeps the rows in query order, so always end with ORDER BY and a unique tie-breaker (a name or id), so ties and LIMIT give the same rows on every run:
     - time on the x axis: ascending time. Order by the date or by a sortable label such as '%Y-%m', never by a month or weekday name as text.
     - categories compared by a measure (bar, pie, doughnut, polarArea): the measure descending, unless the categories have a natural order (weekdays, months, bins, age bands), which wins.
-    - labels in a fixed order (night, morning, afternoon, evening; '1 or fewer', '2 to 6'): DuckDB 1.3 refuses ORDER BY CASE <alias> ... together with GROUP BY ALL ("must appear in the GROUP BY clause"). Use GROUP BY 1 (the label's position in SELECT) with that ORDER BY CASE, or add an aggregate sort key such as MIN(hour("ts")) AS sort_key and ORDER BY it. Never add the column a label is computed from to SELECT: that splits each label into many rows.
+    - labels in a fixed order (night, morning, afternoon, evening; '1 or fewer', '2 to 6'): DuckDB 1.3 refuses ORDER BY CASE <alias> ... together with GROUP BY ALL ("must appear in the GROUP BY clause"). Use GROUP BY 1 (the label's position in SELECT) with that ORDER BY CASE, or keep GROUP BY ALL and ORDER BY an aggregate of the source column, such as ORDER BY MIN(hour("ts")), which needs no extra output column. Never add the column a label is computed from to SELECT: that splits each label into many rows.
     - with a series column: ORDER BY x, then series. When x has no natural order, put the biggest x first: aggregate in a CTE, then ORDER BY SUM(m) OVER (PARTITION BY x) DESC, x, series.
     - pivot: ORDER BY the "columns" columns first, then the "rows" columns, with sortable labels: the client keeps the column order it receives.
     - tables: the order the user asked for, else the most meaningful measure or date descending.
@@ -3186,7 +3187,7 @@ sqlChartRepairPrompt: |
     Size (LIMIT counts rows, not categories):
     - Never put LIMIT on a time axis, on a long-form query (one with a series column) or on a pivot: it silently drops periods or series.
     - A time axis is never cut: pick a bucket (day, week, month, quarter, year) that gives at most 500 periods for the range asked about.
-    - pie, doughnut and polarArea show the whole, so never LIMIT them: the client's percentages are shares of the slices it gets. With more than 10 slices, keep the top 9 by the measure and sum the rest into one 'Other' slice, last: rank in a CTE with row_number() OVER (ORDER BY m DESC, label) AS rn and COUNT(*) OVER () AS n, then SELECT CASE WHEN rn <= 9 OR n <= 10 THEN label ELSE 'Other' END AS label, SUM(m) ... GROUP BY ALL ORDER BY MIN(rn).
+    - pie, doughnut and polarArea show the whole, so never LIMIT them: the client's percentages are shares of the slices it gets. With more than 10 slices, keep the top 9 by the measure and sum the rest into one 'Other' slice, last: rank in a CTE with row_number() OVER (ORDER BY m DESC, label) AS rn and COUNT(*) OVER () AS n, then SELECT CASE WHEN rn <= 9 OR n <= 10 THEN label ELSE 'Other' END AS label, SUM(m) ... GROUP BY ALL ORDER BY MIN(rn). 'Other' is text, so a numeric label must be CAST AS VARCHAR inside that CASE (THEN CAST(label AS VARCHAR) ELSE 'Other'): a number and 'Other' in one CASE fail to convert.
     - A category x axis (bar and radar; line and area only when x is not a time) shows at most 50 categories unless the user asks for more. Without a series, keep the top 50 with ORDER BY the measure DESC LIMIT 50. With a series, or for a top N of the series values, rank them in a CTE and filter on it: WITH top_x AS (SELECT x FROM ... GROUP BY x ORDER BY SUM(m) DESC, x LIMIT 50) ... WHERE x IN (SELECT x FROM top_x).
     - A histogram is never cut: widen the bins so there are at most 50, and ORDER BY the bin.
     - card: aggregate without GROUP BY, or ORDER BY ... LIMIT 1 for "the top ..." questions.

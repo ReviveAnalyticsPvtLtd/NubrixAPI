@@ -931,7 +931,7 @@ CHART_PROMPT_KEYS = ["sqlChartGeneratorPrompt", "sqlChartRepairPrompt"]
 # One key sentence per rule; the generator and the repair prompt both carry it (the shared sections are word for word).
 EVALUATION_RULE_SENTENCES = {
     "numberLabelsStayNumbers": "Never CAST a number to VARCHAR for a label or a table cell.",
-    "wholeDoublesAreIntegers": 'CAST a DOUBLE that holds whole numbers AS INTEGER, so "3" does not show as "3.0".',
+    "wholeDoublesAreIntegers": 'CAST a DOUBLE that holds whole numbers AS BIGINT, so "3" does not show as "3.0".',
     "noAliasOfASortedSourceColumn": "Never alias a computed column with the name of a source column that ORDER BY or GROUP BY also uses",
     "seriesGroupsPoints": 'Never give every row its own series value. When each row is its own point (one point per product or per month), leave "series" out.',
     "mapLabelIsWhatTheUserAsks": '"labelled with the postal code" means the code alone',
@@ -941,7 +941,7 @@ EVALUATION_RULE_SENTENCES = {
     "measureWhatTheQuestionNames": "aggregates that table by region, not only the rows that also match another table.",
     "countEveryEntity": "LEFT JOIN a table some of them lack (orders with no payment), so they still count.",
     "fixedLabelOrder": "DuckDB 1.3 refuses ORDER BY CASE <alias> ... together with GROUP BY ALL",
-    "fixedLabelOrderForms": 'Use GROUP BY 1 (the label\'s position in SELECT) with that ORDER BY CASE, or add an aggregate sort key such as MIN(hour("ts")) AS sort_key and ORDER BY it.',
+    "fixedLabelOrderForms": 'Use GROUP BY 1 (the label\'s position in SELECT) with that ORDER BY CASE, or keep GROUP BY ALL and ORDER BY an aggregate of the source column, such as ORDER BY MIN(hour("ts")), which needs no extra output column.',
     "noSourceColumnInSelect": "Never add the column a label is computed from to SELECT: that splits each label into many rows.",
     "calendarDayComparison": 'compare CAST("a" AS DATE) with CAST("b" AS DATE), not the timestamps',
 }
@@ -957,7 +957,7 @@ def test_repairBinderBulletNamesTheLabelOrderForms():
     repair = _formatted("sqlChartRepairPrompt")
     bullet = next(line for line in repair.splitlines() if line.startswith("- Binder errors"))
 
-    assert "GROUP BY 1" in bullet and "sort_key" in bullet and "never add the column the label is computed from" in bullet
+    assert "GROUP BY 1" in bullet and 'ORDER BY an aggregate such as MIN(hour("ts"))' in bullet and "never add the column the label is computed from" in bullet
 
 
 def test_textLabelsBuiltFromPartsStayAllowed():
@@ -975,9 +975,10 @@ def test_scatterExampleStillGroupsProductsByCategory():
 
 def test_sqlRephraserAsksWhichMeasureWhenNoneIsNamed():
     text = _prompts()["sqlQueryRephraserAgentPrompt"]
-    gate = '| The question names or implies no measure at all ("How are we doing?", "Show me something interesting", "Give me an overview") | YES → Ask which measure and which period |'
+    gate = '| The question names or implies no measure and no subject to list or map (a table, records, places) ("How are we doing?", "Show me something interesting", "Give me an overview") | YES → Ask which measure and which period |'
 
     assert gate in text
+    assert "| The question asks to show a table, list records or map places, with no measure | NO → Execute" in text
     assert "#### Example 6: No Measure Named" in text
     assert "**User Query:** \"How are we doing?\"" in text
     assert "When in doubt about whether to doubt → EXECUTE" in text
@@ -1020,11 +1021,11 @@ def test_groupByAllWithOrderByCaseOnAnAliasIsABinderError():
 
 def test_labelsInAFixedOrderRunWithGroupByOneOrAnAggregateSortKey():
     groupByOne = f'SELECT {PART_OF_DAY} AS part, COUNT(*) AS n FROM events GROUP BY 1 ORDER BY {PART_ORDER}'
-    sortKey = f'SELECT {PART_OF_DAY} AS part, COUNT(*) AS n, MIN(hour("ts")) AS sort_key FROM events GROUP BY ALL ORDER BY sort_key'
+    sortKey = f'SELECT {PART_OF_DAY} AS part, COUNT(*) AS n FROM events GROUP BY ALL ORDER BY MIN(hour("ts"))'
     connection = _eventsConnection()
 
     assert connection.execute(groupByOne).fetchall() == [("night", 1), ("morning", 1), ("afternoon", 1), ("evening", 2)]
-    assert [row[:2] for row in connection.execute(sortKey).fetchall()] == [("night", 1), ("morning", 1), ("afternoon", 1), ("evening", 2)]
+    assert connection.execute(sortKey).fetchall() == [("night", 1), ("morning", 1), ("afternoon", 1), ("evening", 2)]
 
 
 def test_aliasingACastWithTheSourceNameAndOrderingByItSortsAsText():
@@ -1036,3 +1037,46 @@ def test_aliasingACastWithTheSourceNameAndOrderingByItSortsAsText():
 
     assert [row[0] for row in asText] == ["1", "10", "11", "2"]
     assert [row[0] for row in asNumber] == [1, 2, 10, 11]
+
+
+def test_otherSliceNeedsANumericLabelCastToText():
+    connection = duckdb.connect()
+    connection.register("slices", pa.table({"yr": list(range(2000, 2012)), "m": [1.0] * 12}))
+    ranked = "WITH ranked AS (SELECT yr, m, row_number() OVER (ORDER BY m DESC, yr) AS rn, COUNT(*) OVER () AS n FROM slices)"
+    bare = ranked + " SELECT CASE WHEN rn <= 9 OR n <= 10 THEN yr ELSE 'Other' END AS label, SUM(m) AS m FROM ranked GROUP BY ALL ORDER BY MIN(rn)"
+    cast = ranked + " SELECT CASE WHEN rn <= 9 OR n <= 10 THEN CAST(yr AS VARCHAR) ELSE 'Other' END AS label, SUM(m) AS m FROM ranked GROUP BY ALL ORDER BY MIN(rn)"
+
+    with pytest.raises(duckdb.ConversionException):
+        connection.execute(bare).fetchall()
+    rows = connection.execute(cast).fetchall()
+    assert rows[0] == ("2000", 1.0) and rows[-1] == ("Other", 3.0)
+
+
+def test_slicesRuleAndLabelRuleAgreeOnTheOtherSlice():
+    for key in CHART_PROMPT_KEYS:
+        text = _formatted(key)
+
+        assert "when it shares a column with text, as in the 'Other' slice (CAST it AS VARCHAR inside that CASE)" in text
+        assert "a numeric label must be CAST AS VARCHAR inside that CASE" in text
+
+
+def test_noExampleAliasesAComputedColumnWithASortedSourceColumnName():
+    sourceNames = {name for schema in EXAMPLE_SCHEMAS.values() for name in schema.names}
+    offenders = []
+    for request in _examples():
+        select = sqlglot.parse_one(request.sql, read="duckdb")
+        for scope in select.find_all(sqlglot.exp.Select):
+            referenced = {
+                column.name
+                for clause in (scope.args.get("order"), scope.args.get("group"))
+                if clause is not None
+                for column in clause.find_all(sqlglot.exp.Column)
+                if not column.table
+            }
+            for projection in scope.expressions:
+                if not isinstance(projection, sqlglot.exp.Alias) or isinstance(projection.this, sqlglot.exp.Column):
+                    continue  # a bare column renamed to its own name is not a computed column
+                if projection.alias in sourceNames and projection.alias in referenced:
+                    offenders.append((request.chartType, projection.alias))
+
+    assert offenders == []
