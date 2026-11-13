@@ -1,4 +1,5 @@
-"""The period probe helper: current-date lower bounds in a chart query, their probe queries, and the no-data predicate."""
+"""The period probe helper: the current-date bounds that filter a chart query's own rows, their probe query, and the
+no-data predicate."""
 
 from datetime import date, timedelta
 
@@ -6,10 +7,10 @@ import duckdb
 import pyarrow as pa
 import pytest
 
-from nubrix.components.periodProbe import chartHasNoData, findPeriodProbes
+from nubrix.components.periodProbe import MAX_BOUNDS, chartHasNoData, combinedProbeSql, findPeriodProbes
 from nubrix.components.sqlCheck import checkSql
 
-TABLES = ["orders", "items", "Order Lines"]
+TABLES = ["orders", "items", "refunds", "customers", "Order Lines"]
 
 
 def _probe(sql, tables=TABLES):
@@ -18,11 +19,16 @@ def _probe(sql, tables=TABLES):
     return probes[0]
 
 
-def _expectedSql(column, bound, table):
+def _expectedSql(column, bound, table, side=None):
+    side = side or column
     return (
         f"SELECT CAST(max({column}) AS VARCHAR) AS last_value, "
-        f"(max({column}) IS NULL OR max({column}) < ({bound})) AS ended_before FROM {table}"
+        f"(max({side}) IS NULL OR max({side}) < ({bound})) AS ended_before FROM {table}"
     )
+
+
+def _found(sql, tables=TABLES):
+    return [(probe.table, probe.column) for probe in findPeriodProbes(sql, tables)]
 
 
 # -- finding the bound -------------------------------------------------------
@@ -42,12 +48,13 @@ def _expectedSql(column, bound, table):
         ("d >= current_timestamp - INTERVAL 30 DAY", "CURRENT_TIMESTAMP - INTERVAL '30' DAY"),
         ("d >= date_trunc('month', current_date) - INTERVAL 11 MONTH", "DATE_TRUNC('MONTH', CURRENT_DATE) - INTERVAL '11' MONTH"),
         ("status = 'x' AND d >= CURRENT_DATE - 29", "CURRENT_DATE - 29"),
+        ("(status = 'x' AND (d >= CURRENT_DATE - 29))", "CURRENT_DATE - 29"),
     ],
 )
-def test_findsTheCurrentDateLowerBound(where, bound):
+def test_findsATopLevelWhereConjunct(where, bound):
     probe = _probe(f"SELECT count(*) AS n FROM orders WHERE {where}")
     assert probe.table == "orders"
-    assert probe.column == "d"
+    assert probe.column == "d" and probe.side == "d"
     assert probe.bound == bound
     assert probe.sql == _expectedSql("d", bound, '"orders"')
 
@@ -82,17 +89,75 @@ def test_ignoresAComparisonWithNoCurrentDateFunctionOrARowDependentBound(where):
     assert findPeriodProbes(f"SELECT count(*) AS n FROM orders WHERE {where}", TABLES) == []
 
 
-def test_ignoresAnAggregateOnTheColumnSide():
-    sql = "SELECT a FROM orders GROUP BY a HAVING max(d) >= CURRENT_DATE - 30"
+# -- only bounds that filter the chart's own rows (review C1) ----------------
+
+
+@pytest.mark.parametrize(
+    "sql",
+    [
+        # OR branch: the other branch adds rows.
+        "SELECT status, sum(refund) AS total FROM orders WHERE d >= CURRENT_DATE - 30 OR status = 'open' GROUP BY 1",
+        "SELECT count(*) AS n FROM orders WHERE status = 'x' AND (d >= CURRENT_DATE - 30 OR amount > 1)",
+        # CASE label in the projection, and a CASE in WHERE.
+        "SELECT CASE WHEN d >= CURRENT_DATE - 30 THEN 'recent' ELSE 'older' END AS bucket, sum(refund) AS total FROM orders GROUP BY 1",
+        "SELECT count(*) AS n FROM orders WHERE CASE WHEN d >= CURRENT_DATE - 30 THEN false ELSE true END",
+        "SELECT sum(CASE WHEN d >= CURRENT_DATE - 30 THEN amount ELSE 0 END) AS total FROM orders",
+        # Anti-joins: NOT IN, NOT EXISTS, the right side of EXCEPT.
+        "SELECT sum(discount) AS total FROM orders WHERE id NOT IN (SELECT order_id FROM refunds WHERE r_at >= CURRENT_DATE - 30)",
+        "SELECT sum(discount) AS total FROM orders o WHERE NOT EXISTS (SELECT 1 FROM refunds r WHERE r.order_id = o.id AND r.r_at >= CURRENT_DATE - 30)",
+        "SELECT id FROM orders EXCEPT SELECT order_id FROM refunds WHERE r_at >= CURRENT_DATE - 30",
+        # The optional side of an outer join.
+        "SELECT c.region, sum(c.credit) AS total FROM customers c LEFT JOIN orders o ON o.cid = c.id AND o.d >= CURRENT_DATE - 30 GROUP BY 1",
+        "SELECT count(*) AS n FROM orders o RIGHT JOIN items i ON i.oid = o.id AND o.d >= CURRENT_DATE - 30",
+        "SELECT count(*) AS n FROM orders o FULL JOIN items i ON i.oid = o.id AND i.shipped >= CURRENT_DATE - 30",
+        "SELECT count(*) AS n FROM (SELECT * FROM orders WHERE d >= CURRENT_DATE - 30) AS r RIGHT JOIN items i ON i.oid = r.id",
+        "SELECT count(*) AS n FROM customers c LEFT JOIN (SELECT * FROM orders WHERE d >= CURRENT_DATE - 30) AS r ON r.cid = c.id",
+        # An unused CTE.
+        "WITH recent AS (SELECT * FROM orders WHERE d >= CURRENT_DATE - 30) SELECT sum(refund) AS total FROM orders",
+        # The comparison inside another expression.
+        "SELECT count(*) AS n FROM orders WHERE (d >= CURRENT_DATE - 30) = false",
+        "SELECT count(*) AS n FROM orders WHERE (d >= CURRENT_DATE - 30) IS NOT TRUE",
+        "SELECT count(*) AS n FROM orders WHERE coalesce(d >= CURRENT_DATE - 30, true)",
+        # FILTER and HAVING.
+        "SELECT region, sum(refund) FILTER (WHERE d >= CURRENT_DATE - 30) AS recent FROM orders GROUP BY 1",
+        "SELECT region, count(*) AS n FROM orders GROUP BY 1 HAVING max(d) >= CURRENT_DATE - 30",
+        # A set operation other than UNION ALL, and a UNION ALL with an unbounded branch.
+        "SELECT d FROM orders WHERE d >= CURRENT_DATE - 30 UNION SELECT d FROM items WHERE d >= CURRENT_DATE - 30",
+        "SELECT d FROM orders WHERE d >= CURRENT_DATE - 30 EXCEPT SELECT d FROM items",
+        "SELECT d FROM orders WHERE d >= CURRENT_DATE - 30 UNION ALL SELECT d FROM items",
+        # An aggregate without GROUP BY gives a row even from no rows.
+        "SELECT t.n FROM (SELECT count(*) AS n FROM orders WHERE d >= CURRENT_DATE - 30) AS t",
+    ],
+)
+def test_aBoundThatDoesNotFilterTheChartRowsMakesNoProbe(sql):
     assert findPeriodProbes(sql, TABLES) == []
 
 
-def test_aBoundInsideACaseInTheSelectListCounts():
-    probe = _probe("SELECT sum(CASE WHEN d >= CURRENT_DATE - 30 THEN amount ELSE 0 END) AS total FROM orders")
-    assert probe.table == "orders" and probe.column == "d"
+@pytest.mark.parametrize(
+    "sql",
+    [
+        # IN, EXISTS and scalar subqueries, with unqualified and qualified columns (review C2).
+        "SELECT count(*) AS n FROM customers WHERE region = 'X' AND id IN (SELECT customer_id FROM orders WHERE created_at >= CURRENT_DATE - 30)",
+        "SELECT count(*) AS n FROM customers c WHERE c.region = 'X' AND c.id IN (SELECT o.customer_id FROM orders o WHERE o.created_at >= CURRENT_DATE - 30)",
+        "SELECT count(*) AS n FROM orders o WHERE EXISTS (SELECT 1 FROM items i WHERE i.oid = o.id AND d >= CURRENT_DATE - 30)",
+        "SELECT count(*) AS n FROM customers c WHERE EXISTS (SELECT 1 FROM orders o WHERE o.cid = c.id AND o.created_at >= CURRENT_DATE - 30)",
+        "SELECT region, (SELECT count(*) FROM refunds WHERE r_at >= CURRENT_DATE - 30) AS recent FROM customers",
+        "SELECT count(*) AS n FROM customers WHERE (SELECT count(*) FROM orders WHERE created_at >= CURRENT_DATE - 30) > 0",
+    ],
+)
+def test_aBoundInsideASubqueryExpressionMakesNoProbe(sql):
+    assert findPeriodProbes(sql, TABLES) == []
 
 
-# -- resolving the column ----------------------------------------------------
+def test_aCteBodyColumnResolvesInTheCteScope():
+    sql = (
+        "WITH r AS (SELECT * FROM orders WHERE created_at >= CURRENT_DATE - 30) "
+        "SELECT count(*) AS n FROM customers c JOIN r ON r.cid = c.id"
+    )
+    assert _found(sql) == [("orders", "created_at")]
+
+
+# -- the data path -----------------------------------------------------------
 
 
 def test_resolvesASingleTableScope():
@@ -107,8 +172,7 @@ def test_resolvesAnAliasedJoin():
         "WHERE o.created_at >= CURRENT_DATE - 30 GROUP BY 1"
     )
     probe = _probe(sql)
-    assert probe.table == "orders"
-    assert probe.column == "created_at"
+    assert (probe.table, probe.column) == ("orders", "created_at")
     assert probe.sql == _expectedSql("created_at", "CURRENT_DATE - 30", '"orders"')
 
 
@@ -117,8 +181,19 @@ def test_resolvesBothSidesOfAJoinSeparately():
         "SELECT count(*) AS n FROM orders o JOIN items i ON i.order_id = o.id "
         "WHERE o.created_at >= CURRENT_DATE - 30 AND i.shipped_at >= CURRENT_DATE - 30"
     )
-    probes = findPeriodProbes(sql, TABLES)
-    assert [(probe.table, probe.column) for probe in probes] == [("orders", "created_at"), ("items", "shipped_at")]
+    assert _found(sql) == [("orders", "created_at"), ("items", "shipped_at")]
+
+
+def test_findsAConjunctOfAnInnerJoinOn():
+    sql = "SELECT count(*) AS n FROM orders o JOIN items i ON i.order_id = o.id AND i.shipped_at >= CURRENT_DATE - 30"
+    assert _found(sql) == [("items", "shipped_at")]
+    cross = "SELECT count(*) AS n FROM orders o CROSS JOIN (SELECT * FROM items WHERE shipped_at >= CURRENT_DATE - 30) AS i"
+    assert _found(cross) == [("items", "shipped_at")]
+
+
+def test_aWhereBoundOnAnOuterJoinedColumnStillFiltersEveryRow():
+    sql = "SELECT count(*) AS n FROM customers c LEFT JOIN orders o ON o.cid = c.id WHERE o.d >= CURRENT_DATE - 30"
+    assert _found(sql) == [("orders", "d")]
 
 
 def test_resolvesACteOverOneTable():
@@ -127,9 +202,8 @@ def test_resolvesACteOverOneTable():
         "SELECT day, sum(amount) AS total FROM m WHERE day >= CURRENT_DATE - 30 GROUP BY 1"
     )
     probe = _probe(sql)
-    assert probe.table == "orders"
-    assert probe.column == "CAST(d AS DATE)"
-    assert probe.sql == _expectedSql("CAST(d AS DATE)", "CURRENT_DATE - 30", '"orders"')
+    assert (probe.table, probe.column, probe.side) == ("orders", "d", "CAST(d AS DATE)")
+    assert probe.sql == _expectedSql("d", "CURRENT_DATE - 30", '"orders"', side="CAST(d AS DATE)")
 
 
 def test_resolvesAStarCteAndADerivedTable():
@@ -139,15 +213,34 @@ def test_resolvesAStarCteAndADerivedTable():
     assert (derived.table, derived.column) == ("orders", "d")
 
 
-def test_resolvesABoundInsideACteBody():
-    sql = "WITH recent AS (SELECT * FROM orders WHERE d >= CURRENT_DATE - 30) SELECT count(*) AS n FROM recent"
-    assert _probe(sql).table == "orders"
+def test_findsABoundInsideAUsedCteOrDerivedTableBody():
+    cte = "WITH recent AS (SELECT * FROM orders WHERE d >= CURRENT_DATE - 30) SELECT count(*) AS n FROM recent"
+    assert _found(cte) == [("orders", "d")]
+    nested = (
+        "WITH a AS (SELECT * FROM orders WHERE d >= CURRENT_DATE - 30), b AS (SELECT * FROM a) "
+        "SELECT count(*) AS n FROM (SELECT * FROM b) AS t JOIN items i ON i.oid = t.id"
+    )
+    assert _found(nested) == [("orders", "d")]
+
+
+def test_aUnionAllNeedsABoundInEveryBranch():
+    sql = "SELECT d FROM orders WHERE d >= CURRENT_DATE - 30 UNION ALL SELECT shipped FROM items WHERE shipped >= CURRENT_DATE - 30"
+    assert _found(sql) == [("orders", "d"), ("items", "shipped")]
+    inCte = (
+        "WITH u AS (SELECT d FROM orders WHERE d >= CURRENT_DATE - 30 UNION ALL SELECT d FROM items WHERE d >= CURRENT_DATE - 30) "
+        "SELECT count(*) AS n FROM u"
+    )
+    assert _found(inCte) == [("orders", "d"), ("items", "d")]
+
+
+def test_aCteThatShadowsATableIsReadAsTheCte():
+    assert _found("WITH orders AS (SELECT shipped AS d FROM items) SELECT count(*) AS n FROM orders WHERE d >= CURRENT_DATE - 30") == [("items", "shipped")]
 
 
 @pytest.mark.parametrize(
     "sql",
     [
-        # Unqualified column with two tables in FROM.
+        # Unqualified column with two sources in the scope.
         "SELECT count(*) AS n FROM orders o JOIN items i ON i.order_id = o.id WHERE created_at >= CURRENT_DATE - 30",
         # Qualifier that names no source in the scope.
         "SELECT count(*) AS n FROM orders o WHERE x.created_at >= CURRENT_DATE - 30",
@@ -160,27 +253,86 @@ def test_resolvesABoundInsideACteBody():
         # A source that is not a project table.
         "SELECT count(*) AS n FROM (VALUES (DATE '2020-01-01')) AS v(d) WHERE d >= CURRENT_DATE - 30",
         "SELECT count(*) AS n FROM unknown_table WHERE d >= CURRENT_DATE - 30",
+        # One resolvable bound does not excuse another that cannot be resolved.
+        "SELECT count(*) AS n FROM orders o JOIN items i ON i.order_id = o.id WHERE created_at >= CURRENT_DATE - 30 AND o.d >= CURRENT_DATE - 30",
     ],
 )
-def test_skipsAnUnresolvableColumn(sql):
+def test_anUnresolvableBoundDeclinesTheQuery(sql):
     assert findPeriodProbes(sql, TABLES) == []
 
 
-def test_skipsOnlyTheUnresolvableComparison():
-    sql = (
-        "SELECT count(*) AS n FROM orders o JOIN items i ON i.order_id = o.id "
-        "WHERE created_at >= CURRENT_DATE - 30 AND o.d >= CURRENT_DATE - 30"
-    )
-    assert [(probe.table, probe.column) for probe in findPeriodProbes(sql, TABLES)] == [("orders", "d")]
+@pytest.mark.parametrize(
+    "sql",
+    [
+        # A column list renames the source's columns (review M2).
+        "WITH m(d, created) AS (SELECT created, d FROM orders) SELECT count(*) AS n FROM m WHERE d >= CURRENT_DATE - 30",
+        "SELECT count(*) AS n FROM (SELECT created, d FROM orders) AS t(d, created) WHERE t.d >= CURRENT_DATE - 30",
+        "SELECT count(*) AS n FROM orders AS o(created, d) WHERE o.d >= CURRENT_DATE - 30",
+    ],
+)
+def test_aSourceWithAColumnListDeclines(sql):
+    assert findPeriodProbes(sql, TABLES) == []
 
 
 def test_identicalComparisonsGiveOneProbe():
-    sql = "SELECT count(*) AS n FROM orders WHERE d >= CURRENT_DATE - 30 OR (d >= CURRENT_DATE - 30 AND amount > 1)"
+    sql = "SELECT count(*) AS n FROM orders WHERE d >= CURRENT_DATE - 30 AND amount > 1 AND d >= CURRENT_DATE - 30"
     assert len(findPeriodProbes(sql, TABLES)) == 1
 
 
 def test_unparsableSqlGivesNoProbe():
     assert findPeriodProbes("SELECT FROM WHERE >=", TABLES) == []
+
+
+# -- the compared side (review M1) ------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "side, expected",
+    [
+        ("date_trunc('month', d)", "DATE_TRUNC('MONTH', d)"),
+        ("CAST(d AS DATE)", "CAST(d AS DATE)"),
+        ("TRY_CAST(d AS DATE)", "TRY_CAST(d AS DATE)"),
+        ("CAST(date_trunc('month', d) AS DATE)", "CAST(DATE_TRUNC('MONTH', d) AS DATE)"),
+    ],
+)
+def test_aWrappedSideQuotesTheBareColumn(side, expected):
+    probe = _probe(f"SELECT count(*) AS n FROM orders WHERE {side} >= CURRENT_DATE - 30")
+    assert (probe.column, probe.side) == ("d", expected)
+    assert probe.sql == _expectedSql("d", "CURRENT_DATE - 30", '"orders"', side=expected)
+
+
+@pytest.mark.parametrize(
+    "side",
+    ["year(d)", "d + INTERVAL 1 DAY", "strftime(d, '%Y-%m-%d')", "coalesce(d, e)", "date_trunc('month', d + 1)"],
+)
+def test_anyOtherWrapperDeclines(side):
+    assert findPeriodProbes(f"SELECT count(*) AS n FROM orders WHERE {side} >= CURRENT_DATE - 30", TABLES) == []
+
+
+# -- one combined probe (review M4) -----------------------------------------
+
+
+def test_theCombinedProbeCrossJoinsEveryBound():
+    probes = findPeriodProbes(
+        "SELECT count(*) AS n FROM orders o JOIN items i ON i.oid = o.id WHERE o.d >= CURRENT_DATE - 30 AND i.s >= CURRENT_DATE - 7",
+        TABLES,
+    )
+    assert combinedProbeSql(probes) == (
+        "SELECT p1.last_value AS last_value_1, p1.ended_before AS ended_before_1, "
+        "p2.last_value AS last_value_2, p2.ended_before AS ended_before_2 "
+        f"FROM ({probes[0].sql}) AS p1 CROSS JOIN ({probes[1].sql}) AS p2"
+    )
+    assert checkSql(combinedProbeSql(probes), TABLES).tables == ("orders", "items")
+
+
+def test_moreThanEightBoundsDecline():
+    def query(count):
+        conjuncts = " AND ".join(f"d >= CURRENT_DATE - {days}" for days in range(1, count + 1))
+        return f"SELECT count(*) AS n FROM orders WHERE {conjuncts}"
+
+    assert MAX_BOUNDS == 8
+    assert len(findPeriodProbes(query(8), TABLES)) == 8
+    assert findPeriodProbes(query(9), TABLES) == []
 
 
 # -- quoting -----------------------------------------------------------------
@@ -194,6 +346,7 @@ def test_quotesNamesWithSpacesAndDoubleQuotes():
     assert probe.column == '"Ship ""Day"""'
     assert probe.sql == _expectedSql('"Ship ""Day"""', "CURRENT_DATE - 30", '"Order ""Lines"" 2024"')
     assert checkSql(probe.sql, tables).tables == ('Order "Lines" 2024',)
+    assert checkSql(combinedProbeSql([probe]), tables).tables == ('Order "Lines" 2024',)
 
 
 @pytest.mark.parametrize(
@@ -207,32 +360,58 @@ def test_quotesNamesWithSpacesAndDoubleQuotes():
 def test_theProbePassesTheSqlCheck(sql):
     probe = _probe(sql)
     assert checkSql(probe.sql, TABLES).tables == (probe.table,)
+    assert checkSql(combinedProbeSql([probe]), TABLES).tables == (probe.table,)
 
 
 # -- the real DuckDB ---------------------------------------------------------
+
+
+def _duckdb(**tables):
+    connection = duckdb.connect(":memory:")
+    for name, table in tables.items():
+        connection.register(name, table)
+    return connection
 
 
 @pytest.mark.parametrize("day, endedBefore", [(date.today() - timedelta(days=365 * 4), True), (date.today(), False)])
 def test_theProbeRunsOnDuckDb(day, endedBefore):
     sql = "SELECT count(*) AS n FROM orders WHERE d >= CURRENT_DATE - 29"
     probe = _probe(sql)
-    connection = duckdb.connect(":memory:")
+    connection = _duckdb(orders=pa.table({"d": pa.array([day], pa.date32())}))
     try:
-        orders = pa.table({"d": pa.array([day], pa.date32())})
-        connection.register("orders", orders)
         assert connection.execute(sql).fetchone()[0] == (0 if endedBefore else 1)
         lastValue, ended = connection.execute(probe.sql).fetchone()
+        combined = connection.execute(combinedProbeSql([probe])).fetchall()
     finally:
         connection.close()
     assert ended is endedBefore
     assert lastValue == day.isoformat()
+    assert combined == [(day.isoformat(), endedBefore)]
+
+
+def test_theCombinedProbeAnswersEveryBoundOnDuckDb():
+    old, today = date.today() - timedelta(days=365 * 4), date.today()
+    sql = (
+        "SELECT count(*) AS n FROM orders o JOIN items i ON i.oid = o.id "
+        "WHERE date_trunc('month', o.d) >= CURRENT_DATE - 29 AND i.s >= CURRENT_DATE - 29"
+    )
+    probes = findPeriodProbes(sql, TABLES)
+    connection = _duckdb(
+        orders=pa.table({"d": pa.array([old], pa.date32()), "id": [1]}),
+        items=pa.table({"s": pa.array([today], pa.date32()), "oid": [1]}),
+    )
+    try:
+        row = connection.execute(combinedProbeSql(probes)).fetchone()
+    finally:
+        connection.close()
+    # The wrapped side decides `ended_before`; `last_value` is the bare column's latest date.
+    assert row == (old.isoformat(), True, today.isoformat(), False)
 
 
 def test_theProbeOfAnEmptyTableEndedBeforeWithNoValue():
     probe = _probe("SELECT count(*) AS n FROM orders WHERE d >= CURRENT_DATE - 29")
-    connection = duckdb.connect(":memory:")
+    connection = _duckdb(orders=pa.table({"d": pa.array([], pa.date32())}))
     try:
-        connection.register("orders", pa.table({"d": pa.array([], pa.date32())}))
         assert connection.execute(probe.sql).fetchone() == (None, True)
     finally:
         connection.close()
