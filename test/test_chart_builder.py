@@ -1,4 +1,5 @@
 import datetime
+import json
 import logging
 from decimal import Decimal
 
@@ -577,7 +578,9 @@ def test_pivotConsistentInputKeepsFirstAppearanceOutput():
     pairs = [("a", "x"), ("b", "x"), ("c", "x"), ("a", "y"), ("b", "y"), ("c", "y")]
     data = build(request, pivotLong("s", "q", pairs))["data"]
     assert data == {"x": {"a": 1, "b": 2, "c": 3}, "y": {"a": 4, "b": 5, "c": 6}}
+    assert list(data) == ["x", "y"]
     assert [list(column) for column in data.values()] == [["a", "b", "c"], ["a", "b", "c"]]
+    assert json.dumps(data) == '{"x": {"a": 1, "b": 2, "c": 3}, "y": {"a": 4, "b": 5, "c": 6}}'
 
 
 def test_pivotConflictingGroupsFallBackToFirstAppearance():
@@ -609,10 +612,37 @@ def test_pivotMultiLevelKeysUseTheSameMerge():
 
 
 def test_pivotOutputIsDeterministic():
-    import json
-
-    request = makeRequest("pivot", {"rows": ["s"], "columns": ["q"], "value": "n"})
-    pairs = [("c", "x"), ("a", "y"), ("b", "y"), ("c", "y"), ("d", "z"), ("a", "z")]
-    first = json.dumps(build(request, pivotLong("s", "q", pairs)))
-    second = json.dumps(build(request, pivotLong("s", "q", pairs)))
+    request = makeRequest("pivot", {"rows": ["status"], "columns": ["year"], "value": "n"})
+    pairs = [("canceled", "2016"), ("delivered", "2016"), ("approved", "2017"), ("canceled", "2017"),
+             ("created", "2017"), ("delivered", "2017")]
+    first = json.dumps(build(request, pivotLong("status", "year", pairs)))
+    second = json.dumps(build(request, pivotLong("status", "year", pairs)))
     assert first == second
+    assert first.index('"approved"') < first.index('"canceled"') < first.index('"created"')
+
+
+def test_pivotCycleInOneDimensionStillMergesTheOther():
+    request = makeRequest("pivot", {"rows": ["s"], "columns": ["q"], "value": "n"})
+    # Rows conflict (a,b in column y; b,a in column x), so rows keep first appearance.
+    # Columns: row a gives y,x; row c gives z,y -> merged z,y,x although y appeared first.
+    pairs = [("a", "y"), ("b", "y"), ("b", "x"), ("a", "x"), ("c", "z"), ("c", "y")]
+    data = build(request, pivotLong("s", "q", pairs))["data"]
+    assert list(data) == ["z", "y", "x"]
+    assert [list(column) for column in data.values()] == [["a", "b", "c"]] * 3
+
+
+def test_pivotDisjointGroupsKeepFirstAppearance():
+    request = makeRequest("pivot", {"rows": ["s"], "columns": ["q"], "value": "n"})
+    pairs = [("b", "x"), ("a", "x"), ("d", "y"), ("c", "y")]
+    data = build(request, pivotLong("s", "q", pairs))["data"]
+    assert list(data) == ["x", "y"]
+    assert [list(column) for column in data.values()] == [["b", "a", "d", "c"]] * 2
+
+
+def test_pivotSingleColumnAndEmptyResult():
+    request = makeRequest("pivot", {"rows": ["s"], "columns": ["q"], "value": "n"})
+    data = build(request, pivotLong("s", "q", [("b", "x"), ("a", "x"), ("c", "x")]))["data"]
+    assert data == {"x": {"b": 1, "a": 2, "c": 3}}
+    assert list(data["x"]) == ["b", "a", "c"]
+    empty = pa.table({"s": pa.array([], pa.string()), "q": pa.array([], pa.string()), "n": pa.array([], pa.int64())})
+    assert buildChart(request, empty)["data"] == {}
