@@ -521,11 +521,11 @@ def test_pivotColumnsComeOutInOrderWhenDataIsSparse():
 
     chart = _runExample(pivot, tables)
 
-    # The client keeps the column keys in the order it gets them.
+    # The backend recovers the column order whichever key the query sorts first.
     assert list(chart["data"]) == ["Q1", "Q2", "Q3", "Q4"]
     rowsFirst = pivot.sql.replace("ORDER BY order_quarter, region", "ORDER BY region, order_quarter")
     assert rowsFirst != pivot.sql
-    assert list(_runExample(pivot.model_copy(update={"sql": rowsFirst}), tables)["data"]) == ["Q2", "Q3", "Q4", "Q1"]
+    assert list(_runExample(pivot.model_copy(update={"sql": rowsFirst}), tables)["data"]) == ["Q1", "Q2", "Q3", "Q4"]
 
 
 def test_tablesReturnEveryMatchingRow():
