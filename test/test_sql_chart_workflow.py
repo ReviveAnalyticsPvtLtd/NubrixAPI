@@ -528,3 +528,242 @@ def test_generationStillRefusesAnInactiveTable(harness, monkeypatch):
     assert "old_table" not in harness.generator.invoke.call_args.args[0]["grounding"]
     assert "Table 'old_table' is not available" in state["finalOutput"]["error"]
     assert harness.failureRecords()[0]["stage"] == "check"
+
+
+# A period that counts back from today, over a table whose data may end before it.
+
+PERIOD_REQUEST = {
+    "chartType": "line",
+    "title": "Monthly orders",
+    "sql": (
+        "SELECT strftime(date_trunc('month', o.\"b\"), '%Y-%m') AS month, count(*) AS orders FROM \"orders\" AS o "
+        "WHERE date_trunc('month', o.\"b\") >= date_trunc('month', CURRENT_DATE) - INTERVAL 11 MONTH GROUP BY 1 ORDER BY 1"
+    ),
+    "encoding": {"x": "month", "y": ["orders"]},
+}
+SIMPLE_PERIOD_REQUEST = {
+    "chartType": "bar",
+    "title": "Totals",
+    "sql": 'SELECT "a", COUNT(*) AS total FROM "orders" WHERE "b" >= CURRENT_DATE - 29 GROUP BY ALL',
+    "encoding": {"x": "a", "y": ["total"]},
+}
+PROBE_SQL = (
+    'SELECT CAST(max("b") AS VARCHAR) AS last_value, '
+    '(max("b") IS NULL OR max("b") < (CURRENT_DATE - 29)) AS ended_before FROM "orders"'
+)
+ZERO_CHART = {"chartType": "bar", "title": "Totals", "xLabels": "A", "yLabels": "Total", "data": {"labels": ["x", "y"], "datasets": [{"label": "Total", "data": [0, 0]}]}}
+EMPTY_CHART = {"chartType": "bar", "title": "Totals", "xLabels": "A", "yLabels": "Total", "data": {"labels": [], "datasets": []}}
+
+
+def _probeAnswer(lastValue, endedBefore):
+    return {"chartType": "table", "title": "Period check", "columns": ["last_value", "ended_before"], "data": [{"last_value": lastValue, "ended_before": endedBefore}]}
+
+
+def _periodQuestion(clause):
+    return f"There is no data for the period you asked about: {clause}. Which period should the chart cover?"
+
+
+def _withProbe(harness, chart, *answers, request=SIMPLE_PERIOD_REQUEST):
+    """The chart call returns `chart`; each probe call returns (or raises) the next answer."""
+    harness.generator.invoke.return_value = json.dumps(request)
+    pending = list(answers)
+
+    def render(manager, projectId, chartRequest, tables, **kwargs):
+        if "ended_before" in chartRequest.sql:
+            answer = pending.pop(0)
+            if isinstance(answer, BaseException):
+                raise answer
+            return answer
+        return chart
+
+    harness.render.side_effect = render
+
+
+def _probeCalls(harness):
+    return [call for call in harness.render.call_args_list if "ended_before" in call.args[2].sql]
+
+
+def _probeLines(harness):
+    return [line for line in harness.logs if line.startswith("chart_period_probe ")]
+
+
+def test_dataThatEndsBeforeThePeriodAsksWhichPeriod(harness):
+    _withProbe(harness, ZERO_CHART, _probeAnswer("2019-06-30 13:45:00", True))
+    state = harness.run()
+    question = _periodQuestion("the data ends on 2019-06-30")
+    assert state["finalOutput"] == {"response": question}
+    assert state["rephrasedQuery"] == {"rephrasedOutput": "plan", "doubt": question}
+    assert "generatedCode" not in state and "codeOutput" not in state
+    assert set(state) <= OUTPUT_KEYS
+    calls = _probeCalls(harness)
+    assert len(calls) == 1
+    probe = calls[0]
+    assert probe.args[0] is harness.manager and probe.args[1] == "p1"
+    assert probe.args[2].chartType == "table"
+    assert probe.args[2].sql == PROBE_SQL
+    assert list(probe.args[3]) == ["orders"]
+    assert probe.kwargs["waitForSlot"] is True
+    assert harness.logs == []
+    harness.repair.invoke.assert_not_called()
+
+
+def test_anEmptyChartWithDataThatEndsBeforeThePeriodAsksToo(harness):
+    _withProbe(harness, EMPTY_CHART, _probeAnswer("2021-01-31", True))
+    state = harness.run()
+    assert state["finalOutput"] == {"response": _periodQuestion("the data ends on 2021-01-31")}
+
+
+def test_everyComparisonMustHaveEndedAndTheLatestDateIsShown(harness):
+    request = dict(
+        SIMPLE_PERIOD_REQUEST,
+        sql=(
+            'SELECT o."a", count(*) AS total FROM "orders" o JOIN "items" i ON i."a" = o."a" '
+            'WHERE o."b" >= CURRENT_DATE - 29 AND i."c" >= CURRENT_DATE - 29 GROUP BY ALL'
+        ),
+    )
+    metadata = {"orders": {"columns": [{"name": "a"}, {"name": "b"}]}, "items": {"columns": [{"name": "a"}, {"name": "c"}]}}
+    _withProbe(harness, ZERO_CHART, _probeAnswer("2019-01-01", True), _probeAnswer("2020-02-02 00:00:00", True), request=request)
+    state = harness.run(metadata=metadata)
+    assert state["finalOutput"] == {"response": _periodQuestion("the data ends on 2020-02-02")}
+    assert len(_probeCalls(harness)) == 2
+
+    _withProbe(harness, ZERO_CHART, _probeAnswer("2019-01-01", True), _probeAnswer("2030-01-01", False), request=request)
+    state = harness.run(metadata=metadata)
+    assert state["finalOutput"] == ZERO_CHART
+
+
+def test_aLegitimateZeroKeepsTheChart(harness):
+    _withProbe(harness, ZERO_CHART, _probeAnswer("2030-01-01", False))
+    state = harness.run()
+    assert state["finalOutput"] == ZERO_CHART
+    assert state["codeOutput"] == json.dumps(ZERO_CHART)
+    assert decodeGeneratedCode(state["generatedCode"]).sql == SIMPLE_PERIOD_REQUEST["sql"]
+    assert state["rephrasedQuery"] == {"rephrasedOutput": "plan", "doubt": None}
+    assert len(_probeCalls(harness)) == 1
+    assert harness.logs == []
+
+
+def test_everyTableEmptySaysThereAreNoDatedRows(harness):
+    _withProbe(harness, ZERO_CHART, _probeAnswer(None, True))
+    state = harness.run()
+    assert state["finalOutput"] == {"response": _periodQuestion("the table has no dated rows")}
+
+
+@pytest.mark.parametrize(
+    "failure, stage",
+    [
+        (ChartFailure("check", "Table 'orders' is not available."), "check"),
+        (ChartFailure("bind", 'Binder Error: column "b" not found'), "bind"),
+        (ChartFailure("run", "Conversion Error: '2019-06-30'"), "run"),
+        (ChartFailure("timeout", "Execution timed out after 35 seconds"), "timeout"),
+        (ChartFailure("build", "bad"), "build"),
+        (SandboxBusyError(), "busy"),
+        (RuntimeError("No sandbox uid is free."), "exception"),
+        ({"chartType": "table", "title": "Period check", "columns": [], "data": []}, "result"),
+        (_probeAnswer("2019-06-30", "yes"), "result"),
+        (_probeAnswer("not a date", True), "result"),
+    ],
+)
+def test_aFailedProbeKeepsTheChartAndLogsOneWarning(harness, failure, stage):
+    _withProbe(harness, ZERO_CHART, failure)
+    state = harness.run()
+    assert state["finalOutput"] == ZERO_CHART
+    assert decodeGeneratedCode(state["generatedCode"]).sql == SIMPLE_PERIOD_REQUEST["sql"]
+    assert harness.failureRecords() == []
+    lines = _probeLines(harness)
+    assert len(harness.logs) == 1 and len(lines) == 1
+    record = json.loads(lines[0][len("chart_period_probe "):])
+    assert record["stage"] == stage
+    assert record["projectId"] == "p1" and record["shadow"] is False
+    assert "2019" not in lines[0] and "orders" not in lines[0] and '"b"' not in lines[0]
+    harness.repair.invoke.assert_not_called()
+
+
+def test_aFailedFirstProbeRunsNoOther(harness):
+    request = dict(SIMPLE_PERIOD_REQUEST, sql='SELECT "a", count(*) AS total FROM "orders" WHERE "a" >= now() - INTERVAL 1 DAY AND "b" >= CURRENT_DATE - 29 GROUP BY ALL')
+    _withProbe(harness, ZERO_CHART, SandboxBusyError(), _probeAnswer(None, True), request=request)
+    state = harness.run()
+    assert state["finalOutput"] == ZERO_CHART
+    assert len(_probeCalls(harness)) == 1
+    assert len(_probeLines(harness)) == 1
+
+
+@pytest.mark.parametrize(
+    "sql",
+    [
+        'SELECT "a", SUM("b") AS total FROM "orders" GROUP BY ALL',
+        'SELECT "a", SUM("b") AS total FROM "orders" WHERE "b" <= CURRENT_DATE GROUP BY ALL',
+        """SELECT "a", SUM("b") AS total FROM "orders" WHERE "b" >= DATE '2024-01-01' GROUP BY ALL""",
+    ],
+)
+def test_noCurrentDateLowerBoundRunsNoProbe(harness, sql):
+    _withProbe(harness, ZERO_CHART, request=dict(SIMPLE_PERIOD_REQUEST, sql=sql))
+    state = harness.run()
+    assert state["finalOutput"] == ZERO_CHART
+    assert harness.render.call_count == 1
+    assert harness.logs == []
+
+
+def test_aChartWithDataRunsNoProbe(harness):
+    _withProbe(harness, CHART)
+    state = harness.run()
+    assert state["finalOutput"] == CHART
+    assert harness.render.call_count == 1
+
+
+def test_theParallelWorkflowNeverProbes(monkeypatch):
+    harness = Harness(monkeypatch, parallel=True)
+    harness.rephraser.invoke.return_value = {"rephrasedOutput": "plan"}
+    _withProbe(harness, ZERO_CHART, _probeAnswer("2019-06-30", True))
+    state = harness.run()
+    assert state["finalOutput"] == ZERO_CHART
+    assert harness.render.call_count == 1
+
+
+def test_aShadowRunProbesWithoutWaitingAndCountsNoOutcome(harness):
+    outcome = {}
+    _withProbe(harness, ZERO_CHART, _probeAnswer("2019-06-30", True))
+    state = harness.run(config={"configurable": {"shadow": True, "outcome": outcome}})
+    assert state["finalOutput"] == {"response": _periodQuestion("the data ends on 2019-06-30")}
+    assert _probeCalls(harness)[0].kwargs["waitForSlot"] is False
+    assert outcome == {}
+    assert harness.failureRecords() == []
+
+
+def test_aFailedShadowProbeIsLoggedAsShadow(harness):
+    _withProbe(harness, ZERO_CHART, SandboxBusyError())
+    state = harness.run(config={"configurable": {"shadow": True}})
+    assert state["finalOutput"] == ZERO_CHART
+    assert json.loads(_probeLines(harness)[0][len("chart_period_probe "):])["shadow"] is True
+
+
+def test_aProbeAfterARepairUsesTheRepairedQuery(harness):
+    _withProbe(harness, ZERO_CHART, _probeAnswer("2019-06-30", True))
+    chartCalls = []
+    probeOrChart = harness.render.side_effect
+
+    def render(manager, projectId, chartRequest, tables, **kwargs):
+        if "ended_before" not in chartRequest.sql:
+            chartCalls.append(chartRequest.sql)
+            if len(chartCalls) == 1:
+                raise ChartFailure("bind", "Binder Error: nope")
+        return probeOrChart(manager, projectId, chartRequest, tables, **kwargs)
+
+    harness.render.side_effect = render
+    harness.generator.invoke.return_value = MODEL_TEXT
+    harness.repair.invoke.return_value = json.dumps(SIMPLE_PERIOD_REQUEST)
+    state = harness.run()
+    assert state["finalOutput"] == {"response": _periodQuestion("the data ends on 2019-06-30")}
+    assert state["debugAttempts"] == 1
+    assert _probeCalls(harness)[0].args[2].sql == PROBE_SQL
+
+
+def test_aWrappedColumnIsProbedThroughItsExpression(harness):
+    _withProbe(harness, ZERO_CHART, _probeAnswer("2019-06-01", True), request=PERIOD_REQUEST)
+    state = harness.run()
+    assert state["finalOutput"] == {"response": _periodQuestion("the data ends on 2019-06-01")}
+    column = "DATE_TRUNC('MONTH', \"b\")"
+    assert _probeCalls(harness)[0].args[2].sql == (
+        f"SELECT CAST(max({column}) AS VARCHAR) AS last_value, (max({column}) IS NULL OR max({column}) < "
+        "(DATE_TRUNC('MONTH', CURRENT_DATE) - INTERVAL '11' MONTH)) AS ended_before FROM \"orders\""
+    )
