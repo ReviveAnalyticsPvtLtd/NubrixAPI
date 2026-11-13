@@ -920,3 +920,119 @@ def test_sqlChartSectionsUseFlashLite():
     config = getConfig(os.path.join(os.path.dirname(PROMPTS_PATH), "config.ini"))
     for section in ("SQLCHARTGENERATOR", "SQLCHARTREPAIR"):
         assert config.get(section, "model") == "gemini-3.5-flash-lite"
+
+
+# ---------------------------------------------------------------------------
+# Rules added after the private evaluation (fix round 2)
+# ---------------------------------------------------------------------------
+
+CHART_PROMPT_KEYS = ["sqlChartGeneratorPrompt", "sqlChartRepairPrompt"]
+
+# One key sentence per rule; the generator and the repair prompt both carry it (the shared sections are word for word).
+EVALUATION_RULE_SENTENCES = {
+    "numberLabelsStayNumbers": "Never CAST a number to VARCHAR for a label or a table cell.",
+    "wholeDoublesAreIntegers": 'CAST a DOUBLE that holds whole numbers AS INTEGER, so "3" does not show as "3.0".',
+    "noAliasOfASortedSourceColumn": "Never alias a computed column with the name of a source column that ORDER BY or GROUP BY also uses",
+    "seriesGroupsPoints": 'Never give every row its own series value. When each row is its own point (one point per product or per month), leave "series" out.',
+    "mapLabelIsWhatTheUserAsks": '"labelled with the postal code" means the code alone',
+    "joinOnAKeyThatIsUniqueOnOneSide": "join on a key that identifies one row on at least one side.",
+    "aggregateTheManySideFirst": "first aggregate it to one row per key in a CTE, then join the CTE.",
+    "perEntityMeasureOnce": "Compute a per-entity measure (a total per order, a score per order) once per entity before averaging across entities.",
+    "measureWhatTheQuestionNames": "aggregates that table by region, not only the rows that also match another table.",
+    "countEveryEntity": "LEFT JOIN a table some of them lack (orders with no payment), so they still count.",
+    "fixedLabelOrder": "DuckDB 1.3 refuses ORDER BY CASE <alias> ... together with GROUP BY ALL",
+    "fixedLabelOrderForms": 'Use GROUP BY 1 (the label\'s position in SELECT) with that ORDER BY CASE, or add an aggregate sort key such as MIN(hour("ts")) AS sort_key and ORDER BY it.',
+    "noSourceColumnInSelect": "Never add the column a label is computed from to SELECT: that splits each label into many rows.",
+    "calendarDayComparison": 'compare CAST("a" AS DATE) with CAST("b" AS DATE), not the timestamps',
+}
+
+
+@pytest.mark.parametrize("key", CHART_PROMPT_KEYS)
+@pytest.mark.parametrize("rule", sorted(EVALUATION_RULE_SENTENCES))
+def test_evaluationRulesAreInBothChartPrompts(key, rule):
+    assert EVALUATION_RULE_SENTENCES[rule] in _formatted(key)
+
+
+def test_repairBinderBulletNamesTheLabelOrderForms():
+    repair = _formatted("sqlChartRepairPrompt")
+    bullet = next(line for line in repair.splitlines() if line.startswith("- Binder errors"))
+
+    assert "GROUP BY 1" in bullet and "sort_key" in bullet and "never add the column the label is computed from" in bullet
+
+
+def test_textLabelsBuiltFromPartsStayAllowed():
+    text = _formatted("sqlChartGeneratorPrompt")
+
+    assert "'Q' || CAST(quarter(\"col\") AS VARCHAR)" in text
+    assert "A text label is right only when it joins parts into one string" in text
+
+
+def test_scatterExampleStillGroupsProductsByCategory():
+    request = _example("scatter")
+
+    assert request.encoding.series == "category"
+
+
+def test_sqlRephraserAsksWhichMeasureWhenNoneIsNamed():
+    text = _prompts()["sqlQueryRephraserAgentPrompt"]
+    gate = '| The question names or implies no measure at all ("How are we doing?", "Show me something interesting", "Give me an overview") | YES → Ask which measure and which period |'
+
+    assert gate in text
+    assert "#### Example 6: No Measure Named" in text
+    assert "**User Query:** \"How are we doing?\"" in text
+    assert "When in doubt about whether to doubt → EXECUTE" in text
+    assert "NO → Pick the more likely one and execute" in text
+
+
+def test_parallelRephraserIsUnchangedByTheMeasureRule():
+    assert "No Measure Named" not in _prompts()["parallelSqlQueryRephraserAgentPrompt"]
+
+
+# DuckDB facts the rules rely on, pinned on the version the backend runs.
+
+HOUR_EVENTS = [
+    (datetime.datetime(2024, 1, 1, 3), 1),
+    (datetime.datetime(2024, 1, 1, 9), 2),
+    (datetime.datetime(2024, 1, 1, 14), 3),
+    (datetime.datetime(2024, 1, 1, 21), 4),
+    (datetime.datetime(2024, 1, 2, 22), 5),
+]
+PART_OF_DAY = """CASE WHEN hour("ts") < 6 THEN 'night' WHEN hour("ts") < 12 THEN 'morning' WHEN hour("ts") < 18 THEN 'afternoon' ELSE 'evening' END"""
+PART_ORDER = "CASE part WHEN 'night' THEN 1 WHEN 'morning' THEN 2 WHEN 'afternoon' THEN 3 ELSE 4 END"
+
+
+def _eventsConnection() -> duckdb.DuckDBPyConnection:
+    connection = duckdb.connect()
+    connection.register("events", pa.table({"ts": pa.array([row[0] for row in HOUR_EVENTS], pa.timestamp("us")), "id": [row[1] for row in HOUR_EVENTS]}))
+    return connection
+
+
+def test_duckdbVersionIsThePinnedOne():
+    assert duckdb.__version__ == "1.3.2"
+
+
+def test_groupByAllWithOrderByCaseOnAnAliasIsABinderError():
+    sql = f'SELECT {PART_OF_DAY} AS part, COUNT(*) AS n FROM events GROUP BY ALL ORDER BY {PART_ORDER}'
+
+    with pytest.raises(duckdb.BinderException, match="must appear in the GROUP BY clause"):
+        _eventsConnection().execute(sql).fetchall()
+
+
+def test_labelsInAFixedOrderRunWithGroupByOneOrAnAggregateSortKey():
+    groupByOne = f'SELECT {PART_OF_DAY} AS part, COUNT(*) AS n FROM events GROUP BY 1 ORDER BY {PART_ORDER}'
+    sortKey = f'SELECT {PART_OF_DAY} AS part, COUNT(*) AS n, MIN(hour("ts")) AS sort_key FROM events GROUP BY ALL ORDER BY sort_key'
+    connection = _eventsConnection()
+
+    assert connection.execute(groupByOne).fetchall() == [("night", 1), ("morning", 1), ("afternoon", 1), ("evening", 2)]
+    assert [row[:2] for row in connection.execute(sortKey).fetchall()] == [("night", 1), ("morning", 1), ("afternoon", 1), ("evening", 2)]
+
+
+def test_aliasingACastWithTheSourceNameAndOrderingByItSortsAsText():
+    connection = duckdb.connect()
+    connection.register("bins", pa.table({"n": [1, 2, 10, 11]}))
+
+    asText = connection.execute('SELECT CAST("n" AS VARCHAR) AS n, COUNT(*) AS c FROM bins GROUP BY "n" ORDER BY "n"').fetchall()
+    asNumber = connection.execute('SELECT "n" AS n, COUNT(*) AS c FROM bins GROUP BY "n" ORDER BY "n"').fetchall()
+
+    assert [row[0] for row in asText] == ["1", "10", "11", "2"]
+    assert [row[0] for row in asNumber] == [1, 2, 10, 11]
