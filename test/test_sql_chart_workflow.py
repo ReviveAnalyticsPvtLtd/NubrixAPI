@@ -850,3 +850,48 @@ def test_dataThatEndsBeforeAConjunctiveBoundAsksOnDuckDb(harness):
     assert state["finalOutput"] == {"response": _periodQuestion("the data ends on 2019-02-01")}
     assert harness.render.call_count == 2
     assert harness.logs == []
+
+
+# The prompt's pattern for a relative period: list every period, LEFT JOIN the filtered data to it, COALESCE to 0.
+
+FILLED_IN_SQL = (
+    "WITH months AS (SELECT unnest(generate_series(date_trunc('month', CURRENT_DATE) - INTERVAL 11 MONTH, "
+    "date_trunc('month', CURRENT_DATE), INTERVAL 1 MONTH)) AS month_start), "
+    "per_month AS (SELECT date_trunc('month', \"ts\") AS month_start, COUNT(\"id\") AS n FROM \"events\" "
+    "WHERE \"ts\" >= date_trunc('month', CURRENT_DATE) - INTERVAL 11 MONTH AND \"ts\" < CURRENT_DATE + INTERVAL 1 DAY GROUP BY ALL) "
+    "SELECT strftime(m.month_start, '%Y-%m') AS month, COALESCE(p.n, 0) AS n FROM months AS m "
+    "LEFT JOIN per_month AS p ON p.month_start = m.month_start ORDER BY m.month_start"
+)
+EVENTS_METADATA = {"events": {"columns": [{"name": "id"}, {"name": "ts"}]}}
+
+
+def _events(*moments):
+    return {"events": pa.table({"id": list(range(1, len(moments) + 1)), "ts": pa.array(list(moments), pa.timestamp("us"))})}
+
+
+def _askForMonthlyEvents(harness, tables):
+    request = {"chartType": "line", "title": "Monthly events", "sql": FILLED_IN_SQL, "encoding": {"x": "month", "y": ["n"]}}
+    harness.generator.invoke.return_value = json.dumps(request)
+    harness.render.side_effect = _duckdbRender(tables)
+    return harness.run(metadata=EVENTS_METADATA)
+
+
+def test_aFilledInPeriodWithDataThatEndedAsksOnDuckDb(harness):
+    from datetime import datetime
+
+    state = _askForMonthlyEvents(harness, _events(datetime(2019, 3, 1, 8, 0), datetime(2019, 3, 15, 10, 30)))
+    assert state["finalOutput"] == {"response": _periodQuestion("the data ends on 2019-03-15")}
+    assert "generatedCode" not in state and "codeOutput" not in state
+    assert harness.render.call_count == 2
+    assert harness.logs == []
+
+
+def test_aFilledInPeriodWithDataThisMonthKeepsTheChartOnDuckDb(harness):
+    from datetime import datetime
+
+    now = datetime.now()
+    state = _askForMonthlyEvents(harness, _events(datetime(2019, 3, 1, 8, 0), datetime(now.year, now.month, 1, 0, 0, 1)))
+    assert state["finalOutput"]["chartType"] == "line"
+    values = state["finalOutput"]["data"]["datasets"][0]["data"]
+    assert len(values) == 12 and values[-1] == 1 and sum(values) == 1
+    assert harness.render.call_count == 1

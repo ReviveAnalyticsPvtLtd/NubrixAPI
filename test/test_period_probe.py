@@ -417,6 +417,78 @@ def test_theProbeOfAnEmptyTableEndedBeforeWithNoValue():
         connection.close()
 
 
+# -- a list of periods filled in from the data -------------------------------
+
+MONTHS_CTE = (
+    "months AS (SELECT unnest(generate_series(date_trunc('month', CURRENT_DATE) - INTERVAL 11 MONTH, "
+    "date_trunc('month', CURRENT_DATE), INTERVAL 1 MONTH)) AS month_start)"
+)
+PER_MONTH_CTE = (
+    "per_month AS (SELECT date_trunc('month', \"ts\") AS month_start, COUNT(\"id\") AS n FROM \"events\" "
+    "WHERE \"ts\" >= date_trunc('month', CURRENT_DATE) - INTERVAL 11 MONTH AND \"ts\" < CURRENT_DATE + INTERVAL 1 DAY GROUP BY ALL)"
+)
+FILLED_SELECT = (
+    "SELECT strftime(m.month_start, '%Y-%m') AS month, COALESCE(p.n, 0) AS n FROM months AS m "
+    "LEFT JOIN per_month AS p ON p.month_start = m.month_start ORDER BY m.month_start"
+)
+FILLED_IN = f"WITH {MONTHS_CTE}, {PER_MONTH_CTE} {FILLED_SELECT}"
+EVENTS = ["events", "customers"]
+
+
+def test_aListOfPeriodsLeftJoinedToFilteredDataProbesTheDataBound():
+    probe = _probe(FILLED_IN, EVENTS)
+    assert (probe.table, probe.column) == ("events", '"ts"')
+    assert probe.bound == "DATE_TRUNC('MONTH', CURRENT_DATE) - INTERVAL '11' MONTH"
+    assert checkSql(FILLED_IN, EVENTS).tables == ("events",)
+    assert checkSql(combinedProbeSql([probe]), EVENTS).tables == ("events",)
+
+
+@pytest.mark.parametrize(
+    "periods",
+    [
+        "months AS (SELECT * FROM (VALUES (DATE '2024-01-01'), (DATE '2024-02-01')) AS v(month_start))",
+        "months AS (SELECT CAST(date_trunc('month', CURRENT_DATE) AS DATE) AS month_start)",
+        "base AS (SELECT unnest(generate_series(1, 12)) AS k), months AS (SELECT date_trunc('month', CURRENT_DATE) - k * INTERVAL 1 MONTH AS month_start FROM base)",
+    ],
+)
+def test_aPeriodListBuiltWithoutATableIsAccepted(periods):
+    sql = f"WITH {periods}, {PER_MONTH_CTE} {FILLED_SELECT}"
+    assert _found(sql, EVENTS) == [("events", '"ts"')]
+
+
+def test_aBoundInTheOnOfTheFillingJoinCounts():
+    sql = (
+        f"WITH {MONTHS_CTE} SELECT m.month_start, count(e.id) AS n FROM months AS m LEFT JOIN events AS e "
+        "ON date_trunc('month', e.ts) = m.month_start AND e.ts >= CURRENT_DATE - INTERVAL 1 YEAR GROUP BY 1"
+    )
+    assert _found(sql, EVENTS) == [("events", "ts")]
+
+
+@pytest.mark.parametrize(
+    "sql",
+    [
+        # The period list selects from a project table.
+        f"WITH months AS (SELECT DISTINCT date_trunc('month', ts) AS month_start FROM events), {PER_MONTH_CTE} {FILLED_SELECT}",
+        # ... or reads one in a subquery.
+        f"WITH months AS (SELECT unnest(generate_series((SELECT min(ts) FROM events), CURRENT_DATE, INTERVAL 1 MONTH)) AS month_start), {PER_MONTH_CTE} {FILLED_SELECT}",
+        # ... or through another CTE.
+        f"WITH raw AS (SELECT ts FROM events), months AS (SELECT DISTINCT date_trunc('month', ts) AS month_start FROM raw), {PER_MONTH_CTE} {FILLED_SELECT}",
+        # The preserved side is a project table.
+        f"WITH recent AS (SELECT * FROM events WHERE ts >= CURRENT_DATE - 30) SELECT c.region, count(r.id) AS n FROM customers c LEFT JOIN recent r ON r.cid = c.id GROUP BY 1",
+        # A second outer-joined source reads a table too, so not every measure comes from the filtered side.
+        f"WITH {MONTHS_CTE}, {PER_MONTH_CTE} SELECT m.month_start, COALESCE(p.n, 0) AS n, count(c.id) AS c FROM months AS m "
+        "LEFT JOIN per_month AS p ON p.month_start = m.month_start LEFT JOIN customers AS c ON c.joined = m.month_start GROUP BY ALL",
+        # RIGHT and FULL joins still decline.
+        f"WITH {MONTHS_CTE}, {PER_MONTH_CTE} SELECT m.month_start, p.n FROM per_month AS p RIGHT JOIN months AS m ON p.month_start = m.month_start",
+        f"WITH {MONTHS_CTE}, {PER_MONTH_CTE} SELECT m.month_start, p.n FROM months AS m FULL JOIN per_month AS p ON p.month_start = m.month_start",
+        # A bound reached only through a subquery expression.
+        f"WITH {MONTHS_CTE} SELECT m.month_start, (SELECT count(*) FROM events WHERE ts >= CURRENT_DATE - 30) AS n FROM months AS m",
+    ],
+)
+def test_anyOtherOuterJoinDeclines(sql):
+    assert findPeriodProbes(sql, EVENTS) == []
+
+
 # -- the no-data predicate ---------------------------------------------------
 
 

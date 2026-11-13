@@ -12,9 +12,11 @@ A bound counts only when it provably filters the chart's own rows:
 - it is a top-level AND conjunct of a WHERE clause, or of the ON of an inner join (never under OR, NOT, CASE, another
   comparison or any other expression);
 - its SELECT is on the chart's data path: the outermost SELECT, or a CTE or derived table reached from it only
-  through FROM and inner or cross joins, recursively. The optional side of an outer join, IN, EXISTS and scalar
-  subqueries, a set operation other than UNION ALL, an unused CTE and a projection are never on the path. In a UNION
-  ALL every branch must hold a bound;
+  through FROM and inner or cross joins, recursively. One outer join counts too: a LEFT join that fills a list of
+  periods, where every other source of that SELECT reads no table (expressions, VALUES, unnest(generate_series(...))
+  in a select list), so every measure comes from the joined side; its ON conjuncts then filter that side's rows. Any
+  other optional side of an outer join, IN, EXISTS and scalar subqueries, a set operation other than UNION ALL, an
+  unused CTE and a projection are never on the path. In a UNION ALL every branch must hold a bound;
 - `col` is one column, bare or wrapped in date_trunc, CAST or TRY_CAST, resolved in the comparison's own scope to one
   active project table: by its qualifier (an alias of that scope), by the scope's only source, or through a CTE or
   derived table (without a column list) whose matching output column resolves the same way.
@@ -250,6 +252,40 @@ def _isInner(join: exp.Join) -> bool:
     )
 
 
+def _readsATable(scope: Scope, depth: int = 0) -> bool:
+    """Whether a CTE or derived table reads any table, in any of its sources, subqueries or the CTEs it reads."""
+    if depth > _MAX_DEPTH:
+        return True
+    for inner in scope.traverse():
+        for _, source in inner.selected_sources.values():
+            if isinstance(source, exp.Table):
+                return True
+            if isinstance(source, Scope) and source is not inner and _readsATable(source, depth + 1):
+                return True
+    return False
+
+
+def _isFilledIn(scope: Scope, select: exp.Select, join: exp.Join) -> bool:
+    """A LEFT join that fills a list of periods with data: every other source of the SELECT reads no table (only
+    expressions, VALUES or unnest(generate_series(...)) in a select list), so every measure comes from the joined side
+    and its rows are the chart's data."""
+    if join.side != "LEFT" or join.kind not in ("", "OUTER") or join.args.get("method") not in (None, ""):
+        return False
+    if not isinstance(join.this, (exp.Table, exp.Subquery)):
+        return False
+    fromNode = select.args.get("from_") or select.args.get("from")
+    others = [fromNode.this] if fromNode is not None else []
+    others += [other.this for other in select.args.get("joins") or [] if other is not join]
+    if not others:
+        return False
+    for node in others:
+        pair = scope.selected_sources.get(node.alias_or_name)
+        source = pair[1] if pair else None
+        if not isinstance(source, Scope) or _readsATable(source):
+            return False
+    return True
+
+
 def _alwaysOneRow(select: exp.Select) -> bool:
     """An aggregate with no GROUP BY gives one row even from no rows, so its emptiness does not reach its reader."""
     if select.args.get("group"):
@@ -288,7 +324,7 @@ def _scopeBounds(scope: Scope, activeByKey: dict[str, str], depth: int) -> list[
         if fromNode is not None:
             pathNodes.append(fromNode.this)
         for join in joins:
-            if _isInner(join):
+            if _isInner(join) or _isFilledIn(scope, expression, join):
                 pathNodes.append(join.this)
                 if join.args.get("on") is not None:
                     conditions.append(join.args["on"])
