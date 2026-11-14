@@ -1,0 +1,280 @@
+"""
+chartGuards.py
+
+Checks on a chart the SQL chart workflow has just built, for two habits the model keeps despite the prompt rules:
+
+- a number label cast to text under its own name (`CAST("n" AS VARCHAR) AS n ... ORDER BY "n"`). It fires only when
+  the label's own order or scale shows the cast: the query orders by the label first and its labels come out in text
+  order and in no numeric order (1, 10, 2), or every label is a whole number and one is written with a fractional
+  part ("1.0"). Years cast to text, labels in numeric order either way, labels ordered by a measure, a fixed-scale
+  display (1.0, 1.5, 2.0) and an inner level of a pivot key (it restarts per group) are not read as the cast;
+- a scatter or bubble chart that gives every point its own `series` value, so every point becomes its own dataset and
+  legend entry.
+
+A guard returns a message for the repair prompt, or None. It fires only when it can decide: anything it cannot read
+(SQL that does not parse, a projection it cannot match to the label, a chart of an unexpected shape) declines.
+Pure: no sandbox, no model. Only new chart generation calls it; saved widgets re-run without it.
+"""
+
+__all__ = [
+    "POINT_SERIES_MESSAGE",
+    "castLabelMessage",
+    "castLabelText",
+    "guardMessage",
+    "pointSeriesMessage",
+]
+
+import re
+
+import sqlglot
+from sqlglot import exp
+
+from nubrix.components.chartBuilder import EMPTY_LEVEL
+from nubrix.components.chartRequest import ChartRequest
+
+POINT_SERIES_MESSAGE = (
+    "Each point has its own series value, so every point becomes its own dataset and legend entry. Leave `series` out "
+    "when each row is its own point; use it only to group many points into a few datasets, such as a category or a "
+    "region."
+)
+
+_AXIS_LABEL_TYPES = ("bar", "line", "area", "histogram", "radar")
+_SLICE_TYPES = ("pie", "doughnut", "polarArea")
+_POINT_TYPES = ("scatter", "bubble")
+_TEXT_TYPES = frozenset(
+    getattr(exp.DataType.Type, name)
+    for name in ("TEXT", "VARCHAR", "NVARCHAR", "CHAR", "NCHAR", "BPCHAR")
+    if hasattr(exp.DataType.Type, name)
+)
+# Number text: no leading zero (that is a code, such as a postal code), no exponent, no padding.
+_NUMBER_TEXT = re.compile(r"-?(0|[1-9][0-9]*)(\.[0-9]+)?")
+# A whole number, possibly written with a fractional part, as DuckDB casts a whole DOUBLE to text ("1.0").
+_WHOLE_NUMBER = re.compile(r"-?(0|[1-9][0-9]*)(\.0+)?")
+# DuckDB folds unquoted identifiers by ASCII case only.
+_ASCII_FOLD = str.maketrans("ABCDEFGHIJKLMNOPQRSTUVWXYZ", "abcdefghijklmnopqrstuvwxyz")
+# Labels quoted in the message.
+_QUOTED_LABELS = 4
+
+
+def guardMessage(request: ChartRequest, sql: str, chart: object) -> str | None:
+    """The first guard that fires on this built chart, as its repair message; None when none fires or any is unsure."""
+    for guard in (castLabelMessage, pointSeriesMessage):
+        try:
+            message = guard(request, sql, chart)
+        except Exception:
+            # A guard that cannot decide never fires.
+            message = None
+        if message is not None:
+            return message
+    return None
+
+
+def castLabelMessage(request: ChartRequest, sql: str, chart: object) -> str | None:
+    """A label of a category, slice or pivot chart that the outermost SELECT casts to text, that holds only numbers,
+    and whose own order or scale shows the cast: ordered by the label first and in text order but no numeric order, or
+    every label whole and one shown as "1.0"."""
+    chartType = request.chartType
+    encoding = request.encoding
+    if chartType in _AXIS_LABEL_TYPES:
+        roles = [(encoding.x, _categoryLabels(chart), False)]
+    elif chartType in _SLICE_TYPES:
+        roles = [(encoding.label, _categoryLabels(chart), False)]
+    elif chartType == "pivot":
+        roles = _pivotRoles(request, chart)
+    else:
+        return None
+    select = _outerSelect(sql)
+    if select is None:
+        return None
+    projections = list(select.expressions)
+    if any(projection.is_star for projection in projections):
+        # A star can supply the label's column too.
+        return None
+    for name, labels, multiLevel in roles:
+        if not (name and labels is not None and _allNumberText(labels)):
+            continue
+        index = _textCastIndex(projections, name)
+        if index is None:
+            continue
+        shown = list(dict.fromkeys(label for label in labels if label != ""))
+        # A level of a several-level pivot key restarts in every group, so its labels are no single order.
+        ordered = not multiLevel and _orderedByLabel(select, projections, index)
+        textOrder = shown if ordered and _inTextOrderOnly(shown) else None
+        decimal = _wholeDecimal(shown)
+        if textOrder is not None or decimal is not None:
+            return castLabelText(name, textOrder, decimal)
+    return None
+
+
+def castLabelText(name: str, textOrder: list[str] | None, decimal: str | None) -> str:
+    """The repair message for a number label cast to text, naming only what was seen: labels in text order, a whole
+    number shown with a fractional part, or both."""
+    seen = []
+    if textOrder is not None:
+        quoted = ", ".join(textOrder[:_QUOTED_LABELS]) + (", ..." if len(textOrder) > _QUOTED_LABELS else "")
+        seen.append(f"its labels come out in text order ({quoted})")
+    if decimal is not None:
+        seen.append(f"a whole number shows as '{decimal}'")
+    # `_text` in chartBuilder.py shows a whole float as "3" but a DECIMAL as it is ("3.00"), so a DECIMAL needs BIGINT.
+    bigint = "when the value is a DECIMAL or DOUBLE holding whole numbers, CAST it AS BIGINT"
+    # The ORDER BY already names the label (that is when the order check runs), so the fix keeps it: without the cast
+    # the same ORDER BY sorts the numbers as numbers. A measure order is never turned into a number order.
+    keep = (
+        "drop the CAST (also where the ORDER BY repeats it) and keep the ORDER BY: without the cast the same ORDER BY "
+        "sorts the numbers as numbers."
+    )
+    if textOrder is None:
+        fix = f"drop the CAST, and {bigint}. The backend shows a whole-number BIGINT or DOUBLE label as '3' but a DECIMAL as '3.00'."
+    elif decimal is None:
+        fix = f"{keep} The backend shows a number label as text and keeps the query's row order."
+    else:
+        fix = (
+            f"{keep} {bigint[0].upper()}{bigint[1:]}. The backend shows a number label as text, keeps the query's row "
+            "order, and shows a whole-number BIGINT or DOUBLE as '3' but a DECIMAL as '3.00'."
+        )
+    return f"Column '{name}' casts a number to text, so {' and '.join(seen)}. Keep it a number: {fix}"
+
+
+def _wholeDecimal(labels: list[str]) -> str | None:
+    """The first label written as a whole number with a fractional part ("1.0"), when every label is a whole number;
+    None otherwise (1.0, 1.5, 2.0 is a fixed-scale display, not a cast whole number)."""
+    if not labels or not all(_WHOLE_NUMBER.fullmatch(label) for label in labels):
+        return None
+    return next((label for label in labels if "." in label), None)
+
+
+def _inTextOrderOnly(labels: list[str]) -> bool:
+    """Whether the labels, in the order the chart shows them, are sorted as text in some direction and sorted as
+    numbers in neither: labels in numeric order either way (2, 10 or 10, 2) are drawn right, whatever text order says."""
+    textSorted = labels in (sorted(labels), sorted(labels, reverse=True))
+    numericSorted = labels in (sorted(labels, key=float), sorted(labels, key=float, reverse=True))
+    return textSorted and not numericSorted
+
+
+def pointSeriesMessage(request: ChartRequest, sql: str, chart: object) -> str | None:
+    """A scatter or bubble chart with a series where every dataset holds exactly one point."""
+    if request.chartType not in _POINT_TYPES or not request.encoding.series:
+        return None
+    data = chart.get("data") if isinstance(chart, dict) else None
+    datasets = data.get("datasets") if isinstance(data, dict) else None
+    if not isinstance(datasets, list) or len(datasets) < 2:
+        return None
+    for dataset in datasets:
+        points = dataset.get("data") if isinstance(dataset, dict) else None
+        if not isinstance(points, list) or len(points) != 1:
+            return None
+    return POINT_SERIES_MESSAGE
+
+
+def _outerSelect(sql: str) -> exp.Select | None:
+    """The single outermost SELECT; None for anything else (a set operation, a parse failure)."""
+    text = sql.strip() if isinstance(sql, str) else ""
+    while text.endswith(";"):
+        text = text[:-1].rstrip()
+    try:
+        statements = [statement for statement in sqlglot.parse(text, read="duckdb") if statement is not None]
+    except Exception:
+        return None
+    if len(statements) != 1:
+        return None
+    body = statements[0]
+    while isinstance(body, exp.Subquery) and not body.args.get("alias") and not body.args.get("pivots"):
+        body = body.this
+    return body if isinstance(body, exp.Select) else None
+
+
+def _outputName(projection: exp.Expression) -> str | None:
+    """The result column name DuckDB gives a projection, when it can be read off the SQL: an alias or a bare column."""
+    if isinstance(projection, exp.Alias):
+        return projection.alias
+    if isinstance(projection, exp.Column):
+        return projection.name
+    return None
+
+
+def _unwrapped(node: exp.Expression) -> exp.Expression:
+    while isinstance(node, exp.Paren):
+        node = node.this
+    return node
+
+
+def _textCastIndex(projections: list[exp.Expression], name: str) -> int | None:
+    """The position of the one projection that gives `name`, when it is an aliased bare cast to a text type."""
+    matches = [index for index, projection in enumerate(projections) if _outputName(projection) == name]
+    if len(matches) != 1 or not isinstance(projections[matches[0]], exp.Alias):
+        return None
+    value = _unwrapped(projections[matches[0]].this)
+    # TRY_CAST and `::` parse as a Cast too.
+    if not isinstance(value, exp.Cast):
+        return None
+    target = value.args.get("to")
+    return matches[0] if isinstance(target, exp.DataType) and target.this in _TEXT_TYPES else None
+
+
+def _orderedByLabel(select: exp.Select, projections: list[exp.Expression], index: int) -> bool:
+    """Whether the first ORDER BY key of the outermost SELECT is the label itself: an unqualified reference to its
+    output name (unquoted: DuckDB's ASCII case folding; quoted: exact), its position, or the cast expression."""
+    order = select.args.get("order")
+    keys = order.expressions if isinstance(order, exp.Order) else []
+    if not keys:
+        return False
+    key = keys[0].this if isinstance(keys[0], exp.Ordered) else keys[0]
+    key = _unwrapped(key)
+    projection = projections[index]
+    if isinstance(key, exp.Column):
+        identifier = key.this
+        if key.args.get("table") or not isinstance(identifier, exp.Identifier):
+            return False
+        if identifier.quoted:
+            return identifier.name == projection.alias
+        return identifier.name.translate(_ASCII_FOLD) == projection.alias.translate(_ASCII_FOLD)
+    if isinstance(key, exp.Literal):
+        return key.is_int and int(key.this) == index + 1
+    return key == _unwrapped(projection.this)
+
+
+def _allNumberText(labels: list) -> bool:
+    """At least one non-empty label, and every non-empty one is number text."""
+    filled = [label for label in labels if label != ""]
+    return bool(filled) and all(isinstance(label, str) and _NUMBER_TEXT.fullmatch(label) for label in filled)
+
+
+def _categoryLabels(chart: object) -> list | None:
+    data = chart.get("data") if isinstance(chart, dict) else None
+    labels = data.get("labels") if isinstance(data, dict) else None
+    return labels if isinstance(labels, list) else None
+
+
+def _pivotRoles(request: ChartRequest, chart: object) -> list[tuple[str, list | None, bool]]:
+    """(column, its labels, whether its key has several levels) for each pivot rows and columns column, read back
+    from the cross-table's keys."""
+    data = chart.get("data") if isinstance(chart, dict) else None
+    if not isinstance(data, dict) or not all(isinstance(rows, dict) for rows in data.values()):
+        return []
+    columnKeys = list(data)
+    rowKeys = list(dict.fromkeys(rowKey for rows in data.values() for rowKey in rows))
+    roles = []
+    for names, keys in ((request.encoding.rows or [], rowKeys), (request.encoding.columns or [], columnKeys)):
+        levels = [_pivotLevels(key, len(names)) for key in keys]
+        for index, name in enumerate(names):
+            labels = None if any(level is None for level in levels) else [level[index] for level in levels]
+            roles.append((name, labels, len(names) > 1))
+    return roles
+
+
+def _pivotLevels(key: object, count: int) -> list[str] | None:
+    """The levels of a pivot key: plain text for one level, the builder's ('a', 'b') text for several.
+
+    The builder writes an empty level as an em dash and never leaves an apostrophe or a parenthesis in a level.
+    """
+    if not isinstance(key, str):
+        return None
+    if count == 1:
+        levels = [key]
+    elif key.startswith("('") and key.endswith("')"):
+        levels = key[2:-2].split("', '")
+    else:
+        return None
+    if len(levels) != count:
+        return None
+    return ["" if level == EMPTY_LEVEL else level for level in levels]
