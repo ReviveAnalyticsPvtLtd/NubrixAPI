@@ -49,25 +49,59 @@ def _message(chartType, sql, encoding):
 
 
 CAST_ITEMS = 'SELECT CAST("items" AS VARCHAR) AS items, COUNT(*) AS n FROM "orders" GROUP BY "items" ORDER BY "items"'
+TEXT_ORDER = ["1", "10", "11", "2"]
 
 
-def test_aNumberLabelCastToTextUnderItsOwnNameFires():
+def _textOrderMessage(name):
+    return chartGuards.castLabelText(name, TEXT_ORDER, None)
+
+
+def test_aNumberLabelCastToTextAndSortedAsTextFires():
     request, chart = _chart("bar", CAST_ITEMS, {"x": "items", "y": ["n"]})
-    assert chart["data"]["labels"] == ["1", "10", "11", "2"]
+    assert chart["data"]["labels"] == TEXT_ORDER
 
     message = chartGuards.guardMessage(request, CAST_ITEMS, chart)
 
-    assert message == chartGuards.CAST_LABEL_MESSAGE.format(name="items")
-    assert message.startswith("Column 'items' casts a number to text")
-    assert "drop the CAST" in message
+    assert message == (
+        "Column 'items' casts a number to text, so its labels come out in text order (1, 10, 11, 2). Keep it a number: "
+        "drop the CAST and order by the numeric value. The backend shows a number label as text and keeps the query's "
+        "row order."
+    )
+
+
+def test_labelsCastToTextInDescendingTextOrderFire():
+    sql = 'SELECT CAST("items" AS VARCHAR) AS items, COUNT(*) AS n FROM "orders" GROUP BY ALL ORDER BY items DESC'
+    request, chart = _chart("bar", sql, {"x": "items", "y": ["n"]})
+    assert chart["data"]["labels"] == ["2", "11", "10", "1"]
+
+    assert chartGuards.guardMessage(request, sql, chart) == chartGuards.castLabelText("items", ["2", "11", "10", "1"], None)
 
 
 def test_aRoundedDoubleCastToTextShowsAsOnePointZeroAndFires():
     sql = 'SELECT CAST(round("amount") AS VARCHAR) AS amount_band, COUNT(*) AS n FROM "orders" GROUP BY ALL ORDER BY MIN("amount")'
     request, chart = _chart("pie", sql, {"label": "amount_band", "value": "n"})
-    assert chart["data"]["labels"][0] == "1.0"
+    assert chart["data"]["labels"] == ["1.0", "2.0", "3.0", "40.0", "51.0"]
 
-    assert chartGuards.guardMessage(request, sql, chart) == chartGuards.CAST_LABEL_MESSAGE.format(name="amount_band")
+    assert chartGuards.guardMessage(request, sql, chart) == (
+        "Column 'amount_band' casts a number to text, so a whole number shows as '1.0'. Keep it a number: drop the CAST. "
+        "The backend shows a whole-number DOUBLE label as '3'."
+    )
+
+
+def test_yearsCastToTextDoNotFire():
+    sql = 'SELECT CAST("order_id" + 2015 AS VARCHAR) AS order_year, SUM("amount") AS total FROM "orders" GROUP BY ALL ORDER BY order_year'
+    request, chart = _chart("line", sql, {"x": "order_year", "y": ["total"]})
+    assert chart["data"]["labels"] == ["2016", "2017", "2018", "2019", "2020", "2021"]
+
+    assert chartGuards.guardMessage(request, sql, chart) is None
+
+
+def test_labelsCastToTextInMeasureOrderDoNotFire():
+    sql = 'SELECT CAST("items" AS VARCHAR) AS items, SUM("amount") AS total FROM "orders" GROUP BY ALL ORDER BY total DESC, items'
+    request, chart = _chart("bar", sql, {"x": "items", "y": ["total"]})
+    assert chart["data"]["labels"] == ["1", "2", "11", "10"]
+
+    assert chartGuards.guardMessage(request, sql, chart) is None
 
 
 @pytest.mark.parametrize(
@@ -84,8 +118,8 @@ def test_aRoundedDoubleCastToTextShowsAsOnePointZeroAndFires():
     ],
 )
 def test_everySpellingOfATextCastFires(projection):
-    sql = f'SELECT {projection} AS item_count, COUNT(*) AS n FROM "orders" GROUP BY ALL ORDER BY MIN("items")'
-    assert _message("bar", sql, {"x": "item_count", "y": ["n"]}) == chartGuards.CAST_LABEL_MESSAGE.format(name="item_count")
+    sql = f'SELECT {projection} AS item_count, COUNT(*) AS n FROM "orders" GROUP BY ALL ORDER BY item_count'
+    assert _message("bar", sql, {"x": "item_count", "y": ["n"]}) == _textOrderMessage("item_count")
 
 
 @pytest.mark.parametrize("chartType", ["bar", "line", "area", "histogram", "radar"])
@@ -99,8 +133,8 @@ def test_everySliceChartTypeFiresOnItsLabel(chartType):
 
 
 def test_aLongFormChartFiresOnItsXNotItsSeries():
-    castX = 'SELECT CAST("items" AS VARCHAR) AS items, "region" AS region, COUNT(*) AS n FROM "orders" GROUP BY ALL ORDER BY MIN("items"), region'
-    castSeries = 'SELECT "region" AS region, CAST("items" AS VARCHAR) AS items, COUNT(*) AS n FROM "orders" GROUP BY ALL ORDER BY region, MIN("items")'
+    castX = 'SELECT CAST("items" AS VARCHAR) AS items, "region" AS region, COUNT(*) AS n FROM "orders" GROUP BY ALL ORDER BY items, region'
+    castSeries = 'SELECT "region" AS region, CAST("items" AS VARCHAR) AS items, COUNT(*) AS n FROM "orders" GROUP BY ALL ORDER BY region, items'
 
     assert _message("line", castX, {"x": "items", "y": ["n"], "series": "region"}) is not None
     assert _message("line", castSeries, {"x": "region", "y": ["n"], "series": "items"}) is None
@@ -111,15 +145,23 @@ def test_aLongFormChartFiresOnItsXNotItsSeries():
     [
         (["items"], ["region"], "items"),
         (["region"], ["items"], "items"),
-        (["region", "items"], ["n_band"], "items"),
+        (["n_band", "items"], ["region"], "items"),
     ],
 )
 def test_aPivotFiresOnACastRowOrColumnLevel(rows, columns, name):
     sql = (
         'SELECT CAST("items" AS VARCHAR) AS items, "region" AS region, \'all\' AS n_band, SUM("amount") AS total '
-        'FROM "orders" GROUP BY ALL ORDER BY region, MIN("items")'
+        'FROM "orders" GROUP BY ALL ORDER BY items, region'
     )
-    assert _message("pivot", sql, {"rows": rows, "columns": columns, "value": "total"}) == chartGuards.CAST_LABEL_MESSAGE.format(name=name)
+    assert _message("pivot", sql, {"rows": rows, "columns": columns, "value": "total"}) == _textOrderMessage(name)
+
+
+def test_aPivotInNumericOrderDoesNotFire():
+    sql = (
+        'SELECT CAST("items" AS VARCHAR) AS items, "region" AS region, SUM("amount") AS total '
+        'FROM "orders" GROUP BY ALL ORDER BY MIN("items"), region'
+    )
+    assert _message("pivot", sql, {"rows": ["items"], "columns": ["region"], "value": "total"}) is None
 
 
 @pytest.mark.parametrize(
@@ -223,18 +265,36 @@ def test_anUnaliasedCastDeclines():
 @pytest.mark.parametrize(
     "labels, fires",
     [
+        # Text order that is not numeric order, ascending or descending.
         (["1", "10", "2"], True),
-        (["-3", "0", "1.5", ""], True),
+        (["2", "10", "1"], True),
+        (["-3", "0", "10", "2", ""], True),
+        (["1", "10", "10", "2"], True),
+        # A whole number written with a fractional part.
+        (["3", "1.0", "2"], True),
+        (["12.00"], True),
+        (["-4.0", "7"], True),
+        # Numeric order, or neither order, with no whole-number decimal.
+        (["1", "2", "10"], False),
+        (["10", "2", "1"], False),
+        (["2016", "2017", "2018"], False),
+        (["2018", "2017"], False),
+        (["52", "42", "3", "2"], False),
+        (["2", "10", "3"], False),
+        (["1.5", "2.25"], False),
+        (["7"], False),
         (["", ""], False),
         ([], False),
-        (["1", "01026"], False),
-        (["1", "1e3"], False),
-        (["1", "1."], False),
-        (["1", " 2"], False),
-        (["1", "north"], False),
+        # Not all number text.
+        (["01026", "1", "10", "2"], False),
+        (["1", "10", "1e3"], False),
+        (["1.", "10", "2"], False),
+        ([" 2", "1", "10"], False),
+        (["1", "10", "north"], False),
+        (["1.0", "Other"], False),
     ],
 )
-def test_onlyLabelsThatAreAllNumberTextFire(labels, fires):
+def test_onlyNumberLabelsInTextOrderOrWithAWholeDecimalFire(labels, fires):
     request = ChartRequest.model_validate({"chartType": "bar", "title": "T", "sql": CAST_ITEMS, "encoding": {"x": "items", "y": ["n"]}})
     chart = {"chartType": "bar", "title": "T", "data": {"labels": labels, "datasets": [{"label": "N", "data": [1] * len(labels)}]}}
     assert (chartGuards.guardMessage(request, CAST_ITEMS, chart) is not None) is fires
@@ -285,11 +345,11 @@ def test_thePointSeriesGuardIgnoresCategoryCharts():
     assert _message("bar", sql, {"x": "region", "y": ["total"], "series": "order_ref"}) is None
 
 
-def test_theMessagesNameTheFix():
-    assert chartGuards.CAST_LABEL_MESSAGE.format(name="n") == (
-        "Column 'n' casts a number to text, so its labels can sort as text (1, 10, 2) and a whole-number DOUBLE shows as "
-        "'1.0'. Keep it a number: drop the CAST. The backend shows a number label as text, keeps the query's row order, "
-        "and shows a whole-number DOUBLE as '3'. Order by the numeric value."
+def test_theMessagesNameWhatTheGuardSawAndTheFix():
+    assert chartGuards.castLabelText("n", ["1.0", "10.0", "2.0", "3.0", "4.0"], "1.0") == (
+        "Column 'n' casts a number to text, so its labels come out in text order (1.0, 10.0, 2.0, 3.0, ...) and a whole "
+        "number shows as '1.0'. Keep it a number: drop the CAST and order by the numeric value. The backend shows a "
+        "number label as text, keeps the query's row order, and shows a whole-number DOUBLE as '3'."
     )
     assert chartGuards.POINT_SERIES_MESSAGE == (
         "Each point has its own series value, so every point becomes its own dataset and legend entry. Leave `series` "

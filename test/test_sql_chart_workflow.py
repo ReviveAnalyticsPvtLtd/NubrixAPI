@@ -1117,9 +1117,8 @@ NUMBER_REQUEST = dict(CAST_REQUEST, sql='SELECT "items" AS items, COUNT(*) AS n 
 NUMBER_CHART = {"chartType": "bar", "title": "Orders by item count", "xLabels": "Items", "yLabels": "N", "data": {"labels": ["1", "2", "10"], "datasets": [{"label": "N", "data": [4, 2, 1]}]}}
 TRY_CAST_REQUEST = dict(CAST_REQUEST, sql='SELECT TRY_CAST("items" AS VARCHAR) AS items, COUNT(*) AS n FROM "orders" GROUP BY "items" ORDER BY "items"')
 CAST_MESSAGE = (
-    "Column 'items' casts a number to text, so its labels can sort as text (1, 10, 2) and a whole-number DOUBLE shows as "
-    "'1.0'. Keep it a number: drop the CAST. The backend shows a number label as text, keeps the query's row order, "
-    "and shows a whole-number DOUBLE as '3'. Order by the numeric value."
+    "Column 'items' casts a number to text, so its labels come out in text order (1, 10, 2). Keep it a number: drop "
+    "the CAST and order by the numeric value. The backend shows a number label as text and keeps the query's row order."
 )
 GUARD_METADATA = {"orders": {"columns": [{"name": "items"}, {"name": "b"}]}}
 

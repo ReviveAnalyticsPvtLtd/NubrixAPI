@@ -3,8 +3,10 @@ chartGuards.py
 
 Checks on a chart the SQL chart workflow has just built, for two habits the model keeps despite the prompt rules:
 
-- a number label cast to text under its own name (`CAST("n" AS VARCHAR) AS n ... ORDER BY "n"`), so the labels can
-  sort as text (1, 10, 2) and a whole-number DOUBLE shows as "1.0";
+- a number label cast to text under its own name (`CAST("n" AS VARCHAR) AS n ... ORDER BY "n"`). It fires only when
+  the user would see it: the labels come out in text order that is not numeric order (1, 10, 2), or a whole number
+  shows with a fractional part ("1.0"). Years cast to text, or number labels in measure order, draw correctly and
+  pass;
 - a scatter or bubble chart that gives every point its own `series` value, so every point becomes its own dataset and
   legend entry.
 
@@ -14,11 +16,11 @@ Pure: no sandbox, no model. Only new chart generation calls it; saved widgets re
 """
 
 __all__ = [
-    "CAST_LABEL_MESSAGE",
     "CAST_LOG_MESSAGE",
     "POINT_SERIES_LOG_MESSAGE",
     "POINT_SERIES_MESSAGE",
     "castLabelMessage",
+    "castLabelText",
     "guardLogMessage",
     "guardMessage",
     "pointSeriesMessage",
@@ -32,11 +34,6 @@ from sqlglot import exp
 from nubrix.components.chartBuilder import EMPTY_LEVEL
 from nubrix.components.chartRequest import ChartRequest
 
-CAST_LABEL_MESSAGE = (
-    "Column '{name}' casts a number to text, so its labels can sort as text (1, 10, 2) and a whole-number DOUBLE shows "
-    "as '1.0'. Keep it a number: drop the CAST. The backend shows a number label as text, keeps the query's row order, "
-    "and shows a whole-number DOUBLE as '3'. Order by the numeric value."
-)
 CAST_LOG_MESSAGE = "A label column casts a number to text."
 POINT_SERIES_MESSAGE = (
     "Each point has its own series value, so every point becomes its own dataset and legend entry. Leave `series` out "
@@ -55,6 +52,10 @@ _TEXT_TYPES = frozenset(
 )
 # Number text: no leading zero (that is a code, such as a postal code), no exponent, no padding.
 _NUMBER_TEXT = re.compile(r"-?(0|[1-9][0-9]*)(\.[0-9]+)?")
+# A whole number written with a fractional part, as DuckDB casts a whole DOUBLE to text ("1.0").
+_WHOLE_DECIMAL = re.compile(r"-?(0|[1-9][0-9]*)\.0+")
+# Labels quoted in the message.
+_QUOTED_LABELS = 4
 
 
 def guardMessage(request: ChartRequest, sql: str, chart: object) -> str | None:
@@ -76,7 +77,8 @@ def guardLogMessage(message: str) -> str:
 
 
 def castLabelMessage(request: ChartRequest, sql: str, chart: object) -> str | None:
-    """A label of a category, slice or pivot chart that the outermost SELECT casts to text and that holds only numbers."""
+    """A label of a category, slice or pivot chart that the outermost SELECT casts to text, that holds only numbers,
+    and that the user would see wrong: in text order but not numeric order, or a whole number shown as "1.0"."""
     chartType = request.chartType
     encoding = request.encoding
     if chartType in _AXIS_LABEL_TYPES:
@@ -91,9 +93,44 @@ def castLabelMessage(request: ChartRequest, sql: str, chart: object) -> str | No
     if projections is None:
         return None
     for name, labels in roles:
-        if name and labels is not None and _isTextCast(projections, name) and _allNumberText(labels):
-            return CAST_LABEL_MESSAGE.format(name=name)
+        if not (name and labels is not None and _isTextCast(projections, name) and _allNumberText(labels)):
+            continue
+        shown = list(dict.fromkeys(label for label in labels if label != ""))
+        textOrder = shown if _inTextOrderOnly(shown) else None
+        decimal = next((label for label in shown if _WHOLE_DECIMAL.fullmatch(label)), None)
+        if textOrder is not None or decimal is not None:
+            return castLabelText(name, textOrder, decimal)
     return None
+
+
+def castLabelText(name: str, textOrder: list[str] | None, decimal: str | None) -> str:
+    """The repair message for a number label cast to text, naming only what was seen: labels in text order, a whole
+    number shown with a fractional part, or both."""
+    seen = []
+    if textOrder is not None:
+        quoted = ", ".join(textOrder[:_QUOTED_LABELS]) + (", ..." if len(textOrder) > _QUOTED_LABELS else "")
+        seen.append(f"its labels come out in text order ({quoted})")
+    if decimal is not None:
+        seen.append(f"a whole number shows as '{decimal}'")
+    if textOrder is None:
+        fix = "drop the CAST. The backend shows a whole-number DOUBLE label as '3'."
+    elif decimal is None:
+        fix = "drop the CAST and order by the numeric value. The backend shows a number label as text and keeps the query's row order."
+    else:
+        fix = (
+            "drop the CAST and order by the numeric value. The backend shows a number label as text, keeps the query's "
+            "row order, and shows a whole-number DOUBLE as '3'."
+        )
+    return f"Column '{name}' casts a number to text, so {' and '.join(seen)}. Keep it a number: {fix}"
+
+
+def _inTextOrderOnly(labels: list[str]) -> bool:
+    """Whether the labels, in the order the chart shows them, are sorted as text (ascending or descending) while
+    sorting them as numbers in the same direction gives a different sequence."""
+    for descending in (False, True):
+        if labels == sorted(labels, reverse=descending) and labels != sorted(labels, key=float, reverse=descending):
+            return True
+    return False
 
 
 def pointSeriesMessage(request: ChartRequest, sql: str, chart: object) -> str | None:
