@@ -930,7 +930,15 @@ CHART_PROMPT_KEYS = ["sqlChartGeneratorPrompt", "sqlChartRepairPrompt"]
 
 # One key sentence per rule; the generator and the repair prompt both carry it (the shared sections are word for word).
 EVALUATION_RULE_SENTENCES = {
-    "numberLabelsStayNumbers": "Never CAST a number to VARCHAR for a label or a table cell.",
+    "numberLabelsStayNumbers": "Never CAST a number to VARCHAR for a label (an x value, a slice label, a pivot row or column).",
+    "tableMeasuresStayNumbers": "In a table, keep counts, amounts and other measures numeric.",
+    "tableYearsAndCodesAreText": (
+        'A year, an id or a code in a table is text, because the client shows a number cell with thousands separators '
+        '(the year 2016 as "2,016"): CAST it AS VARCHAR under a new name that no ORDER BY or GROUP BY uses for the '
+        'source column, such as CAST(o."order_id" AS VARCHAR) AS order_ref. When you sort by that column, ORDER BY the '
+        "source column, never by its text; with GROUP BY ALL, ORDER BY an aggregate of the source column, such as "
+        'MIN(year(o."order_date")).'
+    ),
     "wholeDoublesAreIntegers": 'CAST a DOUBLE that holds whole numbers AS BIGINT, so "3" does not show as "3.0".',
     "noAliasOfASortedSourceColumn": "Never alias a computed column with the name of a source column that ORDER BY or GROUP BY also uses",
     "seriesGroupsPoints": 'Never give every row its own series value. When each row is its own point (one point per product or per month), leave "series" out.',
@@ -951,6 +959,27 @@ EVALUATION_RULE_SENTENCES = {
 @pytest.mark.parametrize("rule", sorted(EVALUATION_RULE_SENTENCES))
 def test_evaluationRulesAreInBothChartPrompts(key, rule):
     assert EVALUATION_RULE_SENTENCES[rule] in _formatted(key)
+
+
+@pytest.mark.parametrize("key", CHART_PROMPT_KEYS)
+def test_theLabelRuleAgreesWithTheEngineGuardAndLeavesTableCellsToTheirOwnRule(key):
+    text = _formatted(key)
+    rule = next(line for line in text.splitlines() if line.startswith("- Keep a numeric label"))
+
+    # The engine sends a bare number-to-text cast of a label back for repair, ids included, and keeps the row order.
+    assert "table cell" not in rule
+    assert "when it is an id" not in rule
+    assert "sorts it as a number" not in rule
+    assert "keeps the query's row order" in rule
+    assert "Never CAST a number to VARCHAR for a label or a table cell." not in text
+
+
+@pytest.mark.parametrize("key", CHART_PROMPT_KEYS)
+def test_theTableRuleNeverAsksToSortByTheCastColumn(key):
+    rule = next(line for line in _formatted(key).splitlines() if line.startswith("- In a table, keep counts"))
+
+    assert "and sort by the source column" not in rule
+    assert "When you sort by that column, ORDER BY the source column" in rule
 
 
 def test_repairBinderBulletNamesTheLabelOrderForms():
@@ -1037,6 +1066,23 @@ def test_aliasingACastWithTheSourceNameAndOrderingByItSortsAsText():
 
     assert [row[0] for row in asText] == ["1", "10", "11", "2"]
     assert [row[0] for row in asNumber] == [1, 2, 10, 11]
+
+
+def test_aTableCellCastToTextUnderANewNameSortsByItsSourceColumn():
+    connection = duckdb.connect()
+    connection.register("orders", pa.table({"order_id": [2, 10, 9, 100], "amount": [1.0, 2.0, 3.0, 4.0]}))
+    connection.register(
+        "sales", pa.table({"order_date": pa.array([datetime.date(year, 1, 1) for year in (2016, 2009, 2016, 2010)], pa.date32()), "amount": [1.0, 2.0, 3.0, 4.0]})
+    )
+
+    listing = connection.execute('SELECT CAST(o."order_id" AS VARCHAR) AS order_ref, o."amount" AS amount FROM "orders" AS o ORDER BY o."order_id"').fetchall()
+    assert [row[0] for row in listing] == ["2", "9", "10", "100"]
+
+    grouped = 'SELECT CAST(year(o."order_date") AS VARCHAR) AS order_year, SUM(o."amount") AS total FROM "sales" AS o GROUP BY ALL'
+    with pytest.raises(duckdb.BinderException, match="must appear in the GROUP BY clause"):
+        connection.execute(grouped + ' ORDER BY year(o."order_date")').fetchall()
+    rows = connection.execute(grouped + ' ORDER BY MIN(year(o."order_date"))').fetchall()
+    assert rows == [("2009", 2.0), ("2010", 4.0), ("2016", 4.0)]
 
 
 def test_otherSliceNeedsANumericLabelCastToText():
