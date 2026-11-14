@@ -93,7 +93,13 @@ class REPLManager:
                 return runSqlSandbox(projectId=projectId, request=request, timeoutSeconds=self.timeoutSeconds)
             return runSqlSandbox(projectId=projectId, request=request, timeoutSeconds=self.timeoutSeconds, slotWaitSeconds=0)
 
-    def run(self, codeString: str, projectId: str = None, filters: list | None = None) -> str:
+    def run(self, codeString: str, projectId: str = None, filters: list | None = None, waitForSlot: bool = True) -> str:
+        """Run generated code in the sandbox and return its output (or the reason it stopped).
+
+        With `waitForSlot` False it makes one attempt at the project semaphore (a full one gives the usual
+        "Concurrency limit reached" text) and one at a sandbox slot (a full sandbox raises SandboxBusyError), so a
+        caller that can do without the run is never held up.
+        """
         if not projectId:
             return "Error: projectId is required for sandboxed code execution."
 
@@ -101,7 +107,7 @@ class REPLManager:
             codeString = _remove_code_fences(codeString)
 
         # 1. Per-tenant concurrency limits: ZSET-based semaphore (soft cap)
-        with self._projectSlot(projectId, 30.0) as acquired:
+        with self._projectSlot(projectId, 30.0 if waitForSlot else 0) as acquired:
             if not acquired:
                 return f"Concurrency limit reached: Too many running code execution tasks for project '{projectId}'. Please try again in a few seconds."
 
@@ -112,6 +118,8 @@ class REPLManager:
             stopped = None
             try:
                 extra = {"payload": {"filters": filters}} if filters is not None else {}
+                if not waitForSlot:
+                    extra["slotWaitSeconds"] = 0
                 stdout, stderr, returnCode, _, _, stopped = runSandbox("sandbox_launcher.py", projectId, codeString, self.timeoutSeconds, **extra)
             except SandboxBusyError:
                 # Not output: callers must not treat a full sandbox as a code failure. The semaphore entry is released on exit.

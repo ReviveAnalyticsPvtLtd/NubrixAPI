@@ -527,16 +527,18 @@ def _inFreshRun(prepare: Callable[[int | None, str], None], run: Callable[[int |
         releaseRunSlot(slot)
 
 
-def runSandbox(launcherName: str, projectId: str, code: str, timeoutSeconds: int | None, withResult: bool = False, payload: dict | None = None) -> SandboxResult:
+def runSandbox(launcherName: str, projectId: str, code: str, timeoutSeconds: int | None, withResult: bool = False, payload: dict | None = None, slotWaitSeconds: float | None = None) -> SandboxResult:
     """Run generated code in a launcher subprocess, serving its table reads from this process.
 
     Only a launcher that writes a result sets `withResult`: the file is the child's, so it isn't read otherwise.
     `payload` is merged into the child's input, so a launcher can be given run input beyond the code.
+    `slotWaitSeconds` overrides the slot wait (0 tries once).
     """
     kind = _RunKind(payload=payload)
     return _inFreshRun(
         lambda runUid, tablesFolder: None,
         lambda runUid, runFolder, tablesFolder, workFolder, limits: _runChild(launcherName, projectId, code, timeoutSeconds, withResult, runUid, runFolder, tablesFolder, workFolder, limits, kind),
+        slotWaitSeconds,
     )
 
 
