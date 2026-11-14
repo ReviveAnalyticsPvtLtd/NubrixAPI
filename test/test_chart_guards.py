@@ -83,15 +83,43 @@ def test_aRoundedDoubleCastToTextShowsAsOnePointZeroAndFires():
     assert chart["data"]["labels"] == ["1.0", "2.0", "3.0", "40.0", "51.0"]
 
     assert chartGuards.guardMessage(request, sql, chart) == (
-        "Column 'amount_band' casts a number to text, so a whole number shows as '1.0'. Keep it a number: drop the CAST. "
-        "The backend shows a whole-number DOUBLE label as '3'."
+        "Column 'amount_band' casts a number to text, so a whole number shows as '1.0'. Keep it a number: drop the CAST, "
+        "and when the value is a DECIMAL or DOUBLE holding whole numbers, CAST it AS BIGINT. The backend shows a "
+        "whole-number BIGINT or DOUBLE label as '3' but a DECIMAL as '3.00'."
     )
+
+
+def test_aWholeDecimalCastToTextFiresAndTheMessageFixWorksForADecimal():
+    """Dropping the CAST alone still shows a DECIMAL as '1.00'; CAST AS BIGINT shows '1', as the message says."""
+    cast = 'SELECT CAST(CAST("items" AS DECIMAL(10, 2)) AS VARCHAR) AS items, COUNT(*) AS n FROM "orders" GROUP BY ALL ORDER BY MIN("items")'
+    request, chart = _chart("bar", cast, {"x": "items", "y": ["n"]})
+    assert chart["data"]["labels"] == ["1.00", "2.00", "10.00", "11.00"]
+    message = chartGuards.guardMessage(request, cast, chart)
+    assert message is not None and "a whole number shows as '1.00'" in message and "CAST it AS BIGINT" in message
+
+    decimal = 'SELECT CAST("items" AS DECIMAL(10, 2)) AS items, COUNT(*) AS n FROM "orders" GROUP BY ALL ORDER BY items'
+    whole = 'SELECT CAST(CAST("items" AS DECIMAL(10, 2)) AS BIGINT) AS items, COUNT(*) AS n FROM "orders" GROUP BY ALL ORDER BY items'
+    double = 'SELECT CAST("items" AS DOUBLE) AS items, COUNT(*) AS n FROM "orders" GROUP BY ALL ORDER BY items'
+    assert _chart("bar", decimal, {"x": "items", "y": ["n"]})[1]["data"]["labels"] == ["1.00", "2.00", "10.00", "11.00"]
+    assert _chart("bar", whole, {"x": "items", "y": ["n"]})[1]["data"]["labels"] == ["1", "2", "10", "11"]
+    assert _chart("bar", double, {"x": "items", "y": ["n"]})[1]["data"]["labels"] == ["1", "2", "10", "11"]
 
 
 def test_yearsCastToTextDoNotFire():
     sql = 'SELECT CAST("order_id" + 2015 AS VARCHAR) AS order_year, SUM("amount") AS total FROM "orders" GROUP BY ALL ORDER BY order_year'
     request, chart = _chart("line", sql, {"x": "order_year", "y": ["total"]})
     assert chart["data"]["labels"] == ["2016", "2017", "2018", "2019", "2020", "2021"]
+
+    assert chartGuards.guardMessage(request, sql, chart) is None
+
+
+def test_aTwoSlicePieInMeasureOrderDoesNotFire():
+    sql = (
+        'SELECT CAST("items" AS VARCHAR) AS items, SUM("amount") AS total FROM "orders" WHERE "items" IN (2, 10) '
+        "GROUP BY ALL ORDER BY total DESC, items"
+    )
+    request, chart = _chart("pie", sql, {"label": "items", "value": "total"})
+    assert chart["data"]["labels"] == ["2", "10"]
 
     assert chartGuards.guardMessage(request, sql, chart) is None
 
@@ -274,7 +302,14 @@ def test_anUnaliasedCastDeclines():
         (["3", "1.0", "2"], True),
         (["12.00"], True),
         (["-4.0", "7"], True),
-        # Numeric order, or neither order, with no whole-number decimal.
+        (["9", "80", "700", "10"], True),
+        (["1", "10", "11", "2"], True),
+        # Numeric order in either direction (text order the other way), or neither order, with no whole-number decimal.
+        (["2", "10"], False),
+        (["10", "2"], False),
+        (["8", "16", "128"], False),
+        (["128", "16", "8"], False),
+        (["9", "80", "700"], False),
         (["1", "2", "10"], False),
         (["10", "2", "1"], False),
         (["2016", "2017", "2018"], False),
@@ -348,16 +383,15 @@ def test_thePointSeriesGuardIgnoresCategoryCharts():
 def test_theMessagesNameWhatTheGuardSawAndTheFix():
     assert chartGuards.castLabelText("n", ["1.0", "10.0", "2.0", "3.0", "4.0"], "1.0") == (
         "Column 'n' casts a number to text, so its labels come out in text order (1.0, 10.0, 2.0, 3.0, ...) and a whole "
-        "number shows as '1.0'. Keep it a number: drop the CAST and order by the numeric value. The backend shows a "
-        "number label as text, keeps the query's row order, and shows a whole-number DOUBLE as '3'."
+        "number shows as '1.0'. Keep it a number: drop the CAST, and when the value is a DECIMAL or DOUBLE holding whole "
+        "numbers, CAST it AS BIGINT; order by the numeric value. The backend shows a number label as text, keeps the "
+        "query's row order, and shows a whole-number BIGINT or DOUBLE as '3' but a DECIMAL as '3.00'."
     )
     assert chartGuards.POINT_SERIES_MESSAGE == (
         "Each point has its own series value, so every point becomes its own dataset and legend entry. Leave `series` "
         "out when each row is its own point; use it only to group many points into a few datasets, such as a category "
         "or a region."
     )
-    for text in (chartGuards.CAST_LOG_MESSAGE, chartGuards.POINT_SERIES_LOG_MESSAGE):
-        assert "'" not in text
 
 
 def test_theBuilderShowsANumberLabelAsTheMessageSays():

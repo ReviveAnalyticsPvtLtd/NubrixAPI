@@ -935,8 +935,9 @@ EVALUATION_RULE_SENTENCES = {
     "tableYearsAndCodesAreText": (
         'A year, an id or a code in a table is text, because the client shows a number cell with thousands separators '
         '(the year 2016 as "2,016"): CAST it AS VARCHAR under a new name that no ORDER BY or GROUP BY uses for the '
-        'source column, such as CAST(o."order_id" AS VARCHAR) AS order_ref, and sort by the source column, never by '
-        "the text. With GROUP BY ALL, sort by an aggregate of it, such as ORDER BY MIN(year(o.\"order_date\"))."
+        'source column, such as CAST(o."order_id" AS VARCHAR) AS order_ref. When you sort by that column, ORDER BY the '
+        "source column, never by its text; with GROUP BY ALL, ORDER BY an aggregate of the source column, such as "
+        'MIN(year(o."order_date")).'
     ),
     "wholeDoublesAreIntegers": 'CAST a DOUBLE that holds whole numbers AS BIGINT, so "3" does not show as "3.0".',
     "noAliasOfASortedSourceColumn": "Never alias a computed column with the name of a source column that ORDER BY or GROUP BY also uses",
@@ -971,6 +972,14 @@ def test_theLabelRuleAgreesWithTheEngineGuardAndLeavesTableCellsToTheirOwnRule(k
     assert "sorts it as a number" not in rule
     assert "keeps the query's row order" in rule
     assert "Never CAST a number to VARCHAR for a label or a table cell." not in text
+
+
+@pytest.mark.parametrize("key", CHART_PROMPT_KEYS)
+def test_theTableRuleNeverAsksToSortByTheCastColumn(key):
+    rule = next(line for line in _formatted(key).splitlines() if line.startswith("- In a table, keep counts"))
+
+    assert "and sort by the source column" not in rule
+    assert "When you sort by that column, ORDER BY the source column" in rule
 
 
 def test_repairBinderBulletNamesTheLabelOrderForms():

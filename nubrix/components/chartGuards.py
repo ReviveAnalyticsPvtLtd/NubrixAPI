@@ -4,9 +4,9 @@ chartGuards.py
 Checks on a chart the SQL chart workflow has just built, for two habits the model keeps despite the prompt rules:
 
 - a number label cast to text under its own name (`CAST("n" AS VARCHAR) AS n ... ORDER BY "n"`). It fires only when
-  the user would see it: the labels come out in text order that is not numeric order (1, 10, 2), or a whole number
-  shows with a fractional part ("1.0"). Years cast to text, or number labels in measure order, draw correctly and
-  pass;
+  the user would see it: the labels come out in text order and in no numeric order (1, 10, 2), or a whole number
+  shows with a fractional part ("1.0"). Years cast to text, labels in numeric order either way, or number labels in
+  measure order draw correctly and pass;
 - a scatter or bubble chart that gives every point its own `series` value, so every point becomes its own dataset and
   legend entry.
 
@@ -16,12 +16,9 @@ Pure: no sandbox, no model. Only new chart generation calls it; saved widgets re
 """
 
 __all__ = [
-    "CAST_LOG_MESSAGE",
-    "POINT_SERIES_LOG_MESSAGE",
     "POINT_SERIES_MESSAGE",
     "castLabelMessage",
     "castLabelText",
-    "guardLogMessage",
     "guardMessage",
     "pointSeriesMessage",
 ]
@@ -34,13 +31,11 @@ from sqlglot import exp
 from nubrix.components.chartBuilder import EMPTY_LEVEL
 from nubrix.components.chartRequest import ChartRequest
 
-CAST_LOG_MESSAGE = "A label column casts a number to text."
 POINT_SERIES_MESSAGE = (
     "Each point has its own series value, so every point becomes its own dataset and legend entry. Leave `series` out "
     "when each row is its own point; use it only to group many points into a few datasets, such as a category or a "
     "region."
 )
-POINT_SERIES_LOG_MESSAGE = "Every point of a scatter or bubble chart has its own series value."
 
 _AXIS_LABEL_TYPES = ("bar", "line", "area", "histogram", "radar")
 _SLICE_TYPES = ("pie", "doughnut", "polarArea")
@@ -71,14 +66,9 @@ def guardMessage(request: ChartRequest, sql: str, chart: object) -> str | None:
     return None
 
 
-def guardLogMessage(message: str) -> str:
-    """The data-free text of a guard message, for the failure log."""
-    return POINT_SERIES_LOG_MESSAGE if message == POINT_SERIES_MESSAGE else CAST_LOG_MESSAGE
-
-
 def castLabelMessage(request: ChartRequest, sql: str, chart: object) -> str | None:
     """A label of a category, slice or pivot chart that the outermost SELECT casts to text, that holds only numbers,
-    and that the user would see wrong: in text order but not numeric order, or a whole number shown as "1.0"."""
+    and that the user would see wrong: in text order and in no numeric order, or a whole number shown as "1.0"."""
     chartType = request.chartType
     encoding = request.encoding
     if chartType in _AXIS_LABEL_TYPES:
@@ -112,25 +102,26 @@ def castLabelText(name: str, textOrder: list[str] | None, decimal: str | None) -
         seen.append(f"its labels come out in text order ({quoted})")
     if decimal is not None:
         seen.append(f"a whole number shows as '{decimal}'")
+    # `_text` in chartBuilder.py shows a whole float as "3" but a DECIMAL as it is ("3.00"), so a DECIMAL needs BIGINT.
+    bigint = "when the value is a DECIMAL or DOUBLE holding whole numbers, CAST it AS BIGINT"
     if textOrder is None:
-        fix = "drop the CAST. The backend shows a whole-number DOUBLE label as '3'."
+        fix = f"drop the CAST, and {bigint}. The backend shows a whole-number BIGINT or DOUBLE label as '3' but a DECIMAL as '3.00'."
     elif decimal is None:
         fix = "drop the CAST and order by the numeric value. The backend shows a number label as text and keeps the query's row order."
     else:
         fix = (
-            "drop the CAST and order by the numeric value. The backend shows a number label as text, keeps the query's "
-            "row order, and shows a whole-number DOUBLE as '3'."
+            f"drop the CAST, and {bigint}; order by the numeric value. The backend shows a number label as text, keeps "
+            "the query's row order, and shows a whole-number BIGINT or DOUBLE as '3' but a DECIMAL as '3.00'."
         )
     return f"Column '{name}' casts a number to text, so {' and '.join(seen)}. Keep it a number: {fix}"
 
 
 def _inTextOrderOnly(labels: list[str]) -> bool:
-    """Whether the labels, in the order the chart shows them, are sorted as text (ascending or descending) while
-    sorting them as numbers in the same direction gives a different sequence."""
-    for descending in (False, True):
-        if labels == sorted(labels, reverse=descending) and labels != sorted(labels, key=float, reverse=descending):
-            return True
-    return False
+    """Whether the labels, in the order the chart shows them, are sorted as text in some direction and sorted as
+    numbers in neither: labels in numeric order either way (2, 10 or 10, 2) are drawn right, whatever text order says."""
+    textSorted = labels in (sorted(labels), sorted(labels, reverse=True))
+    numericSorted = labels in (sorted(labels, key=float), sorted(labels, key=float, reverse=True))
+    return textSorted and not numericSorted
 
 
 def pointSeriesMessage(request: ChartRequest, sql: str, chart: object) -> str | None:

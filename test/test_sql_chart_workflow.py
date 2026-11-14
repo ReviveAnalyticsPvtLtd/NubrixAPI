@@ -1,6 +1,7 @@
 """The SQL chart workflow: rephrase, ground, generate, evaluate, repair (at most twice), format."""
 
 import json
+import pathlib
 from datetime import date, datetime, timedelta
 from unittest.mock import MagicMock
 
@@ -1304,9 +1305,9 @@ def test_aDashboardRerunOfAGuardedRequestRendersUnchanged(monkeypatch):
     chart = chartEngine.renderChartRequest(MagicMock(), "p1", request, ["orders"], filters=None, lenient=True)
     assert chart == buildChart(request, table)
     assert chart["data"]["labels"] == ["1", "10", "2"]
+    root = pathlib.Path(__file__).resolve().parent.parent
     for path in ("nubrix/components/chartEngine.py", "api/services/dashboardService.py"):
-        with open(path, encoding="utf-8") as source:
-            assert "chartGuards" not in source.read()
+        assert "chartGuards" not in (root / path).read_text(encoding="utf-8")
 
 
 GUARDED_PERIOD_REQUEST = dict(
@@ -1328,3 +1329,73 @@ def test_aServedGuardedChartWithoutDataGoesThroughThePeriodProbe(harness):
     # The probe reads the served (first) request's bound.
     assert '"b"' in probes[0].args[2].sql
     assert harness.logs == []
+
+
+# Fix round 1: a guard repair that is not a better chart keeps the guarded chart.
+
+
+def _guardLines(harness):
+    return [json.loads(line[len("chart_guard_repair "):]) for line in harness.logs if line.startswith("chart_guard_repair ")]
+
+
+@pytest.mark.parametrize("parallel", [False, True])
+def test_aGuardRepairWhoseModelCallRaisesServesTheGuardedChart(monkeypatch, parallel):
+    harness = Harness(monkeypatch, parallel=parallel)
+    harness.rephraser.invoke.return_value = {"rephrasedOutput": "plan", "doubt": None}
+    _guarded(harness, CAST_CHART)
+    harness.repair.invoke.side_effect = RuntimeError("provider 503 for 'Secret Corp'")
+    state = harness.run(config={"callbacks": [TraceHandler()]}, metadata=GUARD_METADATA)
+    assert state["finalOutput"] == CAST_CHART
+    assert decodeGeneratedCode(state["generatedCode"]).sql == CAST_REQUEST["sql"]
+    assert harness.repair.invoke.call_count == 1
+    assert harness.failureRecords() == []
+    assert len(harness.logs) == 1
+    (record,) = _guardLines(harness)
+    assert record == {"stage": "repair", "errorClass": "RuntimeError", "projectId": "p1", "shadow": False, "traceId": "trace-1"}
+    assert "Secret Corp" not in harness.logs[0] and "items" not in harness.logs[0]
+
+
+def test_aLaterRepairWhoseModelCallRaisesServesTheGuardedChart(harness):
+    _guarded(harness, CAST_CHART, ChartFailure("bind", "Binder Error: nope"))
+    harness.repair.invoke.side_effect = [json.dumps(NUMBER_REQUEST), ValueError("credit check failed")]
+    state = harness.run(metadata=GUARD_METADATA)
+    assert state["finalOutput"] == CAST_CHART
+    assert decodeGeneratedCode(state["generatedCode"]).sql == CAST_REQUEST["sql"]
+    assert state["debugAttempts"] == 1
+    assert [record["errorClass"] for record in _guardLines(harness)] == ["ValueError"]
+    assert harness.failureRecords() == []
+
+
+@pytest.mark.parametrize("parallel", [False, True])
+def test_aRepairWhoseModelCallRaisesWithoutAGuardStillRaises(monkeypatch, parallel):
+    harness = Harness(monkeypatch, parallel=parallel)
+    harness.rephraser.invoke.return_value = {"rephrasedOutput": "plan", "doubt": None}
+    harness.render.side_effect = ChartFailure("bind", "Binder Error: nope")
+    harness.repair.invoke.side_effect = RuntimeError("provider 503")
+    with pytest.raises(RuntimeError, match="provider 503"):
+        harness.run(metadata=GUARD_METADATA)
+    assert _guardLines(harness) == []
+
+
+EMPTY_NUMBER_CHART = dict(NUMBER_CHART, data={"labels": [], "datasets": []})
+ZERO_NUMBER_CHART = dict(NUMBER_CHART, data={"labels": ["1", "2", "10"], "datasets": [{"label": "N", "data": [0, 0, 0]}]})
+
+
+@pytest.mark.parametrize("repaired", [EMPTY_NUMBER_CHART, ZERO_NUMBER_CHART])
+def test_aRepairedChartWithoutDataNeverReplacesAGuardedChartWithData(harness, repaired):
+    _guarded(harness, CAST_CHART, repaired)
+    harness.repair.invoke.return_value = json.dumps(NUMBER_REQUEST)
+    state = harness.run(metadata=GUARD_METADATA)
+    assert state["finalOutput"] == CAST_CHART
+    assert decodeGeneratedCode(state["generatedCode"]).sql == CAST_REQUEST["sql"]
+    assert state["debugAttempts"] == 1
+    assert harness.render.call_count == 2
+    assert harness.logs == []
+
+
+def test_whenBothChartsShowNoDataTheRepairedChartIsServed(harness):
+    _guarded(harness, GUARDED_ZERO_CHART, ZERO_NUMBER_CHART)
+    harness.repair.invoke.return_value = json.dumps(NUMBER_REQUEST)
+    state = harness.run(metadata=GUARD_METADATA)
+    assert state["finalOutput"] == ZERO_NUMBER_CHART
+    assert decodeGeneratedCode(state["generatedCode"]).sql == NUMBER_REQUEST["sql"]

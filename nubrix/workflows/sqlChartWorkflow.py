@@ -16,9 +16,10 @@ rephraser's doubt. Anything else, including a probe that fails, keeps the chart.
 A chart that renders is checked by the generation guards (chartGuards.py: a number label cast to text, every scatter
 point its own series). The first time one fires in a request, and a repair is left, the chart and its request are kept
 as the fallback and the guard's message goes to the repair. A later chart that passes the guards is served. When a
-later chart trips a guard again, or the request would end on a failure (repairs run out, a timeout, a busy sandbox,
-a run that broke), the fallback is served instead, as if that attempt had succeeded: it goes on to the probe or
-format like any chart, and logs no failure.
+later chart trips a guard again, shows no data while the fallback does, or the request would end on a failure
+(repairs run out, a timeout, a busy sandbox, a run that broke, a repair whose model call raised), the fallback is
+served instead, as if that attempt had succeeded: it goes on to the probe or format like any chart, and logs no
+failure. A repair call that raises with a fallback in hand logs one chart_guard_repair warning line.
 
     START -> rephrase -> ground -> generate -> (evaluate | repair | format)
                   \\-> format (doubt)
@@ -43,7 +44,7 @@ from typing_extensions import TypedDict
 
 from nubrix.components.chartEngine import ChartFailure, renderChartRequest
 from nubrix.components.chartFailureLog import logChartFailure, traceIdOf
-from nubrix.components.chartGuards import guardLogMessage, guardMessage
+from nubrix.components.chartGuards import guardMessage
 from nubrix.components.chartRequest import ChartRequest, encodeGeneratedCode
 from nubrix.components.llmChainFactory import buildLlmChain
 from nubrix.components.periodProbe import PeriodProbe, chartHasNoData, combinedProbeSql, findPeriodProbes, isDataFree
@@ -310,16 +311,26 @@ class SqlChartWorkflow:
 
     def _repair(self, state: State, config: RunnableConfig):
         previous = json.dumps(state["lastRequest"], ensure_ascii=False) if state.get("lastRequest") else state.get("rawText", "")
-        text = self.repairChain.invoke(
-            {
-                "question": state["inputQuery"],
-                "plan": self._plan(state),
-                "grounding": state["grounding"],
-                "previous_request": previous,
-                "error": state["failure"]["message"],
-            },
-            config,
-        )
+        try:
+            text = self.repairChain.invoke(
+                {
+                    "question": state["inputQuery"],
+                    "plan": self._plan(state),
+                    "grounding": state["grounding"],
+                    "previous_request": previous,
+                    "error": state["failure"]["message"],
+                },
+                config,
+            )
+        except Exception as error:
+            if not state.get("fallback"):
+                raise
+            # A guard's chart is in hand, so a repair call that fails (the provider, a credit check) never turns it
+            # into an error: the request ends, and `_next` serves the fallback.
+            self._logGuardRepairFailure(error, state, config)
+            failure = ChartFailure("model", _UNEXPECTED_MESSAGE)
+            failure.__cause__ = error
+            return {"chart": None, "failure": {"stage": "model", "message": _UNEXPECTED_MESSAGE, "error": failure, "repairable": False}}
         update = self._withMessage(_withPlanSliceType(self._parse(str(text)), self._plan(state)))
         update["debugAttempts"] = state.get("debugAttempts", 0) + 1
         return update
@@ -356,11 +367,14 @@ class SqlChartWorkflow:
             # No repair is left, so nothing a guard says can change the chart.
             return {"chart": chart, "failure": None}
         message = guardMessage(request, request.sql, chart)
+        if fallback is not None and (message is not None or (chartHasNoData(chart) and not chartHasNoData(fallback["chart"]))):
+            # The guard repair gave nothing better: a chart that trips a guard again, or one without data where the
+            # guarded chart had data.
+            return SqlChartWorkflow._fallback(state)
         if message is None:
             return {"chart": chart, "failure": None}
-        if fallback is not None:
-            return SqlChartWorkflow._fallback(state)
-        failure = ChartFailure("build", message, logMessage=guardLogMessage(message))
+        # A guard failure always goes to repair (a repair is left), which replaces it, so it is never logged.
+        failure = ChartFailure("build", message)
         return {
             "chart": None,
             "fallback": {"chart": chart, "chartRequest": state["chartRequest"]},
@@ -448,6 +462,18 @@ class SqlChartWorkflow:
                 raise _ProbeFailed("result")
             answers.append((endedBefore, row.get(f"last_value_{number}")))
         return answers
+
+    @staticmethod
+    def _logGuardRepairFailure(error: BaseException, state: State, config: RunnableConfig | None) -> None:
+        """One line with the stage, the exception class and ids only: no message text, SQL, labels or values."""
+        record = {
+            "stage": "repair",
+            "errorClass": type(error).__name__,
+            "projectId": state["projectId"],
+            "shadow": _isShadow(config),
+            "traceId": traceIdOf({"callbacks": _callbackHandlers(config)}),
+        }
+        logger.warning("chart_guard_repair " + json.dumps(record, sort_keys=True))
 
     @classmethod
     def _logProbeFailure(cls, failure: _ProbeFailed, state: State, config: RunnableConfig | None) -> None:
