@@ -2846,7 +2846,7 @@ sqlChartGeneratorPrompt: |
     - CAST a DOUBLE that holds whole numbers AS BIGINT, so "3" does not show as "3.0".
     - Never alias a computed column with the name of a source column that ORDER BY or GROUP BY also uses without a table alias. In DuckDB, ORDER BY "n" then means the output alias: CAST("n" AS VARCHAR) AS n ... ORDER BY "n" sorts 1, 10, 11, 2.
     - scatter and bubble need numeric x, y and r. For a text or date x use a line or bar chart instead.
-    - scatter and bubble "series" groups many points into a few datasets, one legend entry each (a category, a region). Never give every row its own series value. When each row is its own point (one point per product or per month), leave "series" out.
+    - scatter and bubble "series" groups many points into a few datasets, one legend entry each (a category, a region). With at most 10 points you may give each point its own series value to name it in the legend (4 regions, one point each); it is never required. With more than 10 points, never give every row its own series value: when each row is its own point (one point per product or per month), leave "series" out.
     - bubble "r" is the third measure itself, zero or more (for example COUNT(*) AS order_count). Never rescale it: the client sizes the bubbles and shows the value.
     - card: the query returns exactly one row. "value" is its column (a number, or text such as a name). "label" is literal text shown with the value, not a column name.
     - table: "columns" lists the result columns to show, in order. Leave it out to show every result column in query order.
@@ -3129,7 +3129,7 @@ sqlChartRepairPrompt: |
     - CAST a DOUBLE that holds whole numbers AS BIGINT, so "3" does not show as "3.0".
     - Never alias a computed column with the name of a source column that ORDER BY or GROUP BY also uses without a table alias. In DuckDB, ORDER BY "n" then means the output alias: CAST("n" AS VARCHAR) AS n ... ORDER BY "n" sorts 1, 10, 11, 2.
     - scatter and bubble need numeric x, y and r. For a text or date x use a line or bar chart instead.
-    - scatter and bubble "series" groups many points into a few datasets, one legend entry each (a category, a region). Never give every row its own series value. When each row is its own point (one point per product or per month), leave "series" out.
+    - scatter and bubble "series" groups many points into a few datasets, one legend entry each (a category, a region). With at most 10 points you may give each point its own series value to name it in the legend (4 regions, one point each); it is never required. With more than 10 points, never give every row its own series value: when each row is its own point (one point per product or per month), leave "series" out.
     - bubble "r" is the third measure itself, zero or more (for example COUNT(*) AS order_count). Never rescale it: the client sizes the bubbles and shows the value.
     - card: the query returns exactly one row. "value" is its column (a number, or text such as a name). "label" is literal text shown with the value, not a column name.
     - table: "columns" lists the result columns to show, in order. Leave it out to show every result column in query order.
