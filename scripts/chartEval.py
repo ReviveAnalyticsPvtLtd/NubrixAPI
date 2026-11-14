@@ -39,7 +39,8 @@ How values are compared:
     names: they are data values. For scatter and bubble charts the list holds the point dicts, e.g.
     `{"Series": [{"x": 1, "y": 2}, ...]}`; the dicts must have the same keys. With one expected dataset, a chart of
     2 to 10 points that gives each point its own series (the engine keeps those to name each point) is compared as
-    its points in dataset order; any other difference, or more than 10 such points, still fails.
+    its points in dataset order; any other difference, or more than 10 such points, still fails. Its legend names are
+    not compared then; a case that must check them lists one expected dataset per point, by name.
   - `rows` are compared by position: the values of each row in column order. Column names are compared only when the
     case sets `"columnNames": true`.
   - `card` compares the value only, not the card's label.
