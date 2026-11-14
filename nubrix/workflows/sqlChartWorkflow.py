@@ -13,12 +13,20 @@ filters on ends before its period. Only when at least one bound ended and, given
 provably holds no project data does the response become a question about the period, in the shape of the
 rephraser's doubt. Anything else, including a probe that fails, keeps the chart.
 
+A chart that renders is checked by the generation guards (chartGuards.py: a number label cast to text, every scatter
+point its own series). The first time one fires in a request, and a repair is left, the chart and its request are kept
+as the fallback and the guard's message goes to the repair. A later chart that passes the guards is served. When a
+later chart trips a guard again, or the request would end on a failure (repairs run out, a timeout, a busy sandbox,
+a run that broke), the fallback is served instead, as if that attempt had succeeded: it goes on to the probe or
+format like any chart, and logs no failure.
+
     START -> rephrase -> ground -> generate -> (evaluate | repair | format)
                   \\-> format (doubt)
     ground -> format (a busy sandbox while reading table schemas)
-    evaluate -> (format | probe | repair)
+    evaluate -> (format | probe | repair | fallback)
     probe -> format (served workflow, a chart without data: the chart, or a question about the period)
-    repair -> (evaluate | repair | format)
+    repair -> (evaluate | repair | format | fallback)
+    fallback -> (format | probe) (the chart a guard fired on, once its guard repair gave nothing better)
     format -> END
 """
 
@@ -35,6 +43,7 @@ from typing_extensions import TypedDict
 
 from nubrix.components.chartEngine import ChartFailure, renderChartRequest
 from nubrix.components.chartFailureLog import logChartFailure, traceIdOf
+from nubrix.components.chartGuards import guardLogMessage, guardMessage
 from nubrix.components.chartRequest import ChartRequest, encodeGeneratedCode
 from nubrix.components.llmChainFactory import buildLlmChain
 from nubrix.components.periodProbe import PeriodProbe, chartHasNoData, combinedProbeSql, findPeriodProbes, isDataFree
@@ -97,8 +106,12 @@ class State(OutputState, total=False):
     # The last request the model produced that validated, kept through later invalid replies.
     lastRequest: dict | None
     chart: dict | None
-    # {stage, message, error, repairable?}: `error` is the exception behind the failure, kept for the failure log.
+    # {stage, message, error, repairable?, guard?}: `error` is the exception behind the failure, kept for the failure
+    # log; `guard` marks a failure a generation guard raised on a chart that rendered.
     failure: dict | None
+    # {chart, chartRequest}: the chart a guard fired on and its request, served when the guard's repair gives nothing
+    # better. Set at most once per request, so a request makes at most one guard repair.
+    fallback: dict | None
     grounding: str
     tables: list[str]
     rawText: str
@@ -332,10 +345,37 @@ class SqlChartWorkflow:
             failure = ChartFailure("run", _UNEXPECTED_MESSAGE, logMessage=_UNEXPECTED_MESSAGE)
             failure.__cause__ = error
             return {"chart": None, "failure": {"stage": "run", "message": _UNEXPECTED_MESSAGE, "error": failure, "repairable": False}}
-        return {"chart": chart, "failure": None}
+        return self._guarded(state, request, chart)
+
+    @staticmethod
+    def _guarded(state: State, request: ChartRequest, chart: dict) -> dict:
+        """A rendered chart through the generation guards: served, kept as the fallback for one repair, or replaced by
+        the fallback when a guard fires again after the guard repair."""
+        fallback = state.get("fallback")
+        if fallback is None and state.get("debugAttempts", 0) >= MAX_REPAIRS:
+            # No repair is left, so nothing a guard says can change the chart.
+            return {"chart": chart, "failure": None}
+        message = guardMessage(request, request.sql, chart)
+        if message is None:
+            return {"chart": chart, "failure": None}
+        if fallback is not None:
+            return SqlChartWorkflow._fallback(state)
+        failure = ChartFailure("build", message, logMessage=guardLogMessage(message))
+        return {
+            "chart": None,
+            "fallback": {"chart": chart, "chartRequest": state["chartRequest"]},
+            "failure": {"stage": "build", "message": message, "error": failure, "guard": True},
+        }
+
+    @staticmethod
+    def _fallback(state: State) -> dict:
+        """The chart a guard fired on, with its own request, served as if this attempt had succeeded."""
+        fallback = state["fallback"]
+        return {"chart": fallback["chart"], "chartRequest": fallback["chartRequest"], "lastRequest": fallback["chartRequest"], "failure": None}
 
     def _next(self, state: State):
-        """After generate, evaluate or repair: run a fresh request, repair a failed one, probe an empty chart, or finish."""
+        """After generate, evaluate, repair or fallback: run a fresh request, repair a failed one, probe an empty chart,
+        or finish (with the chart a guard fired on, when there is one)."""
         chart = state.get("chart")
         if chart is not None:
             # The parallel (report) workflow never asks, so it never probes.
@@ -344,7 +384,7 @@ class SqlChartWorkflow:
         if failure is None:
             return "evaluate"
         if failure["stage"] in _TERMINAL_STAGES or failure.get("repairable") is False or state.get("debugAttempts", 0) >= MAX_REPAIRS:
-            return "format"
+            return "fallback" if state.get("fallback") else "format"
         return "repair"
 
     def _probe(self, state: State, config: RunnableConfig):
@@ -485,16 +525,17 @@ class SqlChartWorkflow:
         workflow.add_node("generate", self._generate)
         workflow.add_node("evaluate", self._evaluate)
         workflow.add_node("repair", self._repair)
+        workflow.add_node("fallback", self._fallback)
         workflow.add_node("format", self._format)
         workflow.add_edge(START, "rephrase")
         workflow.add_conditional_edges("rephrase", self._afterRephrase, {"ground": "ground", "format": "format"})
         workflow.add_conditional_edges("ground", self._afterGround, {"generate": "generate", "format": "format"})
-        route = {"evaluate": "evaluate", "repair": "repair", "format": "format"}
+        route = {"evaluate": "evaluate", "repair": "repair", "format": "format", "fallback": "fallback"}
         if not self.parallel:
             workflow.add_node("probe", self._probe)
             workflow.add_edge("probe", "format")
             route["probe"] = "probe"
-        for node in ("generate", "evaluate", "repair"):
+        for node in ("generate", "evaluate", "repair", "fallback"):
             workflow.add_conditional_edges(node, self._next, route)
         workflow.add_edge("format", END)
         return workflow.compile()

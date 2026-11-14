@@ -1101,3 +1101,231 @@ def test_aBoundWhoseColumnDuckDbBindsElsewhereKeepsTheChartOnDuckDb(harness, sql
     assert "generatedCode" in state
     assert harness.render.call_count == 1
     assert harness.logs == []
+
+
+# Generation guards (fix round 4): a number label cast to text, or every scatter point its own series, goes back for one
+# repair; when that repair gives nothing better, the chart the guard fired on is served as it was.
+
+CAST_REQUEST = {
+    "chartType": "bar",
+    "title": "Orders by item count",
+    "sql": 'SELECT CAST("items" AS VARCHAR) AS items, COUNT(*) AS n FROM "orders" GROUP BY "items" ORDER BY "items"',
+    "encoding": {"x": "items", "y": ["n"]},
+}
+CAST_CHART = {"chartType": "bar", "title": "Orders by item count", "xLabels": "Items", "yLabels": "N", "data": {"labels": ["1", "10", "2"], "datasets": [{"label": "N", "data": [4, 1, 2]}]}}
+NUMBER_REQUEST = dict(CAST_REQUEST, sql='SELECT "items" AS items, COUNT(*) AS n FROM "orders" GROUP BY ALL ORDER BY items')
+NUMBER_CHART = {"chartType": "bar", "title": "Orders by item count", "xLabels": "Items", "yLabels": "N", "data": {"labels": ["1", "2", "10"], "datasets": [{"label": "N", "data": [4, 2, 1]}]}}
+TRY_CAST_REQUEST = dict(CAST_REQUEST, sql='SELECT TRY_CAST("items" AS VARCHAR) AS items, COUNT(*) AS n FROM "orders" GROUP BY "items" ORDER BY "items"')
+CAST_MESSAGE = (
+    "Column 'items' casts a number to text, so its labels can sort as text (1, 10, 2) and a whole-number DOUBLE shows as "
+    "'1.0'. Keep it a number: drop the CAST. The backend shows a number label as text, keeps the query's row order, "
+    "and shows a whole-number DOUBLE as '3'. Order by the numeric value."
+)
+GUARD_METADATA = {"orders": {"columns": [{"name": "items"}, {"name": "b"}]}}
+
+
+def _guarded(harness, *outcomes, generated=CAST_REQUEST):
+    """The generator answers `generated`; each chart render returns (or raises) the next outcome in turn."""
+    harness.generator.invoke.return_value = json.dumps(generated)
+    pending = list(outcomes)
+
+    def render(manager, projectId, chartRequest, tables, **kwargs):
+        answer = pending.pop(0)
+        if isinstance(answer, BaseException):
+            raise answer
+        return answer
+
+    harness.render.side_effect = render
+
+
+def _modelCalls(harness):
+    return harness.generator.invoke.call_count + harness.repair.invoke.call_count
+
+
+def test_aGuardRepairThatPassesIsServed(harness):
+    _guarded(harness, CAST_CHART, NUMBER_CHART)
+    harness.repair.invoke.return_value = json.dumps(NUMBER_REQUEST)
+    state = harness.run(metadata=GUARD_METADATA)
+    assert state["finalOutput"] == NUMBER_CHART
+    assert state["codeOutput"] == json.dumps(NUMBER_CHART)
+    assert decodeGeneratedCode(state["generatedCode"]).sql == NUMBER_REQUEST["sql"]
+    assert state["debugAttempts"] == 1
+    given = harness.repair.invoke.call_args.args[0]
+    assert given["error"] == CAST_MESSAGE
+    assert json.loads(given["previous_request"])["sql"] == CAST_REQUEST["sql"]
+    assert _modelCalls(harness) <= 1 + module.MAX_REPAIRS
+    assert harness.logs == []
+
+
+def test_aRepairThatTripsAGuardAgainServesTheFirstChart(harness):
+    _guarded(harness, CAST_CHART, CAST_CHART)
+    harness.repair.invoke.return_value = json.dumps(TRY_CAST_REQUEST)
+    state = harness.run(metadata=GUARD_METADATA)
+    assert state["finalOutput"] == CAST_CHART
+    assert state["codeOutput"] == json.dumps(CAST_CHART)
+    assert decodeGeneratedCode(state["generatedCode"]).sql == CAST_REQUEST["sql"]
+    assert state["debugAttempts"] == 1
+    assert harness.repair.invoke.call_count == 1
+    assert harness.render.call_count == 2
+    assert _modelCalls(harness) <= 1 + module.MAX_REPAIRS
+    assert harness.logs == []
+
+
+def test_aRepairThatFailsTwiceServesTheGuardedChart(harness):
+    _guarded(harness, CAST_CHART, ChartFailure("check", "Table 'x' is not available."), ChartFailure("bind", "Binder Error: nope"))
+    harness.repair.invoke.side_effect = [json.dumps(NUMBER_REQUEST), json.dumps(dict(NUMBER_REQUEST, title="Second"))]
+    state = harness.run(metadata=GUARD_METADATA)
+    assert state["finalOutput"] == CAST_CHART
+    assert decodeGeneratedCode(state["generatedCode"]).sql == CAST_REQUEST["sql"]
+    assert decodeGeneratedCode(state["generatedCode"]).title == CAST_REQUEST["title"]
+    assert state["debugAttempts"] == 2
+    assert harness.repair.invoke.call_args_list[1].args[0]["error"] == "Table 'x' is not available."
+    assert _modelCalls(harness) == 1 + module.MAX_REPAIRS
+    assert harness.failureRecords() == []
+    assert harness.logs == []
+
+
+def test_anInvalidRepairReplyServesTheGuardedChartOnceRepairsRunOut(harness):
+    _guarded(harness, CAST_CHART)
+    harness.repair.invoke.side_effect = ["not json", "still not json"]
+    state = harness.run(metadata=GUARD_METADATA)
+    assert state["finalOutput"] == CAST_CHART
+    assert decodeGeneratedCode(state["generatedCode"]).sql == CAST_REQUEST["sql"]
+    assert state["debugAttempts"] == 2
+    assert harness.failureRecords() == []
+
+
+@pytest.mark.parametrize(
+    "failure",
+    [ChartFailure("timeout", "Execution timed out after 35 seconds"), SandboxBusyError(), RuntimeError("No sandbox uid is free.")],
+)
+def test_aRepairThatEndsTheRunServesTheGuardedChart(harness, failure):
+    _guarded(harness, CAST_CHART, failure)
+    harness.repair.invoke.return_value = json.dumps(NUMBER_REQUEST)
+    state = harness.run(metadata=GUARD_METADATA)
+    assert state["finalOutput"] == CAST_CHART
+    assert decodeGeneratedCode(state["generatedCode"]).sql == CAST_REQUEST["sql"]
+    assert state["debugAttempts"] == 1
+    assert harness.repair.invoke.call_count == 1
+    assert harness.failureRecords() == []
+
+
+def test_aShadowRunServesTheGuardedChartAsASuccess(harness):
+    outcome = {}
+    _guarded(harness, CAST_CHART, SandboxBusyError())
+    harness.repair.invoke.return_value = json.dumps(NUMBER_REQUEST)
+    state = harness.run(config={"configurable": {"shadow": True, "outcome": outcome}}, metadata=GUARD_METADATA)
+    assert state["finalOutput"] == CAST_CHART
+    assert outcome == {}
+    assert harness.failureRecords() == []
+
+
+def test_aGuardWithNoRepairLeftServesTheChart(harness):
+    _guarded(harness, ChartFailure("bind", "Binder Error: one"), ChartFailure("bind", "Binder Error: two"), CAST_CHART, generated=NUMBER_REQUEST)
+    harness.repair.invoke.side_effect = [json.dumps(NUMBER_REQUEST), json.dumps(CAST_REQUEST)]
+    state = harness.run(metadata=GUARD_METADATA)
+    assert state["finalOutput"] == CAST_CHART
+    assert decodeGeneratedCode(state["generatedCode"]).sql == CAST_REQUEST["sql"]
+    assert state["debugAttempts"] == 2
+    assert _modelCalls(harness) == 1 + module.MAX_REPAIRS
+
+
+def test_aGuardAfterAnOrdinaryRepairStillGetsItsRepair(harness):
+    _guarded(harness, ChartFailure("bind", "Binder Error: one"), CAST_CHART, NUMBER_CHART, generated=NUMBER_REQUEST)
+    harness.repair.invoke.side_effect = [json.dumps(CAST_REQUEST), json.dumps(NUMBER_REQUEST)]
+    state = harness.run(metadata=GUARD_METADATA)
+    assert state["finalOutput"] == NUMBER_CHART
+    assert state["debugAttempts"] == 2
+    assert harness.repair.invoke.call_args_list[1].args[0]["error"] == CAST_MESSAGE
+    assert _modelCalls(harness) == 1 + module.MAX_REPAIRS
+
+
+def test_aGuardRepairIsMadeOnlyOncePerRequest(harness):
+    """The guard repair passes the guard but fails to run; the next guarded chart is not repaired again."""
+    _guarded(harness, CAST_CHART, ChartFailure("bind", "Binder Error: nope"), CAST_CHART)
+    harness.repair.invoke.side_effect = [json.dumps(NUMBER_REQUEST), json.dumps(TRY_CAST_REQUEST)]
+    state = harness.run(metadata=GUARD_METADATA)
+    assert state["finalOutput"] == CAST_CHART
+    assert decodeGeneratedCode(state["generatedCode"]).sql == CAST_REQUEST["sql"]
+    assert state["debugAttempts"] == 2
+    assert harness.failureRecords() == []
+
+
+SERIES_REQUEST = {
+    "chartType": "scatter",
+    "title": "Amount vs items",
+    "xLabel": "Amount",
+    "yLabel": "Items",
+    "sql": 'SELECT "b" AS amount, "items" AS items, "a" AS order_ref FROM "orders"',
+    "encoding": {"x": "amount", "y": ["items"], "series": "order_ref"},
+}
+SERIES_CHART = {
+    "chartType": "scatter",
+    "title": "Amount vs items",
+    "xLabels": "Amount",
+    "yLabels": "Items",
+    "data": {"datasets": [{"label": "1", "data": [{"x": 1, "y": 2}]}, {"label": "2", "data": [{"x": 3, "y": 4}]}]},
+}
+POINTS_CHART = dict(SERIES_CHART, data={"datasets": [{"label": "Items", "data": [{"x": 1, "y": 2}, {"x": 3, "y": 4}]}]})
+
+
+def test_everyPointItsOwnSeriesGoesBackForRepair(harness):
+    _guarded(harness, SERIES_CHART, POINTS_CHART, generated=SERIES_REQUEST)
+    harness.repair.invoke.return_value = json.dumps(dict(SERIES_REQUEST, encoding={"x": "amount", "y": ["items"]}))
+    state = harness.run(metadata=GUARD_METADATA)
+    assert state["finalOutput"] == POINTS_CHART
+    assert harness.repair.invoke.call_args.args[0]["error"].startswith("Each point has its own series value")
+    assert state["debugAttempts"] == 1
+
+
+@pytest.mark.parametrize("repairPasses", [True, False])
+def test_theParallelWorkflowGuardsTheSameWay(monkeypatch, repairPasses):
+    harness = Harness(monkeypatch, parallel=True)
+    harness.rephraser.invoke.return_value = {"rephrasedOutput": "plan"}
+    _guarded(harness, CAST_CHART, NUMBER_CHART if repairPasses else CAST_CHART)
+    harness.repair.invoke.return_value = json.dumps(NUMBER_REQUEST if repairPasses else TRY_CAST_REQUEST)
+    state = harness.run(metadata=GUARD_METADATA)
+    assert state["finalOutput"] == (NUMBER_CHART if repairPasses else CAST_CHART)
+    assert decodeGeneratedCode(state["generatedCode"]).sql == (NUMBER_REQUEST if repairPasses else CAST_REQUEST)["sql"]
+    assert harness.repair.invoke.call_args.args[0]["error"] == CAST_MESSAGE
+    assert state["debugAttempts"] == 1
+    assert _modelCalls(harness) <= 1 + module.MAX_REPAIRS
+
+
+def test_aDashboardRerunOfAGuardedRequestRendersUnchanged(monkeypatch):
+    """renderChartRequest, which the dashboard re-runs call with lenient=True, has no guard."""
+    from nubrix.components import chartEngine
+    from nubrix.components.chartBuilder import buildChart
+    from nubrix.components.chartRequest import ChartRequest
+    from utils.sqlRunner import QueryResult
+
+    table = pa.table({"items": ["1", "10", "2"], "n": [4, 1, 2]})
+    monkeypatch.setattr(chartEngine, "runChartQuery", lambda *args, **kwargs: QueryResult(table=table, truncated=False))
+    request = ChartRequest.model_validate(CAST_REQUEST)
+    chart = chartEngine.renderChartRequest(MagicMock(), "p1", request, ["orders"], filters=None, lenient=True)
+    assert chart == buildChart(request, table)
+    assert chart["data"]["labels"] == ["1", "10", "2"]
+    for path in ("nubrix/components/chartEngine.py", "api/services/dashboardService.py"):
+        with open(path, encoding="utf-8") as source:
+            assert "chartGuards" not in source.read()
+
+
+GUARDED_PERIOD_REQUEST = dict(
+    CAST_REQUEST,
+    sql='SELECT CAST("items" AS VARCHAR) AS items, COUNT(*) AS n FROM "orders" WHERE "b" >= CURRENT_DATE - 29 GROUP BY "items" ORDER BY "items"',
+)
+GUARDED_ZERO_CHART = dict(CAST_CHART, data={"labels": ["1", "10", "2"], "datasets": [{"label": "N", "data": [0, 0, 0]}]})
+
+
+def test_aServedGuardedChartWithoutDataGoesThroughThePeriodProbe(harness):
+    _withProbe(harness, GUARDED_ZERO_CHART, _probeAnswer(("2019-06-30", True)), request=GUARDED_PERIOD_REQUEST)
+    harness.repair.invoke.return_value = json.dumps(dict(GUARDED_PERIOD_REQUEST, sql=GUARDED_PERIOD_REQUEST["sql"].replace("CAST(", "TRY_CAST(", 1)))
+    state = harness.run(metadata=GUARD_METADATA)
+    assert state["finalOutput"] == {"response": _periodQuestion("the data ends on 2019-06-30")}
+    assert state["debugAttempts"] == 1
+    assert harness.repair.invoke.call_args.args[0]["error"] == CAST_MESSAGE
+    probes = _probeCalls(harness)
+    assert len(probes) == 1
+    # The probe reads the served (first) request's bound.
+    assert '"b"' in probes[0].args[2].sql
+    assert harness.logs == []

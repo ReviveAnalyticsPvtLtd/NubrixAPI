@@ -1,0 +1,307 @@
+"""The generation guards: a number label cast to text, and a scatter or bubble whose every point is its own series.
+
+Each chart is built the way the engine builds it: the SQL runs on an in-process DuckDB over invented rows and the
+builder turns the result into the chart, so the labels a guard reads are the ones the client would get.
+"""
+
+from datetime import date
+
+import duckdb
+import pyarrow as pa
+import pytest
+
+from nubrix.components import chartGuards
+from nubrix.components.chartBuilder import buildChart
+from nubrix.components.chartRequest import ChartRequest
+
+TABLES = {
+    "orders": pa.table(
+        {
+            "order_id": [1, 2, 3, 4, 5, 6],
+            "items": [1, 2, 10, 11, 2, 1],
+            "amount": [1.0, 2.0, 2.0, 3.0, 40.0, 51.0],
+            "region": ["north", "south", "north", "east", "west", "south"],
+            "postal_code": ["01026", "01027", "10001", "01026", "20002", "10001"],
+            "ordered_at": pa.array([date(2024, month, 1) for month in (1, 2, 3, 3, 4, 5)], pa.date32()),
+            "lat": [10.0, 11.0, 12.0, 13.0, 14.0, 15.0],
+            "long": [20.0, 21.0, 22.0, 23.0, 24.0, 25.0],
+        }
+    ),
+}
+
+
+def _chart(chartType, sql, encoding):
+    """The request and the chart the engine would build for it."""
+    request = ChartRequest.model_validate({"chartType": chartType, "title": "Chart", "sql": sql, "encoding": encoding})
+    connection = duckdb.connect(":memory:")
+    try:
+        for name, table in TABLES.items():
+            connection.register(name, table)
+        result = connection.execute(sql).arrow()
+    finally:
+        connection.close()
+    return request, buildChart(request, result)
+
+
+def _message(chartType, sql, encoding):
+    request, chart = _chart(chartType, sql, encoding)
+    return chartGuards.guardMessage(request, sql, chart)
+
+
+CAST_ITEMS = 'SELECT CAST("items" AS VARCHAR) AS items, COUNT(*) AS n FROM "orders" GROUP BY "items" ORDER BY "items"'
+
+
+def test_aNumberLabelCastToTextUnderItsOwnNameFires():
+    request, chart = _chart("bar", CAST_ITEMS, {"x": "items", "y": ["n"]})
+    assert chart["data"]["labels"] == ["1", "10", "11", "2"]
+
+    message = chartGuards.guardMessage(request, CAST_ITEMS, chart)
+
+    assert message == chartGuards.CAST_LABEL_MESSAGE.format(name="items")
+    assert message.startswith("Column 'items' casts a number to text")
+    assert "drop the CAST" in message
+
+
+def test_aRoundedDoubleCastToTextShowsAsOnePointZeroAndFires():
+    sql = 'SELECT CAST(round("amount") AS VARCHAR) AS amount_band, COUNT(*) AS n FROM "orders" GROUP BY ALL ORDER BY MIN("amount")'
+    request, chart = _chart("pie", sql, {"label": "amount_band", "value": "n"})
+    assert chart["data"]["labels"][0] == "1.0"
+
+    assert chartGuards.guardMessage(request, sql, chart) == chartGuards.CAST_LABEL_MESSAGE.format(name="amount_band")
+
+
+@pytest.mark.parametrize(
+    "projection",
+    [
+        'CAST("items" AS VARCHAR)',
+        'TRY_CAST("items" AS VARCHAR)',
+        '"items"::VARCHAR',
+        '"items"::TEXT',
+        'CAST("items" AS STRING)',
+        'CAST("items" AS VARCHAR(10))',
+        '"items"::BPCHAR',
+        '(CAST("items" AS VARCHAR))',
+    ],
+)
+def test_everySpellingOfATextCastFires(projection):
+    sql = f'SELECT {projection} AS item_count, COUNT(*) AS n FROM "orders" GROUP BY ALL ORDER BY MIN("items")'
+    assert _message("bar", sql, {"x": "item_count", "y": ["n"]}) == chartGuards.CAST_LABEL_MESSAGE.format(name="item_count")
+
+
+@pytest.mark.parametrize("chartType", ["bar", "line", "area", "histogram", "radar"])
+def test_everyAxisChartTypeFiresOnItsX(chartType):
+    assert _message(chartType, CAST_ITEMS, {"x": "items", "y": ["n"]}) is not None
+
+
+@pytest.mark.parametrize("chartType", ["pie", "doughnut", "polarArea"])
+def test_everySliceChartTypeFiresOnItsLabel(chartType):
+    assert _message(chartType, CAST_ITEMS, {"label": "items", "value": "n"}) is not None
+
+
+def test_aLongFormChartFiresOnItsXNotItsSeries():
+    castX = 'SELECT CAST("items" AS VARCHAR) AS items, "region" AS region, COUNT(*) AS n FROM "orders" GROUP BY ALL ORDER BY MIN("items"), region'
+    castSeries = 'SELECT "region" AS region, CAST("items" AS VARCHAR) AS items, COUNT(*) AS n FROM "orders" GROUP BY ALL ORDER BY region, MIN("items")'
+
+    assert _message("line", castX, {"x": "items", "y": ["n"], "series": "region"}) is not None
+    assert _message("line", castSeries, {"x": "region", "y": ["n"], "series": "items"}) is None
+
+
+@pytest.mark.parametrize(
+    "rows, columns, name",
+    [
+        (["items"], ["region"], "items"),
+        (["region"], ["items"], "items"),
+        (["region", "items"], ["n_band"], "items"),
+    ],
+)
+def test_aPivotFiresOnACastRowOrColumnLevel(rows, columns, name):
+    sql = (
+        'SELECT CAST("items" AS VARCHAR) AS items, "region" AS region, \'all\' AS n_band, SUM("amount") AS total '
+        'FROM "orders" GROUP BY ALL ORDER BY region, MIN("items")'
+    )
+    assert _message("pivot", sql, {"rows": rows, "columns": columns, "value": "total"}) == chartGuards.CAST_LABEL_MESSAGE.format(name=name)
+
+
+@pytest.mark.parametrize(
+    "chartType, sql, encoding",
+    [
+        # A numeric label with no cast.
+        ("bar", 'SELECT "items" AS items, COUNT(*) AS n FROM "orders" GROUP BY ALL ORDER BY items', {"x": "items", "y": ["n"]}),
+        # A text label joined from parts.
+        (
+            "bar",
+            "SELECT 'Q' || CAST(quarter(\"ordered_at\") AS VARCHAR) AS order_quarter, COUNT(*) AS n FROM \"orders\" GROUP BY ALL ORDER BY 1",
+            {"x": "order_quarter", "y": ["n"]},
+        ),
+        # The 'Other' slice's CASE.
+        (
+            "pie",
+            "WITH ranked AS (SELECT \"items\" AS items, COUNT(*) AS m, row_number() OVER (ORDER BY COUNT(*) DESC, \"items\") AS rn, "
+            "COUNT(*) OVER () AS k FROM \"orders\" GROUP BY \"items\") "
+            "SELECT CASE WHEN rn <= 2 OR k <= 3 THEN CAST(items AS VARCHAR) ELSE 'Other' END AS items, SUM(m) AS m FROM ranked GROUP BY ALL ORDER BY MIN(rn)",
+            {"label": "items", "value": "m"},
+        ),
+        # strftime labels.
+        (
+            "line",
+            "SELECT strftime(date_trunc('month', \"ordered_at\"), '%Y') AS order_year, COUNT(*) AS n FROM \"orders\" GROUP BY ALL ORDER BY 1",
+            {"x": "order_year", "y": ["n"]},
+        ),
+        # '0-50' ranges.
+        (
+            "histogram",
+            "WITH binned AS (SELECT CAST(floor(\"amount\" / 50) AS INTEGER) AS bin FROM \"orders\") "
+            "SELECT CAST(bin * 50 AS VARCHAR) || '-' || CAST((bin + 1) * 50 AS VARCHAR) AS value_range, COUNT(*) AS n FROM binned GROUP BY bin ORDER BY bin",
+            {"x": "value_range", "y": ["n"]},
+        ),
+        # A cast to text in a CTE that the outer SELECT passes through.
+        (
+            "bar",
+            'WITH counted AS (SELECT CAST("items" AS VARCHAR) AS items, COUNT(*) AS n FROM "orders" GROUP BY "items") SELECT items, n FROM counted ORDER BY n DESC, items',
+            {"x": "items", "y": ["n"]},
+        ),
+        # A code with a leading zero.
+        (
+            "bar",
+            'SELECT CAST("postal_code" AS VARCHAR) AS postal_code, COUNT(*) AS n FROM "orders" GROUP BY ALL ORDER BY n DESC, postal_code',
+            {"x": "postal_code", "y": ["n"]},
+        ),
+        # A UNION at the top.
+        (
+            "bar",
+            'SELECT CAST("items" AS VARCHAR) AS items, 1 AS n FROM "orders" WHERE "items" < 5 UNION ALL SELECT CAST("items" AS VARCHAR) AS items, 2 AS n FROM "orders" WHERE "items" >= 5',
+            {"x": "items", "y": ["n"]},
+        ),
+        # A cast to a number, not to text.
+        ("bar", 'SELECT CAST("amount" AS BIGINT) AS amount, COUNT(*) AS n FROM "orders" GROUP BY ALL ORDER BY 1', {"x": "amount", "y": ["n"]}),
+        # Text cast to text.
+        ("bar", 'SELECT CAST("region" AS VARCHAR) AS region, COUNT(*) AS n FROM "orders" GROUP BY ALL ORDER BY n DESC, region', {"x": "region", "y": ["n"]}),
+        # A table casting a year.
+        (
+            "table",
+            "SELECT CAST(year(\"ordered_at\") AS VARCHAR) AS order_year, COUNT(*) AS n FROM \"orders\" GROUP BY ALL ORDER BY MIN(year(\"ordered_at\"))",
+            {"columns": ["order_year", "n"]},
+        ),
+        # A geoMap label cast.
+        (
+            "geoMap",
+            'SELECT "lat" AS lat, "long" AS long, CAST("order_id" AS VARCHAR) AS label FROM "orders" ORDER BY "order_id"',
+            {"lat": "lat", "long": "long", "label": "label"},
+        ),
+        # A card.
+        ("card", 'SELECT CAST(COUNT(*) AS VARCHAR) AS n FROM "orders"', {"value": "n"}),
+    ],
+)
+def test_theCastGuardDeclines(chartType, sql, encoding):
+    assert _message(chartType, sql, encoding) is None
+
+
+def test_aStarInTheProjectionDeclines():
+    sql = 'SELECT CAST("items" AS VARCHAR) AS item_label, * EXCLUDE ("items") FROM "orders" ORDER BY "order_id"'
+    request, chart = _chart("bar", 'SELECT CAST("items" AS VARCHAR) AS item_label, COUNT(*) AS n FROM "orders" GROUP BY "items" ORDER BY "items"', {"x": "item_label", "y": ["n"]})
+    assert chartGuards.guardMessage(request, sql, chart) is None
+
+
+def test_anUnparsableSqlDeclines():
+    request, chart = _chart("bar", CAST_ITEMS, {"x": "items", "y": ["n"]})
+    assert chartGuards.guardMessage(request, "SELECT CAST(( FROM", chart) is None
+
+
+def test_twoProjectionsWithTheLabelNameDecline():
+    sql = 'SELECT CAST("items" AS VARCHAR) AS items, "items" AS items, COUNT(*) AS n FROM "orders" GROUP BY ALL'
+    request, chart = _chart("bar", CAST_ITEMS, {"x": "items", "y": ["n"]})
+    assert chartGuards.guardMessage(request, sql, chart) is None
+
+
+def test_anUnaliasedCastDeclines():
+    # DuckDB names it CAST(items AS VARCHAR), not "items", so its output name cannot be decided here.
+    sql = 'SELECT CAST("items" AS VARCHAR), COUNT(*) AS n FROM "orders" GROUP BY ALL'
+    request, chart = _chart("bar", CAST_ITEMS, {"x": "items", "y": ["n"]})
+    assert chartGuards.guardMessage(request, sql, chart) is None
+
+
+@pytest.mark.parametrize(
+    "labels, fires",
+    [
+        (["1", "10", "2"], True),
+        (["-3", "0", "1.5", ""], True),
+        (["", ""], False),
+        ([], False),
+        (["1", "01026"], False),
+        (["1", "1e3"], False),
+        (["1", "1."], False),
+        (["1", " 2"], False),
+        (["1", "north"], False),
+    ],
+)
+def test_onlyLabelsThatAreAllNumberTextFire(labels, fires):
+    request = ChartRequest.model_validate({"chartType": "bar", "title": "T", "sql": CAST_ITEMS, "encoding": {"x": "items", "y": ["n"]}})
+    chart = {"chartType": "bar", "title": "T", "data": {"labels": labels, "datasets": [{"label": "N", "data": [1] * len(labels)}]}}
+    assert (chartGuards.guardMessage(request, CAST_ITEMS, chart) is not None) is fires
+
+
+def test_aChartOfAnUnexpectedShapeDeclines():
+    request = ChartRequest.model_validate({"chartType": "bar", "title": "T", "sql": CAST_ITEMS, "encoding": {"x": "items", "y": ["n"]}})
+    for chart in (None, {}, {"data": None}, {"data": {"labels": "1"}}, {"data": {"labels": [1, 2]}}):
+        assert chartGuards.guardMessage(request, CAST_ITEMS, chart) is None
+
+
+# Every point its own series.
+
+PER_POINT = 'SELECT "amount" AS amount, "items" AS items, CAST("order_id" AS VARCHAR) AS order_ref FROM "orders" ORDER BY "order_id"'
+
+
+@pytest.mark.parametrize("chartType", ["scatter", "bubble"])
+def test_everyPointItsOwnSeriesFires(chartType):
+    encoding = {"x": "amount", "y": ["items"], "series": "order_ref"}
+    if chartType == "bubble":
+        encoding["r"] = "items"
+    request, chart = _chart(chartType, PER_POINT, encoding)
+    assert len(chart["data"]["datasets"]) == 6
+
+    assert chartGuards.guardMessage(request, PER_POINT, chart) == chartGuards.POINT_SERIES_MESSAGE
+
+
+@pytest.mark.parametrize(
+    "sql, encoding",
+    [
+        # Some series hold several points.
+        ('SELECT "amount" AS amount, "items" AS items, "region" AS region FROM "orders" ORDER BY "order_id"', {"x": "amount", "y": ["items"], "series": "region"}),
+        # No series.
+        ('SELECT "amount" AS amount, "items" AS items FROM "orders" ORDER BY "order_id"', {"x": "amount", "y": ["items"]}),
+        # A single point.
+        (
+            'SELECT "amount" AS amount, "items" AS items, CAST("order_id" AS VARCHAR) AS order_ref FROM "orders" WHERE "order_id" = 1',
+            {"x": "amount", "y": ["items"], "series": "order_ref"},
+        ),
+    ],
+)
+def test_thePointSeriesGuardDeclines(sql, encoding):
+    assert _message("scatter", sql, encoding) is None
+
+
+def test_thePointSeriesGuardIgnoresCategoryCharts():
+    sql = 'SELECT "region" AS region, CAST("order_id" AS VARCHAR) AS order_ref, SUM("amount") AS total FROM "orders" GROUP BY ALL ORDER BY region, order_ref'
+    assert _message("bar", sql, {"x": "region", "y": ["total"], "series": "order_ref"}) is None
+
+
+def test_theMessagesNameTheFix():
+    assert chartGuards.CAST_LABEL_MESSAGE.format(name="n") == (
+        "Column 'n' casts a number to text, so its labels can sort as text (1, 10, 2) and a whole-number DOUBLE shows as "
+        "'1.0'. Keep it a number: drop the CAST. The backend shows a number label as text, keeps the query's row order, "
+        "and shows a whole-number DOUBLE as '3'. Order by the numeric value."
+    )
+    assert chartGuards.POINT_SERIES_MESSAGE == (
+        "Each point has its own series value, so every point becomes its own dataset and legend entry. Leave `series` "
+        "out when each row is its own point; use it only to group many points into a few datasets, such as a category "
+        "or a region."
+    )
+    for text in (chartGuards.CAST_LOG_MESSAGE, chartGuards.POINT_SERIES_LOG_MESSAGE):
+        assert "'" not in text
+
+
+def test_theBuilderShowsANumberLabelAsTheMessageSays():
+    """The message's claims: a whole-number DOUBLE label reads '3', labels keep the query's row order."""
+    sql = 'SELECT CAST("amount" AS DOUBLE) AS amount, COUNT(*) AS n FROM "orders" GROUP BY ALL ORDER BY amount DESC'
+    _, chart = _chart("bar", sql, {"x": "amount", "y": ["n"]})
+    assert chart["data"]["labels"] == ["51", "40", "3", "2", "1"]
