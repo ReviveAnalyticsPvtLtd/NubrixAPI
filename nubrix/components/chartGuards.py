@@ -39,9 +39,10 @@ from nubrix.components.chartRequest import ChartRequest
 MAX_NAMED_POINTS = 10
 
 POINT_SERIES_MESSAGE = (
-    f"Each of more than {MAX_NAMED_POINTS} points has its own series value, so every point becomes its own dataset and "
-    f"legend entry. With more than {MAX_NAMED_POINTS} points, leave `series` out when each row is its own point; use it "
-    "only to group many points into a few datasets, such as a category or a region."
+    f"There are more than {MAX_NAMED_POINTS} points and each has its own series value, so every point becomes its own "
+    f"dataset and legend entry. Leave `series` out and keep every row: never drop rows to get down to "
+    f"{MAX_NAMED_POINTS} points. Use `series` only to group many points into a few datasets, such as a category or a "
+    "region."
 )
 
 _AXIS_LABEL_TYPES = ("bar", "line", "area", "histogram", "radar")
