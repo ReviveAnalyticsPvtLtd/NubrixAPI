@@ -15,7 +15,7 @@ from concurrent.futures import ThreadPoolExecutor
 from api.commons import updateProjectModifiedAt
 from utils.exceptionHandler import CustomException
 from utils.storageListing import listProjectFiles
-from utils.codeExecutor import replManager, _remove_code_fences
+from utils.codeExecutor import REPLManager, replManager, _remove_code_fences
 from utils.sandboxSlots import BUSY_CODE, BUSY_MESSAGE, isBusy
 from sqlalchemy import URL, create_engine
 from utils.projectStorage import readJson, readTableBytes
@@ -42,9 +42,17 @@ import json
 import os
 import io
 import re
+from math import isfinite
 
 _CHART_KEYS = ("chartType", "title", "xLabels", "yLabels", "label", "data", "map", "columns")
 FAILED_CODE_PREFIX = "# Failed to generate code"
+# Exactly the text JavaScript's `String(number)` gives for a finite number: no leading zeros, no trailing fraction
+# zeros, an exponent only as `d[.ddd]e+N` / `e-N`, and never "-0". Only a card exported as such text is run at export
+# to learn whether its query gives that number; any other text was never a number the user saw, and is kept.
+_NUMBER_TEXT = re.compile(r"(?!-0(?![.e]))-?(?:(?:0|[1-9][0-9]*)(?:\.[0-9]*[1-9])?|[1-9](?:\.[0-9]*[1-9])?e[+-][1-9][0-9]*)")
+# The card check at export runs like a Panel chart run (the reporting workflows give each 35 s) and never waits for
+# a slot, so an export takes at most about that long, and a busy sandbox just keeps the exported text.
+cardCheckManager = REPLManager(timeoutSeconds=35)
 
 
 class _RerunFailure(Exception):
@@ -164,7 +172,8 @@ class DashboardService:
         return fresh, produced is not None
 
     @staticmethod
-    def _rerunWidgetProduced(widget: dict, filters: list | None, projectId: str, rerunTables: Sequence[str] | None) -> tuple[dict, dict | None]:
+    def _rerunWidgetProduced(widget: dict, filters: list | None, projectId: str, rerunTables: Sequence[str] | None,
+                             manager: REPLManager | None = None, waitForSlot: bool = True) -> tuple[dict, dict | None]:
         """
         Re-run one saved widget in its own form and return a copy with the new chart data.
 
@@ -179,6 +188,9 @@ class DashboardService:
                 saved Python widget can read), for the SQL check, in the order it should prefer a spelling; see
                 `_rerunTables`. None means no list could be read, so a ChartRequest widget fails (a Python widget
                 does not need it).
+            manager (REPLManager | None): The manager to run with; None is the dashboard's `replManager`.
+            waitForSlot (bool): False makes one attempt at each slot: a full sandbox raises at once, and a full
+                project semaphore fails a Python run at once.
 
         Returns:
             tuple[dict, dict | None]: The widget copy, and the keys the run produced (None when it failed, and
@@ -191,18 +203,21 @@ class DashboardService:
         """
         widget = widget.copy()
         form = "chartRequest"
+        manager = replManager if manager is None else manager
+        # Only a no-wait run names the argument, so the re-runs call exactly as before.
+        noWait = {} if waitForSlot else {"waitForSlot": False}
         try:
             request = decodeGeneratedCode(widget.get("generatedCode"))
             if request is not None:
                 if rerunTables is None:
                     raise ValueError("the project's table list could not be read")
-                result = renderChartRequest(replManager, projectId, request, rerunTables, filters=filters, lenient=True)
+                result = renderChartRequest(manager, projectId, request, rerunTables, filters=filters, lenient=True, **noWait)
             else:
                 form = "python"
                 code = widget.get("generatedCode")
                 if isinstance(code, str) and "```" in code:
                     code = _remove_code_fences(code)
-                result = _pythonResult(replManager.run(code, projectId=projectId, filters=filters))
+                result = _pythonResult(manager.run(code, projectId=projectId, filters=filters, **noWait))
         except Exception as error:
             if isBusy(error):
                 raise
@@ -403,9 +418,54 @@ class DashboardService:
             logger.error(exception)
             raise exception   
         
+    def _exportedCardData(self, details: ExportToDashboard, widgetId: str) -> object:
+        """
+        The value to save for an exported card: the number its query gives, when the client sent it as that number's text.
+
+        The client exports a card's value with `String(value)`, so the number 99441 and a text value "99441" (a year or
+        an id the query returns as text) arrive the same way. A re-run returns the query's own type, and the client shows
+        a number with thousands separators and text as it is. So a card whose text could be a number is run once, the way
+        a filter re-runs it but with no filters, and the number is saved only when the run gives a number equal to the
+        text. The run uses `cardCheckManager`: the Panel's 35 s, and no wait for a slot. Anything else keeps the text,
+        exactly as before: text `String(number)` never gives, a text value, a run that fails, times out or gives another
+        value (the data changed since the Panel ran), a busy sandbox, and a card with no code to run. Nothing else is
+        taken from the run.
+
+        Args:
+            details (ExportToDashboard): The exported widget.
+            widgetId (str): The new widget's id, for the run's log lines.
+
+        Returns:
+            object: The data to save.
+        """
+        text = details.data
+        if details.chartType != "card" or not isinstance(text, str) or not _NUMBER_TEXT.fullmatch(text):
+            return text
+        widget = {"id": widgetId, "chartType": "card", "generatedCode": details.generatedCode}
+        if not details.generatedCode.strip() or not self._isRerunnable(widget):
+            return text
+        try:
+            rerunTables = self._rerunTables(details.projectId) if self._usesChartRequest(widget) else ()
+            _, produced = self._rerunWidgetProduced(widget, None, details.projectId, rerunTables, cardCheckManager, waitForSlot=False)
+        except Exception as error:
+            # A busy sandbox (the re-run path lets only that through): the export goes ahead with the text. The
+            # error's type only, as the re-runs log.
+            logger.warning(f"Card {widgetId} was exported as text: its query could not be run ({type(error).__name__}).")
+            return text
+        value = produced.get("data") if produced else None
+        # isfinite only on a float: on an int above about 1.8e308 it raises OverflowError.
+        if isinstance(value, bool) or not isinstance(value, (int, float)) or (isinstance(value, float) and not isfinite(value)):
+            return text
+        if float(text) != value:
+            return text
+        return value
+
     def exportToDashboard(self, details: ExportToDashboard) -> str:
         """
         Export a widget to a dashboard page.
+
+        A card exported as the text of a number is saved as that number when its query gives it; see
+        `_exportedCardData`. That run happens before the dashboard is read, so the read-to-save window stays short.
 
         Args:
             details (ExportToDashboard): Details of the widget and page to export to.
@@ -417,9 +477,10 @@ class DashboardService:
             CustomException: For any errors during export.
         """
         try:
+            widgetId = str(uuid.uuid4())
+            data = self._exportedCardData(details, widgetId)
             dashboardConfig = readJson(details.projectId, "dashboardConfig.json")
             pageDict = dashboardConfig.get(details.page)
-            widgetId = str(uuid.uuid4())
             newWidget = {
                 "id": widgetId,
                 "chartType": details.chartType,
@@ -427,7 +488,7 @@ class DashboardService:
                 "label": details.label,
                 "xLabels": details.xLabels,
                 "yLabels": details.yLabels,
-                "data": details.data,
+                "data": data,
                 "map": details.map,
                 "layout": details.layout,
                 "generatedCode": details.generatedCode
