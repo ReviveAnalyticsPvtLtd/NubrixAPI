@@ -7,10 +7,17 @@ with the exact error (at most twice) when a step fails.
 
 The response keeps the keys of the Python chart workflows. Everything else stays in internal state.
 
+When the served workflow's chart shows no data and its query filters on dates counted back from today (see
+periodProbe.py for which bounds count), the probe node checks, in one sandbox run, whether the data each bound
+filters on ends before its period. Only when at least one bound ended and, given the bounds that ended, the chart
+provably holds no project data does the response become a question about the period, in the shape of the
+rephraser's doubt. Anything else, including a probe that fails, keeps the chart.
+
     START -> rephrase -> ground -> generate -> (evaluate | repair | format)
                   \\-> format (doubt)
     ground -> format (a busy sandbox while reading table schemas)
-    evaluate -> (format | repair)
+    evaluate -> (format | probe | repair)
+    probe -> format (served workflow, a chart without data: the chart, or a question about the period)
     repair -> (evaluate | repair | format)
     format -> END
 """
@@ -30,6 +37,7 @@ from nubrix.components.chartEngine import ChartFailure, renderChartRequest
 from nubrix.components.chartFailureLog import logChartFailure, traceIdOf
 from nubrix.components.chartRequest import ChartRequest, encodeGeneratedCode
 from nubrix.components.llmChainFactory import buildLlmChain
+from nubrix.components.periodProbe import PeriodProbe, chartHasNoData, combinedProbeSql, findPeriodProbes, isDataFree
 from nubrix.components.queryRephraser import ParallelQueryRephaser, QueryRephaser
 from nubrix.components.sqlGrounding import groundingText
 from utils.codeExecutor import REPLManager
@@ -43,6 +51,30 @@ RUN_TIMEOUT_SECONDS = 35
 _MODEL_LOG_MESSAGE = "The model reply is not a valid chart request."
 _TERMINAL_STAGES = ("timeout", "busy")
 _UNEXPECTED_MESSAGE = "The chart query could not be run."
+
+# The question asked when the data a chart's period filters on ends before that period: `question` with one `reason`.
+PERIOD_QUESTION = {
+    "question": "There is no data for the period you asked about: {reason}. Which period should the chart cover?",
+    "ended": "the data ends on {date}",
+    "empty": "the table has no dated rows",
+}
+_PROBE_TITLE = "Period check"
+_ISO_DATE = re.compile(r"[0-9]{4}-[0-9]{2}-[0-9]{2}")
+
+
+class _ProbeFailed(Exception):
+    """A probe that gave no answer; `stage` is all the warning line says about it."""
+
+    def __init__(self, stage: str, error: BaseException | None = None):
+        super().__init__(stage)
+        self.stage = stage
+        self.error = error
+
+
+def periodQuestion(lastDate: str | None) -> str:
+    """The period question, naming the latest date the data reaches, or saying there is none."""
+    reason = PERIOD_QUESTION["ended"].format(date=lastDate) if lastDate else PERIOD_QUESTION["empty"]
+    return PERIOD_QUESTION["question"].format(reason=reason)
 
 
 class OutputState(TypedDict, total=False):
@@ -303,15 +335,95 @@ class SqlChartWorkflow:
         return {"chart": chart, "failure": None}
 
     def _next(self, state: State):
-        """After generate, evaluate or repair: run a fresh request, repair a failed one, or finish."""
-        if state.get("chart") is not None:
-            return "format"
+        """After generate, evaluate or repair: run a fresh request, repair a failed one, probe an empty chart, or finish."""
+        chart = state.get("chart")
+        if chart is not None:
+            # The parallel (report) workflow never asks, so it never probes.
+            return "probe" if not self.parallel and chartHasNoData(chart) else "format"
         failure = state.get("failure")
         if failure is None:
             return "evaluate"
         if failure["stage"] in _TERMINAL_STAGES or failure.get("repairable") is False or state.get("debugAttempts", 0) >= MAX_REPAIRS:
             return "format"
         return "repair"
+
+    def _probe(self, state: State, config: RunnableConfig):
+        """A chart without data: ask which period to chart when the data of at least one date bound ends before that
+        bound and, given the bounds that ended, the chart provably holds no project data. Anything else, including a
+        probe that fails, keeps the chart (an empty update)."""
+        sql = state["chartRequest"]["sql"]
+        try:
+            probes = findPeriodProbes(sql, state["tables"])
+        except Exception as error:
+            self._logProbeFailure(_ProbeFailed("parse", error), state, config)
+            return {}
+        if not probes:
+            return {}
+        try:
+            answers = self._runProbes(probes, state, config)
+        except _ProbeFailed as failure:
+            self._logProbeFailure(failure, state, config)
+            return {}
+        ended = [(probe, lastValue) for probe, (endedBefore, lastValue) in zip(probes, answers) if endedBefore]
+        try:
+            dataFree = bool(ended) and isDataFree(sql, state["tables"], [probe.sql for probe, _ in ended])
+        except Exception as error:
+            self._logProbeFailure(_ProbeFailed("parse", error), state, config)
+            return {}
+        if not dataFree:
+            return {}
+        lastValues = [lastValue for _, lastValue in ended if lastValue is not None]
+        if not all(isinstance(value, str) and _ISO_DATE.match(value) for value in lastValues):
+            # Not a date the question can quote (a date column of an unusual type): a known limit, not a failure.
+            self._logProbeRecord("undated", None, state, config, logger.info)
+            return {}
+        rephrased = state.get("rephrasedQuery")
+        # The same shape as a rephraser doubt: format answers {"response": doubt} with no code and no output.
+        doubt = periodQuestion(max(value[:10] for value in lastValues) if lastValues else None)
+        return {"rephrasedQuery": {**(rephrased if isinstance(rephrased, dict) else {}), "doubt": doubt}, "chart": None}
+
+    def _runProbes(self, probes: list[PeriodProbe], state: State, config: RunnableConfig) -> list[tuple[bool, Any]]:
+        """(ended before, last value) per probe, from one sandbox run the way the chart ran."""
+        try:
+            request = ChartRequest(chartType="table", title=_PROBE_TITLE, sql=combinedProbeSql(probes), encoding={})
+            chart = renderChartRequest(
+                self.replManager,
+                state["projectId"],
+                request,
+                state["tables"],
+                waitForSlot=not _isShadow(config),
+            )
+        except ChartFailure as error:
+            raise _ProbeFailed(error.stage, error) from error
+        except SandboxBusyError as error:
+            raise _ProbeFailed("busy", error) from error
+        except Exception as error:
+            raise _ProbeFailed("exception", error) from error
+        rows = chart.get("data") if isinstance(chart, dict) else None
+        row = rows[0] if isinstance(rows, list) and len(rows) == 1 and isinstance(rows[0], dict) else {}
+        answers = []
+        for number in range(1, len(probes) + 1):
+            endedBefore = row.get(f"ended_before_{number}")
+            if not isinstance(endedBefore, bool):
+                raise _ProbeFailed("result")
+            answers.append((endedBefore, row.get(f"last_value_{number}")))
+        return answers
+
+    @classmethod
+    def _logProbeFailure(cls, failure: _ProbeFailed, state: State, config: RunnableConfig | None) -> None:
+        cls._logProbeRecord(failure.stage, failure.error, state, config, logger.warning)
+
+    @staticmethod
+    def _logProbeRecord(stage: str, error: BaseException | None, state: State, config: RunnableConfig | None, log) -> None:
+        """One line with the stage and ids only: no SQL, table names or values."""
+        record = {
+            "stage": stage,
+            "errorClass": type(error.__cause__ or error).__name__ if error is not None else None,
+            "projectId": state["projectId"],
+            "shadow": _isShadow(config),
+            "traceId": traceIdOf({"callbacks": _callbackHandlers(config)}),
+        }
+        log("chart_period_probe " + json.dumps(record, sort_keys=True))
 
     def _format(self, state: State, config: RunnableConfig):
         return {**self._formatted(state, config), "debugAttempts": state.get("debugAttempts", 0)}
@@ -378,6 +490,10 @@ class SqlChartWorkflow:
         workflow.add_conditional_edges("rephrase", self._afterRephrase, {"ground": "ground", "format": "format"})
         workflow.add_conditional_edges("ground", self._afterGround, {"generate": "generate", "format": "format"})
         route = {"evaluate": "evaluate", "repair": "repair", "format": "format"}
+        if not self.parallel:
+            workflow.add_node("probe", self._probe)
+            workflow.add_edge("probe", "format")
+            route["probe"] = "probe"
         for node in ("generate", "evaluate", "repair"):
             workflow.add_conditional_edges(node, self._next, route)
         workflow.add_edge("format", END)

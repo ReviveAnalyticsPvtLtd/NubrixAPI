@@ -374,6 +374,32 @@ def test_engineRendersARealChart(orders):
     assert chart["data"]["datasets"][0]["data"] == [90, 60]
 
 
+def test_aPeriodProbeRunsThroughTheEngineAndKeepsItsTypes(storage):
+    """The workflow's period probe, checked, run and built as a table like any chart request: a bool and a string."""
+    from datetime import date
+
+    from nubrix.components.periodProbe import combinedProbeSql, findPeriodProbes
+
+    _putTable(storage, "orders", pa.table({"d": pa.array([date(2019, 6, 30), date(2019, 1, 1)], pa.date32()), "amount": [1, 2]}))
+    _putTable(storage, "items", pa.table({"s": pa.array([date.today()], pa.date32()), "oid": [1]}))
+    sql = (
+        "SELECT count(*) AS n FROM orders o JOIN items i ON i.oid = o.amount "
+        "WHERE date_trunc('month', o.d) >= CURRENT_DATE - 29 AND i.s >= CURRENT_DATE - 29"
+    )
+    probes = findPeriodProbes(sql, ["orders", "items"])
+    manager = codeExecutor.REPLManager(timeoutSeconds=60)
+    request = ChartRequest(chartType="table", title="Period check", sql=combinedProbeSql(probes), encoding={})
+
+    chart = renderChartRequest(manager, PROJECT, request, ["orders", "items"])
+
+    assert chart["data"] == [
+        {"last_value_1": "2019-06-30", "ended_before_1": True, "last_value_2": date.today().isoformat(), "ended_before_2": False}
+    ]
+    row = chart["data"][0]
+    assert type(row["ended_before_1"]) is bool and type(row["ended_before_2"]) is bool
+    assert type(row["last_value_1"]) is str and type(row["last_value_2"]) is str
+
+
 def test_engineReportsAMissingColumnAsABindFailure(orders):
     manager = codeExecutor.REPLManager(timeoutSeconds=60)
     request = ChartRequest(chartType="card", title="Total", sql="SELECT sum(amount) AS total FROM orders", encoding={"value": "sum"})
