@@ -11,6 +11,7 @@ __version__ = "1.0.0"
 __author__ = "Rohit Mishra"
 __all__ = ["ChartBuildError", "buildChart", "emptyChart", "readableLabel"]
 
+import heapq
 import logging
 import math
 import re
@@ -327,6 +328,43 @@ def _pivotKey(levels: tuple[str, ...]) -> str:
     return f"({quoted})"
 
 
+def _mergedKeyOrder(keys: list[str], groupKeys: list[str]) -> list[str]:
+    """Order one pivot dimension the way the query sorted it.
+
+    The query can order only one dimension first, so a key with no value in the first group shows up late and
+    first-appearance order puts it at the end. Each group (rows sharing a groupKey) lists its keys in query order;
+    consecutive keys become edges and a topological sort that takes the earliest-seen ready key merges the groups.
+    If the groups disagree (a cycle), plain first-appearance order is used.
+    """
+    firstSeen: dict[str, int] = {}
+    for key in keys:
+        firstSeen.setdefault(key, len(firstSeen))
+    appearance = list(firstSeen)
+    previousInGroup: dict[str, str] = {}
+    successors: dict[str, list[str]] = {key: [] for key in appearance}
+    waiting = dict.fromkeys(appearance, 0)
+    seenEdges: set[tuple[str, str]] = set()
+    for key, groupKey in zip(keys, groupKeys):
+        previous = previousInGroup.get(groupKey)
+        previousInGroup[groupKey] = key
+        if previous is None or previous == key or (previous, key) in seenEdges:
+            continue
+        seenEdges.add((previous, key))
+        successors[previous].append(key)
+        waiting[key] += 1
+    ready = [firstSeen[key] for key in appearance if waiting[key] == 0]
+    heapq.heapify(ready)
+    ordered: list[str] = []
+    while ready:
+        key = appearance[heapq.heappop(ready)]
+        ordered.append(key)
+        for following in successors[key]:
+            waiting[following] -= 1
+            if waiting[following] == 0:
+                heapq.heappush(ready, firstSeen[following])
+    return ordered if len(ordered) == len(appearance) else appearance
+
+
 def _buildPivot(request: ChartRequest, table: pa.Table, truncated: bool) -> dict:
     encoding = request.encoding
     if truncated:
@@ -338,11 +376,13 @@ def _buildPivot(request: ChartRequest, table: pa.Table, truncated: bool) -> dict
     _requireNumeric(table, [encoding.value], "Return a numeric value column, aggregated with SUM, AVG or COUNT.")
     rowLevels = zip(*[[_levelText(v) for v in _column(table, name)] for name in encoding.rows])
     columnLevels = zip(*[[_levelText(v) for v in _column(table, name)] for name in encoding.columns])
-    rowKeys: dict[str, None] = {}
+    rowKeys: list[str] = []
+    columnKeys: list[str] = []
     cells: dict[str, dict[str, int | float | None]] = {}
     for rowLevel, columnLevel, value in zip(rowLevels, columnLevels, _column(table, encoding.value)):
         rowKey, columnKey = _pivotKey(rowLevel), _pivotKey(columnLevel)
-        rowKeys[rowKey] = None
+        rowKeys.append(rowKey)
+        columnKeys.append(columnKey)
         column = cells.setdefault(columnKey, {})
         if rowKey in column:
             raise ChartBuildError(
@@ -351,10 +391,12 @@ def _buildPivot(request: ChartRequest, table: pa.Table, truncated: bool) -> dict
                 logMessage="The query has more than one row for a pivot row and column pair.",
             )
         column[rowKey] = _number(value)
+    rowOrder = _mergedKeyOrder(rowKeys, columnKeys)
+    columnOrder = _mergedKeyOrder(columnKeys, rowKeys)
     return {
         "chartType": "pivot",
         "title": request.title,
-        "data": {key: {rowKey: column.get(rowKey) for rowKey in rowKeys} for key, column in cells.items()},
+        "data": {key: {rowKey: cells[key].get(rowKey) for rowKey in rowOrder} for key in columnOrder},
     }
 
 

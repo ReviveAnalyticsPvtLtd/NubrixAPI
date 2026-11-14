@@ -1,6 +1,7 @@
 """The SQL chart workflow: rephrase, ground, generate, evaluate, repair (at most twice), format."""
 
 import json
+from datetime import date, datetime, timedelta
 from unittest.mock import MagicMock
 
 import pyarrow as pa
@@ -528,3 +529,575 @@ def test_generationStillRefusesAnInactiveTable(harness, monkeypatch):
     assert "old_table" not in harness.generator.invoke.call_args.args[0]["grounding"]
     assert "Table 'old_table' is not available" in state["finalOutput"]["error"]
     assert harness.failureRecords()[0]["stage"] == "check"
+
+
+
+# A period that counts back from today, over a table whose data may end before it.
+
+PERIOD_REQUEST = {
+    "chartType": "line",
+    "title": "Monthly orders",
+    "sql": (
+        "SELECT strftime(date_trunc('month', o.\"b\"), '%Y-%m') AS month, count(*) AS orders FROM \"orders\" AS o "
+        "WHERE date_trunc('month', o.\"b\") >= date_trunc('month', CURRENT_DATE) - INTERVAL 11 MONTH GROUP BY 1 ORDER BY 1"
+    ),
+    "encoding": {"x": "month", "y": ["orders"]},
+}
+SIMPLE_PERIOD_REQUEST = {
+    "chartType": "bar",
+    "title": "Totals",
+    "sql": 'SELECT "a", COUNT(*) AS total FROM "orders" WHERE "b" >= CURRENT_DATE - 29 GROUP BY ALL',
+    "encoding": {"x": "a", "y": ["total"]},
+}
+PROBE_SQL = (
+    "SELECT p1.last_value AS last_value_1, p1.ended_before AS ended_before_1 FROM ("
+    'SELECT CAST(max("b") AS VARCHAR) AS last_value, '
+    '(max("b") IS NULL OR max("b") < (CURRENT_DATE - 29)) AS ended_before FROM "orders") AS p1'
+)
+ZERO_CHART = {"chartType": "bar", "title": "Totals", "xLabels": "A", "yLabels": "Total", "data": {"labels": ["x", "y"], "datasets": [{"label": "Total", "data": [0, 0]}]}}
+EMPTY_CHART = {"chartType": "bar", "title": "Totals", "xLabels": "A", "yLabels": "Total", "data": {"labels": [], "datasets": []}}
+TWO_BOUND_REQUEST = dict(
+    SIMPLE_PERIOD_REQUEST,
+    sql=(
+        'SELECT o."a", count(*) AS total FROM "orders" o JOIN "items" i ON i."a" = o."a" '
+        'WHERE o."b" >= CURRENT_DATE - 29 AND i."c" >= CURRENT_DATE - 29 GROUP BY ALL'
+    ),
+)
+TWO_BOUND_METADATA = {"orders": {"columns": [{"name": "a"}, {"name": "b"}]}, "items": {"columns": [{"name": "a"}, {"name": "c"}]}}
+
+
+def _probeAnswer(*pairs):
+    """The combined probe's table: one row with (last_value_n, ended_before_n) for each (last value, ended) pair."""
+    row = {}
+    for number, (lastValue, endedBefore) in enumerate(pairs, start=1):
+        row[f"last_value_{number}"] = lastValue
+        row[f"ended_before_{number}"] = endedBefore
+    return {"chartType": "table", "title": "Period check", "columns": list(row), "data": [row]}
+
+
+def _periodQuestion(clause):
+    return f"There is no data for the period you asked about: {clause}. Which period should the chart cover?"
+
+
+def _withProbe(harness, chart, *answers, request=SIMPLE_PERIOD_REQUEST):
+    """The chart call returns `chart`; each probe call returns (or raises) the next answer."""
+    harness.generator.invoke.return_value = json.dumps(request)
+    pending = list(answers)
+
+    def render(manager, projectId, chartRequest, tables, **kwargs):
+        if "ended_before" in chartRequest.sql:
+            answer = pending.pop(0)
+            if isinstance(answer, BaseException):
+                raise answer
+            return answer
+        return chart
+
+    harness.render.side_effect = render
+
+
+def _probeCalls(harness):
+    return [call for call in harness.render.call_args_list if "ended_before" in call.args[2].sql]
+
+
+def _probeLines(harness):
+    return [line for line in harness.logs if line.startswith("chart_period_probe ")]
+
+
+def test_dataThatEndsBeforeThePeriodAsksWhichPeriod(harness):
+    _withProbe(harness, ZERO_CHART, _probeAnswer(("2019-06-30 13:45:00", True)))
+    state = harness.run()
+    question = _periodQuestion("the data ends on 2019-06-30")
+    assert state["finalOutput"] == {"response": question}
+    assert state["rephrasedQuery"] == {"rephrasedOutput": "plan", "doubt": question}
+    assert "generatedCode" not in state and "codeOutput" not in state
+    assert set(state) <= OUTPUT_KEYS
+    calls = _probeCalls(harness)
+    assert len(calls) == 1
+    probe = calls[0]
+    assert probe.args[0] is harness.manager and probe.args[1] == "p1"
+    assert probe.args[2].chartType == "table"
+    assert probe.args[2].sql == PROBE_SQL
+    assert list(probe.args[3]) == ["orders"]
+    assert probe.kwargs["waitForSlot"] is True
+    assert harness.logs == []
+    harness.repair.invoke.assert_not_called()
+
+
+def test_anEmptyChartWithDataThatEndsBeforeThePeriodAsksToo(harness):
+    _withProbe(harness, EMPTY_CHART, _probeAnswer(("2021-01-31", True)))
+    state = harness.run()
+    assert state["finalOutput"] == {"response": _periodQuestion("the data ends on 2021-01-31")}
+
+
+def test_everyBoundRunsInOneProbeAndOneEndedBoundThatEmptiesTheRowsAsks(harness):
+    _withProbe(harness, ZERO_CHART, _probeAnswer(("2019-01-01", True), ("2020-02-02 00:00:00", True)), request=TWO_BOUND_REQUEST)
+    state = harness.run(metadata=TWO_BOUND_METADATA)
+    assert state["finalOutput"] == {"response": _periodQuestion("the data ends on 2020-02-02")}
+    calls = _probeCalls(harness)
+    assert len(calls) == 1
+    assert "AS p1 CROSS JOIN (" in calls[0].args[2].sql and calls[0].args[2].sql.endswith(") AS p2")
+
+    # Either WHERE conjunct empties the joined rows by itself; the question quotes only the bounds that ended.
+    _withProbe(harness, ZERO_CHART, _probeAnswer(("2019-01-01", True), ("2030-01-01", False)), request=TWO_BOUND_REQUEST)
+    state = harness.run(metadata=TWO_BOUND_METADATA)
+    assert state["finalOutput"] == {"response": _periodQuestion("the data ends on 2019-01-01")}
+
+    _withProbe(harness, ZERO_CHART, _probeAnswer(("2030-01-01", False), ("2030-01-01", False)), request=TWO_BOUND_REQUEST)
+    state = harness.run(metadata=TWO_BOUND_METADATA)
+    assert state["finalOutput"] == ZERO_CHART
+    assert harness.logs == []
+
+
+def test_anEndedBoundThatLeavesOtherDataKeepsTheChart(harness):
+    request = dict(
+        SIMPLE_PERIOD_REQUEST,
+        sql=(
+            'SELECT "a", count(*) AS total FROM (SELECT "a" FROM "orders" WHERE "b" >= CURRENT_DATE - 29 '
+            'UNION ALL SELECT "a" FROM "items" WHERE "c" >= CURRENT_DATE - 29) AS u GROUP BY ALL'
+        ),
+    )
+    _withProbe(harness, ZERO_CHART, _probeAnswer(("2019-01-01", True), ("2030-01-01", False)), request=request)
+    state = harness.run(metadata=TWO_BOUND_METADATA)
+    assert state["finalOutput"] == ZERO_CHART
+    assert len(_probeCalls(harness)) == 1
+    assert harness.logs == []
+
+
+def test_aLegitimateZeroKeepsTheChart(harness):
+    _withProbe(harness, ZERO_CHART, _probeAnswer(("2030-01-01", False)))
+    state = harness.run()
+    assert state["finalOutput"] == ZERO_CHART
+    assert state["codeOutput"] == json.dumps(ZERO_CHART)
+    assert decodeGeneratedCode(state["generatedCode"]).sql == SIMPLE_PERIOD_REQUEST["sql"]
+    assert state["rephrasedQuery"] == {"rephrasedOutput": "plan", "doubt": None}
+    assert len(_probeCalls(harness)) == 1
+    assert harness.logs == []
+
+
+def test_everyTableEmptySaysThereAreNoDatedRows(harness):
+    _withProbe(harness, ZERO_CHART, _probeAnswer((None, True)))
+    state = harness.run()
+    assert state["finalOutput"] == {"response": _periodQuestion("the table has no dated rows")}
+
+
+@pytest.mark.parametrize(
+    "failure, stage",
+    [
+        (ChartFailure("check", "Table 'orders' is not available."), "check"),
+        (ChartFailure("bind", 'Binder Error: column "b" not found'), "bind"),
+        (ChartFailure("run", "Conversion Error: '2019-06-30'"), "run"),
+        (ChartFailure("timeout", "Execution timed out after 35 seconds"), "timeout"),
+        (ChartFailure("build", "bad"), "build"),
+        (SandboxBusyError(), "busy"),
+        (RuntimeError("No sandbox uid is free."), "exception"),
+        ({"chartType": "table", "title": "Period check", "columns": [], "data": []}, "result"),
+        (_probeAnswer(("2019-06-30", "yes")), "result"),
+        ({"chartType": "table", "title": "Period check", "columns": ["x"], "data": [{"x": 1}]}, "result"),
+    ],
+)
+def test_aFailedProbeKeepsTheChartAndLogsOneWarning(harness, failure, stage):
+    _withProbe(harness, ZERO_CHART, failure)
+    state = harness.run()
+    assert state["finalOutput"] == ZERO_CHART
+    assert decodeGeneratedCode(state["generatedCode"]).sql == SIMPLE_PERIOD_REQUEST["sql"]
+    assert harness.failureRecords() == []
+    lines = _probeLines(harness)
+    assert len(harness.logs) == 1 and len(lines) == 1
+    record = json.loads(lines[0][len("chart_period_probe "):])
+    assert record["stage"] == stage
+    assert record["projectId"] == "p1" and record["shadow"] is False
+    assert "2019" not in lines[0] and "orders" not in lines[0] and '"b"' not in lines[0]
+    harness.repair.invoke.assert_not_called()
+
+
+def test_aMissingBoundInTheAnswerIsAFailedProbe(harness):
+    _withProbe(harness, ZERO_CHART, _probeAnswer(("2019-01-01", True)), request=TWO_BOUND_REQUEST)
+    state = harness.run(metadata=TWO_BOUND_METADATA)
+    assert state["finalOutput"] == ZERO_CHART
+    assert [json.loads(line[len("chart_period_probe "):])["stage"] for line in _probeLines(harness)] == ["result"]
+
+
+def test_anUndatedLastValueKeepsTheChartWithAnInfoLine(harness, monkeypatch):
+    infos = []
+    monkeypatch.setattr(module.logger, "info", lambda message, *a, **k: infos.append(message))
+    _withProbe(harness, ZERO_CHART, _probeAnswer(("2019", True)))
+    state = harness.run()
+    assert state["finalOutput"] == ZERO_CHART
+    assert harness.logs == []
+    assert harness.failureRecords() == []
+    lines = [line for line in infos if line.startswith("chart_period_probe ")]
+    assert len(lines) == 1
+    record = json.loads(lines[0][len("chart_period_probe "):])
+    assert record["stage"] == "undated" and record["errorClass"] is None
+    assert "2019" not in lines[0]
+
+
+@pytest.mark.parametrize(
+    "sql",
+    [
+        'SELECT "a", COUNT(*) AS total FROM "orders" GROUP BY ALL',
+        'SELECT "a", COUNT(*) AS total FROM "orders" WHERE "b" <= CURRENT_DATE GROUP BY ALL',
+        """SELECT "a", COUNT(*) AS total FROM "orders" WHERE "b" >= DATE '2024-01-01' GROUP BY ALL""",
+        'SELECT "a", COUNT(*) AS total FROM "orders" WHERE "b" >= CURRENT_DATE - 29 OR "a" = 1 GROUP BY ALL',
+    ],
+)
+def test_noBoundThatFiltersTheRowsRunsNoProbe(harness, sql):
+    _withProbe(harness, ZERO_CHART, request=dict(SIMPLE_PERIOD_REQUEST, sql=sql))
+    state = harness.run()
+    assert state["finalOutput"] == ZERO_CHART
+    assert harness.render.call_count == 1
+    assert harness.logs == []
+
+
+def test_aChartWithDataRunsNoProbe(harness):
+    _withProbe(harness, CHART)
+    state = harness.run()
+    assert state["finalOutput"] == CHART
+    assert harness.render.call_count == 1
+
+
+def test_theParallelWorkflowNeverProbes(monkeypatch):
+    harness = Harness(monkeypatch, parallel=True)
+    harness.rephraser.invoke.return_value = {"rephrasedOutput": "plan"}
+    _withProbe(harness, ZERO_CHART, _probeAnswer(("2019-06-30", True)))
+    state = harness.run()
+    assert state["finalOutput"] == ZERO_CHART
+    assert harness.render.call_count == 1
+
+
+def test_aShadowRunProbesWithoutWaitingAndCountsNoOutcome(harness):
+    outcome = {}
+    _withProbe(harness, ZERO_CHART, _probeAnswer(("2019-06-30", True)))
+    state = harness.run(config={"configurable": {"shadow": True, "outcome": outcome}})
+    assert state["finalOutput"] == {"response": _periodQuestion("the data ends on 2019-06-30")}
+    assert _probeCalls(harness)[0].kwargs["waitForSlot"] is False
+    assert outcome == {}
+    assert harness.failureRecords() == []
+
+
+def test_aFailedShadowProbeIsLoggedAsShadow(harness):
+    _withProbe(harness, ZERO_CHART, SandboxBusyError())
+    state = harness.run(config={"configurable": {"shadow": True}})
+    assert state["finalOutput"] == ZERO_CHART
+    assert json.loads(_probeLines(harness)[0][len("chart_period_probe "):])["shadow"] is True
+
+
+def test_aProbeAfterARepairUsesTheRepairedQuery(harness):
+    _withProbe(harness, ZERO_CHART, _probeAnswer(("2019-06-30", True)))
+    chartCalls = []
+    probeOrChart = harness.render.side_effect
+
+    def render(manager, projectId, chartRequest, tables, **kwargs):
+        if "ended_before" not in chartRequest.sql:
+            chartCalls.append(chartRequest.sql)
+            if len(chartCalls) == 1:
+                raise ChartFailure("bind", "Binder Error: nope")
+        return probeOrChart(manager, projectId, chartRequest, tables, **kwargs)
+
+    harness.render.side_effect = render
+    harness.generator.invoke.return_value = MODEL_TEXT
+    harness.repair.invoke.return_value = json.dumps(SIMPLE_PERIOD_REQUEST)
+    state = harness.run()
+    assert state["finalOutput"] == {"response": _periodQuestion("the data ends on 2019-06-30")}
+    assert state["debugAttempts"] == 1
+    assert _probeCalls(harness)[0].args[2].sql == PROBE_SQL
+
+
+def test_aWrappedColumnIsProbedThroughItsExpressionAndQuotesTheBareDate(harness):
+    _withProbe(harness, ZERO_CHART, _probeAnswer(("2019-06-30", True)), request=PERIOD_REQUEST)
+    state = harness.run()
+    assert state["finalOutput"] == {"response": _periodQuestion("the data ends on 2019-06-30")}
+    side = "DATE_TRUNC('MONTH', \"b\")"
+    assert _probeCalls(harness)[0].args[2].sql == (
+        "SELECT p1.last_value AS last_value_1, p1.ended_before AS ended_before_1 FROM ("
+        f'SELECT CAST(max("b") AS VARCHAR) AS last_value, (max({side}) IS NULL OR max({side}) < '
+        "(DATE_TRUNC('MONTH', CURRENT_DATE) - INTERVAL '11' MONTH)) AS ended_before FROM \"orders\") AS p1"
+    )
+
+
+# The review's repro on a real DuckDB: open orders from long ago with no refunds.
+
+OLD_ORDERS = {
+    "orders": pa.table(
+        {"d": pa.array([date(2019, 1, 1), date(2019, 2, 1)], pa.date32()), "status": ["open", "open"], "refund": pa.array([0, 0], pa.int64())}
+    )
+}
+
+
+def _duckdbRender(tables):
+    """Check, run on an in-process DuckDB and build, as renderChartRequest does with the sandbox."""
+    import duckdb
+
+    from nubrix.components.chartBuilder import buildChart
+    from nubrix.components.sqlCheck import checkSql
+
+    def render(manager, projectId, chartRequest, activeTables, **kwargs):
+        checked = checkSql(chartRequest.sql, activeTables)
+        connection = duckdb.connect(":memory:")
+        try:
+            for name, table in tables.items():
+                connection.register(name, table)
+            result = connection.execute(checked.sql).arrow()
+        finally:
+            connection.close()
+        return buildChart(chartRequest, result)
+
+    return render
+
+
+@pytest.mark.parametrize(
+    "sql, x",
+    [
+        ("SELECT status, sum(refund) AS total FROM orders WHERE d >= CURRENT_DATE - 30 OR status = 'open' GROUP BY 1", "status"),
+        ("SELECT CASE WHEN d >= CURRENT_DATE - 30 THEN 'recent' ELSE 'older' END AS bucket, sum(refund) AS total FROM orders GROUP BY 1", "bucket"),
+    ],
+)
+def test_aLegitimateZeroBehindAnOrOrACaseKeepsTheChartOnDuckDb(harness, sql, x):
+    harness.generator.invoke.return_value = json.dumps({"chartType": "bar", "title": "Refunds", "sql": sql, "encoding": {"x": x, "y": ["total"]}})
+    harness.render.side_effect = _duckdbRender(OLD_ORDERS)
+    state = harness.run()
+    assert state["finalOutput"]["data"]["datasets"][0]["data"] == [0]
+    assert "generatedCode" in state
+    assert harness.render.call_count == 1
+    assert harness.logs == []
+
+
+def test_dataThatEndsBeforeAConjunctiveBoundAsksOnDuckDb(harness):
+    sql = "SELECT status, sum(refund) AS total FROM orders WHERE d >= CURRENT_DATE - 30 GROUP BY 1"
+    harness.generator.invoke.return_value = json.dumps({"chartType": "bar", "title": "Refunds", "sql": sql, "encoding": {"x": "status", "y": ["total"]}})
+    harness.render.side_effect = _duckdbRender(OLD_ORDERS)
+    state = harness.run()
+    assert state["finalOutput"] == {"response": _periodQuestion("the data ends on 2019-02-01")}
+    assert harness.render.call_count == 2
+    assert harness.logs == []
+
+
+# The prompt's pattern for a relative period: list every period, LEFT JOIN the filtered data to it, COALESCE to 0.
+
+FILLED_IN_SQL = (
+    "WITH months AS (SELECT unnest(generate_series(date_trunc('month', CURRENT_DATE) - INTERVAL 11 MONTH, "
+    "date_trunc('month', CURRENT_DATE), INTERVAL 1 MONTH)) AS month_start), "
+    "per_month AS (SELECT date_trunc('month', \"ts\") AS month_start, COUNT(\"id\") AS n FROM \"events\" "
+    "WHERE \"ts\" >= date_trunc('month', CURRENT_DATE) - INTERVAL 11 MONTH AND \"ts\" < CURRENT_DATE + INTERVAL 1 DAY GROUP BY ALL) "
+    "SELECT strftime(m.month_start, '%Y-%m') AS month, COALESCE(p.n, 0) AS n FROM months AS m "
+    "LEFT JOIN per_month AS p ON p.month_start = m.month_start ORDER BY m.month_start"
+)
+EVENTS_METADATA = {"events": {"columns": [{"name": "id"}, {"name": "ts"}]}}
+
+
+def _events(*moments):
+    return {"events": pa.table({"id": list(range(1, len(moments) + 1)), "ts": pa.array(list(moments), pa.timestamp("us"))})}
+
+
+def _askForMonthlyEvents(harness, tables):
+    request = {"chartType": "line", "title": "Monthly events", "sql": FILLED_IN_SQL, "encoding": {"x": "month", "y": ["n"]}}
+    harness.generator.invoke.return_value = json.dumps(request)
+    harness.render.side_effect = _duckdbRender(tables)
+    return harness.run(metadata=EVENTS_METADATA)
+
+
+def test_aFilledInPeriodWithDataThatEndedAsksOnDuckDb(harness):
+    from datetime import datetime
+
+    state = _askForMonthlyEvents(harness, _events(datetime(2019, 3, 1, 8, 0), datetime(2019, 3, 15, 10, 30)))
+    assert state["finalOutput"] == {"response": _periodQuestion("the data ends on 2019-03-15")}
+    assert "generatedCode" not in state and "codeOutput" not in state
+    assert harness.render.call_count == 2
+    assert harness.logs == []
+
+
+def test_aFilledInPeriodWithDataThisMonthKeepsTheChartOnDuckDb(harness):
+    from datetime import datetime
+
+    now = datetime.now()
+    state = _askForMonthlyEvents(harness, _events(datetime(2019, 3, 1, 8, 0), datetime(now.year, now.month, 1, 0, 0, 1)))
+    assert state["finalOutput"]["chartType"] == "line"
+    values = state["finalOutput"]["data"]["datasets"][0]["data"]
+    assert len(values) == 12 and values[-1] == 1 and sum(values) == 1
+    assert harness.render.call_count == 1
+
+
+# Round 3 on a real DuckDB: events that ended long ago, refunds inside the period whose every amount is 0 (a legitimate
+# zero), and customers.
+
+MONTHS_SQL = (
+    "months AS (SELECT unnest(generate_series(date_trunc('month', CURRENT_DATE) - INTERVAL 11 MONTH, "
+    "date_trunc('month', CURRENT_DATE), INTERVAL 1 MONTH)) AS month_start)"
+)
+EVENTS_PER_MONTH_SQL = (
+    "per_month AS (SELECT date_trunc('month', ts) AS month_start, count(id) AS n FROM events "
+    "WHERE ts >= date_trunc('month', CURRENT_DATE) - INTERVAL 11 MONTH GROUP BY ALL)"
+)
+MIXED_METADATA = {
+    "events": {"columns": [{"name": "id"}, {"name": "ts"}, {"name": "cid"}, {"name": "amount"}]},
+    "refunds": {"columns": [{"name": "r_at"}, {"name": "amount"}, {"name": "status"}, {"name": "cid"}]},
+    "customers": {"columns": [{"name": "id"}, {"name": "region"}]},
+}
+
+
+def _mixedTables():
+    today = date.today()
+    recent = [datetime.combine(today - timedelta(days=days), datetime.min.time()) for days in (2, 20, 40)]
+    return {
+        "events": pa.table(
+            {
+                "id": [1, 2],
+                "ts": pa.array([datetime(2019, 3, 1, 8, 0), datetime(2019, 3, 15, 10, 30)], pa.timestamp("us")),
+                "cid": [1, 2],
+                "amount": pa.array([5, 7], pa.int64()),
+            }
+        ),
+        "refunds": pa.table(
+            {"r_at": pa.array(recent, pa.timestamp("us")), "amount": pa.array([0, 0, 0], pa.int64()), "status": ["done"] * 3, "cid": [1, 2, 1]}
+        ),
+        "customers": pa.table({"id": [1, 2], "region": ["north", "south"]}),
+    }
+
+
+def _chartOnDuckDb(harness, sql, x, y):
+    request = {"chartType": "bar", "title": "Chart", "sql": sql, "encoding": {"x": x, "y": y}}
+    harness.generator.invoke.return_value = json.dumps(request)
+    harness.render.side_effect = _duckdbRender(_mixedTables())
+    return harness.run(metadata=MIXED_METADATA)
+
+
+def test_anInnerJoinWithEndedDataAsksOnDuckDb(harness):
+    sql = "SELECT c.region, count(*) AS n FROM events e JOIN customers c ON c.id = e.cid WHERE e.ts >= CURRENT_DATE - 30 GROUP BY 1"
+    state = _chartOnDuckDb(harness, sql, "region", ["n"])
+    assert state["finalOutput"] == {"response": _periodQuestion("the data ends on 2019-03-15")}
+    assert "generatedCode" not in state
+    assert harness.render.call_count == 2
+    assert harness.logs == []
+
+
+def test_theFilledInPatternAsksOnDuckDb(harness):
+    sql = (
+        f"WITH {MONTHS_SQL}, {EVENTS_PER_MONTH_SQL} SELECT strftime(m.month_start, '%Y-%m') AS month, COALESCE(p.n, 0) AS n "
+        "FROM months m LEFT JOIN per_month p ON p.month_start = m.month_start ORDER BY 1"
+    )
+    state = _chartOnDuckDb(harness, sql, "month", ["n"])
+    assert state["finalOutput"] == {"response": _periodQuestion("the data ends on 2019-03-15")}
+    assert harness.render.call_count == 2
+
+
+@pytest.mark.parametrize(
+    "sql, x, y, probed",
+    [
+        # Refunds inside the period: the probe runs and finds data.
+        ("SELECT status, sum(amount) AS total FROM refunds WHERE r_at >= CURRENT_DATE - 90 GROUP BY 1", "status", ["total"], True),
+        (
+            "SELECT c.region, sum(r.amount) AS total FROM refunds r JOIN customers c ON c.id = r.cid "
+            "WHERE r.r_at >= CURRENT_DATE - 90 GROUP BY 1",
+            "region",
+            ["total"],
+            True,
+        ),
+        # A refunds measure joined after the events were filled in, or read in a scalar subquery (review I1).
+        (
+            f"WITH {MONTHS_SQL}, {EVENTS_PER_MONTH_SQL}, "
+            "filled AS (SELECT m.month_start, COALESCE(p.n, 0) AS n FROM months m LEFT JOIN per_month p ON p.month_start = m.month_start), "
+            "rpm AS (SELECT date_trunc('month', r_at) AS month_start, sum(amount) AS total FROM refunds GROUP BY ALL) "
+            "SELECT strftime(f.month_start, '%Y-%m') AS month, f.n AS events, COALESCE(r.total, 0) AS refunds "
+            "FROM filled f LEFT JOIN rpm r ON r.month_start = f.month_start ORDER BY 1",
+            "month",
+            ["events", "refunds"],
+            False,
+        ),
+        (
+            f"WITH {MONTHS_SQL}, {EVENTS_PER_MONTH_SQL} SELECT strftime(m.month_start, '%Y-%m') AS month, COALESCE(p.n, 0) AS events, "
+            "(SELECT COALESCE(sum(amount), 0) FROM refunds r WHERE date_trunc('month', r.r_at) = m.month_start) AS refunds "
+            "FROM months m LEFT JOIN per_month p ON p.month_start = m.month_start ORDER BY 1",
+            "month",
+            ["events", "refunds"],
+            False,
+        ),
+        # Refunds beside a summary of no events that still gives a row (review I2).
+        (
+            "SELECT r.status, sum(r.amount) AS total FROM refunds r "
+            "CROSS JOIN (SELECT count(*) AS k FROM events WHERE ts >= CURRENT_DATE - 30 GROUP BY ()) e GROUP BY 1",
+            "status",
+            ["total"],
+            False,
+        ),
+    ],
+)
+def test_aLegitimateZeroInsideThePeriodNeverAsksOnDuckDb(harness, sql, x, y, probed):
+    state = _chartOnDuckDb(harness, sql, x, y)
+    assert state["finalOutput"]["chartType"] == "bar"
+    values = [value for dataset in state["finalOutput"]["data"]["datasets"] for value in dataset["data"]]
+    assert values and all(value in (0, None) for value in values)
+    assert "generatedCode" in state
+    assert harness.render.call_count == (2 if probed else 1)
+    assert harness.logs == []
+
+
+# Round 4 on a real DuckDB: the bound's column is bound by DuckDB to something other than the ended table column. Events
+# ended long ago on `ts`, but `shipped` is today; refunds are inside the period; every amount is 0.
+
+RECENT_SQL = "CURRENT_DATE - INTERVAL 30 DAY"
+BINDING_METADATA = {
+    "events": {"columns": [{"name": "id"}, {"name": "ts"}, {"name": "shipped"}, {"name": "kind"}, {"name": "amount"}]},
+    "refunds": {"columns": [{"name": "eid"}, {"name": "r_at"}, {"name": "amount"}, {"name": "status"}]},
+}
+
+
+def _bindingTables():
+    today = datetime.combine(date.today(), datetime.min.time())
+    return {
+        "events": pa.table(
+            {
+                "id": [1, 2],
+                "ts": pa.array([datetime(2019, 3, 15)] * 2, pa.timestamp("us")),
+                "shipped": pa.array([today] * 2, pa.timestamp("us")),
+                "kind": ["a", "b"],
+                "amount": pa.array([0, 0], pa.int64()),
+            }
+        ),
+        "refunds": pa.table(
+            {
+                "eid": [1, 2, 3],
+                "r_at": pa.array([today - timedelta(days=days) for days in (1, 2, 3)], pa.timestamp("us")),
+                "amount": pa.array([0, 0, 0], pa.int64()),
+                "status": ["done"] * 3,
+            }
+        ),
+    }
+
+
+@pytest.mark.parametrize(
+    "sql, x",
+    [
+        # A star with REPLACE, or EXCLUDE plus RENAME (review 2, P1).
+        (f"WITH x AS (SELECT * REPLACE (coalesce(shipped, ts) AS ts) FROM events) SELECT kind, sum(amount) AS t FROM x WHERE ts >= {RECENT_SQL} GROUP BY 1", "kind"),
+        (f"WITH x AS (SELECT * REPLACE (CAST(CURRENT_DATE AS TIMESTAMP) AS ts) FROM events) SELECT kind, sum(amount) AS t FROM x WHERE ts >= {RECENT_SQL} GROUP BY 1", "kind"),
+        (f"WITH x AS (SELECT * EXCLUDE (ts) RENAME (shipped AS ts) FROM events) SELECT kind, sum(amount) AS t FROM x WHERE ts >= {RECENT_SQL} GROUP BY 1", "kind"),
+        # A star that already supplies the name of a later projection (review 2, P2).
+        (
+            f"WITH x AS (SELECT r.*, e.ts AS r_at FROM refunds r JOIN events e ON e.id = r.eid) "
+            f"SELECT status, sum(amount) AS t FROM x WHERE r_at >= {RECENT_SQL} GROUP BY 1",
+            "status",
+        ),
+        # A CTE defined later, or quoted in another case, that DuckDB reads instead of the table (review 2, P3).
+        (
+            f"WITH a AS (SELECT status, sum(amount) AS t FROM events WHERE ts >= {RECENT_SQL} GROUP BY 1), "
+            "events AS (SELECT r_at AS ts, amount, status FROM refunds) SELECT * FROM a",
+            "status",
+        ),
+        (
+            f'WITH "EVENTS" AS (SELECT r_at AS ts, amount, status FROM refunds) '
+            f"SELECT status, sum(amount) AS t FROM events WHERE ts >= {RECENT_SQL} GROUP BY 1",
+            "status",
+        ),
+    ],
+)
+def test_aBoundWhoseColumnDuckDbBindsElsewhereKeepsTheChartOnDuckDb(harness, sql, x):
+    request = {"chartType": "bar", "title": "Chart", "sql": sql, "encoding": {"x": x, "y": ["t"]}}
+    harness.generator.invoke.return_value = json.dumps(request)
+    harness.render.side_effect = _duckdbRender(_bindingTables())
+    state = harness.run(metadata=BINDING_METADATA)
+    assert state["finalOutput"]["chartType"] == "bar"
+    values = state["finalOutput"]["data"]["datasets"][0]["data"]
+    assert values and all(value == 0 for value in values)
+    assert "generatedCode" in state
+    assert harness.render.call_count == 1
+    assert harness.logs == []

@@ -744,7 +744,11 @@ def _rephrasedDoubt(response: dict) -> str | None:
 
 
 def _isGenuineDoubt(response: dict, output: dict) -> bool:
-    """A question the rephraser asked and the workflow returned as it was, with no code or chart behind it."""
+    """A question the workflow returned in place of a chart, with no code or chart behind it.
+
+    The question is the rephraser's doubt, or the no-data period question, which the SQL workflow returns in the same
+    shape: the text in ``rephrasedQuery["doubt"]`` and ``finalOutput == {"response": doubt}``.
+    """
     doubt = _rephrasedDoubt(response)
     return doubt is not None and output == {"response": doubt} and not response.get("generatedCode") and not response.get("codeOutput")
 
