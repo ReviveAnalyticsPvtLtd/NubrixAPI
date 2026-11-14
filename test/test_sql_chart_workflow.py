@@ -1278,8 +1278,29 @@ def test_everyPointItsOwnSeriesGoesBackForRepair(harness):
     harness.repair.invoke.return_value = json.dumps(dict(SERIES_REQUEST, encoding={"x": "amount", "y": ["items"]}))
     state = harness.run(metadata=GUARD_METADATA)
     assert state["finalOutput"] == POINTS_CHART
-    assert harness.repair.invoke.call_args.args[0]["error"].startswith("Each of more than 10 points has its own series value")
+    assert harness.repair.invoke.call_args.args[0]["error"].startswith("There are more than 10 points and each has its own series value")
     assert state["debugAttempts"] == 1
+
+
+def test_aPerPointRepairOfTenPointsPassesTheGuardAndIsServed(harness):
+    """The guard cannot tell a dropped row: a repaired chart of 10 per-point series passes it and is served."""
+    tenPoints = _perPointChart(10)
+    _guarded(harness, SERIES_CHART, tenPoints, generated=SERIES_REQUEST)
+    harness.repair.invoke.return_value = json.dumps(SERIES_REQUEST)
+    state = harness.run(metadata=GUARD_METADATA)
+    assert state["finalOutput"] == tenPoints
+    assert harness.repair.invoke.call_count == 1
+    assert state["debugAttempts"] == 1
+
+
+def test_aPerPointRepairOfMoreThanTenPointsServesTheFirstChart(harness):
+    _guarded(harness, SERIES_CHART, _perPointChart(12), generated=SERIES_REQUEST)
+    harness.repair.invoke.return_value = json.dumps(SERIES_REQUEST)
+    state = harness.run(metadata=GUARD_METADATA)
+    assert state["finalOutput"] == SERIES_CHART
+    assert harness.repair.invoke.call_count == 1
+    assert harness.render.call_count == 2
+    assert _modelCalls(harness) <= 1 + module.MAX_REPAIRS
 
 
 def test_aTenPointScatterWithASeriesPerPointIsServedWithoutRepair(harness):

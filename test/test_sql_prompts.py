@@ -984,8 +984,9 @@ def test_theScatterSeriesRuleAgreesWithTheEngineGuard(key):
     assert f"With at most {MAX_NAMED_POINTS} points you may give each point its own series value" in rule
     assert f"With more than {MAX_NAMED_POINTS} points, never give every row its own series value" in rule
     assert "Never give every row its own series value." not in rule
-    # The repair message names the same limit.
-    assert f"With more than {MAX_NAMED_POINTS} points, leave `series` out" in POINT_SERIES_MESSAGE
+    # The repair message names the same limit and never invites dropping rows to get under it.
+    assert f"There are more than {MAX_NAMED_POINTS} points" in POINT_SERIES_MESSAGE
+    assert f"Leave `series` out and keep every row: never drop rows to get down to {MAX_NAMED_POINTS} points." in POINT_SERIES_MESSAGE
 
 
 @pytest.mark.parametrize("key", CHART_PROMPT_KEYS)

@@ -513,10 +513,9 @@ def test_theMessagesNameWhatTheGuardSawAndTheFix():
         "order, and shows a whole-number BIGINT or DOUBLE as '3' but a DECIMAL as '3.00'."
     )
     assert chartGuards.POINT_SERIES_MESSAGE == (
-        "Each of more than 10 points has its own series value, so every point becomes its own dataset and legend entry. "
-        "With more than 10 points, leave `series` out when each row is its own point; use it only to group many points "
-        "into a few datasets, such as a category "
-        "or a region."
+        "There are more than 10 points and each has its own series value, so every point becomes its own dataset and "
+        "legend entry. Leave `series` out and keep every row: never drop rows to get down to 10 points. Use `series` "
+        "only to group many points into a few datasets, such as a category or a region."
     )
 
 
