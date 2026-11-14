@@ -1119,7 +1119,8 @@ NUMBER_CHART = {"chartType": "bar", "title": "Orders by item count", "xLabels": 
 TRY_CAST_REQUEST = dict(CAST_REQUEST, sql='SELECT TRY_CAST("items" AS VARCHAR) AS items, COUNT(*) AS n FROM "orders" GROUP BY "items" ORDER BY "items"')
 CAST_MESSAGE = (
     "Column 'items' casts a number to text, so its labels come out in text order (1, 10, 2). Keep it a number: drop "
-    "the CAST and order by the numeric value. The backend shows a number label as text and keeps the query's row order."
+    "the CAST (also where the ORDER BY repeats it) and keep the ORDER BY: without the cast the same ORDER BY sorts the "
+    "numbers as numbers. The backend shows a number label as text and keeps the query's row order."
 )
 GUARD_METADATA = {"orders": {"columns": [{"name": "items"}, {"name": "b"}]}}
 

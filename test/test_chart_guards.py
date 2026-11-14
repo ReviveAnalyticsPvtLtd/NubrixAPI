@@ -64,9 +64,49 @@ def test_aNumberLabelCastToTextAndSortedAsTextFires():
 
     assert message == (
         "Column 'items' casts a number to text, so its labels come out in text order (1, 10, 11, 2). Keep it a number: "
-        "drop the CAST and order by the numeric value. The backend shows a number label as text and keeps the query's "
-        "row order."
+        "drop the CAST (also where the ORDER BY repeats it) and keep the ORDER BY: without the cast the same ORDER BY "
+        "sorts the numbers as numbers. The backend shows a number label as text and keeps the query's row order."
     )
+    assert "numeric value" not in message
+
+
+# Three labels whose text order is 1, 10, 2; whether the guard may call that text order depends on the ORDER BY.
+THREE = "WITH t AS (SELECT * FROM (VALUES (1, 5), (10, 4), (2, 3)) AS v(k, m)) "
+THREE_SELECT = THREE + 'SELECT CAST(k AS VARCHAR) AS k, SUM(m) AS total FROM t GROUP BY ALL ORDER BY '
+
+
+@pytest.mark.parametrize("orderBy", ["k", "K", '"k"', "1", "CAST(k AS VARCHAR)", "k ASC, total"])
+def test_labelsOrderedByTheCastLabelItselfFire(orderBy):
+    sql = THREE_SELECT + orderBy
+    request, chart = _chart("bar", sql, {"x": "k", "y": ["total"]})
+    assert chart["data"]["labels"] == ["1", "10", "2"]
+
+    assert chartGuards.guardMessage(request, sql, chart) == chartGuards.castLabelText("k", ["1", "10", "2"], None)
+
+
+@pytest.mark.parametrize("orderBy", ["total DESC", "2 DESC", "SUM(m) DESC", '"K"'])
+def test_labelsInTextOrderByAnotherKeyDoNotFire(orderBy):
+    sql = THREE_SELECT + orderBy
+    request, chart = _chart("bar", sql, {"x": "k", "y": ["total"]})
+    assert chart["data"]["labels"] == ["1", "10", "2"]
+
+    assert chartGuards.guardMessage(request, sql, chart) is None
+
+
+def test_labelsInTextOrderWithNoOrderByDoNotFire():
+    sql = THREE + "SELECT CAST(k AS VARCHAR) AS k, m AS total FROM t"
+    request = ChartRequest.model_validate({"chartType": "bar", "title": "T", "sql": sql, "encoding": {"x": "k", "y": ["total"]}})
+    chart = {"chartType": "bar", "title": "T", "data": {"labels": ["1", "10", "2"], "datasets": [{"label": "N", "data": [5, 4, 3]}]}}
+
+    assert chartGuards.guardMessage(request, sql, chart) is None
+
+
+def test_aThreeLabelChartInMeasureOrderThatReadsAsTextOrderDoesNotFire():
+    sql = THREE_SELECT + "total DESC, k"
+    request, chart = _chart("pie", sql, {"label": "k", "value": "total"})
+    assert chart["data"]["labels"] == ["1", "10", "2"]
+
+    assert chartGuards.guardMessage(request, sql, chart) is None
 
 
 def test_labelsCastToTextInDescendingTextOrderFire():
@@ -173,7 +213,6 @@ def test_aLongFormChartFiresOnItsXNotItsSeries():
     [
         (["items"], ["region"], "items"),
         (["region"], ["items"], "items"),
-        (["n_band", "items"], ["region"], "items"),
     ],
 )
 def test_aPivotFiresOnACastRowOrColumnLevel(rows, columns, name):
@@ -182,6 +221,29 @@ def test_aPivotFiresOnACastRowOrColumnLevel(rows, columns, name):
         'FROM "orders" GROUP BY ALL ORDER BY items, region'
     )
     assert _message("pivot", sql, {"rows": rows, "columns": columns, "value": "total"}) == _textOrderMessage(name)
+
+
+GROUPED = "WITH t AS (SELECT * FROM (VALUES ('a', 2, 1.0), ('a', 10, 1.0), ('b', 1, 1.0), ('b', 2, 1.0)) AS v(g, k, m)) "
+
+
+@pytest.mark.parametrize(
+    "orderBy",
+    [
+        # The reviewer's case: numeric order within each group reads 2, 10, 1 across groups.
+        "g, MIN(t.k)",
+        # Text order inside a two-level key: the levels restart per group, so no order is read from them.
+        "k, g",
+    ],
+)
+def test_aPivotLevelOfATwoLevelKeyNeverFiresOnOrder(orderBy):
+    sql = GROUPED + f"SELECT g, CAST(k AS VARCHAR) AS k, 'all' AS c, SUM(m) AS total FROM t GROUP BY ALL ORDER BY {orderBy}"
+    assert _message("pivot", sql, {"rows": ["g", "k"], "columns": ["c"], "value": "total"}) is None
+
+
+def test_aPivotLevelOfATwoLevelKeyStillFiresOnAWholeDecimal():
+    sql = GROUPED + "SELECT g, CAST(CAST(k AS DOUBLE) AS VARCHAR) AS k, 'all' AS c, SUM(m) AS total FROM t GROUP BY ALL ORDER BY g, MIN(t.k)"
+    message = _message("pivot", sql, {"rows": ["g", "k"], "columns": ["c"], "value": "total"})
+    assert message == chartGuards.castLabelText("k", None, "2.0")
 
 
 def test_aPivotInNumericOrderDoesNotFire():
@@ -327,6 +389,11 @@ def test_anUnaliasedCastDeclines():
         ([" 2", "1", "10"], False),
         (["1", "10", "north"], False),
         (["1.0", "Other"], False),
+        # A fixed-scale display is not a cast whole number.
+        (["1.0", "1.5", "2.0"], False),
+        (["2.00", "0.50"], False),
+        (["1.0", "2.0", "3.0"], True),
+        (["2.00", "10.00", "1"], True),
     ],
 )
 def test_onlyNumberLabelsInTextOrderOrWithAWholeDecimalFire(labels, fires):
@@ -383,9 +450,10 @@ def test_thePointSeriesGuardIgnoresCategoryCharts():
 def test_theMessagesNameWhatTheGuardSawAndTheFix():
     assert chartGuards.castLabelText("n", ["1.0", "10.0", "2.0", "3.0", "4.0"], "1.0") == (
         "Column 'n' casts a number to text, so its labels come out in text order (1.0, 10.0, 2.0, 3.0, ...) and a whole "
-        "number shows as '1.0'. Keep it a number: drop the CAST, and when the value is a DECIMAL or DOUBLE holding whole "
-        "numbers, CAST it AS BIGINT; order by the numeric value. The backend shows a number label as text, keeps the "
-        "query's row order, and shows a whole-number BIGINT or DOUBLE as '3' but a DECIMAL as '3.00'."
+        "number shows as '1.0'. Keep it a number: drop the CAST (also where the ORDER BY repeats it) and keep the ORDER "
+        "BY: without the cast the same ORDER BY sorts the numbers as numbers. When the value is a DECIMAL or DOUBLE "
+        "holding whole numbers, CAST it AS BIGINT. The backend shows a number label as text, keeps the query's row "
+        "order, and shows a whole-number BIGINT or DOUBLE as '3' but a DECIMAL as '3.00'."
     )
     assert chartGuards.POINT_SERIES_MESSAGE == (
         "Each point has its own series value, so every point becomes its own dataset and legend entry. Leave `series` "
