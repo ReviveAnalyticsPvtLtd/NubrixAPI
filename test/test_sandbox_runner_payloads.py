@@ -60,6 +60,13 @@ def test_runSqlSandboxPassesTheSlotWait(monkeypatch):
     assert waits == [0, None]
 
 
+def test_runSandboxPassesTheSlotWait(monkeypatch):
+    waits = []
+    monkeypatch.setattr(sandboxRunner, "_inFreshRun", lambda prepare, run, slotWaitSeconds=None: waits.append(slotWaitSeconds) or OK)
+    sandboxRunner.runSandbox("sandbox_launcher.py", "p1", "print(1)", 9, slotWaitSeconds=0)
+    sandboxRunner.runSandbox("sandbox_launcher.py", "p1", "print(1)", 9)
+    assert waits == [0, None]
+
 def test_slotWaitOverride(monkeypatch):
     waits = []
     monkeypatch.setattr(sandboxRunner, "acquireRunSlot", lambda root, maxRuns, wait: waits.append(wait))
@@ -105,6 +112,26 @@ def test_replRunPassesFiltersOnlyWhenGiven(monkeypatch):
     assert "payload" not in calls[0][1]
     assert calls[1][1] == {"payload": {"filters": [{"a": 1}]}}
 
+
+def test_replRunWithoutWaitTriesTheSemaphoreOnce(monkeypatch):
+    redis = _FakeRedis(count=50)
+    manager = _manager(monkeypatch, redis)
+    run = MagicMock()
+    monkeypatch.setattr(codeExecutor, "runSandbox", run)
+    output = manager.run("print(1)", "p1", waitForSlot=False)
+    assert output.startswith("Concurrency limit reached")
+    assert redis.zcardCalls == 1
+    run.assert_not_called()
+
+
+def test_replRunWithoutWaitAsksForNoSlotWait(monkeypatch):
+    calls = []
+    monkeypatch.setattr(codeExecutor, "runSandbox", lambda *args, **kwargs: calls.append(kwargs) or ("ok", "", 0, None, None, None))
+    manager = _manager(monkeypatch, _FakeRedis())
+    manager.run("print(1)", "p1", waitForSlot=False)
+    manager.run("print(1)", "p1", filters=[{"a": 1}], waitForSlot=False)
+    manager.run("print(1)", "p1")
+    assert calls == [{"slotWaitSeconds": 0}, {"payload": {"filters": [{"a": 1}]}, "slotWaitSeconds": 0}, {}]
 
 def test_runSqlWithoutWaitTriesTheSemaphoreOnce(monkeypatch):
     redis = _FakeRedis(count=50)
