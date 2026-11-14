@@ -7,10 +7,11 @@ with the exact error (at most twice) when a step fails.
 
 The response keeps the keys of the Python chart workflows. Everything else stays in internal state.
 
-When the served workflow's chart shows no data and its rows are filtered by dates counted back from today (see
+When the served workflow's chart shows no data and its query filters on dates counted back from today (see
 periodProbe.py for which bounds count), the probe node checks, in one sandbox run, whether the data each bound
-filters on ends before its period. Only when every bound says so does the response become a question about the
-period, in the shape of the rephraser's doubt. A probe that fails, or any bound that still has data, keeps the chart.
+filters on ends before its period. Only when at least one bound ended and, given the bounds that ended, the chart
+provably holds no project data does the response become a question about the period, in the shape of the
+rephraser's doubt. Anything else, including a probe that fails, keeps the chart.
 
     START -> rephrase -> ground -> generate -> (evaluate | repair | format)
                   \\-> format (doubt)
@@ -36,7 +37,7 @@ from nubrix.components.chartEngine import ChartFailure, renderChartRequest
 from nubrix.components.chartFailureLog import logChartFailure, traceIdOf
 from nubrix.components.chartRequest import ChartRequest, encodeGeneratedCode
 from nubrix.components.llmChainFactory import buildLlmChain
-from nubrix.components.periodProbe import PeriodProbe, chartHasNoData, combinedProbeSql, findPeriodProbes
+from nubrix.components.periodProbe import PeriodProbe, chartHasNoData, combinedProbeSql, findPeriodProbes, isDataFree
 from nubrix.components.queryRephraser import ParallelQueryRephaser, QueryRephaser
 from nubrix.components.sqlGrounding import groundingText
 from utils.codeExecutor import REPLManager
@@ -347,10 +348,12 @@ class SqlChartWorkflow:
         return "repair"
 
     def _probe(self, state: State, config: RunnableConfig):
-        """A chart without data: ask which period to chart when the data every date bound that filters the chart's
-        rows reads ends before that bound. Anything else, including a probe that fails, keeps the chart (an empty update)."""
+        """A chart without data: ask which period to chart when the data of at least one date bound ends before that
+        bound and, given the bounds that ended, the chart provably holds no project data. Anything else, including a
+        probe that fails, keeps the chart (an empty update)."""
+        sql = state["chartRequest"]["sql"]
         try:
-            probes = findPeriodProbes(state["chartRequest"]["sql"], state["tables"])
+            probes = findPeriodProbes(sql, state["tables"])
         except Exception as error:
             self._logProbeFailure(_ProbeFailed("parse", error), state, config)
             return {}
@@ -361,9 +364,15 @@ class SqlChartWorkflow:
         except _ProbeFailed as failure:
             self._logProbeFailure(failure, state, config)
             return {}
-        if not all(endedBefore for endedBefore, _ in answers):
+        ended = [(probe, lastValue) for probe, (endedBefore, lastValue) in zip(probes, answers) if endedBefore]
+        try:
+            dataFree = bool(ended) and isDataFree(sql, state["tables"], [probe.sql for probe, _ in ended])
+        except Exception as error:
+            self._logProbeFailure(_ProbeFailed("parse", error), state, config)
             return {}
-        lastValues = [lastValue for _, lastValue in answers if lastValue is not None]
+        if not dataFree:
+            return {}
+        lastValues = [lastValue for _, lastValue in ended if lastValue is not None]
         if not all(isinstance(value, str) and _ISO_DATE.match(value) for value in lastValues):
             # Not a date the question can quote (a date column of an unusual type): a known limit, not a failure.
             self._logProbeRecord("undated", None, state, config, logger.info)

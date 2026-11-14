@@ -1,5 +1,5 @@
-"""The period probe helper: the current-date bounds that filter a chart query's own rows, their probe query, and the
-no-data predicate."""
+"""The period probe helper: the current-date bounds of a chart query, their probe query, the analysis that proves a
+chart holds no project data once some bounds ended, and the no-data predicate."""
 
 from datetime import date, timedelta
 
@@ -7,7 +7,7 @@ import duckdb
 import pyarrow as pa
 import pytest
 
-from nubrix.components.periodProbe import MAX_BOUNDS, chartHasNoData, combinedProbeSql, findPeriodProbes
+from nubrix.components.periodProbe import MAX_BOUNDS, chartHasNoData, combinedProbeSql, findPeriodProbes, isDataFree
 from nubrix.components.sqlCheck import checkSql
 
 TABLES = ["orders", "items", "refunds", "customers", "Order Lines"]
@@ -29,6 +29,12 @@ def _expectedSql(column, bound, table, side=None):
 
 def _found(sql, tables=TABLES):
     return [(probe.table, probe.column) for probe in findPeriodProbes(sql, tables)]
+
+
+def _asks(sql, tables=TABLES):
+    """Whether the chart would ask when every probed bound ended (the most any probe answer can give)."""
+    probes = findPeriodProbes(sql, tables)
+    return bool(probes) and isDataFree(sql, tables, [probe.sql for probe in probes])
 
 
 # -- finding the bound -------------------------------------------------------
@@ -89,7 +95,7 @@ def test_ignoresAComparisonWithNoCurrentDateFunctionOrARowDependentBound(where):
     assert findPeriodProbes(f"SELECT count(*) AS n FROM orders WHERE {where}", TABLES) == []
 
 
-# -- only bounds that filter the chart's own rows (review C1) ----------------
+# -- bounds that cannot decide the chart (review C1) ------------------------
 
 
 @pytest.mark.parametrize(
@@ -121,16 +127,15 @@ def test_ignoresAComparisonWithNoCurrentDateFunctionOrARowDependentBound(where):
         # FILTER and HAVING.
         "SELECT region, sum(refund) FILTER (WHERE d >= CURRENT_DATE - 30) AS recent FROM orders GROUP BY 1",
         "SELECT region, count(*) AS n FROM orders GROUP BY 1 HAVING max(d) >= CURRENT_DATE - 30",
-        # A set operation other than UNION ALL, and a UNION ALL with an unbounded branch.
-        "SELECT d FROM orders WHERE d >= CURRENT_DATE - 30 UNION SELECT d FROM items WHERE d >= CURRENT_DATE - 30",
+        # A set operation with a branch that reads a table without a bound.
         "SELECT d FROM orders WHERE d >= CURRENT_DATE - 30 EXCEPT SELECT d FROM items",
         "SELECT d FROM orders WHERE d >= CURRENT_DATE - 30 UNION ALL SELECT d FROM items",
-        # An aggregate without GROUP BY gives a row even from no rows.
-        "SELECT t.n FROM (SELECT count(*) AS n FROM orders WHERE d >= CURRENT_DATE - 30) AS t",
+        "SELECT d FROM orders WHERE d >= CURRENT_DATE - 30 UNION SELECT d FROM items",
     ],
 )
-def test_aBoundThatDoesNotFilterTheChartRowsMakesNoProbe(sql):
+def test_aBoundThatCannotDecideTheChartMakesNoProbe(sql):
     assert findPeriodProbes(sql, TABLES) == []
+    assert not _asks(sql)
 
 
 @pytest.mark.parametrize(
@@ -147,6 +152,7 @@ def test_aBoundThatDoesNotFilterTheChartRowsMakesNoProbe(sql):
 )
 def test_aBoundInsideASubqueryExpressionMakesNoProbe(sql):
     assert findPeriodProbes(sql, TABLES) == []
+    assert not isDataFree(sql, TABLES, [])
 
 
 def test_aCteBodyColumnResolvesInTheCteScope():
@@ -253,12 +259,16 @@ def test_aCteThatShadowsATableIsReadAsTheCte():
         # A source that is not a project table.
         "SELECT count(*) AS n FROM (VALUES (DATE '2020-01-01')) AS v(d) WHERE d >= CURRENT_DATE - 30",
         "SELECT count(*) AS n FROM unknown_table WHERE d >= CURRENT_DATE - 30",
-        # One resolvable bound does not excuse another that cannot be resolved.
-        "SELECT count(*) AS n FROM orders o JOIN items i ON i.order_id = o.id WHERE created_at >= CURRENT_DATE - 30 AND o.d >= CURRENT_DATE - 30",
     ],
 )
-def test_anUnresolvableBoundDeclinesTheQuery(sql):
+def test_anUnresolvableComparisonIsNotABound(sql):
     assert findPeriodProbes(sql, TABLES) == []
+
+
+def test_anUnresolvableComparisonBesideAnEndedBoundIsJustNotABound():
+    sql = "SELECT count(*) AS n FROM orders o JOIN items i ON i.order_id = o.id WHERE created_at >= CURRENT_DATE - 30 AND o.d >= CURRENT_DATE - 30"
+    assert _found(sql) == [("orders", "d")]
+    assert _asks(sql)
 
 
 @pytest.mark.parametrize(
@@ -272,6 +282,7 @@ def test_anUnresolvableBoundDeclinesTheQuery(sql):
 )
 def test_aSourceWithAColumnListDeclines(sql):
     assert findPeriodProbes(sql, TABLES) == []
+    assert not _asks(sql)
 
 
 def test_identicalComparisonsGiveOneProbe():
@@ -474,19 +485,155 @@ def test_aBoundInTheOnOfTheFillingJoinCounts():
         # ... or through another CTE.
         f"WITH raw AS (SELECT ts FROM events), months AS (SELECT DISTINCT date_trunc('month', ts) AS month_start FROM raw), {PER_MONTH_CTE} {FILLED_SELECT}",
         # The preserved side is a project table.
-        f"WITH recent AS (SELECT * FROM events WHERE ts >= CURRENT_DATE - 30) SELECT c.region, count(r.id) AS n FROM customers c LEFT JOIN recent r ON r.cid = c.id GROUP BY 1",
+        "WITH recent AS (SELECT * FROM events WHERE ts >= CURRENT_DATE - 30) SELECT c.region, count(r.id) AS n FROM customers c LEFT JOIN recent r ON r.cid = c.id GROUP BY 1",
         # A second outer-joined source reads a table too, so not every measure comes from the filtered side.
         f"WITH {MONTHS_CTE}, {PER_MONTH_CTE} SELECT m.month_start, COALESCE(p.n, 0) AS n, count(c.id) AS c FROM months AS m "
         "LEFT JOIN per_month AS p ON p.month_start = m.month_start LEFT JOIN customers AS c ON c.joined = m.month_start GROUP BY ALL",
-        # RIGHT and FULL joins still decline.
-        f"WITH {MONTHS_CTE}, {PER_MONTH_CTE} SELECT m.month_start, p.n FROM per_month AS p RIGHT JOIN months AS m ON p.month_start = m.month_start",
-        f"WITH {MONTHS_CTE}, {PER_MONTH_CTE} SELECT m.month_start, p.n FROM months AS m FULL JOIN per_month AS p ON p.month_start = m.month_start",
+        # A RIGHT or FULL join with a project table on either side.
+        f"WITH {PER_MONTH_CTE} SELECT c.region, p.n FROM per_month AS p RIGHT JOIN customers AS c ON p.month_start = c.joined",
+        f"WITH {PER_MONTH_CTE} SELECT c.region, p.n FROM customers AS c FULL JOIN per_month AS p ON p.month_start = c.joined",
         # A bound reached only through a subquery expression.
         f"WITH {MONTHS_CTE} SELECT m.month_start, (SELECT count(*) FROM events WHERE ts >= CURRENT_DATE - 30) AS n FROM months AS m",
     ],
 )
 def test_anyOtherOuterJoinDeclines(sql):
     assert findPeriodProbes(sql, EVENTS) == []
+    assert not _asks(sql, EVENTS)
+
+
+@pytest.mark.parametrize(
+    "sql",
+    [
+        f"WITH {MONTHS_CTE}, {PER_MONTH_CTE} SELECT m.month_start, p.n FROM per_month AS p RIGHT JOIN months AS m ON p.month_start = m.month_start",
+        f"WITH {MONTHS_CTE}, {PER_MONTH_CTE} SELECT m.month_start, p.n FROM months AS m FULL JOIN per_month AS p ON p.month_start = m.month_start",
+    ],
+)
+def test_aRightOrFullJoinOfAPeriodListAndEndedDataAsks(sql):
+    assert _found(sql, EVENTS) == [("events", '"ts"')]
+    assert _asks(sql, EVENTS)
+
+
+# -- the data-free analysis (round 3) ----------------------------------------
+
+REPRO_TABLES = ["events", "refunds", "customers"]
+FILLED_CTE = "filled AS (SELECT m.month_start, COALESCE(p.n, 0) AS n FROM months m LEFT JOIN per_month p ON p.month_start = m.month_start)"
+REFUNDS_PER_MONTH_CTE = "rpm AS (SELECT date_trunc('month', r_at) AS month_start, sum(amount) AS total FROM refunds GROUP BY ALL)"
+RECENT_EVENTS = "(SELECT {select} FROM events WHERE ts >= CURRENT_DATE - 30{tail})"
+
+
+def _summaryJoin(summary):
+    """Refunds per status, cross-joined to a summary of the recent events."""
+    return f"SELECT r.status, sum(r.amount) AS total FROM refunds r CROSS JOIN {summary} e GROUP BY 1"
+
+
+@pytest.mark.parametrize(
+    "sql",
+    [
+        # A second measure joined after the period list was filled in, or written as a scalar subquery (review I1).
+        f"WITH {MONTHS_CTE}, {PER_MONTH_CTE}, {FILLED_CTE}, {REFUNDS_PER_MONTH_CTE} "
+        "SELECT f.month_start, f.n AS events, COALESCE(r.total, 0) AS refunds FROM filled f LEFT JOIN rpm r ON r.month_start = f.month_start",
+        f"WITH {MONTHS_CTE}, {PER_MONTH_CTE}, {FILLED_CTE}, {REFUNDS_PER_MONTH_CTE} "
+        "SELECT f.month_start, f.n AS events, r.total AS refunds FROM filled f JOIN rpm r ON r.month_start = f.month_start",
+        f"WITH {MONTHS_CTE}, {PER_MONTH_CTE} SELECT m.month_start, COALESCE(p.n, 0) AS events, "
+        "(SELECT COALESCE(sum(amount), 0) FROM refunds r WHERE date_trunc('month', r.r_at) = m.month_start) AS refunds "
+        "FROM months m LEFT JOIN per_month p ON p.month_start = m.month_start",
+        # A summary that gives a row from no rows, beside a table that has data (review I2).
+        _summaryJoin(RECENT_EVENTS.format(select="count(*) AS k", tail=" GROUP BY ()")),
+        _summaryJoin(RECENT_EVENTS.format(select="kind, count(*) AS k", tail=" GROUP BY ROLLUP (kind)")),
+        _summaryJoin(RECENT_EVENTS.format(select="kind, count(*) AS k", tail=" GROUP BY CUBE (kind)")),
+        _summaryJoin(RECENT_EVENTS.format(select="kind, count(*) AS k", tail=" GROUP BY GROUPING SETS ((kind), ())")),
+        _summaryJoin(RECENT_EVENTS.format(select="1 AS k", tail=" HAVING count(*) >= 0")),
+        _summaryJoin(RECENT_EVENTS.format(select="fsum(id) AS k", tail="")),
+        _summaryJoin(RECENT_EVENTS.format(select="product(id) AS k", tail="")),
+        _summaryJoin(RECENT_EVENTS.format(select="count(*) AS k", tail="")),
+        # A period list that reads a table in a VALUES row or in unnest((SELECT ...)) (review N1).
+        f"WITH {PER_MONTH_CTE} SELECT v.month_start, COALESCE(p.n, 0) AS n FROM (VALUES ((SELECT max(r_at) FROM refunds))) AS v(month_start) "
+        "LEFT JOIN per_month p ON p.month_start = v.month_start",
+        f"WITH months AS (SELECT unnest((SELECT list(r_at) FROM refunds)) AS month_start), {PER_MONTH_CTE} {FILLED_SELECT}",
+        # A period list that reads a table in any other way.
+        f"WITH a AS (SELECT ts FROM events), b AS (SELECT ts FROM a), months AS (SELECT DISTINCT date_trunc('month', ts) AS month_start FROM b), {PER_MONTH_CTE} {FILLED_SELECT}",
+        f"WITH months AS (SELECT unnest(generate_series(DATE '2024-01-01', DATE '2024-12-01', INTERVAL 1 MONTH)) AS month_start WHERE EXISTS (SELECT 1 FROM refunds)), {PER_MONTH_CTE} {FILLED_SELECT}",
+        f"WITH months AS (SELECT CASE WHEN (SELECT count(*) FROM refunds) > 0 THEN CURRENT_DATE END AS month_start), {PER_MONTH_CTE} {FILLED_SELECT}",
+        f"WITH months AS (SELECT * FROM (VALUES ((SELECT max(r_at) FROM refunds))) AS v(month_start)), {PER_MONTH_CTE} {FILLED_SELECT}",
+        f"WITH months AS (WITH x AS (SELECT r_at FROM refunds) SELECT DISTINCT date_trunc('month', r_at) AS month_start FROM x), {PER_MONTH_CTE} {FILLED_SELECT}",
+        f"WITH months AS (SELECT l.month_start FROM (SELECT 1 AS k) a, LATERAL (SELECT date_trunc('month', r_at) AS month_start FROM refunds) l), {PER_MONTH_CTE} {FILLED_SELECT}",
+        f"WITH months AS (SELECT CAST(CURRENT_DATE AS TIMESTAMP) AS month_start UNION ALL SELECT r_at FROM refunds), {PER_MONTH_CTE} {FILLED_SELECT}",
+        # A recursive period list.
+        f"WITH RECURSIVE months AS (SELECT date_trunc('month', CURRENT_DATE) AS month_start UNION ALL "
+        f"SELECT month_start - INTERVAL 1 MONTH FROM months WHERE month_start > CURRENT_DATE - INTERVAL 1 YEAR), {PER_MONTH_CTE} {FILLED_SELECT}",
+        # The bound of the filling join under OR.
+        f"WITH {MONTHS_CTE} SELECT m.month_start, count(e.id) AS n FROM months m LEFT JOIN events e "
+        "ON date_trunc('month', e.ts) = m.month_start AND (e.ts >= CURRENT_DATE - INTERVAL 1 YEAR OR e.kind = 'x') GROUP BY 1",
+        f"WITH {MONTHS_CTE} SELECT m.month_start, count(e.id) AS n FROM months m LEFT JOIN events e "
+        "ON date_trunc('month', e.ts) = m.month_start OR e.ts >= CURRENT_DATE - INTERVAL 1 YEAR GROUP BY 1",
+        # A UNION ALL branch without a bound, on the data side or at the root.
+        f"WITH {MONTHS_CTE}, per_month AS (SELECT date_trunc('month', ts) AS month_start, count(id) AS n FROM events "
+        "WHERE ts >= CURRENT_DATE - INTERVAL 1 YEAR GROUP BY ALL UNION ALL SELECT date_trunc('month', r_at), count(*) FROM refunds GROUP BY ALL) "
+        f"{FILLED_SELECT}",
+        "SELECT ts AS d FROM events WHERE ts >= CURRENT_DATE - 30 UNION ALL SELECT r_at FROM refunds",
+        # Lateral subqueries, correlated or not.
+        "SELECT count(*) AS n FROM customers c, LATERAL (SELECT * FROM events e WHERE e.cid = c.id AND e.ts >= CURRENT_DATE - 30) x",
+        "SELECT count(*) AS n FROM customers c JOIN LATERAL (SELECT * FROM events e WHERE c.joined >= CURRENT_DATE - 30) x ON true",
+        # A series list read from a table (the prompt's multi-series grid).
+        f"WITH {MONTHS_CTE}, series AS (SELECT DISTINCT kind FROM events), grid AS (SELECT * FROM months CROSS JOIN series), "
+        "pm AS (SELECT date_trunc('month', ts) AS month_start, kind, count(*) AS n FROM events WHERE ts >= CURRENT_DATE - INTERVAL 1 YEAR GROUP BY ALL) "
+        "SELECT g.month_start, g.kind, COALESCE(p.n, 0) AS n FROM grid g LEFT JOIN pm p ON p.month_start = g.month_start AND p.kind = g.kind",
+    ],
+)
+def test_aChartThatMayHoldOtherDataNeverAsks(sql):
+    assert checkSql(sql, REPRO_TABLES).sql
+    assert findPeriodProbes(sql, REPRO_TABLES) == []
+    assert not _asks(sql, REPRO_TABLES)
+
+
+@pytest.mark.parametrize(
+    "sql",
+    [
+        FILLED_IN,
+        # The period list reads the filtered data itself.
+        f"WITH {PER_MONTH_CTE}, months AS (SELECT DISTINCT month_start FROM per_month) {FILLED_SELECT}",
+        # The same filtered CTE, joined twice.
+        f"WITH {MONTHS_CTE}, {PER_MONTH_CTE} SELECT m.month_start, COALESCE(a.n, 0) + COALESCE(b.n, 0) AS n FROM months m "
+        "LEFT JOIN per_month a ON a.month_start = m.month_start LEFT JOIN per_month b ON b.month_start = m.month_start",
+        "WITH f AS (SELECT * FROM events WHERE ts >= CURRENT_DATE - 30) SELECT count(*) AS n FROM f a JOIN f b ON a.id = b.id",
+        # An inner join with the bound on one side, in WHERE or in ON.
+        "SELECT c.region, count(*) AS n FROM events e JOIN customers c ON c.id = e.cid WHERE e.ts >= CURRENT_DATE - 30 GROUP BY 1",
+        "SELECT c.region, count(*) AS n FROM events e JOIN customers c ON c.id = e.cid AND e.ts >= CURRENT_DATE - 30 GROUP BY 1",
+        # A grouped summary gives no row from no rows, so it empties the inner join.
+        "SELECT c.region, sum(t.n) AS n FROM customers c JOIN (SELECT cid, count(*) AS n FROM events WHERE ts >= CURRENT_DATE - 30 GROUP BY 1) t "
+        "ON t.cid = c.id GROUP BY 1",
+        # A one-row summary of no rows holds no project data.
+        "SELECT t.n FROM (SELECT count(*) AS n FROM events WHERE ts >= CURRENT_DATE - 30) AS t",
+        # Every branch of a set operation emptied.
+        "SELECT ts FROM events WHERE ts >= CURRENT_DATE - 30 UNION SELECT r_at FROM refunds WHERE r_at >= CURRENT_DATE - 30",
+    ],
+)
+def test_aChartWithNoProjectDataOnceTheBoundsEndedAsks(sql):
+    assert findPeriodProbes(sql, REPRO_TABLES)
+    assert _asks(sql, REPRO_TABLES)
+
+
+def test_theAnswerDependsOnWhichBoundsEnded():
+    sql = (
+        "SELECT c.region, count(*) AS n FROM events e JOIN customers c ON c.id = e.cid "
+        "WHERE e.ts >= CURRENT_DATE - 30 AND c.joined >= CURRENT_DATE - 30 GROUP BY 1"
+    )
+    events, customers = findPeriodProbes(sql, REPRO_TABLES)
+    assert (events.table, customers.table) == ("events", "customers")
+    assert not isDataFree(sql, REPRO_TABLES, [])
+    assert isDataFree(sql, REPRO_TABLES, [events.sql])
+    assert isDataFree(sql, REPRO_TABLES, [customers.sql])
+
+    union = "SELECT ts FROM events WHERE ts >= CURRENT_DATE - 30 UNION ALL SELECT r_at FROM refunds WHERE r_at >= CURRENT_DATE - 30"
+    first, second = findPeriodProbes(union, REPRO_TABLES)
+    assert not isDataFree(union, REPRO_TABLES, [first.sql])
+    assert isDataFree(union, REPRO_TABLES, [first.sql, second.sql])
+
+    # The optional side of a LEFT join ended; the preserved side still reads a table.
+    left = "SELECT c.region, count(e.id) AS n FROM customers c LEFT JOIN events e ON e.cid = c.id AND e.ts >= CURRENT_DATE - 30 GROUP BY 1"
+    assert findPeriodProbes(left, REPRO_TABLES) == []
+    assert not isDataFree(left, REPRO_TABLES, ["anything"])
+    assert not isDataFree("SELECT FROM WHERE >=", REPRO_TABLES, [])
 
 
 # -- the no-data predicate ---------------------------------------------------
