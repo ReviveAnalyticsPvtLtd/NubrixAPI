@@ -1029,3 +1029,75 @@ def test_aLegitimateZeroInsideThePeriodNeverAsksOnDuckDb(harness, sql, x, y, pro
     assert "generatedCode" in state
     assert harness.render.call_count == (2 if probed else 1)
     assert harness.logs == []
+
+
+# Round 4 on a real DuckDB: the bound's column is bound by DuckDB to something other than the ended table column. Events
+# ended long ago on `ts`, but `shipped` is today; refunds are inside the period; every amount is 0.
+
+RECENT_SQL = "CURRENT_DATE - INTERVAL 30 DAY"
+BINDING_METADATA = {
+    "events": {"columns": [{"name": "id"}, {"name": "ts"}, {"name": "shipped"}, {"name": "kind"}, {"name": "amount"}]},
+    "refunds": {"columns": [{"name": "eid"}, {"name": "r_at"}, {"name": "amount"}, {"name": "status"}]},
+}
+
+
+def _bindingTables():
+    today = datetime.combine(date.today(), datetime.min.time())
+    return {
+        "events": pa.table(
+            {
+                "id": [1, 2],
+                "ts": pa.array([datetime(2019, 3, 15)] * 2, pa.timestamp("us")),
+                "shipped": pa.array([today] * 2, pa.timestamp("us")),
+                "kind": ["a", "b"],
+                "amount": pa.array([0, 0], pa.int64()),
+            }
+        ),
+        "refunds": pa.table(
+            {
+                "eid": [1, 2, 3],
+                "r_at": pa.array([today - timedelta(days=days) for days in (1, 2, 3)], pa.timestamp("us")),
+                "amount": pa.array([0, 0, 0], pa.int64()),
+                "status": ["done"] * 3,
+            }
+        ),
+    }
+
+
+@pytest.mark.parametrize(
+    "sql, x",
+    [
+        # A star with REPLACE, or EXCLUDE plus RENAME (review 2, P1).
+        (f"WITH x AS (SELECT * REPLACE (coalesce(shipped, ts) AS ts) FROM events) SELECT kind, sum(amount) AS t FROM x WHERE ts >= {RECENT_SQL} GROUP BY 1", "kind"),
+        (f"WITH x AS (SELECT * REPLACE (CAST(CURRENT_DATE AS TIMESTAMP) AS ts) FROM events) SELECT kind, sum(amount) AS t FROM x WHERE ts >= {RECENT_SQL} GROUP BY 1", "kind"),
+        (f"WITH x AS (SELECT * EXCLUDE (ts) RENAME (shipped AS ts) FROM events) SELECT kind, sum(amount) AS t FROM x WHERE ts >= {RECENT_SQL} GROUP BY 1", "kind"),
+        # A star that already supplies the name of a later projection (review 2, P2).
+        (
+            f"WITH x AS (SELECT r.*, e.ts AS r_at FROM refunds r JOIN events e ON e.id = r.eid) "
+            f"SELECT status, sum(amount) AS t FROM x WHERE r_at >= {RECENT_SQL} GROUP BY 1",
+            "status",
+        ),
+        # A CTE defined later, or quoted in another case, that DuckDB reads instead of the table (review 2, P3).
+        (
+            f"WITH a AS (SELECT status, sum(amount) AS t FROM events WHERE ts >= {RECENT_SQL} GROUP BY 1), "
+            "events AS (SELECT r_at AS ts, amount, status FROM refunds) SELECT * FROM a",
+            "status",
+        ),
+        (
+            f'WITH "EVENTS" AS (SELECT r_at AS ts, amount, status FROM refunds) '
+            f"SELECT status, sum(amount) AS t FROM events WHERE ts >= {RECENT_SQL} GROUP BY 1",
+            "status",
+        ),
+    ],
+)
+def test_aBoundWhoseColumnDuckDbBindsElsewhereKeepsTheChartOnDuckDb(harness, sql, x):
+    request = {"chartType": "bar", "title": "Chart", "sql": sql, "encoding": {"x": x, "y": ["t"]}}
+    harness.generator.invoke.return_value = json.dumps(request)
+    harness.render.side_effect = _duckdbRender(_bindingTables())
+    state = harness.run(metadata=BINDING_METADATA)
+    assert state["finalOutput"]["chartType"] == "bar"
+    values = state["finalOutput"]["data"]["datasets"][0]["data"]
+    assert values and all(value == 0 for value in values)
+    assert "generatedCode" in state
+    assert harness.render.call_count == 1
+    assert harness.logs == []

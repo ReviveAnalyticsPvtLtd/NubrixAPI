@@ -636,6 +636,83 @@ def test_theAnswerDependsOnWhichBoundsEnded():
     assert not isDataFree("SELECT FROM WHERE >=", REPRO_TABLES, [])
 
 
+# -- a column that DuckDB could bind differently (round 4) --------------------
+
+RECENT = "CURRENT_DATE - INTERVAL 30 DAY"
+JOINED = "FROM refunds r JOIN events e ON e.id = r.eid"
+
+
+@pytest.mark.parametrize(
+    "sql",
+    [
+        # A star with REPLACE, EXCLUDE or RENAME (review 2, P1).
+        f"WITH x AS (SELECT * REPLACE (coalesce(shipped, ts) AS ts) FROM events) SELECT kind, sum(amount) AS t FROM x WHERE ts >= {RECENT} GROUP BY 1",
+        f"WITH x AS (SELECT * REPLACE (CAST(CURRENT_DATE AS TIMESTAMP) AS ts) FROM events) SELECT kind, sum(amount) AS t FROM x WHERE ts >= {RECENT} GROUP BY 1",
+        f"WITH x AS (SELECT * EXCLUDE (ts) RENAME (shipped AS ts) FROM events) SELECT kind, sum(amount) AS t FROM x WHERE ts >= {RECENT} GROUP BY 1",
+        f"WITH x AS (SELECT e.* REPLACE (e.shipped AS ts) FROM events e) SELECT kind, sum(amount) AS t FROM x WHERE ts >= {RECENT} GROUP BY 1",
+        # EXCLUDE alone: the outer WHERE then reads its own select alias.
+        f"WITH x AS (SELECT * EXCLUDE (ts) FROM events) SELECT shipped AS ts, sum(amount) AS t FROM x WHERE ts >= {RECENT} GROUP BY 1",
+        # A name supplied twice: by a star and a projection, in either order, or by two projections (review 2, P2).
+        f"WITH x AS (SELECT r.*, e.ts AS r_at {JOINED}) SELECT status, sum(amount) AS t FROM x WHERE r_at >= {RECENT} GROUP BY 1",
+        f"WITH x AS (SELECT e.ts AS r_at, r.* {JOINED}) SELECT status, sum(amount) AS t FROM x WHERE r_at >= {RECENT} GROUP BY 1",
+        f"WITH x AS (SELECT r.status, r.amount, r.r_at AS d, e.ts AS d {JOINED}) SELECT status, sum(amount) AS t FROM x WHERE d >= {RECENT} GROUP BY 1",
+        # ... by a column in parentheses, which DuckDB names after the column.
+        f"WITH x AS (SELECT (r.r_at), r.amount, r.status, e.ts AS r_at {JOINED}) SELECT status, sum(amount) AS t FROM x WHERE r_at >= {RECENT} GROUP BY 1",
+        # ... by unnest of a struct, which supplies the struct's field names whatever its alias.
+        f"WITH x AS (SELECT unnest({{'ts': shipped}}), ts, kind, amount FROM events) SELECT kind, sum(amount) AS t FROM x WHERE ts >= {RECENT} GROUP BY 1",
+        f"WITH x AS (SELECT unnest({{'ts': shipped}}) AS q, ts, kind, amount FROM events) SELECT kind, sum(amount) AS t FROM x WHERE ts >= {RECENT} GROUP BY 1",
+        # A CTE that DuckDB reads where sqlglot's scope sees the table: defined later, or quoted in another case (review 2, P3).
+        f"WITH a AS (SELECT status, sum(amount) AS t FROM events WHERE ts >= {RECENT} GROUP BY 1), "
+        "events AS (SELECT r_at AS ts, amount, status FROM refunds) SELECT * FROM a",
+        f'WITH "EVENTS" AS (SELECT r_at AS ts, amount, status FROM refunds) SELECT status, sum(amount) AS t FROM events WHERE ts >= {RECENT} GROUP BY 1',
+        f'WITH "EVENTS" AS (SELECT r_at AS ts, amount, status FROM refunds) SELECT e.status, sum(e.amount) AS t FROM events e WHERE e.ts >= {RECENT} GROUP BY 1',
+    ],
+)
+def test_aBoundWhoseColumnDuckDbCouldBindDifferentlyMakesNoProbe(sql):
+    assert checkSql(sql, REPRO_TABLES).sql
+    assert findPeriodProbes(sql, REPRO_TABLES) == []
+    assert not _asks(sql, REPRO_TABLES)
+
+
+def test_aPlainStarAndASingleProjectionStillResolve():
+    star = f"WITH x AS (SELECT * FROM events) SELECT kind, sum(amount) AS t FROM x WHERE ts >= {RECENT} GROUP BY 1"
+    assert _found(star, REPRO_TABLES) == [("events", "ts")]
+    alias = f"WITH x AS (SELECT ts AS d, kind, amount, count(*) OVER () AS n FROM events) SELECT kind, sum(amount) AS t FROM x WHERE d >= {RECENT} GROUP BY 1"
+    assert _found(alias, REPRO_TABLES) == [("events", "ts")]
+    qualified = f"WITH x AS (SELECT r.* {JOINED}) SELECT status, sum(amount) AS t FROM x WHERE r_at >= {RECENT} GROUP BY 1"
+    assert _found(qualified, REPRO_TABLES) == [("refunds", "r_at")]
+    shadow = f"WITH events AS (SELECT r_at AS ts, amount FROM refunds) SELECT sum(amount) AS t FROM events WHERE ts >= {RECENT}"
+    assert _found(shadow, REPRO_TABLES) == [("refunds", "r_at")]
+
+
+def _chain(depth, reads):
+    """CTEs c1..c<depth>, each reading the one before `reads` times, over a constant c0."""
+    ctes = ["c0 AS (SELECT 1 AS x)"]
+    for level in range(1, depth + 1):
+        sources = ", ".join(f"c{level - 1} s{k}" for k in range(reads))
+        ctes.append(f"c{level} AS (SELECT s0.x FROM {sources})")
+    return f"WITH {', '.join(ctes)} SELECT (SELECT count(*) FROM c{depth}) AS k, count(*) AS n FROM events WHERE ts >= {RECENT}"
+
+
+def test_aCteIsReadOncePerAnalysis(monkeypatch):
+    import nubrix.components.periodProbe as periodProbe
+
+    calls = []
+    original = periodProbe._cteFor
+    monkeypatch.setattr(periodProbe, "_cteFor", lambda table: calls.append(1) or original(table))
+    sql = _chain(14, 2)
+    assert _found(sql, REPRO_TABLES) == [("events", "ts")]
+    assert _asks(sql, REPRO_TABLES)
+    # Unmemoised, each analysis follows 2^14 references to c0.
+    assert len(calls) < 2000
+
+
+def test_aCteChainDeeperThanTheCapDeclines():
+    assert _asks(_chain(3, 1), REPRO_TABLES)
+    assert findPeriodProbes(_chain(20, 1), REPRO_TABLES) == []
+    assert not isDataFree(_chain(20, 1), REPRO_TABLES, [probe.sql for probe in findPeriodProbes(_chain(3, 1), REPRO_TABLES)])
+
+
 # -- the no-data predicate ---------------------------------------------------
 
 

@@ -11,7 +11,10 @@ A bound is a top-level AND conjunct of a WHERE, or of the ON of an inner, semi, 
 function and nothing that differs by row. `col` is one column, bare or wrapped in date_trunc, CAST or TRY_CAST. It is
 resolved in the comparison's own scope to one active project table: by its qualifier (an alias of that scope), by the
 scope's only source, or through a CTE or derived table (without a column list) whose matching output column resolves
-the same way. A conjunct that does not resolve is not a bound. Per bound, `max(side) IS NULL OR max(side) < (expr)`
+the same way. It does not resolve wherever DuckDB could bind it to something else: a reference that DuckDB's CTE lookup
+(`_cteFor`) and sqlglot's scope read differently, a name supplied more than once in a SELECT it passes through (by a
+star and a projection, or twice, as DuckDB names each item), or a star with EXCLUDE, REPLACE or RENAME. A conjunct
+that does not resolve is not a bound. Per bound, `max(side) IS NULL OR max(side) < (expr)`
 over the whole table is true exactly when no row of the table can pass it ("ended"). Every value the column takes in
 the scope is the side of some table row, or NULL, so an ended bound is false for every row of that scope. Its
 `last_value` is the latest value of the bare column, which the question quotes. All bounds run as one query, one row
@@ -195,19 +198,73 @@ def _replaced(expression: exp.Expression, column: exp.Column, replacement: exp.E
     return copy
 
 
-def _isStar(item: exp.Expression) -> bool:
-    return isinstance(item, exp.Star) or (isinstance(item, exp.Column) and isinstance(item.this, exp.Star))
+# A select item whose output names cannot be read from the item: it may supply any name (a star, COLUMNS(...), unnest of
+# a struct, which keeps the struct's field names whatever its alias, or a positional reference such as #1).
+_ANY_NAME = object()
+_EXPANDING = tuple(
+    getattr(exp, name) for name in ("Columns", "Explode", "Unnest", "PositionalColumn") if hasattr(exp, name)
+)
+_STAR_MODIFIERS = ("except_", "except", "replace", "rename")
+
+
+def _expands(node: exp.Expression) -> bool:
+    """Whether the item may give several columns, or columns whose names it does not state."""
+    # A subquery inside the item gives one value, whatever its own select list holds.
+    for child in node.walk(prune=lambda inner: inner is not node and isinstance(inner, (exp.Subquery, exp.Query))):
+        if isinstance(child, _EXPANDING):
+            return True
+        # A star anywhere except as an aggregate's argument (count(*)).
+        if isinstance(child, exp.Star) and not isinstance(child.parent, exp.AggFunc):
+            return True
+    return False
+
+
+def _outputName(item: exp.Expression):
+    """The folded name DuckDB gives a select item's column, or _ANY_NAME when the item may supply any name."""
+    if isinstance(item, exp.Alias):
+        return _ANY_NAME if _expands(item.this) else _fold(item.alias)
+    node = item
+    while isinstance(node, exp.Paren):
+        node = node.this
+    if _expands(node):
+        return _ANY_NAME
+    if isinstance(node, exp.Column):
+        return _fold(node.name)
+    # DuckDB names any other expression after its text, e.g. "CAST(ts AS DATE)" or "current_date".
+    return _fold(node.sql(dialect=_DIALECT))
+
+
+def _plainStar(item: exp.Expression) -> exp.Star | exp.Column | None:
+    """The item when it is a bare `*` or `t.*` with no EXCLUDE, REPLACE or RENAME, else None."""
+    star = item.this if isinstance(item, exp.Column) else item
+    if not isinstance(star, exp.Star) or any(star.args.get(key) for key in _STAR_MODIFIERS):
+        return None
+    return item
+
+
+def _isTheCte(node: exp.Expression, source) -> bool:
+    """Whether sqlglot's scope and DuckDB's name lookup (`_cteFor`) agree about what a source reference reads."""
+    cte = _cteFor(node) if isinstance(node, exp.Table) else None
+    if isinstance(source, Scope) and isinstance(source.expression.parent, exp.CTE):
+        return cte is source.expression.parent
+    return cte is None
 
 
 def _resolve(scope: Scope, column: exp.Column, activeByKey: dict[str, str], depth: int = 0):
-    """(canonical table, side over that table's own columns) for a column of `scope`, or None."""
+    """(canonical table, side over that table's own columns) for a column of `scope`, or None.
+
+    None whenever DuckDB could bind the column to something else: the source reference reads a CTE by DuckDB's name
+    lookup that sqlglot's scope does not see (or the other way round), the name is supplied more than once in a
+    SELECT it passes through (by a star and a projection, or twice), or it passes through a star with EXCLUDE,
+    REPLACE or RENAME.
+    """
     if depth > _MAX_DEPTH:
         return None
     pair = _sourceOf(scope, column)
     if pair is None:
         return None
     node, source = pair
-    if _hasColumnList(node, source):
+    if _hasColumnList(node, source) or not _isTheCte(node, source):
         return None
     if isinstance(source, exp.Table):
         if source.args.get("db") or source.args.get("catalog") or not isinstance(source.this, exp.Identifier):
@@ -222,8 +279,11 @@ def _resolve(scope: Scope, column: exp.Column, activeByKey: dict[str, str], dept
         return None
     inner = source
     name = _fold(column.name)
-    matches = [item for item in inner.expression.selects if not _isStar(item) and _fold(item.alias_or_name) == name]
-    if len(matches) == 1:
+    selects = inner.expression.selects
+    names = [_outputName(item) for item in selects]
+    matches = [item for item, itemName in zip(selects, names) if itemName == name]
+    open_ = [item for item, itemName in zip(selects, names) if itemName is _ANY_NAME]
+    if len(matches) == 1 and not open_:
         projection = matches[0].unalias() if isinstance(matches[0], exp.Alias) else matches[0]
         innerColumn = _innerColumn(projection)
         if innerColumn is None:
@@ -233,12 +293,11 @@ def _resolve(scope: Scope, column: exp.Column, activeByKey: dict[str, str], dept
             return None
         table, replacement = resolved
         return table, _replaced(projection, innerColumn, replacement)
-    if matches:
+    if matches or len(open_) != 1:
         return None
-    stars = [item for item in inner.expression.selects if _isStar(item)]
-    if len(stars) != 1:
+    star = _plainStar(open_[0])
+    if star is None:
         return None
-    star = stars[0]
     qualifier = star.table if isinstance(star, exp.Column) else None
     return _resolve(inner, exp.column(column.args["this"].copy(), table=qualifier), activeByKey, depth + 1)
 
@@ -277,8 +336,12 @@ def _cteFor(table: exp.Table) -> exp.CTE | None:
     return None
 
 
-def _readsTable(node: exp.Expression, reading: tuple = ()) -> bool:
-    """Whether anything in `node` reads a table, directly or through the CTEs it reads (a CTE reading itself counts)."""
+def _readsTable(node: exp.Expression, memo: dict[int, bool], reading: tuple = ()) -> bool:
+    """Whether anything in `node` reads a table, directly or through the CTEs it reads (a CTE reading itself counts).
+
+    `memo` holds each CTE's answer for one analysis, so every CTE body is walked once. A chain of CTEs deeper than
+    _MAX_DEPTH counts as reading a table, which can only keep the chart.
+    """
     if len(reading) > _MAX_DEPTH:
         return True
     for table in node.find_all(exp.Table):
@@ -286,12 +349,16 @@ def _readsTable(node: exp.Expression, reading: tuple = ()) -> bool:
             # range() or generate_series(): its arguments are walked as part of `node`.
             continue
         cte = _cteFor(table)
-        if cte is None or any(cte is outer for outer in reading) or _readsTable(cte.this, reading + (cte,)):
+        if cte is None or any(cte is outer for outer in reading):
+            return True
+        if id(cte) not in memo:
+            memo[id(cte)] = _readsTable(cte.this, memo, reading + (cte,))
+        if memo[id(cte)]:
             return True
     return False
 
 
-def _readsOutsideSources(query: exp.Expression, sources: tuple[str, ...]) -> bool:
+def _readsOutsideSources(query: exp.Expression, sources: tuple[str, ...], memo: dict[int, bool]) -> bool:
     """Rule 1: whether a part of the query other than its sources and its WITH reads a table."""
     for key, value in query.args.items():
         if key in sources or key == "with_":
@@ -301,9 +368,9 @@ def _readsOutsideSources(query: exp.Expression, sources: tuple[str, ...]) -> boo
                 continue
             if isinstance(item, exp.Join):
                 parts = [part for name, part in item.args.items() if name != "this" and isinstance(part, exp.Expression)]
-                if any(_readsTable(part) for part in parts):
+                if any(_readsTable(part, memo) for part in parts):
                     return True
-            elif _readsTable(item):
+            elif _readsTable(item, memo):
                 return True
     return False
 
@@ -338,6 +405,8 @@ class _Analysis:
         self.ended = ended
         self.probes: dict[str, PeriodProbe] = {}
         self.statuses: dict[int, int] = {}
+        # Whether each CTE reads a table, per CTE once for this analysis.
+        self.reads: dict[int, bool] = {}
 
     def status(self, scope: Scope, depth: int = 0) -> int:
         key = id(scope.expression)
@@ -350,12 +419,12 @@ class _Analysis:
     def _status(self, scope: Scope, depth: int) -> int:
         query = scope.expression
         if isinstance(query, exp.SetOperation):
-            if _readsOutsideSources(query, ("this", "expression")):
+            if _readsOutsideSources(query, ("this", "expression"), self.reads):
                 return _UNKNOWN
             return min(self._query(branch, depth) for branch in (query.this, query.expression))
         if not isinstance(query, exp.Select):
-            return _UNKNOWN if _readsTable(query) else _DATAFREE
-        if _readsOutsideSources(query, ("from_",)):
+            return _UNKNOWN if _readsTable(query, self.reads) else _DATAFREE
+        if _readsOutsideSources(query, ("from_",), self.reads):
             return _UNKNOWN
         where = query.args.get("where")
         emptied = where is not None and self._anyEnded(scope, where.this)
@@ -374,7 +443,7 @@ class _Analysis:
         scope = self.scopes.get(id(node))
         if scope is not None:
             return self.status(scope, depth + 1)
-        return _UNKNOWN if _readsTable(node) else _DATAFREE
+        return _UNKNOWN if _readsTable(node, self.reads) else _DATAFREE
 
     def _source(self, node: exp.Expression, depth: int) -> int:
         """Rule 3 for one source: a table is UNKNOWN, a CTE or derived table has its status, anything else reading a
@@ -387,7 +456,7 @@ class _Analysis:
             if cte is None or id(cte.this) not in self.scopes:
                 return _UNKNOWN
             return self.status(self.scopes[id(cte.this)], depth + 1)
-        return _UNKNOWN if _readsTable(node) else _DATAFREE
+        return _UNKNOWN if _readsTable(node, self.reads) else _DATAFREE
 
     def _join(self, scope: Scope, rows: int, join: exp.Join, depth: int) -> int:
         right = self._source(join.this, depth)
