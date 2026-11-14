@@ -686,6 +686,110 @@ def test_refreshReturnsTheLatestPageWhenEverySucceededWidgetWasDeleted(monkeypat
     assert page["id"] == "pg"
 
 
+
+# Saved SQL charts: the chart the SQL workflow served (or failed), saved as the client and the automatic dashboard save it
+
+
+def _sqlRender(manager, projectId, request, activeTables, filters=None, **options):
+    """A deterministic stand-in for the SQL engine: the chart depends only on the request and the filters."""
+    total = 7 if not filters else 2
+    return {"chartType": request.chartType, "title": request.title,
+            "data": {"labels": ["x"], "datasets": [{"label": "total", "data": [total]}]}}
+
+
+def _savedFiles(monkeypatch, service):
+    """Dashboard files the service reads, kept as the JSON its uploads wrote."""
+    from api.services import dashboardService as module
+    from test.test_sql_chart_workflow import METADATA
+
+    files = {"dashboardConfig.json": {"pg": {"name": "n", "widgets": []}}, "metadata.json": copy.deepcopy(METADATA)}
+    monkeypatch.setattr(module, "readJson", lambda projectId, name: copy.deepcopy(files[name]))
+    monkeypatch.setattr(module, "updateProjectModifiedAt", lambda projectId: None)
+
+    def saved():
+        files["dashboardConfig.json"] = _uploaded(service)
+        service.client.reset_mock()
+
+    return files, saved
+
+
+def test_aSavedSqlChartReRunsThroughTheSqlPathAndGivesTheSameChart(monkeypatch):
+    from api.models import ExportToDashboard
+    from test.test_sql_chart_workflow import Harness
+
+    harness = Harness(monkeypatch)
+    harness.render.side_effect = _sqlRender
+    served = harness.run()
+    chart = served["finalOutput"]
+    servedRequest = harness.render.call_args.args[2]
+
+    service, manager, renderer = _setup(monkeypatch, [], render=_sqlRender)
+    files, saved = _savedFiles(monkeypatch, service)
+    widgetId = service.exportToDashboard(ExportToDashboard(
+        projectId="p1", page="pg", chartType=chart["chartType"], title=chart["title"], data=chart["data"],
+        layout={"x": 0, "y": 0, "w": 6, "h": 10}, generatedCode=served["generatedCode"]))
+    saved()
+
+    filtered = service.getData(GetData(projectId="p1", page="pg", filters=FILTERS))["widgets"][0]
+    args, kwargs = renderer.call_args
+    assert args[2] == servedRequest and args[3] == ("orders", "old_table")
+    assert kwargs == {"filters": FILTERS, "lenient": True}
+    assert filtered["id"] == widgetId and filtered["generatedCode"] == served["generatedCode"]
+    assert filtered["data"] == _sqlRender(None, "p1", servedRequest, None, filters=FILTERS)["data"]
+    service.client.storage.from_.assert_not_called()
+
+    refreshed = service.getData(GetData(projectId="p1", page="pg", refresh=True))["widgets"][0]
+    assert renderer.call_args.kwargs == {"filters": None, "lenient": True}
+    for widget in (refreshed, _uploaded(service)["pg"]["widgets"][0]):
+        assert {key: widget[key] for key in ("chartType", "title", "data")} == {key: chart[key] for key in ("chartType", "title", "data")}
+        assert widget["generatedCode"] == served["generatedCode"] and widget["layout"] == {"x": 0, "y": 0, "w": 6, "h": 10}
+    manager.run.assert_not_called()
+
+
+_INVALID = json.dumps({"chartType": "bar", "title": "Totals", "sql": 'SELECT "a" FROM "orders"'})  # no encoding
+
+
+def _python(code, projectId=None, filters=None):
+    """What Python does with the text: the sandbox's output, or its error."""
+    import subprocess
+    import sys
+
+    done = subprocess.run([sys.executable, "-I", "-c", code], capture_output=True, text=True, timeout=60)
+    return done.stdout if done.returncode == 0 else "Traceback (most recent call last):\n" + done.stderr
+
+
+@pytest.mark.parametrize("reply", [_INVALID, "```json\n" + _INVALID + "\n```"], ids=["json-without-marker", "fenced"])
+def test_aFailedSqlChartSavedWithItsRawTextIsAFailedReRunThatChangesNothing(monkeypatch, logLines, reply):
+    from test.test_sql_chart_workflow import Harness
+
+    harness = Harness(monkeypatch)
+    harness.generator.invoke.return_value = reply
+    harness.repair.invoke.return_value = reply
+    failed = harness.run()
+    assert "error" in failed["finalOutput"] and failed["generatedCode"] == reply
+    harness.render.assert_not_called()
+
+    # The automatic dashboard saves a failed chart as a widget without a chart type, keeping the raw text.
+    widget = {"id": "F1", "chartType": failed["finalOutput"].get("chartType"), "title": None, "label": None,
+              "xLabels": None, "yLabels": None, "data": None, "query": "Totals by a",
+              "layout": {"x": 0, "y": 0, "w": 6, "h": 10}, "generatedCode": failed["generatedCode"]}
+    service, manager, renderer = _setup(monkeypatch, [widget], run=_python)
+
+    filtered = service.getData(GetData(projectId="p1", page="pg", filters=FILTERS))["widgets"][0]
+    assert filtered == widget
+    refreshed = service.getData(GetData(projectId="p1", page="pg", refresh=True))["widgets"][0]
+    assert refreshed == widget
+    service.client.storage.from_.assert_not_called()
+
+    # It went down the old Python path (fences stripped as for any saved code), failed, and was logged by id and form only.
+    renderer.assert_not_called()
+    assert manager.run.call_count == 2
+    assert manager.run.call_args.args[0] == reply.removesuffix("\n```")
+    lines = _failureLines(logLines, "F1")
+    assert len(lines) == 2 and all("(python)" in line for line in lines)
+    assert not any("orders" in line or "SELECT" in line for line in lines)
+
+
 # A table switched to inactive: saved widgets on it keep working, in both forms. The SQL check is the real one.
 
 INACTIVE_PYTHON = "df = fetch_data('p1', 'old')\nprint(1)"

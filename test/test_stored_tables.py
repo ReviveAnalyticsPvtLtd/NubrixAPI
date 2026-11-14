@@ -1321,6 +1321,165 @@ def test_tailFooterReadsOnlyAFooterItMayParse(storage):
             assert storedTables.readTailFooter(tableFile) is None, name
 
 
+# ---- A table's schema, for the chart generator's grounding: never a whole decode in this process ----
+
+
+def _everyKindOfColumn() -> "pa.Table":
+    import datetime as dt
+    from decimal import Decimal
+
+    return pa.table(
+        {
+            "i": pa.array([1, 2, None], pa.int64()),
+            "f": pa.array([1.5, None, 2.5]),
+            "d": pa.array([Decimal("1.20"), None, Decimal("3.40")], pa.decimal128(10, 2)),
+            "day": pa.array([dt.date(2020, 1, 1), dt.date(2020, 1, 2), None]),
+            "at": pa.array([dt.datetime(2020, 1, 1), None, dt.datetime(2020, 1, 2)], pa.timestamp("us")),
+            "atZone": pa.array([dt.datetime(2020, 1, 1), None, dt.datetime(2020, 1, 2)], pa.timestamp("ms", tz="UTC")),
+            "s": pa.array(["a", None, "b"]),
+            "ds": pa.array(["a", "b", "a"]).dictionary_encode(),
+            "b": pa.array([True, False, None]),
+            "l": pa.array([[1], [], [2, 3]]),
+            "st": pa.array([{"x": 1, "y": "a"}, None, {"x": 2, "y": "b"}]),
+        }
+    )
+
+
+def _plainSchema(schema: "pa.Schema") -> "pa.Schema":
+    return pa.schema([pa.field(field.name, storedTables.plainType(field.type), field.nullable) for field in schema])
+
+
+def _typeNames(schema: "pa.Schema") -> list:
+    from nubrix.components.sqlGrounding import duckdbTypeName
+
+    return [(field.name, duckdbTypeName(field.type)) for field in schema]
+
+
+def _rangeBytes(requests: list) -> int:
+    ranges = [r["range"] for r in requests if r["method"] == "GET"]
+    return sum(int(end) - int(start) + 1 for start, end in (r.split("=")[1].split("-") for r in ranges))
+
+
+def test_markedTableSchemaComesFromItsFooterAndMatchesTheDecode(monkeypatch, storage, noChild):
+    data = writeStoredTable(_everyKindOfColumn(), PROJECT_ID, "orders")
+    storage.put(PROJECT_ID, "orders.parquet", data)
+    _refuseReader(monkeypatch)
+    decoded = storedTables.decodeStoredTable(PROJECT_ID, "orders", data).schema
+    assert pa.types.is_dictionary(decoded.field("ds").type)  # a trusted decode keeps the stored dictionary
+
+    schema = storedTables.storedTableSchema(PROJECT_ID, "orders")
+    assert schema.equals(_plainSchema(decoded))
+    assert schema.field("ds").type == pa.string()
+    assert schema.field("atZone").type == pa.timestamp("ms", tz="UTC")
+    assert not schema.metadata
+    assert _typeNames(schema) == _typeNames(decoded)
+
+
+def test_unmarkedTableSchemaComesFromTheReaderChildAndMatchesTheDecode(monkeypatch, storage):
+    data = _parquet(_everyKindOfColumn())
+    storage.put(PROJECT_ID, "orders.parquet", data)
+    ops = []
+    realRun = sandboxRunner.runTrustedSandbox
+
+    def spy(*args, **kwargs):
+        ops.append(args[3]["op"])
+        return realRun(*args, **kwargs)
+
+    monkeypatch.setattr(sandboxRunner, "runTrustedSandbox", spy)
+    schema = storedTables.storedTableSchema(PROJECT_ID, "orders")  # the real reader child
+    decoded = storedTables.decodeStoredTable(PROJECT_ID, "orders", data).schema
+    assert ops == ["schema", "table"]
+    assert schema.equals(decoded)
+    assert not schema.metadata
+
+    trustedDecode = storedTables.decodeStoredTable(PROJECT_ID, "orders", writeStoredTable(_everyKindOfColumn(), PROJECT_ID, "orders")).schema
+    assert schema.equals(_plainSchema(trustedDecode))
+    assert _typeNames(schema) == _typeNames(decoded) == _typeNames(trustedDecode)
+
+
+def test_aSchemaCacheMissOnAMarkedTableReadsOnlyItsFooterByRanges(monkeypatch, storage, noChild):
+    from utils import tableSchemas
+
+    rows = 200_000
+    table = pa.table({"id": pa.array(np.arange(rows)), "amount": pa.array(np.random.default_rng(0).random(rows))})
+    data = writeStoredTable(table, PROJECT_ID, "orders")
+    storage.put(PROJECT_ID, "orders.parquet", data)
+    monkeypatch.setattr(tableSchemas, "_client", lambda: (_ for _ in ()).throw(ConnectionError("no redis")))
+
+    def refuse(*_args, **_kwargs):
+        raise AssertionError("decoded the table")
+
+    monkeypatch.setattr(pq, "read_table", refuse)
+    monkeypatch.setattr(pq.ParquetFile, "iter_batches", refuse)
+    monkeypatch.setattr(pq.ParquetFile, "read", refuse)
+    storage.requests.clear()
+    schemas = tableSchemas.tableSchemas(PROJECT_ID, ["orders"])
+    assert schemas["orders"].equals(table.schema)
+    assert storage.requests
+    assert all(r["method"] == "HEAD" or (r["method"] == "GET" and r["range"]) for r in storage.requests), storage.requests
+    assert _rangeBytes(storage.requests) <= 64 * 1024 < len(data)
+
+
+def test_schemaReadRefusesAsTheOtherReadsDo(monkeypatch, storage):
+    big = pd.DataFrame({"a": np.arange(200_000, dtype="int64")})
+    storage.put(PROJECT_ID, "orders.parquet", writeStoredTable(big, PROJECT_ID, "orders"))
+    storage.put(PROJECT_ID, "legacy.parquet", _runOutput(big))
+    storage.put(PROJECT_ID, "junk.parquet", b"not a parquet file at all")
+    monkeypatch.setenv("STORED_TABLE_MAX_DECODED_BYTES", "1048576")
+    for name in ("orders", "legacy"):
+        with pytest.raises(TableTooLargeError) as caught:
+            storedTables.storedTableSchema(PROJECT_ID, name)
+        assert str(caught.value) == "This table is too large to open (over 1 MiB).", name
+    with pytest.raises(storedTables.TableUnreadableError) as caught:
+        storedTables.storedTableSchema(PROJECT_ID, "junk")
+    assert str(caught.value) == READ_FAILED
+
+    def busy(*_args):
+        raise SandboxBusyError()
+
+    monkeypatch.setattr(sandboxRunner, "acquireRunSlot", busy)
+    with pytest.raises(SandboxBusyError):
+        storedTables.storedTableSchema(PROJECT_ID, "legacy")
+
+
+@pytest.mark.parametrize(
+    "outcome, expected",
+    [
+        (sandboxRunner.ResultTooLargeError("too large"), storedTables.TableUnreadableError),
+        (_result(returncode=storedTables.EXIT_TOO_LARGE, resultBytes=None), TableTooLargeError),
+        (_result(returncode=1, resultBytes=None), storedTables.TableUnreadableError),
+        (_result(returncode=0, resultBytes=b"not an ipc schema"), storedTables.TableUnreadableError),
+        (_result(returncode=0, resultBytes=pa.schema([("d", pa.dictionary(pa.int32(), pa.string()))]).serialize().to_pybytes()), storedTables.TableUnreadableError),
+    ],
+    ids=["overItsCap", "tooLarge", "failed", "notASchema", "holdsADictionary"],
+)
+def test_readerSchemaMapsEveryChildOutcome(monkeypatch, warningLog, outcome, expected):
+    _fakeRun(monkeypatch, outcome)
+    with pytest.raises(expected):
+        storedTables.readUntrustedSchema("p1", "t", b"x")
+
+
+def test_readerSchemaAnswerHasTheInfoCap(monkeypatch):
+    calls = []
+
+    def record(launcherName, projectId, inputBytes, request, timeoutSeconds, maxResultBytes, limits=None):
+        calls.append((launcherName, request["op"], timeoutSeconds, maxResultBytes))
+        raise SandboxBusyError()
+
+    monkeypatch.setattr(sandboxRunner, "runTrustedSandbox", record)
+    with pytest.raises(SandboxBusyError):
+        storedTables.readUntrustedSchema("p1", "t", b"x")
+    assert calls == [("table_reader_launcher.py", "schema", 60, 4 * 1024 * 1024)]
+
+
+def test_readerRevertReadsTheSchemaInThisProcess(monkeypatch, noChild):
+    monkeypatch.setenv("TABLE_READER_MEMORY_BYTES", "0")
+    data = _parquet(_everyKindOfColumn())
+    schema = storedTables.readUntrustedSchema("p1", "t", data)
+    assert schema.equals(_plainSchema(pq.read_table(io.BytesIO(data)).schema))
+    assert not schema.metadata
+
+
 def test_redisParquetFallbackUsesTheChokePoint(monkeypatch):
     from utils import initMethods
 
@@ -1878,6 +2037,9 @@ _DECODERS = {
     "utils/sandboxRunner.py": {"return pq.read_table(path)"},
     # Only the type annotations of the shared filter use the module; it decodes nothing.
     "utils/runFilters.py": {"import pyarrow.dataset as ds"},
+    # The cached Arrow schema this process wrote to Redis: a schema message only, no table data. A miss reads the
+    # schema through storedTables.
+    "utils/tableSchemas.py": {"return pa.ipc.read_schema(pa.py_buffer(blob))"},
 }
 # The launchers that decode run in a sandbox child under the run limits: transform_launcher reads back its own output for
 # the preview, normalise_launcher and table_reader_launcher are the normaliser and the reader. inspect_launcher and

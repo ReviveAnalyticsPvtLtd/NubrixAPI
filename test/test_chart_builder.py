@@ -542,6 +542,69 @@ def test_lenientTruncatedWithinCapSaysDataIsIncomplete(caplog):
     assert "keeping the first" not in caplog.text
 
 
+# --- the data-free message used by the failure log (Task 9) ---
+
+SECRET = "SecretLabel"
+
+
+def buildError(request, table, **kwargs):
+    with pytest.raises(ChartBuildError) as caught:
+        buildChart(request, table, **kwargs)
+    return caught.value
+
+
+def test_everyRaiseSiteHasADataFreeLogMessage():
+    errors = {
+        "missing column": buildError(
+            makeRequest("bar", {"x": "a", "y": SECRET}), pa.table({"a": [SECRET], "b": [1]})
+        ),
+        "not numeric": buildError(
+            makeRequest("bar", {"x": "a", "y": "b"}), pa.table({"a": [SECRET], "b": [SECRET]})
+        ),
+        "too many labels": buildError(
+            makeRequest("bar", {"x": "x", "y": "y"}),
+            pa.table({"x": [f"{SECRET}{i}" for i in range(LABEL_CAP + 1)], "y": list(range(LABEL_CAP + 1))}),
+        ),
+        "series duplicate": buildError(
+            makeRequest("bar", {"x": "m", "y": "n", "series": "g"}),
+            pa.table({"m": [SECRET, SECRET], "g": ["Other", "Other"], "n": [1, 2]}),
+        ),
+        "card rows": buildError(makeRequest("card", {"value": "n"}), pa.table({"n": [1, 2]})),
+        "card struct": buildError(makeRequest("card", {"value": "v"}), pa.table({"v": [[SECRET]]})),
+        "pivot truncated": buildError(
+            makeRequest("pivot", {"rows": ["s"], "columns": ["q"], "value": "n"}),
+            pa.table({"s": [SECRET], "q": ["x"], "n": [1]}),
+            truncated=True,
+        ),
+        "pivot duplicate": buildError(
+            makeRequest("pivot", {"rows": ["s"], "columns": ["q"], "value": "n"}),
+            pa.table({"s": ["Alice", "Alice"], "q": ["North", "North"], "n": [1, 2]}),
+        ),
+        "geo not numeric": buildError(
+            makeRequest("geoMap", {"lat": "a", "long": "b"}), pa.table({"a": [SECRET], "b": [2]})
+        ),
+    }
+    for name, error in errors.items():
+        assert isinstance(error.logMessage, str) and error.logMessage, name
+        for value in (SECRET, "Alice", "North", "Other"):
+            assert value not in error.logMessage, name
+
+
+def test_duplicatePivotPairKeepsTheFullMessageForRepairButNotTheLogMessage():
+    request = makeRequest("pivot", {"rows": ["s"], "columns": ["q"], "value": "n"})
+    table = pa.table({"s": ["Alice", "Alice"], "q": ["North", "North"], "n": [1, 2]})
+    error = buildError(request, table)
+    assert "Alice" in str(error) and "North" in str(error)
+    assert "Alice" not in error.logMessage and "North" not in error.logMessage
+    assert "GROUP BY" in str(error)
+
+
+def test_duplicateSeriesPairKeepsTheFullMessageForRepair():
+    request = makeRequest("bar", {"x": "month", "y": "n", "series": "grp"})
+    error = buildError(request, pa.table({"month": ["Jan", "Jan"], "grp": ["a", "a"], "n": [1, 2]}))
+    assert "'Jan'" in str(error) and "Jan" not in error.logMessage
+
+
 def pivotLong(rowName, columnName, pairs):
     return pa.table(
         {

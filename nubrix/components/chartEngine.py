@@ -20,12 +20,21 @@ if TYPE_CHECKING:
 
 
 class ChartFailure(Exception):
-    """A chart that could not be made. `stage` says where; `message` is what to tell the model."""
+    """A chart that could not be made. `stage` says where; `message` is what to tell the model.
 
-    def __init__(self, stage: Literal["model", "check", "bind", "run", "build", "timeout"], message: str):
+    `logMessage`, when set, is the data-free text for the failure log (a build error's); `__cause__` is the error it wraps.
+    """
+
+    def __init__(
+        self,
+        stage: Literal["model", "check", "bind", "run", "build", "timeout"],
+        message: str,
+        logMessage: str | None = None,
+    ):
         super().__init__(message)
         self.stage = stage
         self.message = message
+        self.logMessage = logMessage
 
 
 def renderChartRequest(
@@ -49,4 +58,4 @@ def renderChartRequest(
     try:
         return buildChart(request, result.table, result.truncated, lenient)
     except ChartBuildError as error:
-        raise ChartFailure("build", str(error)) from error
+        raise ChartFailure("build", str(error), logMessage=error.logMessage) from error

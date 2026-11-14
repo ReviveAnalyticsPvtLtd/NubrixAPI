@@ -92,35 +92,44 @@ from langfuse.langchain import CallbackHandler
 
 _langfuse_handler = None
 
+def _langfuseConfigured() -> bool:
+    """True when the Langfuse keys are set. Maps LANGFUSE_BASE_URL to the standard LANGFUSE_HOST if needed."""
+    if "LANGFUSE_BASE_URL" in os.environ and "LANGFUSE_HOST" not in os.environ:
+        os.environ["LANGFUSE_HOST"] = os.environ["LANGFUSE_BASE_URL"]
+    return bool(os.environ.get("LANGFUSE_PUBLIC_KEY") and os.environ.get("LANGFUSE_SECRET_KEY"))
+
 def getLangfuseHandler() -> CallbackHandler | None:
     """
     Returns a cached instance of the Langfuse CallbackHandler for LangChain tracing.
     """
     global _langfuse_handler
     if _langfuse_handler is None:
-        # Map user's LANGFUSE_BASE_URL to standard LANGFUSE_HOST if needed
-        if "LANGFUSE_BASE_URL" in os.environ and "LANGFUSE_HOST" not in os.environ:
-            os.environ["LANGFUSE_HOST"] = os.environ["LANGFUSE_BASE_URL"]
-            
-        public_key = os.environ.get("LANGFUSE_PUBLIC_KEY")
-        secret_key = os.environ.get("LANGFUSE_SECRET_KEY")
-        
-        if public_key and secret_key:
+        if _langfuseConfigured():
             _langfuse_handler = CallbackHandler()
     return _langfuse_handler
+
+def newLangfuseHandler() -> CallbackHandler | None:
+    """
+    Returns a new CallbackHandler (the Langfuse client behind it stays shared), or None without keys.
+
+    The cached handler keeps one `last_trace_id` for the whole process, which concurrent runs overwrite.
+    A run that logs its own trace id needs a handler of its own.
+    """
+    return CallbackHandler() if _langfuseConfigured() else None
 
 def getLangfuseConfig(
     trace_name: str,
     projectId: str = None,
     userId: str = None,
     session_id: str = None,
-    tags: list[str] = None
+    tags: list[str] = None,
+    perRequestHandler: bool = False
 ) -> dict:
     """
     Constructs the config dictionary to pass to LangChain chain executions
     (e.g., config=getLangfuseConfig(...)) containing callbacks for Langfuse.
     """
-    handler = getLangfuseHandler()
+    handler = newLangfuseHandler() if perRequestHandler else getLangfuseHandler()
     if not handler:
         return {}
         

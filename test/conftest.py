@@ -58,3 +58,19 @@ def _freshPaymentWorkerHeartbeat(request):
                 INSERT INTO private.payment_recovery_runtime(singleton,worker_seen_at) VALUES(true,clock_timestamp())
                 ON CONFLICT(singleton) DO UPDATE SET worker_seen_at=EXCLUDED.worker_seen_at; END IF; END $$''')
         db.close()
+
+
+@pytest.fixture(autouse=True)
+def _schemaCacheFailsFast(request):
+    """No test may wait on a Redis that isn't there.
+
+    `invalidate_data_cache` and `tableSchemas` reach Redis through `utils.tableSchemas._client`; here it raises
+    ConnectionError at once, so the real swallow-and-warn path runs everywhere. test_table_schemas.py uses its own fakes.
+    """
+    if request.node.fspath.basename == "test_table_schemas.py":
+        yield
+        return
+    from unittest import mock
+
+    with mock.patch("utils.tableSchemas._client", side_effect=ConnectionError("no Redis in unit tests")):
+        yield

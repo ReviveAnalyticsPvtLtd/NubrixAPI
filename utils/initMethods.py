@@ -111,6 +111,9 @@ _REDIS_MAX_ROWS = 100000
 # The largest file the parent caches for a sandbox. It never decodes one, so all it can go on is the file's size.
 _REDIS_MAX_SPOOLED_BYTES = 64 * 1024 * 1024
 _REDIS_SPOOLED_TTL_SECONDS = 300
+# How long Redis keeps a cached table: the small one, and a medium one (over 10,000 rows). Cached schemas use the longer.
+_REDIS_SMALL_TABLE_TTL_SECONDS = 600
+_REDIS_MEDIUM_TABLE_TTL_SECONDS = 300
 
 # Set in sandbox children, where the parent process supplies tables.
 _TABLE_SOURCE: "Callable[[str], pa.Table] | None" = None
@@ -252,9 +255,9 @@ def _store_to_redis(redis_key: str, table: "pa.Table") -> None:
         return
 
     if num_rows <= 10000:
-        ttl = 600  # 10 minutes for small tables
+        ttl = _REDIS_SMALL_TABLE_TTL_SECONDS
     else:
-        ttl = 300  # 5 minutes for medium tables
+        ttl = _REDIS_MEDIUM_TABLE_TTL_SECONDS
 
     r = redis.Redis(connection_pool=_redis_pool())
     try:
@@ -446,7 +449,18 @@ def classify_table_size(projectId: str, tableName: str) -> dict:
 
 
 def invalidate_data_cache(projectId: str | None = None, tableName: str | None = None) -> None:
-    """Drop cached tables for a project/table. Call after transformations apply."""
+    """Drop cached tables for a project/table. Call after transformations apply.
+
+    Also drops the cached Arrow schemas (best effort, never raises) when a project is named.
+    """
+    _drop_local_cache(projectId, tableName)
+    if projectId is not None:
+        from utils.tableSchemas import dropSchemas
+
+        dropSchemas(projectId, tableName)
+
+
+def _drop_local_cache(projectId: str | None, tableName: str | None) -> None:
     global _DF_CACHE_BYTES
     with _DF_CACHE_LOCK:
         if projectId is None and tableName is None:
@@ -471,6 +485,16 @@ def forget_table(projectId: str, tableName: str) -> None:
     Other workers drop their copy when it expires. This worker's copy goes first,
     then Redis, which raises if it fails so a caller that can retry the delete may stop.
     """
-    invalidate_data_cache(projectId, tableName)
+    from utils.tableSchemas import schemasKey
+
+    _drop_local_cache(projectId, tableName)
     r = redis.Redis(connection_pool=_redis_pool())
-    r.delete(f"{projectId}::{tableName}", f"{projectId}::metadata.json", f"{projectId}::metadata")
+    # One transaction, so a failure can't clear the data and leave the schema cached; execute raises as a lone DEL did.
+    pipe = r.pipeline(transaction=True)
+    pipe.delete(
+        f"{projectId}::{tableName}",
+        f"{projectId}::metadata.json",
+        f"{projectId}::metadata",
+    )
+    pipe.hdel(schemasKey(projectId), tableName)
+    pipe.execute()

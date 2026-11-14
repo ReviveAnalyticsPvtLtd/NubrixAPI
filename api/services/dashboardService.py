@@ -764,26 +764,29 @@ class DashboardService:
                 futures = [executor.submit(self._pullData, connection) for connection in connections]
                 results = [x.result() for x in futures]
                 results = {connection.get("table"): result for connection, result in zip(connections, results)}
-            for result in results:
-                # A folder rather than an open temporary file, which other writers cannot reopen on every platform.
-                with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as folder:
-                    path = os.path.join(folder, "table.parquet")
-                    writeStoredTableToPath(results[result], projectId, result, path)
-                    _ = self.client.storage.from_("AnalyticsHub").upload(
-                        file = path,
-                        path = f"{projectId}/{result + '.parquet'}",
-                        file_options = {"upsert": "true"}
-                    )
-            # Deterministically refresh row/column counts in metadata.json so
-            # they never drift from the just-refreshed parquet files.
-            shapes = {name: [int(len(df.index)), int(len(df.columns))] for name, df in results.items()}
-            self._updateMetadataShapes(projectId, shapes)
-            # Drop the in-process Arrow LRU so fetch/classify see the new data.
             try:
-                from utils.initMethods import invalidate_data_cache
-                invalidate_data_cache(projectId=projectId)
-            except Exception as e:
-                logger.warning(f"Failed to invalidate data cache after refresh for {projectId}: {e}")
+                for result in results:
+                    # A folder rather than an open temporary file, which other writers cannot reopen on every platform.
+                    with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as folder:
+                        path = os.path.join(folder, "table.parquet")
+                        writeStoredTableToPath(results[result], projectId, result, path)
+                        _ = self.client.storage.from_("AnalyticsHub").upload(
+                            file = path,
+                            path = f"{projectId}/{result + '.parquet'}",
+                            file_options = {"upsert": "true"}
+                        )
+                # Deterministically refresh row/column counts in metadata.json so
+                # they never drift from the just-refreshed parquet files.
+                shapes = {name: [int(len(df.index)), int(len(df.columns))] for name, df in results.items()}
+                self._updateMetadataShapes(projectId, shapes)
+            finally:
+                # Drop the cached tables so fetch/classify see the new data, even when a later upload
+                # failed after earlier tables were already replaced.
+                try:
+                    from utils.initMethods import invalidate_data_cache
+                    invalidate_data_cache(projectId=projectId)
+                except Exception as e:
+                    logger.warning(f"Failed to invalidate data cache after refresh for {projectId}: {e}")
             updateProjectModifiedAt(projectId)
             return {"status": "SUCCESS"}
         except Exception as e:

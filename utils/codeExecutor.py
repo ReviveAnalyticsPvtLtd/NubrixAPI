@@ -44,10 +44,11 @@ class REPLManager:
         self.maxConcurrentPerProject = maxConcurrentPerProject
 
     @contextlib.contextmanager
-    def _projectSlot(self, projectId: str, waitSeconds: float):
+    def _projectSlot(self, projectId: str, waitSeconds: float, onlyIfIdle: bool = False):
         """Take one entry of the project's Redis semaphore, trying for up to `waitSeconds` (at least one attempt).
 
-        Yields whether an entry was taken and releases it on exit. A Redis failure counts as taken, as it always has.
+        With `onlyIfIdle` an entry is taken only while the project has none running. Yields whether an entry was taken
+        and releases it on exit. A Redis failure counts as taken, as it always has.
         """
         r = creditService._redis()
         sem_key = f"semaphore:{projectId}"
@@ -60,7 +61,7 @@ class REPLManager:
             try:
                 r.zremrangebyscore(sem_key, 0, time.time() - staleSeconds)
                 count = r.zcard(sem_key)
-                if count < self.maxConcurrentPerProject:
+                if count < (1 if onlyIfIdle else self.maxConcurrentPerProject):
                     r.zadd(sem_key, {slot_id: time.time()})
                     r.expire(sem_key, int(staleSeconds))
                     acquired = True
@@ -84,14 +85,15 @@ class REPLManager:
     def runSql(self, request: dict, projectId: str, waitForSlot: bool = True) -> SandboxResult:
         """Run one SQL chart query under the project's semaphore. Raises SandboxBusyError when the project or the sandbox is full.
 
-        With `waitForSlot` False it makes one attempt at each, so a caller that can retry later is never held up.
+        With `waitForSlot` False (a shadow run) it makes one attempt at each, so a caller that can retry later is never held
+        up, and it runs only while the project has nothing else running and the sandbox has slots to spare.
         """
-        with self._projectSlot(projectId, 30.0 if waitForSlot else 0) as acquired:
+        with self._projectSlot(projectId, 30.0 if waitForSlot else 0, onlyIfIdle=not waitForSlot) as acquired:
             if not acquired:
                 raise SandboxBusyError(f"Too many running code execution tasks for project '{projectId}'.")
             if waitForSlot:
                 return runSqlSandbox(projectId=projectId, request=request, timeoutSeconds=self.timeoutSeconds)
-            return runSqlSandbox(projectId=projectId, request=request, timeoutSeconds=self.timeoutSeconds, slotWaitSeconds=0)
+            return runSqlSandbox(projectId=projectId, request=request, timeoutSeconds=self.timeoutSeconds, slotWaitSeconds=0, requireHeadroom=True)
 
     def run(self, codeString: str, projectId: str = None, filters: list | None = None) -> str:
         if not projectId:

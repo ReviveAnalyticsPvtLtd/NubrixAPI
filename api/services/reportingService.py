@@ -13,11 +13,17 @@ from api.models import GenerateChartInput, PanelChartDetails, GenerateChartsInPa
 from nubrix.components.llmChainFactory import buildLlmChain
 from nubrix.workflows.reportingToolWorkflow import buildReportingWorkflow
 from nubrix.workflows.parallelReportingToolWorkflow import buildParallelReportingWorkflow
+from nubrix.workflows.sqlChartWorkflow import activeTableNames, buildSqlChartWorkflow
+from nubrix.components.chartCompare import compareCharts
+from nubrix.components.chartContract import contractErrors
+from nubrix.components.chartEngineMode import chartEngineMode
+from nubrix.components.chartFailureLog import redactedFirstLine, traceIdOf
+from utils.sandboxSlots import BUSY_MESSAGE, isBusy
 from api.services.credits.creditTrackingCallback import CreditTrackingCallback
 from api.commons import updateProjectModifiedAt
 from utils.exceptionHandler import CustomException
 from utils.storedTables import tableReadException
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import Future, ThreadPoolExecutor
 from utils.initMethods import fetch_data, scan_data
 from utils.projectStorage import authHeaders, objectUrl
 from nubrix.utils import readYaml
@@ -32,6 +38,7 @@ import orjson
 import random
 import json
 import threading
+import copy
 import uuid
 import time
 import os
@@ -64,12 +71,200 @@ def initWorkflow():
     finally:
         logger.enable("")
 
-def initParallelWorkflow():
+def initParallelWorkflow(mode: str | None = None):
+    """Builds this thread's parallel workflow for `mode` (the engine mode when not given), as the pool initializer."""
     logger.disable("")
     try:
-        threadLocal.parallelWorkflow = buildParallelReportingWorkflow()
+        if (mode or chartEngineMode()) == "on":
+            threadLocal.sqlParallelWorkflow = buildSqlChartWorkflow(parallel=True)
+        else:
+            threadLocal.parallelWorkflow = buildParallelReportingWorkflow()
     finally:
         logger.enable("")
+
+
+# The SQL chart engine (CHART_ENGINE=on serves it, shadow runs it after the Python response).
+_sqlWorkflows: dict[bool, object] = {}
+_sqlWorkflowsLock = threading.Lock()
+
+
+def _sqlWorkflow():
+    """The one SQL chart workflow of the process, built on first use. Chains and sandbox manager hold no per-run state."""
+    with _sqlWorkflowsLock:
+        if False not in _sqlWorkflows:
+            _sqlWorkflows[False] = buildSqlChartWorkflow()
+        return _sqlWorkflows[False]
+
+
+def _threadSqlParallelWorkflow():
+    """This thread's parallel SQL workflow, built on first use, like the Python one in `initParallelWorkflow`."""
+    workflow = getattr(threadLocal, "sqlParallelWorkflow", None)
+    if workflow is None:
+        workflow = threadLocal.sqlParallelWorkflow = buildSqlChartWorkflow(parallel=True)
+    return workflow
+
+
+def _sqlConfig(traceName: str, tags: list[str], projectId: str, userId: str | None, shadow: bool = False) -> dict:
+    """The config of one SQL run: its own Langfuse handler (so its trace id is its own) and, served, the credit callback.
+
+    A shadow run never carries `CreditTrackingCallback` and says so in `configurable`, which makes the sandbox calls
+    skip waiting for a slot. It also gets an empty `outcome` dict there, which the workflow fills with a failure's stage.
+    """
+    from utils.llm import getLangfuseConfig
+    config = getLangfuseConfig(trace_name=traceName, projectId=projectId, userId=userId, tags=tags, perRequestHandler=True)
+    if shadow:
+        config.setdefault("configurable", {}).update(shadow=True, outcome={})
+    elif userId:
+        config.setdefault("callbacks", []).append(CreditTrackingCallback(userId=userId, operationType="reporting_query"))
+    return config
+
+
+# Shadow runs: at most 2 at a time, at most 4 queued or running, and never on the request's thread.
+_SHADOW_WORKERS = 2
+_SHADOW_PERMITS = 4
+
+
+def _newShadowExecutor() -> ThreadPoolExecutor:
+    """The shadow pool: `_SHADOW_WORKERS` threads named chart-shadow."""
+    return ThreadPoolExecutor(max_workers=_SHADOW_WORKERS, thread_name_prefix="chart-shadow")
+
+
+_shadowExecutor = _newShadowExecutor()
+_shadowSlots = threading.BoundedSemaphore(_SHADOW_PERMITS)
+_shadowClosed = threading.Event()
+_shadowCancelled = 0
+_shadowCancelledLock = threading.Lock()
+
+
+def _shadowDone(future: Future) -> None:
+    """Done-callback of every admitted run. A run cancelled before it started never reaches its `finally`, so its permit comes back here."""
+    global _shadowCancelled
+    if future.cancelled():
+        _shadowSlots.release()
+        with _shadowCancelledLock:
+            _shadowCancelled += 1
+
+
+def shutdownShadow() -> None:
+    """Stops admitting shadow runs and cancels the queued ones, without waiting for the running ones. Call it when the app shuts down.
+
+    Each cancelled run gives its permit back and is counted in the `chart_shadow_shutdown` line, which is written only
+    when at least one run was cancelled, so a worker that queued none (off mode) logs nothing at exit.
+    """
+    _shadowClosed.set()
+    with _shadowCancelledLock:
+        before = _shadowCancelled
+    try:
+        _shadowExecutor.shutdown(wait=False, cancel_futures=True)
+    except Exception as e:
+        logger.warning(f"Could not shut down the shadow chart pool: {type(e).__name__}")
+    with _shadowCancelledLock:
+        cancelled = _shadowCancelled - before
+    if not cancelled:
+        return
+    try:
+        logger.info("chart_shadow_shutdown " + json.dumps({"cancelled": cancelled}))
+    except Exception as e:
+        logger.warning(f"chart_shadow_shutdown line could not be written: {type(e).__name__}")
+
+
+def _chartOk(output) -> bool:
+    return isinstance(output, dict) and "error" not in output and "chartType" in output
+
+
+def _logShadow(record: dict) -> None:
+    """One `chart_shadow` line: ids, outcomes and counts only, never a data value. A failure to log is only a warning."""
+    try:
+        logger.info("chart_shadow " + json.dumps(record, sort_keys=True))
+    except Exception as e:
+        logger.warning(f"chart_shadow line could not be written: {type(e).__name__}")
+
+
+def _shadowRecord(parallel: bool, projectId: str, pythonOutput, **outcome) -> dict:
+    record = {
+        "traceId": None, "projectId": projectId, "parallel": parallel, "pythonOk": _chartOk(pythonOutput),
+        "sqlOk": None, "sqlStage": None, "agreement": None, "contractErrors": None,
+    }
+    record.update(outcome)
+    return record
+
+
+def _runShadow(parallel: bool, projectId: str, userId: str | None, metadata: dict, query: str, pythonOutput) -> None:
+    """Run the SQL engine for a request Python already answered, and log how it went. Never raises, always frees its permit."""
+    record = _shadowRecord(parallel, projectId, pythonOutput)
+    config = None
+    try:
+        try:
+            config = _sqlConfig("ReportingWorkflowShadow", ["reporting", "shadow"], projectId, userId, shadow=True)
+            workflow = _threadSqlParallelWorkflow() if parallel else _sqlWorkflow()
+            response = workflow.invoke({"metadata": metadata, "inputQuery": query, "projectId": projectId}, config=config)
+            output = response.get("finalOutput")
+            if isinstance(output, dict) and output.get("error") == BUSY_MESSAGE:
+                record["result"] = "dropped_busy"
+            elif _chartOk(output):
+                record.update(sqlOk=True, contractErrors=len(contractErrors(output)))
+                if record["pythonOk"]:
+                    record["agreement"] = compareCharts(pythonOutput, output)
+            elif isinstance(output, dict) and "error" in output:
+                # The workflow's stage name (as in the chart_failure line), never the message.
+                stage = (config.get("configurable") or {}).get("outcome", {}).get("stage")
+                record.update(sqlOk=False, sqlStage=stage if isinstance(stage, str) else "failed")
+            else:
+                record.update(sqlOk=False, sqlStage="doubt")
+        except Exception as error:
+            if isBusy(error):
+                record["result"] = "dropped_busy"
+            else:
+                # The class only: a model API or sandbox error's text can hold keys, ids or data.
+                record.update(sqlOk=False, sqlStage=type(error).__name__)
+        try:
+            record["traceId"] = traceIdOf(config)
+        except Exception:
+            pass
+        _logShadow(record)
+    finally:
+        _shadowSlots.release()
+
+
+def _submitShadow(*, parallel: bool, projectId: str, userId: str | None, metadata: dict, query: str, pythonOutput) -> Future | None:
+    """Queue the SQL run for a request Python has answered. Drops it, with a log line, when 4 are already queued or running.
+
+    Never raises into the request. The permit is taken first, so a dropped run pays nothing. Only an admitted run copies
+    the chart (the served dict may still be changed by the caller, so the shadow thread must not read it), and the
+    permit is released by the shadow run, or here when it cannot be queued. Call it off the event loop.
+    """
+    try:
+        if _shadowClosed.is_set():
+            _logShadow(_shadowRecord(parallel, projectId, pythonOutput, result="dropped_shutdown"))
+            return None
+        if not _shadowSlots.acquire(blocking=False):
+            _logShadow(_shadowRecord(parallel, projectId, pythonOutput, result="dropped_queue"))
+            return None
+        try:
+            pythonOutput = copy.deepcopy(pythonOutput)
+            future = _shadowExecutor.submit(_runShadow, parallel, projectId, userId, metadata, query, pythonOutput)
+            future.add_done_callback(_shadowDone)
+            return future
+        except BaseException:
+            _shadowSlots.release()
+            raise
+    except Exception as e:
+        logger.warning(f"Could not queue the shadow chart run: {type(e).__name__}")
+        return None
+
+
+def _failureCard(query: str, errorText: str) -> dict:
+    return {
+        "finalOutput": {
+            "chartType": "card",
+            "title": f"Chart: {query}",
+            "label": "Status",
+            "xLabels": "Status",
+            "yLabels": "Value",
+            "data": "Error/No data"
+        },
+        "generatedCode": f"# Failed to generate code for: {query}\n# Error: {errorText}"
+    }
 
 class ReportingService:
     """
@@ -486,21 +681,29 @@ class ReportingService:
         the FastAPI event loop. Metadata is fetched asynchronously via httpx with a cache.
         """
         try:
-            from utils.llm import getLangfuseConfig
-            reportConfig = getLangfuseConfig(
-                trace_name="ReportingWorkflow", projectId=chartDetails.projectId, userId=userId,
-                tags=["reporting", "generateChart"],
-            )
-            if userId:
-                reportConfig.setdefault("callbacks", []).append(
-                    CreditTrackingCallback(userId=userId, operationType="reporting_query")
+            mode = chartEngineMode()
+            if mode == "on":
+                workflow = _sqlWorkflow()
+                reportConfig = _sqlConfig(
+                    "ReportingWorkflow", ["reporting", "generateChart"], chartDetails.projectId, userId,
                 )
+            else:
+                from utils.llm import getLangfuseConfig
+                workflow = self.reportingToolWorkflow
+                reportConfig = getLangfuseConfig(
+                    trace_name="ReportingWorkflow", projectId=chartDetails.projectId, userId=userId,
+                    tags=["reporting", "generateChart"],
+                )
+                if userId:
+                    reportConfig.setdefault("callbacks", []).append(
+                        CreditTrackingCallback(userId=userId, operationType="reporting_query")
+                    )
 
             metadata = await self._getProjectMetadata(chartDetails.projectId)
             loop = asyncio.get_running_loop()
             response = await loop.run_in_executor(
                 None,
-                lambda: self.reportingToolWorkflow.invoke(
+                lambda: workflow.invoke(
                     {
                         "metadata": metadata,
                         "inputQuery": chartDetails.inputQuery,
@@ -510,6 +713,15 @@ class ReportingService:
                 ),
             )
             updateProjectModifiedAt(chartDetails.projectId)
+            if mode == "shadow":
+                # Not awaited: the permit check and the copy run on a pool thread and never delay the response.
+                loop.run_in_executor(
+                    None,
+                    lambda: _submitShadow(
+                        parallel=False, projectId=chartDetails.projectId, userId=userId, metadata=metadata,
+                        query=chartDetails.inputQuery, pythonOutput=response.get("finalOutput"),
+                    ),
+                )
             return response
         except Exception as e:
             exception = CustomException(e)
@@ -517,7 +729,7 @@ class ReportingService:
             raise exception
 
     @staticmethod
-    def _generateSingleChartForParallel(metadata: dict, projectId: str, query: str, userId: str | None = None) -> dict:
+    def _generateSingleChartForParallel(metadata: dict, projectId: str, query: str, userId: str | None = None, mode: str | None = None) -> dict:
         """
         Helper function to generate a single chart in parallel.
 
@@ -526,21 +738,27 @@ class ReportingService:
             projectId: The project ID.
             query: The input query for the chart.
             userId: The user ID for credit/observability tracking.
+            mode: The engine mode of the batch this chart belongs to; read from the environment when not given.
 
         Returns:
             dict: The generated chart data.
         """
         try:
-            from utils.llm import getLangfuseConfig
-            workflow = threadLocal.parallelWorkflow
-            reportConfig = getLangfuseConfig(
-                trace_name="ParallelReportingWorkflow", projectId=projectId, userId=userId,
-                tags=["reporting", "parallelChart"],
-            )
-            if userId:
-                reportConfig.setdefault("callbacks", []).append(
-                    CreditTrackingCallback(userId=userId, operationType="reporting_query")
+            mode = mode or chartEngineMode()
+            if mode == "on":
+                workflow = _threadSqlParallelWorkflow()
+                reportConfig = _sqlConfig("ParallelReportingWorkflow", ["reporting", "parallelChart"], projectId, userId)
+            else:
+                from utils.llm import getLangfuseConfig
+                workflow = threadLocal.parallelWorkflow
+                reportConfig = getLangfuseConfig(
+                    trace_name="ParallelReportingWorkflow", projectId=projectId, userId=userId,
+                    tags=["reporting", "parallelChart"],
                 )
+                if userId:
+                    reportConfig.setdefault("callbacks", []).append(
+                        CreditTrackingCallback(userId=userId, operationType="reporting_query")
+                    )
             response = workflow.invoke({
                 "metadata": metadata,
                 "inputQuery": query,
@@ -549,20 +767,20 @@ class ReportingService:
             _ = response.pop("metadata", None)
             _ = response.pop("rephrasedQuery", None)
             _ = response.pop("codeOutput", None)
+            finalOutput = response.get("finalOutput")
+            if mode == "shadow":
+                _submitShadow(
+                    parallel=True, projectId=projectId, userId=userId, metadata=metadata, query=query, pythonOutput=finalOutput,
+                )
+            if isinstance(finalOutput, dict) and "error" in finalOutput:
+                # Either engine: a chart that ended in an error is a failure card, not a widget with no chart type.
+                # The saved text is the error's first line with data values redacted, as in the failure log, which
+                # keeps the project's own table names.
+                return _failureCard(query, redactedFirstLine(str(finalOutput["error"]), activeTableNames(metadata)))
             return response
         except Exception as e:
             logger.error(f"Failed to generate parallel chart for query '{query}': {e}")
-            return {
-                "finalOutput": {
-                    "chartType": "card",
-                    "title": f"Chart: {query}",
-                    "label": "Status",
-                    "xLabels": "Status",
-                    "yLabels": "Value",
-                    "data": "Error/No data"
-                },
-                "generatedCode": f"# Failed to generate code for: {query}\n# Error: {e}"
-            }
+            return _failureCard(query, str(e))
 
     async def generateChartsInParallel(self, details: GenerateChartsInParallel, userId: str | None = None) -> dict:
         """
@@ -576,6 +794,8 @@ class ReportingService:
             than process workers is intentional and safe.
         """
         try:
+            # One mode for the whole batch: the pool threads and every chart use the mode read here.
+            mode = chartEngineMode()
             metadata = await self._getProjectMetadata(details.projectId)
             insightsUrl = self._projectMetadataUrl(details.projectId, "insights.json")
             try:
@@ -591,9 +811,9 @@ class ReportingService:
             # Scale workers with the box; cap to avoid LLM rate-limit thrash on huge batches.
             from utils.sizing import parallel_chart_workers
             max_workers = parallel_chart_workers()
-            with ThreadPoolExecutor(max_workers=max_workers, initializer=initParallelWorkflow) as executor:
+            with ThreadPoolExecutor(max_workers=max_workers, initializer=initParallelWorkflow, initargs=(mode,)) as executor:
                 futures = [
-                    executor.submit(self._generateSingleChartForParallel, metadata, details.projectId, query, userId)
+                    executor.submit(self._generateSingleChartForParallel, metadata, details.projectId, query, userId, mode)
                     for query in uniqueQueries
                 ]
                 responses = [f.result() for f in futures]
