@@ -299,28 +299,9 @@ class ReportingService:
 
     @staticmethod
     def _augment_with_size_hints(metadata: dict, projectId: str) -> dict:
-        """Annotate each table entry in metadata with a deterministic size_class.
-
-        The metadata shape is ``{<tableName>: {"shape": [rows, cols], "columns": [...]}}``.
-        The hint steers the LLM away from guessing memory cost and toward lazy
-        Polars for large tables.
-        """
-        from utils.initMethods import classify_table_size
-        size_by_table = (metadata or {}).get(...) if isinstance(metadata, dict) else None
-        if size_by_table is None:
-            size_by_table = {}
-        for table_name, entry in (metadata or {}).items():
-            if not isinstance(entry, dict) or table_name.startswith("_"):
-                continue
-            cls = classify_table_size(projectId, table_name)
-            entry["size_class"] = cls.get("size_class", "unknown")
-            entry["size_hint"] = cls.get("hint", "")
-            existing_rows = cls.get("rows_estimate")
-            if existing_rows is not None and "shape" in entry and isinstance(entry["shape"], list):
-                entry["_size_check"] = (existing_rows == entry["shape"][0])
-            # Pre-warm the in-process Arrow cache so the post-processor can route
-            # by row count synchronously without an extra parquet read.
-        return metadata
+        """Annotate each table entry in metadata with a deterministic size_class. See `utils.modelMetadata`."""
+        from utils.modelMetadata import augmentWithSizeHints
+        return augmentWithSizeHints(metadata, projectId)
 
     async def _getProjectMetadata(self, projectId: str) -> dict:
         """Fetch project metadata with a two-layer cache + per-table size hint annotation.

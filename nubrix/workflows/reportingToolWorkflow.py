@@ -13,7 +13,7 @@ from nubrix.components.queryRephraser import QueryRephaser
 from nubrix.components.llmChainFactory import buildLlmChain
 from langgraph.graph import StateGraph, START, END
 from utils.codeExecutor import REPLManager, _remove_code_fences
-from typing_extensions import TypedDict
+from typing_extensions import NotRequired, TypedDict
 from utils.logger import logger
 from utils.sandboxSlots import BUSY_MESSAGE, SandboxBusyError
 from utils.mapPointLabels import ensureScatterMapPointLabels
@@ -32,6 +32,8 @@ class State(TypedDict):
     codeOutput: str
     finalOutput: dict
     debugAttempts: int
+    # The project's metadata.json for a caller that has it in hand (the evaluation harness); a served request has none.
+    knownMetadata: NotRequired[dict]
 
 class ReportingToolWorkflow:
     """
@@ -74,7 +76,7 @@ class ReportingToolWorkflow:
         })
         pid = state["projectId"]
         response = self._injectProjectId(response, pid)
-        response = self._route_large_tables_to_scan(response, pid)
+        response = self._route_large_tables_to_scan(response, pid, state.get("knownMetadata"))
         # Normalize every json.dumps() call to have exactly one default=serializer
         # (LLM sometimes emits default=str or duplicate default= kwargs → SyntaxError).
         import re as _re
@@ -93,7 +95,7 @@ class ReportingToolWorkflow:
         }
 
     @staticmethod
-    def _route_large_tables_to_scan(code: str, projectId: str) -> str:
+    def _route_large_tables_to_scan(code: str, projectId: str, knownMetadata: dict | None = None) -> str:
         """Rewrite eager ``fetch_data_pl("<pid>", "<table>")`` -> lazy ``scan_data(...)``.
 
         Only applied to tables with rows >= LAZY_FETCH_ROW_THRESHOLD (default 1M)
@@ -110,7 +112,7 @@ class ReportingToolWorkflow:
             return code
         def _maybe_swap(match: re.Match) -> str:
             table = match.group(1)
-            size = classify_table_size(projectId, table)
+            size = classify_table_size(projectId, table) if knownMetadata is None else classify_table_size(projectId, table, knownMetadata=knownMetadata)
             rows = size.get("rows_estimate")
             if isinstance(rows, int) and rows >= threshold:
                 return f'scan_data("{projectId}", "{table}"'
@@ -172,7 +174,7 @@ class ReportingToolWorkflow:
         })
         pid = state["projectId"]
         response = self._injectProjectId(response, pid)
-        response = self._route_large_tables_to_scan(response, pid)
+        response = self._route_large_tables_to_scan(response, pid, state.get("knownMetadata"))
         return {
             "generatedCode": response,
             "debugAttempts": attempts + 1,
