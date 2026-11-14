@@ -9,7 +9,9 @@ __author__ = "Rauhan Ahmed Siddiqui"
 __all__ = ["dashboardService"] 
 
 
-from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor
+from collections import Counter
+from collections.abc import Sequence
+from concurrent.futures import ThreadPoolExecutor
 from api.commons import updateProjectModifiedAt
 from utils.exceptionHandler import CustomException
 from utils.storageListing import listProjectFiles
@@ -21,6 +23,10 @@ from utils.storedTables import decodeStoredTable, tableReadException, tableWrite
 from utils.logger import logger
 from utils.mapPointLabels import ensureScatterMapPointLabels
 from api.commons import client
+from nubrix.components.chartBuilder import emptyChart
+from nubrix.components.chartEngine import renderChartRequest
+from nubrix.components.chartRequest import decodeGeneratedCode
+from nubrix.components.sqlCheck import _foldName
 from api.models import (
     DeleteDashboardElement,
     ExportToDashboard,
@@ -28,24 +34,114 @@ from api.models import (
     CreatePage,
     GetData
 )
+import builtins
 import pandas as pd
 import tempfile
 import uuid
 import json
-import ast
 import os
 import io
 import re
 
-class _FetchDataFilterTransformer(ast.NodeTransformer):
-    def __init__(self, filters: list):
-        self.filters = filters
+_CHART_KEYS = ("chartType", "title", "xLabels", "yLabels", "label", "data", "map", "columns")
+FAILED_CODE_PREFIX = "# Failed to generate code"
 
-    def visit_Call(self, node):
-        if isinstance(node.func, ast.Name) and node.func.id == "fetch_data":
-            filters_node = ast.parse(repr(self.filters)).body[0].value
-            node.args.append(filters_node)
-        return self.generic_visit(node)
+
+class _RerunFailure(Exception):
+    """A saved Python widget's run did not return a chart. `kind` is safe to log: it never holds output text."""
+
+    def __init__(self, kind: str) -> None:
+        super().__init__(kind)
+        self.kind = kind
+
+
+_EXCEPTION_SUFFIXES = ("Error", "Exception", "Warning", "Exit", "Interrupt")
+
+
+def _exceptionClass(traceback: str) -> str:
+    """
+    The exception class of a Python traceback, or "unknown exception". Never any message text.
+
+    The exception line is the first line without leading whitespace after the last `  File "` frame line (source
+    and caret lines are indented); the message may continue on later lines, which can hold data values. The dotted
+    name at its start counts only when `:` or the end of the line follows it, and it looks like an exception class.
+    """
+    lines = traceback.splitlines()
+    frames = [index for index, line in enumerate(lines) if line.startswith('  File "')]
+    if not frames:
+        return "unknown exception"
+    for line in lines[frames[-1] + 1:]:
+        if not line or line[0].isspace():
+            continue
+        match = re.match(r"([A-Za-z_]\w*(?:\.[A-Za-z_]\w*)*)(?::|$)", line.rstrip())
+        if match is None:
+            return "unknown exception"
+        name = match.group(1)
+        last = name.rsplit(".", 1)[-1]
+        builtin = getattr(builtins, last, None) if "." not in name else None
+        if last.endswith(_EXCEPTION_SUFFIXES) or (isinstance(builtin, type) and issubclass(builtin, BaseException)):
+            return name
+        return "unknown exception"
+    return "unknown exception"
+
+
+def _metadataTableNames(metadata: dict) -> tuple[str, ...]:
+    """
+    Every table in a project's metadata.json, active or inactive: each key not starting with `_` whose value is a
+    table entry (a dict). `isActive` is ignored on purpose: a saved widget re-runs on any table the project has,
+    as a saved Python widget does. Only new chart generation is limited to active tables.
+
+    The order is fixed: the active tables in metadata order, then the inactive ones in metadata order. The SQL check
+    keeps the first name it is given for each case-folded name (DuckDB names ignore case), so a name that matches an
+    active and an inactive table resolves to the active one, the same on every worker.
+    """
+    tables = [
+        (name, entry) for name, entry in metadata.items()
+        if isinstance(name, str) and not name.startswith("_") and isinstance(entry, dict)
+    ]
+    active = [name for name, entry in tables if entry.get("isActive", True) is not False]
+    inactive = [name for name, entry in tables if entry.get("isActive", True) is False]
+    return tuple(active + inactive)
+
+
+def _storedTableNames(files: list[dict]) -> tuple[str, ...]:
+    """
+    The tables stored in a project folder: the name of each `<table>.parquet` file, the files a Python widget reads,
+    sorted.
+
+    Names that differ only in case (folded as the SQL check and DuckDB fold them) are all left out: the listing can't
+    tell which of them is active, and showing the wrong table's numbers is worse than not refreshing. A widget naming
+    one of them is refused by the check and keeps its saved data.
+    """
+    suffix = ".parquet"
+    names = {entry.get("name") for entry in files if isinstance(entry, dict)}
+    tables = sorted(
+        name[:-len(suffix)] for name in names
+        if isinstance(name, str) and name.endswith(suffix) and len(name) > len(suffix)
+    )
+    spellings = Counter(_foldName(name) for name in tables)
+    return tuple(name for name in tables if spellings[_foldName(name)] == 1)
+
+
+def _pythonResult(output: str) -> dict:
+    """The chart dict a saved Python widget printed, or `_RerunFailure` naming only the kind of failure."""
+    try:
+        result = json.loads(output)
+    except ValueError:
+        text = output.strip() if isinstance(output, str) else ""
+        if text.startswith("Execution timed out"):
+            raise _RerunFailure("timed out")
+        if text.startswith("Concurrency limit reached"):
+            raise _RerunFailure("concurrency limit")
+        if text.startswith("Traceback"):
+            raise _RerunFailure(_exceptionClass(text))
+        raise _RerunFailure("not JSON")
+    if isinstance(result, dict) and "error" in result:
+        raise _RerunFailure("error key")
+    if not isinstance(result, dict):
+        raise _RerunFailure("not JSON")
+    return result
+
 
 class DashboardService:
     """
@@ -62,40 +158,154 @@ class DashboardService:
         self.client = client
 
     @staticmethod
-    def _addCodeFences(code: str):
-        """Add code fences to a string."""
-        return "```python\n" + code.strip() + "\n```"
+    def _rerunWidget(widget: dict, filters: list | None, projectId: str, rerunTables: Sequence[str] | None) -> tuple[dict, bool]:
+        """Re-run one saved widget; see `_rerunWidgetProduced`. Returns the widget copy and whether the run succeeded."""
+        fresh, produced = DashboardService._rerunWidgetProduced(widget, filters, projectId, rerunTables)
+        return fresh, produced is not None
 
     @staticmethod
-    def _applyFilterToAWidget(widget: dict, filters: list, codeExecutor: callable, projectId: str) -> dict:
+    def _rerunWidgetProduced(widget: dict, filters: list | None, projectId: str, rerunTables: Sequence[str] | None) -> tuple[dict, dict | None]:
         """
-        Apply filters to a widget's generated code and update its data accordingly.
+        Re-run one saved widget in its own form and return a copy with the new chart data.
+
+        A ChartRequest runs through the SQL path with lenient limits. Anything else is the old Python, run with the
+        filters as run input. `generatedCode`, `id` and `layout` are never changed.
+
+        Args:
+            widget (dict): The saved widget.
+            filters (list | None): The sidebar filters, if any.
+            projectId (str): The project.
+            rerunTables (Sequence[str] | None): Names of every table of the project, active or inactive (the tables a
+                saved Python widget can read), for the SQL check, in the order it should prefer a spelling; see
+                `_rerunTables`. None means no list could be read, so a ChartRequest widget fails (a Python widget
+                does not need it).
+
+        Returns:
+            tuple[dict, dict | None]: The widget copy, and the keys the run produced (None when it failed, and
+                the widget is returned as it was). A Python run produces every key of its output except `id`,
+                `layout` and `generatedCode`; a ChartRequest run produces the chart keys it returned. A refresh
+                saves exactly these keys.
+
+        Raises:
+            SandboxBusyError: The sandbox has no free slot. Nothing is returned for the widget.
         """
         widget = widget.copy()
-        code = widget.get("generatedCode")
-        if "```" in code: code = _remove_code_fences(code)
-        tree = ast.parse(code)
-        transformer = _FetchDataFilterTransformer(filters)
-        tree = transformer.visit(tree)
-        ast.fix_missing_locations(tree)
-        code = ast.unparse(tree)
-        code = DashboardService._addCodeFences(code)
-        result = codeExecutor.run(code, projectId=projectId)
-        widget["generatedCode"] = code
+        form = "chartRequest"
         try:
-            resultDict = json.loads(result)
-            widget.update(resultDict)
-        except:
-            widgetChartType = widget.get("chartType")
-            if widgetChartType == "card":
-                widget["data"] = None
+            request = decodeGeneratedCode(widget.get("generatedCode"))
+            if request is not None:
+                if rerunTables is None:
+                    raise ValueError("the project's table list could not be read")
+                result = renderChartRequest(replManager, projectId, request, rerunTables, filters=filters, lenient=True)
             else:
-                dataKey = widget.get("data")
-                datasets = dataKey.get("datasets")
-                for dataset in datasets:
-                    dataset["data"] = list()
+                form = "python"
+                code = widget.get("generatedCode")
+                if isinstance(code, str) and "```" in code:
+                    code = _remove_code_fences(code)
+                result = _pythonResult(replManager.run(code, projectId=projectId, filters=filters))
+        except Exception as error:
+            if isBusy(error):
+                raise
+            # Widget id, form and failure kind only: output text and filter values can hold data.
+            kind = error.kind if isinstance(error, _RerunFailure) else type(error).__name__
+            logger.warning(f"Widget {widget.get('id')} could not be re-run ({form}): {kind}")
+            return widget, None
+        kept = {key: widget.get(key) for key in ("id", "layout", "generatedCode") if key in widget}
+        produced = (
+            {key for key in result if key not in ("id", "layout", "generatedCode")}
+            if request is None
+            else {key for key in _CHART_KEYS if key in result}
+        )
+        widget.update({key: result[key] for key in produced})
+        widget.update(kept)
+        ensureScatterMapPointLabels(widget)
+        return widget, {key: widget[key] for key in produced}
+
+    @staticmethod
+    def _emptiedWidget(widget: dict) -> dict:
+        """A copy of a widget whose re-run failed under a filter: an empty chart of its own type, never old numbers."""
+        widget = widget.copy()
+        try:
+            empty = emptyChart(widget.get("chartType"), widget.get("title"), widget.get("xLabels") or None, widget.get("yLabels") or None)
+        except ValueError:
+            return widget
+        savedLabel = widget.get("label")
+        if widget.get("chartType") == "card" and isinstance(savedLabel, str) and savedLabel:
+            empty["label"] = savedLabel
+        widget.update(empty)
         return widget
-    
+
+    @staticmethod
+    def _isRerunnable(widget: object) -> bool:
+        """
+        Whether a saved widget has code worth re-running.
+
+        A widget needs `generatedCode` that is a non-empty string and not the failure card of an automatic
+        dashboard. A missing `chartType` does not matter: such a widget (an automatic dashboard chart that
+        failed when it was created) is re-run too, so a refresh can recover it. A widget without code, and the
+        failure card, have nothing to re-run.
+        """
+        if not isinstance(widget, dict):
+            return False
+        code = widget.get("generatedCode")
+        if not widget.get("chartType") and not (isinstance(code, str) and code.strip()):
+            return False
+        return not (isinstance(code, str) and code.lstrip().startswith(FAILED_CODE_PREFIX))
+
+    @staticmethod
+    def _usesChartRequest(widget: dict) -> bool:
+        try:
+            return decodeGeneratedCode(widget.get("generatedCode")) is not None
+        except ValueError:
+            return True
+
+    def _rerunWidgets(self, widgets: list, filters: list | None, projectId: str) -> list[tuple[dict, bool]]:
+        """Re-run every re-runnable widget, four at a time. A widget that isn't re-runnable comes back (widget, False)."""
+        return [(widget, produced is not None) for widget, produced in self._rerunProduced(widgets, filters, projectId)]
+
+    def _rerunProduced(self, widgets: list, filters: list | None, projectId: str) -> list[tuple[dict, dict | None]]:
+        """Like `_rerunWidgets`, but each result carries the keys the run produced (None when it failed or didn't run)."""
+        todo = [widget for widget in widgets if self._isRerunnable(widget)]
+        rerunTables: Sequence[str] | None = ()
+        if any(self._usesChartRequest(widget) for widget in todo):
+            rerunTables = self._rerunTables(projectId)
+        with ThreadPoolExecutor(max_workers = 4) as executor:
+            outcomes = iter(list(executor.map(lambda widget: self._rerunWidgetProduced(widget, filters, projectId, rerunTables), todo)))
+        return [next(outcomes) if self._isRerunnable(widget) else (widget, None) for widget in widgets]
+
+    def _rerunTables(self, projectId: str) -> tuple[str, ...] | None:
+        """
+        The tables a saved ChartRequest widget may name when it is re-run: every table of the project, active or
+        inactive, exactly the set a saved Python widget can read. New chart generation is not affected: it still
+        sees and accepts only active tables.
+
+        The list comes from metadata.json. When that can't be read (or isn't an object), it comes from the project's
+        stored table files, the `<table>.parquet` files a Python widget reads. When neither can be read, None: the
+        ChartRequest widgets are not re-run, while the Python ones still are. A busy sandbox error propagates.
+        Never logs an error's message, which can hold table names.
+
+        The tuple's order is fixed (`_metadataTableNames`, `_storedTableNames`): the SQL check keeps the first
+        spelling it sees of names that differ only in case, so a set here would resolve them differently per worker.
+        From metadata a clash resolves to the active table; the fallback leaves every clashing name out.
+        """
+        try:
+            metadata = readJson(projectId, "metadata.json")
+            if not isinstance(metadata, dict):
+                raise ValueError("metadata.json is not an object")
+            return _metadataTableNames(metadata)
+        except Exception as error:
+            if isBusy(error):
+                raise
+            logger.warning(f"The table list of project {projectId} could not be read from its metadata ({type(error).__name__}); its chart widgets use the stored table files.")
+        try:
+            return _storedTableNames(listProjectFiles(self.client, projectId))
+        except Exception as error:
+            if isBusy(error):
+                raise
+            # Only the new chart widgets need the list; the Python ones still run.
+            logger.warning(f"The stored table list of project {projectId} could not be read either ({type(error).__name__}); its chart widgets are not re-run.")
+            return None
+
     @staticmethod
     def _getDataTypes(projectId: str, tableName: str) -> list[dict]:   
         """
@@ -235,6 +445,36 @@ class DashboardService:
             logger.error(exception)
             raise exception  
         
+    def _saveRefreshed(self, details: GetData, produced: dict) -> dict | None:
+        """
+        Save refreshed widget data into the latest dashboard, not the copy read before the re-runs.
+
+        The re-runs can take minutes, so the dashboard may have changed meanwhile (a widget deleted, a layout
+        moved). The file is read again and each refreshed widget is merged by `id` into that copy: only the keys the
+        re-run produced change (`produced` maps widget id to them), so an edit made meanwhile to any other key stays. A widget that no longer exists
+        is skipped. Nothing is uploaded when no widget was merged.
+
+        Returns:
+            dict | None: The latest page (with its `id`), as saved, or as it already is when nothing was merged
+                (every refreshed widget was deleted meanwhile). None when the page is gone from the latest file.
+        """
+        latest = readJson(details.projectId, "dashboardConfig.json")
+        latestPage = latest.get(details.page)
+        if not isinstance(latestPage, dict) or not isinstance(latestPage.get("widgets"), list):
+            return None
+        merged = 0
+        for widget in latestPage["widgets"]:
+            keys = produced.get(widget.get("id")) if isinstance(widget, dict) else None
+            if keys is not None:
+                widget.update(keys)
+                merged += 1
+        if merged:
+            with io.BytesIO() as buffer:
+                buffer.write(json.dumps(latest, indent=4).encode("utf-8"))
+                buffer.seek(0)
+                _ = self.client.storage.from_("AnalyticsHub").upload(path = f"{details.projectId}/dashboardConfig.json", file = buffer.getvalue(), file_options = {"upsert": "true"})
+        return {**latestPage, "id": details.page}
+
     def getData(self, details: GetData) -> dict:
         """
         Retrieve data for a dashboard page, applying filters if provided.
@@ -256,28 +496,16 @@ class DashboardService:
                 pass
             elif (details.filters) and (not details.refresh):
                 widgets = pageInfo.get("widgets")
-                numWidgets = len(widgets)
-                with ProcessPoolExecutor(max_workers = 4) as executor:
-                    results = executor.map(self._applyFilterToAWidget, widgets, [details.filters] * numWidgets, [replManager] * numWidgets, [details.projectId] * numWidgets)
-                pageInfo["widgets"] = [x for x in results]
+                outcomes = self._rerunWidgets(widgets, details.filters, details.projectId)
+                pageInfo["widgets"] = [widget if succeeded else (self._emptiedWidget(widget) if self._isRerunnable(widget) and widget.get("chartType") else widget) for widget, succeeded in outcomes]
             elif (not details.filters) and (details.refresh):
                 widgets = pageInfo.get("widgets")
-                numWidgets = len(widgets)
-                with ProcessPoolExecutor(max_workers = 4) as executor:
-                    results = executor.map(self._applyFilterToAWidget, widgets, [details.filters] * numWidgets, [replManager] * numWidgets, [details.projectId] * numWidgets)
-                pageInfo["widgets"] = [x for x in results] 
-                prevPageInfo = dashboardConfig.get(details.page)
-                for prevWidget in prevPageInfo.get("widgets"):
-                    for newWidget in pageInfo.get("widgets"):
-                        if newWidget.get("id") == prevWidget.get("id"):
-                            prevWidget.update(newWidget)
-                        else:
-                            continue
-                dashboardConfig[details.page] = prevPageInfo
-                with io.BytesIO() as buffer:
-                    buffer.write(json.dumps(dashboardConfig, indent=4).encode("utf-8"))
-                    buffer.seek(0)
-                    _ = self.client.storage.from_("AnalyticsHub").upload(path = f"{details.projectId}/dashboardConfig.json", file = buffer.getvalue(), file_options = {"upsert": "true"})    
+                outcomes = self._rerunProduced(widgets, None, details.projectId)
+                if any(produced is not None for _, produced in outcomes):
+                    for saved, (fresh, produced) in zip(widgets, outcomes):
+                        if produced is not None:
+                            saved.update(fresh)
+                    pageInfo = self._saveRefreshed(details, {fresh.get("id"): produced for fresh, produced in outcomes if produced is not None and fresh.get("id") is not None}) or pageInfo
             else:
                 raise ValueError("Filters and Refresh cannot be implemented simultaneously.")
             widgets = pageInfo.get("widgets")

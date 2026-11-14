@@ -46,10 +46,92 @@ def test_containsIgnoresCaseStartsAndEndsWithMatchCase():
     assert _names(applyFilters(t, "t", [{"name": {"endswith": "OL"}}])) == []
 
 
-def test_textOperatorsIgnoredOnNumberColumns():
+def test_textOperatorsMatchNumberColumnsByTheirText():
     t = _people()
-    assert applyFilters(t, "t", [{"qty": {"contains": "1"}}]).num_rows == 5
-    assert applyFilters(t, "t", [{"qty": {"startswith": "1", "endswith": "1"}}]).num_rows == 5
+    assert _names(applyFilters(t, "t", [{"qty": {"contains": "1"}}])) == ["Alice"]
+    assert _names(applyFilters(t, "t", [{"qty": {"startswith": "1", "endswith": "1"}}])) == ["Alice"]
+
+
+def _typed():
+    return pa.table(
+        {
+            "id": pa.array([1, 2, 3, 4], type=pa.int64()),
+            "d": pa.array(
+                [datetime.date(2024, 1, 5), datetime.date(2024, 2, 5), datetime.date(2023, 1, 20), None], type=pa.date32()
+            ),
+            "ts": pa.array(
+                [
+                    datetime.datetime(2024, 1, 15, 8, 30),
+                    datetime.datetime(2024, 1, 16, 8, 30),
+                    datetime.datetime(2023, 1, 15, 0, 0),
+                    datetime.datetime(2024, 1, 15, 23, 59),
+                ],
+                type=pa.timestamp("us"),
+            ),
+            "dec": pa.array(
+                [decimal.Decimal("12.50"), decimal.Decimal("112.00"), decimal.Decimal("120.75"), decimal.Decimal("3.00")],
+                type=pa.decimal128(10, 2),
+            ),
+            "num": pa.array([15, 25, 30, 105], type=pa.int64()),
+            "lst": pa.array([[1], [2], [3], [4]], type=pa.list_(pa.int64())),
+            "st": pa.array([{"a": 1}, {"a": 2}, {"a": 3}, {"a": 4}], type=pa.struct([("a", pa.int64())])),
+        }
+    )
+
+
+def _ids(table):
+    return table.column("id").to_pylist()
+
+
+def test_textOperatorsMatchDateColumnsByTheirIsoText():
+    t = _typed()
+    assert _ids(applyFilters(t, "t", [{"d": {"contains": "2024-01"}}])) == [1]
+    assert _ids(applyFilters(t, "t", [{"d": {"startswith": "2024"}}])) == [1, 2]
+    assert _ids(applyFilters(t, "t", [{"d": {"endswith": "-05"}}])) == [1, 2]
+
+
+def test_textOperatorsMatchTimestampColumnsByTheirText():
+    t = _typed()
+    assert _ids(applyFilters(t, "t", [{"ts": {"startswith": "2024-01-15"}}])) == [1, 4]
+
+
+def test_textOperatorsMatchDecimalColumnsByTheirText():
+    t = _typed()
+    assert _ids(applyFilters(t, "t", [{"dec": {"startswith": "12"}}])) == [1, 3]
+
+
+def test_textOperatorsMatchIntegerColumnsByTheirText():
+    t = _typed()
+    assert _ids(applyFilters(t, "t", [{"num": {"endswith": "5"}}])) == [1, 2, 4]
+
+
+def test_textOperatorsOnUncastableColumnsMatchNothing():
+    t = _typed()
+    assert applyFilters(t, "t", [{"lst": {"contains": "1"}}]).num_rows == 0
+    assert applyFilters(t, "t", [{"st": {"startswith": "1"}}]).num_rows == 0
+
+
+def test_textOperatorsOnNonStringColumnsWorkInTheDatasetPath(tmp_path):
+    t = _typed().drop_columns(["lst", "st"])
+    path = tmp_path / "t.parquet"
+    pq.write_table(t, path)
+    dataset = ds.dataset(path)
+    for flt in (
+        [{"d": {"contains": "2024-01"}}],
+        [{"ts": {"startswith": "2024-01-15"}}],
+        [{"dec": {"startswith": "12"}}],
+        [{"num": {"endswith": "5"}}],
+    ):
+        assert filterDataset(dataset, "t", flt).to_table().equals(applyFilters(t, "t", flt))
+    assert _ids(filterDataset(dataset, "t", [{"d": {"contains": "2024-01"}}]).to_table()) == [1]
+    assert _ids(filterDataset(dataset, "t", [{"dec": {"startswith": "12"}}]).to_table()) == [1, 3]
+
+
+def test_textOperatorsOnUncastableColumnsMatchNothingInTheDatasetPath(tmp_path):
+    path = tmp_path / "t.parquet"
+    pq.write_table(_typed(), path)
+    dataset = ds.dataset(path)
+    assert filterDataset(dataset, "t", [{"lst": {"contains": "1"}}]).to_table().num_rows == 0
 
 
 def test_tableScopedKeyOnlyAppliesToItsTable():
@@ -250,3 +332,27 @@ def test_stringViewColumnsAreFilteredAsText():
     assert applyFilters(t, "t", [{"s": {"contains": "ALP"}}]).num_rows == 2
     assert applyFilters(t, "t", [{"s": {"startswith": "al"}}]).num_rows == 1
     assert applyFilters(t, "t", [{"s": {"min": "b"}}]).num_rows == 1
+
+
+def test_textFilterMatchesNoRowsWhenTheColumnsTextFormCannotBeBuilt(monkeypatch, tmp_path):
+    """A tz-aware timestamp needs a time zone database to become text; without one the condition matches nothing."""
+    table = pa.table(
+        {
+            "id": pa.array([1, 2], type=pa.int64()),
+            "at": pa.array([datetime.datetime(2024, 1, 15, 6), datetime.datetime(2023, 1, 15, 6)], type=pa.timestamp("us", tz="UTC")),
+        }
+    )
+    path = tmp_path / "t.parquet"
+    pq.write_table(table, path)
+    realArray = pa.array
+
+    def noTimeZoneDatabase(values, type=None, *args, **kwargs):
+        if type is not None and pa.types.is_timestamp(type) and type.tz is not None and len(values):
+            raise pa.ArrowInvalid("Cannot locate timezone 'UTC': Timezone database not found")
+        return realArray(values, type, *args, **kwargs)
+
+    monkeypatch.setattr(pa, "array", noTimeZoneDatabase)
+
+    flt = [{"at": {"startswith": "2024"}}]
+    assert applyFilters(table, "t", flt).num_rows == 0
+    assert filterDataset(ds.dataset(path), "t", flt).to_table().num_rows == 0

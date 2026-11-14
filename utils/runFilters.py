@@ -4,12 +4,13 @@ The dashboard's filter list becomes ONE Arrow expression per table. The SQL laun
 registered table with ``Dataset.filter(expr)``; saved Python widgets call ``applyFilters`` on every table
 they load. Filter values are Arrow scalars and never reach SQL text.
 
-Meaning (same as ``_apply_filters`` in ``utils/initMethods.py``, plus the documented changes):
+Meaning (the old pandas ``_apply_filters`` of ``utils/initMethods.py``, plus the documented changes):
 - entries that are not dicts are ignored; a ``table.column`` key applies only to that table;
 - a column the table does not have is skipped; several conditions combine with AND;
 - a scalar means equals, a non-empty list means one of, ``min`` is ``>=``, ``max`` is ``<=`` (both apply);
-- ``contains`` ignores case (literal substring), ``startswith`` / ``endswith`` match case, and the text
-  operators apply only to string columns;
+- ``contains`` ignores case (literal substring), ``startswith`` / ``endswith`` match case; on a column that
+  is not a string they apply to the column cast to string (Arrow's text form: ``2024-01-02`` for a date,
+  ``12.50`` for a decimal), and a type with no string cast matches no rows;
 - a value is cast to the column's type with Arrow's safe cast; when the cast fails the condition matches
   no rows, so a filtered page never shows unfiltered numbers.
 """
@@ -117,20 +118,36 @@ def _comparable(field: pc.Expression, dataType: pa.DataType) -> tuple[pc.Express
     return field, dataType
 
 
+def _hasStringCast(dataType: pa.DataType) -> bool:
+    """Whether the column's values can be cast to text. A tz-aware timestamp needs the time zone database to do
+    so, and an empty array would not reach it, so those are probed with one value (no database: no text form)."""
+    try:
+        needsValue = pa.types.is_timestamp(dataType) and dataType.tz is not None
+        pa.array([0] if needsValue else [], type=dataType).cast(pa.string())
+    except (pa.ArrowException, NotImplementedError):
+        return False
+    return True
+
+
 def _conditionExpressions(column: str, dataType: pa.DataType, condition) -> list[pc.Expression]:
     field, valueType = _comparable(pc.field(column), dataType)
     predicates: list[pc.Expression] = []
 
     if isinstance(condition, dict):
-        if _isString(valueType):
-            for key, build in (
-                ("contains", lambda f, s: pc.match_substring(f, s, ignore_case=True)),
-                ("startswith", pc.starts_with),
-                ("endswith", pc.ends_with),
-            ):
-                if condition.get(key) is not None:
-                    text = condition[key] if isinstance(condition[key], str) else str(condition[key])
-                    predicates.append(build(field, text))
+        textColumn = field if _isString(valueType) else None
+        if textColumn is None and _hasStringCast(dataType):
+            textColumn = pc.field(column).cast(pa.string())
+        for key, build in (
+            ("contains", lambda f, s: pc.match_substring(f, s, ignore_case=True)),
+            ("startswith", pc.starts_with),
+            ("endswith", pc.ends_with),
+        ):
+            if condition.get(key) is not None:
+                if textColumn is None:
+                    predicates.append(_matchNothing())
+                    continue
+                text = condition[key] if isinstance(condition[key], str) else str(condition[key])
+                predicates.append(build(textColumn, text))
         for key, compare in (("min", pc.greater_equal), ("max", pc.less_equal)):
             if key in condition:
                 scalar = _castScalar(condition[key], valueType)

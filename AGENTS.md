@@ -90,7 +90,7 @@ NubrixAI Analytics Hub API — FastAPI + Celery + LangChain monolith.
   - A marked table is decoded in the API worker, bounded by `STORED_TABLE_MAX_DECODED_BYTES` and not by a memory limit, so several large reads at once still add up in one worker.
   - Blocked event loop: the sandbox calls are synchronous, so a run, and now a slot wait of up to 120 s, can block the event loop in the async approve, apply and rollback paths of `transformationService`. Approve now makes two runs (the run and the normaliser). The async load handlers in `dataLoadService` also generate metadata on the event loop; a freshly loaded table is marked, so that needs no reader run, except with `STORED_TABLE_NORMALISE=0` or no `SUPABASE_KEY`. Moving those onto a thread is a follow-up.
   - Watchdog sampling: memory is sampled every 0.1 s and `work/` every 1 s, so a run can pass a limit briefly before it is stopped. The watchdog measures `work/` once a second; a container-level disk cap is a follow-up.
-  - A `ProcessPoolExecutor` that forks without exec (`dashboardService`, `managementService`) can keep a slot's file descriptor until its pool ends. Reader runs from other requests make a held slot at fork time more likely; it is not a deadlock, the pool's own runs just skip that slot.
+  - A `ProcessPoolExecutor` that forks without exec (`managementService`; the dashboard re-runs use threads) can keep a slot's file descriptor until its pool ends. Reader runs from other requests make a held slot at fork time more likely; it is not a deadlock, the pool's own runs just skip that slot.
   - A dashboard database refresh refused with 413 on a later table keeps the tables it already uploaded, but their shapes and caches are only updated by the next successful refresh.
   - Slot waiting polls. It has no queue, so waiters have no order.
   - If the watchdog itself crashes it stops the run with the "ran out of memory" sentence.
@@ -125,6 +125,7 @@ NubrixAI Analytics Hub API — FastAPI + Celery + LangChain monolith.
   - `blendService.getDataSources` / `getFieldsFromSources` (raw tables only)
   - `reportGenerator.getAllTables` (only active tables)
   - `insightContextBuilder.build` (filters metadata)
+- Dashboard re-runs (`getData` with filters or refresh) deliberately ignore `isActive`: saved Python and ChartRequest widgets keep reading inactive tables. `dashboardService._rerunTables` passes every metadata table to the SQL check (active ones first, then inactive, each in metadata order, so a name that differs only in case resolves to the active table), or, when metadata.json can't be read, the stored `<table>.parquet` names, sorted, leaving out every name that differs from another only in case (the listing can't tell which is active, so a widget naming one is refused: a refresh keeps its saved data, a filter shows its empty chart). Only new chart generation is limited to active tables. Don't switch it to `filterActiveTables`.
 - `getMetadata` endpoint returns ALL tables with `isActive` flag (frontend shows active/inactive status).
 - New tables get `isActive: true` automatically. Metadata regeneration preserves existing `isActive` for unchanged tables.
 
