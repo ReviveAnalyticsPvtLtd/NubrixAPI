@@ -155,6 +155,85 @@ def test_scatterAndBubbleGoThroughValuesWithPointDicts():
     assert _check({"values": {"B": [{"x": 1, "y": 2, "r": 4}]}}, bubble)["ok"] is False
 
 
+def _perPoint(chartType, points, names=None):
+    """A scatter or bubble that gives every point its own series, named like regions."""
+    names = names or [f"region {index}" for index in range(len(points))]
+    return {"chartType": chartType, "data": {"datasets": [{"label": name, "data": [point]} for name, point in zip(names, points)]}}
+
+
+def _points(count, r=False):
+    return [{"x": index, "y": 2.5 * index, **({"r": index + 1} if r else {})} for index in range(1, count + 1)]
+
+
+@pytest.mark.parametrize("chartType, count", [("scatter", 2), ("scatter", 8), ("scatter", 10), ("bubble", 8)])
+def test_aSmallChartWithASeriesPerPointIsComparedAsItsPointsInOrder(chartType, count):
+    """The engine lets a chart of at most 10 points name each point with its own series: a correct one passes."""
+    points = _points(count, r=chartType == "bubble")
+    assert _check({"values": {"Series": points}}, _perPoint(chartType, points))["ok"] is True
+
+
+def _flatMismatch(result, index):
+    """The check failed on the flattened points (dataset "Series"), first differing at `index`."""
+    return result["ok"] is False and result["field"] == "values" and result["dataset"] == "Series" and result["index"] == index
+
+
+def _setMismatch(result):
+    """The check failed on the dataset names: the chart was not read as one list of points."""
+    return result["ok"] is False and result["field"] == "values" and result["dataset"] is None
+
+
+def test_aSeriesPerPointFailsOnAnyOtherDifference():
+    points = _points(8)
+    expect = {"values": {"Series": points}}
+    changed = [dict(point) for point in points]
+    changed[3]["y"] = 99.0
+    assert _flatMismatch(_check(expect, _perPoint("scatter", changed)), 3)
+    # Out of order, a point missing or extra.
+    assert _flatMismatch(_check(expect, _perPoint("scatter", points[1:2] + points[:1] + points[2:])), 0)
+    assert _flatMismatch(_check(expect, _perPoint("scatter", points[:-1])), 7)
+    assert _flatMismatch(_check(expect, _perPoint("scatter", points + [{"x": 9, "y": 1.0}])), 8)
+    # A point without a key the expected points have, or with an extra one.
+    assert _flatMismatch(_check(expect, _perPoint("scatter", [{"x": point["x"]} for point in points])), 0)
+    assert _flatMismatch(_check(expect, _perPoint("scatter", [dict(point, r=1) for point in points])), 0)
+    # Bubble sizes are compared.
+    bubbles = _points(4, r=True)
+    resized = _perPoint("bubble", [bubbles[0], dict(bubbles[1], r=bubbles[1]["r"] + 1), *bubbles[2:]])
+    assert _flatMismatch(_check({"values": {"Series": bubbles}}, resized), 1)
+
+
+def test_aSeriesPerPointAboveTheNamedPointLimitFails():
+    """Above 10 points the engine sends a series per point back for repair, so the harness does not accept it."""
+    points = _points(11)
+    assert _setMismatch(_check({"values": {"Series": points}}, _perPoint("scatter", points)))
+    assert _flatMismatch(_check({"values": {"Series": points}}, _perPoint("scatter", points[:10])), 10)
+    assert _check({"values": {"Series": points[:10]}}, _perPoint("scatter", points[:10]))["ok"] is True
+
+
+def test_aSeriesPerPointIsComparedWithoutItsLegendNames():
+    """The names are not compared: a case that must check them lists one expected dataset per point by name."""
+    points = _points(3)
+    renamed = _perPoint("scatter", points, names=["wrong", "names", "here"])
+    assert _check({"values": {"Series": points}}, renamed)["ok"] is True
+    assert _setMismatch(_check({"values": {"north": points[:1], "south": points[1:2], "east": points[2:]}}, renamed))
+
+
+def test_onlyAChartWhoseEverySeriesHoldsOnePointIsFlattened():
+    points = _points(6)
+    expect = {"values": {"Series": points}}
+    grouped = {"chartType": "scatter", "data": {"datasets": [
+        {"label": "north", "data": points[:2]},
+        *({"label": f"region {index}", "data": [point]} for index, point in enumerate(points[2:])),
+    ]}}
+    assert _setMismatch(_check(expect, grouped))
+    # A category chart with one value per dataset is never read as points.
+    bar = {"chartType": "bar", "data": {"labels": ["a"], "datasets": [{"label": "A", "data": [1]}, {"label": "B", "data": [2]}]}}
+    assert _setMismatch(_check({"values": {"Total": [1, 2]}}, bar))
+    # Several expected datasets are still compared by their legend names.
+    named = _perPoint("scatter", points[:2], names=["north", "south"])
+    assert _check({"values": {"north": points[:1], "south": points[1:2]}}, named)["ok"] is True
+    assert _setMismatch(_check({"values": {"north": points[:1], "east": points[1:2]}}, named))
+
+
 def test_aPivotUsesRowKeysAsLabelsAndColumnKeysAsDatasets():
     pivot = {"chartType": "pivot", "data": {"c1": {"r1": 1, "r2": None}, "c2": {"r1": 2, "r2": 3}}}
     assert _check({"labels": ["r1", "r2"], "values": {"c1": [1, None], "c2": [2, 3]}}, pivot)["ok"] is True

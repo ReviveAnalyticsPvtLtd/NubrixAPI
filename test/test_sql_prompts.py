@@ -23,6 +23,7 @@ from langchain_core.runnables import RunnableBinding
 
 from nubrix.components.chartBuilder import buildChart
 from nubrix.components.chartContract import contractErrors
+from nubrix.components.chartGuards import MAX_NAMED_POINTS, POINT_SERIES_MESSAGE
 from nubrix.components.chartRequest import CATEGORY_TYPES, CHART_TYPES, ChartRequest, requiredColumns
 from nubrix.components.sqlCheck import checkSql
 from nubrix.components.sqlGrounding import groundingText
@@ -941,7 +942,8 @@ EVALUATION_RULE_SENTENCES = {
     ),
     "wholeDoublesAreIntegers": 'CAST a DOUBLE that holds whole numbers AS BIGINT, so "3" does not show as "3.0".',
     "noAliasOfASortedSourceColumn": "Never alias a computed column with the name of a source column that ORDER BY or GROUP BY also uses",
-    "seriesGroupsPoints": 'Never give every row its own series value. When each row is its own point (one point per product or per month), leave "series" out.',
+    "seriesGroupsPoints": 'With more than 10 points, never give every row its own series value: when each row is its own point (one point per product or per month), leave "series" out.',
+    "smallChartsMayNameEachPoint": "With at most 10 points you may give each point its own series value to name it in the legend (4 regions, one point each); it is never required.",
     "mapLabelIsWhatTheUserAsks": '"labelled with the postal code" means the code alone',
     "joinOnAKeyThatIsUniqueOnOneSide": "join on a key that identifies one row on at least one side.",
     "aggregateTheManySideFirst": "first aggregate it to one row per key in a CTE, then join the CTE.",
@@ -972,6 +974,19 @@ def test_theLabelRuleAgreesWithTheEngineGuardAndLeavesTableCellsToTheirOwnRule(k
     assert "sorts it as a number" not in rule
     assert "keeps the query's row order" in rule
     assert "Never CAST a number to VARCHAR for a label or a table cell." not in text
+
+
+@pytest.mark.parametrize("key", CHART_PROMPT_KEYS)
+def test_theScatterSeriesRuleAgreesWithTheEngineGuard(key):
+    """The engine keeps a series per point up to MAX_NAMED_POINTS points and sends more back for repair."""
+    rule = next(line for line in _formatted(key).splitlines() if line.startswith('- scatter and bubble "series"'))
+
+    assert f"With at most {MAX_NAMED_POINTS} points you may give each point its own series value" in rule
+    assert f"With more than {MAX_NAMED_POINTS} points, never give every row its own series value" in rule
+    assert "Never give every row its own series value." not in rule
+    # The repair message names the same limit and never invites dropping rows to get under it.
+    assert f"There are more than {MAX_NAMED_POINTS} points" in POINT_SERIES_MESSAGE
+    assert f"Leave `series` out and keep every row: never drop rows to get down to {MAX_NAMED_POINTS} points." in POINT_SERIES_MESSAGE
 
 
 @pytest.mark.parametrize("key", CHART_PROMPT_KEYS)

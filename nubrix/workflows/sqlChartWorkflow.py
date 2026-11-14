@@ -13,13 +13,13 @@ filters on ends before its period. Only when at least one bound ended and, given
 provably holds no project data does the response become a question about the period, in the shape of the
 rephraser's doubt. Anything else, including a probe that fails, keeps the chart.
 
-A chart that renders is checked by the generation guards (chartGuards.py: a number label cast to text, every scatter
-point its own series). The first time one fires in a request, and a repair is left, the chart and its request are kept
-as the fallback and the guard's message goes to the repair. A later chart that passes the guards is served. When a
-later chart trips a guard again, shows no data while the fallback does, or the request would end on a failure
-(repairs run out, a timeout, a busy sandbox, a run that broke, a repair whose model call raised), the fallback is
-served instead, as if that attempt had succeeded: it goes on to the probe or format like any chart, and logs no
-failure. A repair call that raises with a fallback in hand logs one chart_guard_repair warning line.
+A chart that renders is checked by the generation guards (chartGuards.py: a number label cast to text, every point of
+a scatter with more than 10 points its own series). The first time one fires in a request, and a repair is left, the
+chart and its request are kept as the fallback and the guard's message goes to the repair. A later chart that passes
+the guards is served. When a later chart trips a guard again, shows no data while the fallback does, or the request
+would end on a failure (repairs run out, a timeout, a busy sandbox, a run that broke, a repair whose model call
+raised), the fallback is served instead, as if that attempt had succeeded: it goes on to the probe or format like any
+chart, and logs no failure. A repair call that raises with a fallback in hand logs one chart_guard_repair warning line.
 
     START -> rephrase -> ground -> generate -> (evaluate | repair | format)
                   \\-> format (doubt)

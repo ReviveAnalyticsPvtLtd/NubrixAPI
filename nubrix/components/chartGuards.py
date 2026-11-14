@@ -8,8 +8,9 @@ Checks on a chart the SQL chart workflow has just built, for two habits the mode
   order and in no numeric order (1, 10, 2), or every label is a whole number and one is written with a fractional
   part ("1.0"). Years cast to text, labels in numeric order either way, labels ordered by a measure, a fixed-scale
   display (1.0, 1.5, 2.0) and an inner level of a pivot key (it restarts per group) are not read as the cast;
-- a scatter or bubble chart that gives every point its own `series` value, so every point becomes its own dataset and
-  legend entry.
+- a scatter or bubble chart with more than MAX_NAMED_POINTS points that gives every point its own `series` value, so
+  every point becomes its own dataset and legend entry. Up to MAX_NAMED_POINTS points (4 regions, one point each) a
+  series per point names each point in the legend, so it is kept.
 
 A guard returns a message for the repair prompt, or None. It fires only when it can decide: anything it cannot read
 (SQL that does not parse, a projection it cannot match to the label, a chart of an unexpected shape) declines.
@@ -17,6 +18,7 @@ Pure: no sandbox, no model. Only new chart generation calls it; saved widgets re
 """
 
 __all__ = [
+    "MAX_NAMED_POINTS",
     "POINT_SERIES_MESSAGE",
     "castLabelMessage",
     "castLabelText",
@@ -32,9 +34,14 @@ from sqlglot import exp
 from nubrix.components.chartBuilder import EMPTY_LEVEL
 from nubrix.components.chartRequest import ChartRequest
 
+# The most points a scatter or bubble may name one by one, each its own series and legend entry. It matches the most
+# slices a pie or doughnut shows before the rest becomes 'Other' (the SQL chart prompts' rule).
+MAX_NAMED_POINTS = 10
+
 POINT_SERIES_MESSAGE = (
-    "Each point has its own series value, so every point becomes its own dataset and legend entry. Leave `series` out "
-    "when each row is its own point; use it only to group many points into a few datasets, such as a category or a "
+    f"There are more than {MAX_NAMED_POINTS} points and each has its own series value, so every point becomes its own "
+    f"dataset and legend entry. Leave `series` out and keep every row: never drop rows to get down to "
+    f"{MAX_NAMED_POINTS} points. Use `series` only to group many points into a few datasets, such as a category or a "
     "region."
 )
 
@@ -152,12 +159,12 @@ def _inTextOrderOnly(labels: list[str]) -> bool:
 
 
 def pointSeriesMessage(request: ChartRequest, sql: str, chart: object) -> str | None:
-    """A scatter or bubble chart with a series where every dataset holds exactly one point."""
+    """A scatter or bubble chart with a series and more than MAX_NAMED_POINTS datasets, each holding exactly one point."""
     if request.chartType not in _POINT_TYPES or not request.encoding.series:
         return None
     data = chart.get("data") if isinstance(chart, dict) else None
     datasets = data.get("datasets") if isinstance(data, dict) else None
-    if not isinstance(datasets, list) or len(datasets) < 2:
+    if not isinstance(datasets, list) or len(datasets) <= MAX_NAMED_POINTS:
         return None
     for dataset in datasets:
         points = dataset.get("data") if isinstance(dataset, dict) else None

@@ -413,15 +413,72 @@ def test_aChartOfAnUnexpectedShapeDeclines():
 PER_POINT = 'SELECT "amount" AS amount, "items" AS items, CAST("order_id" AS VARCHAR) AS order_ref FROM "orders" ORDER BY "order_id"'
 
 
-@pytest.mark.parametrize("chartType", ["scatter", "bubble"])
-def test_everyPointItsOwnSeriesFires(chartType):
-    encoding = {"x": "amount", "y": ["items"], "series": "order_ref"}
+def _perPoint(count):
+    """`count` points, each with its own series value (one point per order)."""
+    return (
+        f'SELECT i * 1.5 AS amount, i AS items, \'order \' || CAST(i AS VARCHAR) AS order_ref FROM range(1, {count + 1}) AS t(i) '
+        "ORDER BY i"
+    )
+
+
+def _pointEncoding(chartType, series="order_ref"):
+    encoding = {"x": "amount", "y": ["items"], "series": series}
     if chartType == "bubble":
         encoding["r"] = "items"
-    request, chart = _chart(chartType, PER_POINT, encoding)
+    return encoding
+
+
+def test_namedPointsMatchThePieSliceLimit():
+    assert chartGuards.MAX_NAMED_POINTS == 10
+
+
+@pytest.mark.parametrize("chartType", ["scatter", "bubble"])
+def test_everyPointItsOwnSeriesFiresAboveTheNamedPointLimit(chartType):
+    sql = _perPoint(11)
+    request, chart = _chart(chartType, sql, _pointEncoding(chartType))
+    assert len(chart["data"]["datasets"]) == 11
+
+    assert chartGuards.guardMessage(request, sql, chart) == chartGuards.POINT_SERIES_MESSAGE
+
+
+@pytest.mark.parametrize("chartType", ["scatter", "bubble"])
+@pytest.mark.parametrize("count", [2, 6, 10])
+def test_aSmallChartKeepsASeriesPerPoint(chartType, count):
+    """Up to 10 points, a series per point names each point in the legend (4 regions, one point each)."""
+    sql = _perPoint(count)
+    request, chart = _chart(chartType, sql, _pointEncoding(chartType))
+    assert len(chart["data"]["datasets"]) == count
+    assert all(len(dataset["data"]) == 1 for dataset in chart["data"]["datasets"])
+
+    assert chartGuards.guardMessage(request, sql, chart) is None
+
+
+def test_theSixOrderScatterKeepsItsSeriesPerPoint():
+    request, chart = _chart("scatter", PER_POINT, _pointEncoding("scatter"))
     assert len(chart["data"]["datasets"]) == 6
 
-    assert chartGuards.guardMessage(request, PER_POINT, chart) == chartGuards.POINT_SERIES_MESSAGE
+    assert chartGuards.guardMessage(request, PER_POINT, chart) is None
+
+
+@pytest.mark.parametrize("chartType", ["scatter", "bubble"])
+@pytest.mark.parametrize(
+    "groups, points",
+    [
+        (3, 30),  # many points in a few series
+        (12, 24),  # more than 10 series, two points each
+        (11, 12),  # more than 10 series, one holds two points
+    ],
+)
+def test_manyPointsInSeriesThatGroupThemDoNotFire(chartType, groups, points):
+    sql = (
+        f"SELECT i * 1.5 AS amount, i AS items, 'region ' || CAST(i % {groups} AS VARCHAR) AS region "
+        f"FROM range({points}) AS t(i) ORDER BY i"
+    )
+    request, chart = _chart(chartType, sql, _pointEncoding(chartType, series="region"))
+    assert len(chart["data"]["datasets"]) == groups
+    assert sum(len(dataset["data"]) for dataset in chart["data"]["datasets"]) == points
+
+    assert chartGuards.guardMessage(request, sql, chart) is None
 
 
 @pytest.mark.parametrize(
@@ -456,9 +513,9 @@ def test_theMessagesNameWhatTheGuardSawAndTheFix():
         "order, and shows a whole-number BIGINT or DOUBLE as '3' but a DECIMAL as '3.00'."
     )
     assert chartGuards.POINT_SERIES_MESSAGE == (
-        "Each point has its own series value, so every point becomes its own dataset and legend entry. Leave `series` "
-        "out when each row is its own point; use it only to group many points into a few datasets, such as a category "
-        "or a region."
+        "There are more than 10 points and each has its own series value, so every point becomes its own dataset and "
+        "legend entry. Leave `series` out and keep every row: never drop rows to get down to 10 points. Use `series` "
+        "only to group many points into a few datasets, such as a category or a region."
     )
 
 

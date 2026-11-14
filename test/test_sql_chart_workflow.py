@@ -1104,8 +1104,9 @@ def test_aBoundWhoseColumnDuckDbBindsElsewhereKeepsTheChartOnDuckDb(harness, sql
     assert harness.logs == []
 
 
-# Generation guards (fix round 4): a number label cast to text, or every scatter point its own series, goes back for one
-# repair; when that repair gives nothing better, the chart the guard fired on is served as it was.
+# Generation guards (fix round 4): a number label cast to text, or every point of a scatter with more than 10 points its
+# own series, goes back for one repair; when that repair gives nothing better, the chart the guard fired on is served as
+# it was.
 
 CAST_REQUEST = {
     "chartType": "bar",
@@ -1260,14 +1261,16 @@ SERIES_REQUEST = {
     "sql": 'SELECT "b" AS amount, "items" AS items, "a" AS order_ref FROM "orders"',
     "encoding": {"x": "amount", "y": ["items"], "series": "order_ref"},
 }
-SERIES_CHART = {
-    "chartType": "scatter",
-    "title": "Amount vs items",
-    "xLabels": "Amount",
-    "yLabels": "Items",
-    "data": {"datasets": [{"label": "1", "data": [{"x": 1, "y": 2}]}, {"label": "2", "data": [{"x": 3, "y": 4}]}]},
-}
-POINTS_CHART = dict(SERIES_CHART, data={"datasets": [{"label": "Items", "data": [{"x": 1, "y": 2}, {"x": 3, "y": 4}]}]})
+
+
+def _perPointChart(count):
+    """A scatter whose `count` points each have their own series value."""
+    datasets = [{"label": str(i), "data": [{"x": i, "y": 2 * i}]} for i in range(1, count + 1)]
+    return {"chartType": "scatter", "title": "Amount vs items", "xLabels": "Amount", "yLabels": "Items", "data": {"datasets": datasets}}
+
+
+SERIES_CHART = _perPointChart(11)
+POINTS_CHART = dict(SERIES_CHART, data={"datasets": [{"label": "Items", "data": [{"x": i, "y": 2 * i} for i in range(1, 12)]}]})
 
 
 def test_everyPointItsOwnSeriesGoesBackForRepair(harness):
@@ -1275,8 +1278,40 @@ def test_everyPointItsOwnSeriesGoesBackForRepair(harness):
     harness.repair.invoke.return_value = json.dumps(dict(SERIES_REQUEST, encoding={"x": "amount", "y": ["items"]}))
     state = harness.run(metadata=GUARD_METADATA)
     assert state["finalOutput"] == POINTS_CHART
-    assert harness.repair.invoke.call_args.args[0]["error"].startswith("Each point has its own series value")
+    assert harness.repair.invoke.call_args.args[0]["error"].startswith("There are more than 10 points and each has its own series value")
     assert state["debugAttempts"] == 1
+
+
+def test_aPerPointRepairOfTenPointsPassesTheGuardAndIsServed(harness):
+    """The guard cannot tell a dropped row: a repaired chart of 10 per-point series passes it and is served."""
+    tenPoints = _perPointChart(10)
+    _guarded(harness, SERIES_CHART, tenPoints, generated=SERIES_REQUEST)
+    harness.repair.invoke.return_value = json.dumps(SERIES_REQUEST)
+    state = harness.run(metadata=GUARD_METADATA)
+    assert state["finalOutput"] == tenPoints
+    assert harness.repair.invoke.call_count == 1
+    assert state["debugAttempts"] == 1
+
+
+def test_aPerPointRepairOfMoreThanTenPointsServesTheFirstChart(harness):
+    _guarded(harness, SERIES_CHART, _perPointChart(12), generated=SERIES_REQUEST)
+    harness.repair.invoke.return_value = json.dumps(SERIES_REQUEST)
+    state = harness.run(metadata=GUARD_METADATA)
+    assert state["finalOutput"] == SERIES_CHART
+    assert harness.repair.invoke.call_count == 1
+    assert harness.render.call_count == 2
+    assert _modelCalls(harness) <= 1 + module.MAX_REPAIRS
+
+
+def test_aTenPointScatterWithASeriesPerPointIsServedWithoutRepair(harness):
+    """At most 10 points, a series per point names each point: the chart is served as built, with no repair call."""
+    tenPoints = _perPointChart(10)
+    _guarded(harness, tenPoints, generated=SERIES_REQUEST)
+    state = harness.run(metadata=GUARD_METADATA)
+    assert state["finalOutput"] == tenPoints
+    assert harness.repair.invoke.call_count == 0
+    assert harness.render.call_count == 1
+    assert state["debugAttempts"] == 0
 
 
 @pytest.mark.parametrize("repairPasses", [True, False])

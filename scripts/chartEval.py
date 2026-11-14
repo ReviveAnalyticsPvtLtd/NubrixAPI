@@ -37,7 +37,10 @@ How values are compared:
     chart, the labels are not compared (the model chooses its own column names). With several, the datasets must be
     exactly the expected ones by label, since legend names are visible to users. A pivot always compares its column
     names: they are data values. For scatter and bubble charts the list holds the point dicts, e.g.
-    `{"Series": [{"x": 1, "y": 2}, ...]}`; the dicts must have the same keys.
+    `{"Series": [{"x": 1, "y": 2}, ...]}`; the dicts must have the same keys. With one expected dataset, a chart of
+    2 to 10 points that gives each point its own series (the engine keeps those to name each point) is compared as
+    its points in dataset order; any other difference, or more than 10 such points, still fails. Its legend names are
+    not compared then; a case that must check them lists one expected dataset per point, by name.
   - `rows` are compared by position: the values of each row in column order. Column names are compared only when the
     case sets `"columnNames": true`.
   - `card` compares the value only, not the card's label.
@@ -91,6 +94,7 @@ from unittest import mock
 
 from nubrix.components.chartBuilder import _cell, _levelText, _number, _text
 from nubrix.components.chartContract import contractErrors
+from nubrix.components.chartGuards import MAX_NAMED_POINTS
 
 _REPO = Path(__file__).resolve().parent.parent
 _DEFAULT_REL_TOL = 0.0
@@ -99,6 +103,7 @@ _EXPECT_KEYS = {"doubt", "chartType", *_CHECK_FIELDS, "relTol", "columnNames", "
 _CASE_KEYS = {"id", "prompt", "expect"}
 _POINT_KEYS = {"id", "lat", "long", "label"}
 _NO_EXPECT_SQL = {"scatter", "bubble"}
+_POINT_CHART_TYPES = ("scatter", "bubble")
 _DETAIL_CHARS = 4000
 
 
@@ -195,6 +200,27 @@ def _gotPoints(chart: dict) -> list | None:
     return points if isinstance(points, list) else None
 
 
+def _namedPoints(chart: dict) -> list | None:
+    """A scatter or bubble of 2 to MAX_NAMED_POINTS datasets that each hold one point: its points in dataset order.
+
+    The engine keeps such a chart (a series per point names each point in the legend) and sends a larger one back for
+    repair, so only this shape is read as one list of points. None for any other chart.
+    """
+    if chart.get("chartType") not in _POINT_CHART_TYPES:
+        return None
+    data = chart.get("data")
+    datasets = data.get("datasets") if isinstance(data, dict) else None
+    if not isinstance(datasets, list) or not 2 <= len(datasets) <= MAX_NAMED_POINTS:
+        return None
+    points = []
+    for dataset in datasets:
+        held = dataset.get("data") if isinstance(dataset, dict) else None
+        if not isinstance(held, list) or len(held) != 1:
+            return None
+        points.append(held[0])
+    return points
+
+
 def _sameRow(expected: Any, got: Any, relTol: float, columnNames: bool) -> bool:
     """A row by the values in column order; with `columnNames` also by name."""
     if not isinstance(expected, dict) or not isinstance(got, dict):
@@ -239,9 +265,13 @@ def checkValues(expect: dict, chart: dict) -> dict:
         got = _gotValues(chart)
         if got is None:
             return _mismatch("values", values, got, dataset=None)
+        namedPoints = _namedPoints(chart) if len(values) == 1 else None
         if len(values) == 1 and len(got) == 1 and chart.get("chartType") != "pivot":
             # The model names its own measure column, so a lone dataset is matched by position.
             pairs = [(name, expected, next(iter(got.values()))) for name, expected in values.items()]
+        elif namedPoints is not None:
+            # A small scatter or bubble may name each point with its own series; its points are the one dataset.
+            pairs = [(name, expected, namedPoints) for name, expected in values.items()]
         elif set(values) != set(got):
             return _mismatch("values", values, got, dataset=None)
         else:
