@@ -12,6 +12,7 @@ counts address space that polars reserves without using.
 __all__ = ["replManager", "REPLManager", "_remove_code_fences"]
 
 
+import contextlib
 import os
 import time
 import uuid
@@ -19,7 +20,7 @@ import re
 from api.services.credits.creditService import creditService
 from utils.logger import logger
 from utils.sandboxLimits import currentRunLimits, defaultTimeoutSeconds
-from utils.sandboxRunner import runSandbox
+from utils.sandboxRunner import SandboxResult, runSandbox, runSqlSandbox
 from utils.sandboxSlots import SandboxBusyError
 
 
@@ -42,23 +43,20 @@ class REPLManager:
         self.timeoutSeconds = timeoutSeconds
         self.maxConcurrentPerProject = maxConcurrentPerProject
 
-    def run(self, codeString: str, projectId: str = None) -> str:
-        if not projectId:
-            return "Error: projectId is required for sandboxed code execution."
+    @contextlib.contextmanager
+    def _projectSlot(self, projectId: str, waitSeconds: float):
+        """Take one entry of the project's Redis semaphore, trying for up to `waitSeconds` (at least one attempt).
 
-        if "```" in codeString:
-            codeString = _remove_code_fences(codeString)
-
-        # 1. Per-tenant concurrency limits: ZSET-based semaphore (soft cap)
+        Yields whether an entry was taken and releases it on exit. A Redis failure counts as taken, as it always has.
+        """
         r = creditService._redis()
         sem_key = f"semaphore:{projectId}"
         slot_id = str(uuid.uuid4())
-
         # An entry may wait for a run slot as well as run, so it isn't stale before both are over.
         staleSeconds = self.timeoutSeconds + 60 + currentRunLimits().slotWaitSeconds
         acquired = False
         start_time = time.time()
-        while time.time() - start_time < 30.0:
+        while True:
             try:
                 r.zremrangebyscore(sem_key, 0, time.time() - staleSeconds)
                 count = r.zcard(sem_key)
@@ -71,29 +69,55 @@ class REPLManager:
                 logger.warning(f"Failed to check/acquire concurrency semaphore for project {projectId}: {e}")
                 acquired = True
                 break
+            if time.time() - start_time >= waitSeconds:
+                break
             time.sleep(0.2)
-
-        if not acquired:
-            return f"Concurrency limit reached: Too many running code execution tasks for project '{projectId}'. Please try again in a few seconds."
-
-        # 2. Launch subprocess
-        stdout = ""
-        stderr = ""
-        returnCode = None
-        stopped = None
         try:
-            stdout, stderr, returnCode, _, _, stopped = runSandbox("sandbox_launcher.py", projectId, codeString, self.timeoutSeconds)
-        except SandboxBusyError:
-            # Not output: callers must not treat a full sandbox as a code failure. The semaphore entry is released below.
-            raise
-        except Exception as e:
-            stderr = f"Error during subprocess execution: {e}\n"
+            yield acquired
         finally:
             if acquired:
                 try:
                     r.zrem(sem_key, slot_id)
                 except Exception as e:
                     logger.warning(f"Failed to release semaphore for project {projectId}: {e}")
+
+    def runSql(self, request: dict, projectId: str, waitForSlot: bool = True) -> SandboxResult:
+        """Run one SQL chart query under the project's semaphore. Raises SandboxBusyError when the project or the sandbox is full.
+
+        With `waitForSlot` False it makes one attempt at each, so a caller that can retry later is never held up.
+        """
+        with self._projectSlot(projectId, 30.0 if waitForSlot else 0) as acquired:
+            if not acquired:
+                raise SandboxBusyError(f"Too many running code execution tasks for project '{projectId}'.")
+            if waitForSlot:
+                return runSqlSandbox(projectId=projectId, request=request, timeoutSeconds=self.timeoutSeconds)
+            return runSqlSandbox(projectId=projectId, request=request, timeoutSeconds=self.timeoutSeconds, slotWaitSeconds=0)
+
+    def run(self, codeString: str, projectId: str = None, filters: list | None = None) -> str:
+        if not projectId:
+            return "Error: projectId is required for sandboxed code execution."
+
+        if "```" in codeString:
+            codeString = _remove_code_fences(codeString)
+
+        # 1. Per-tenant concurrency limits: ZSET-based semaphore (soft cap)
+        with self._projectSlot(projectId, 30.0) as acquired:
+            if not acquired:
+                return f"Concurrency limit reached: Too many running code execution tasks for project '{projectId}'. Please try again in a few seconds."
+
+            # 2. Launch subprocess
+            stdout = ""
+            stderr = ""
+            returnCode = None
+            stopped = None
+            try:
+                extra = {"payload": {"filters": filters}} if filters is not None else {}
+                stdout, stderr, returnCode, _, _, stopped = runSandbox("sandbox_launcher.py", projectId, codeString, self.timeoutSeconds, **extra)
+            except SandboxBusyError:
+                # Not output: callers must not treat a full sandbox as a code failure. The semaphore entry is released on exit.
+                raise
+            except Exception as e:
+                stderr = f"Error during subprocess execution: {e}\n"
 
         if stopped:
             # Tell the caller why the run ended, after whatever it printed. The sentence on the end keeps a stopped
