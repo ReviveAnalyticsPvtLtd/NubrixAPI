@@ -2343,3 +2343,117 @@ def test_endToEndWriteOnTheSyntheticTables(tmp_path, synthetic):
     converted = {widget["id"]: decodeGeneratedCode(widget["generatedCode"]) for widget in after["page-1"]["widgets"] if widget["id"] in ("w-bar", "w-card")}
     assert converted["w-bar"].title == "Revenue by region (saved)" and converted["w-card"].chartType == "card"
     assert _report(tmp_path)["outcome"] == "written"
+
+
+# The client's export shape: what only the Panel's export gave a saved widget
+
+
+PALETTE = {"backgroundColor": "rgba(1, 2, 3, 0.7)", "borderColor": "rgba(1, 2, 3, 1)"}
+
+
+def _exported(chart: dict) -> dict:
+    """`chart` as the client exports it from the Panel: axis labels as lists, its palette on every dataset."""
+    exported = copy.deepcopy(chart)
+    for axis in ("xLabels", "yLabels"):
+        if isinstance(exported.get(axis), str):
+            exported[axis] = [exported[axis]]
+    for dataset in exported["data"]["datasets"]:
+        dataset.update(PALETTE)
+    return exported
+
+
+def test_theClientsExportShapeIsNotADifference():
+    saved = _exported(SAVED)
+    assert conv.savedVerdict(saved, SAVED) == ("match", None)
+    # Between the two forms' own re-runs nothing is set aside: a colour the Python prints comes back on every re-run.
+    assert conv.verdictOf(saved, SAVED) == ("differ", "xLabels")
+    assert saved == _exported(SAVED)  # the saved widget itself is never changed
+
+
+def test_aSliceChartsExportedPaletteIsNotADifference():
+    pie = {"chartType": "pie", "title": "t", "data": {"labels": ["a", "b"], "datasets": [{"label": "Share", "data": [1, 2]}]}}
+    saved = copy.deepcopy(pie)
+    saved["data"]["datasets"][0].update(backgroundColor=["rgba(1, 2, 3, 0.7)", "rgba(4, 5, 6, 0.7)"], borderColor=["rgba(1, 2, 3, 1)", "rgba(4, 5, 6, 1)"])
+    assert conv.savedVerdict(saved, pie) == ("match", None)
+
+
+def _savedWith(**changes) -> dict:
+    saved = _exported(SAVED)
+    saved.update(changes)
+    return saved
+
+
+def _savedDataset(**keys) -> dict:
+    saved = _exported(SAVED)
+    saved["data"]["datasets"][0].update(keys)
+    return saved
+
+
+@pytest.mark.parametrize("saved, field", [
+    (_savedWith(xLabels=["Region", "Area"]), "xLabels"),
+    (_savedWith(xLabels=["Area"]), "xLabels"),
+    (_savedWith(xLabels=[]), "xLabels"),
+    (_savedWith(xLabels=[""]), "xLabels"),
+    (_savedWith(yLabels=[7]), "yLabels"),
+    (_savedWith(yLabels=[["Total Revenue"]]), "yLabels"),
+    (_savedDataset(borderWidth=2), "data.datasets[0]"),
+    (_savedDataset(data=[10.5, 21]), "data.datasets[0].data[1]"),
+], ids=["twoLabels", "anotherLabel", "noLabel", "emptyLabel", "aNumberLabel", "aNestedLabel", "anotherStyleKey", "anotherValue"])
+def test_anythingElseInAnExportedWidgetStillDiffers(saved, field):
+    assert conv.savedVerdict(saved, SAVED) == ("differ", field)
+
+
+def test_aLabelListOnTheNewChartIsNotSetAside():
+    """Only the saved side has an export shape: a request's chart with a list label is a different chart."""
+    assert conv.savedVerdict(SAVED, _savedWith()) == ("differ", "xLabels")
+
+
+def _card(data) -> dict:
+    return {"chartType": "card", "title": "Orders", "label": "Orders placed", "data": data}
+
+
+@pytest.mark.parametrize("text, value", [("36", 36), ("36", 36.0), ("-3", -3), ("0", 0), ("12.5", 12.5), ("1e+21", 1e21)])
+def test_aCardExportedAsTheTextOfItsNumberIsNotADifference(text, value):
+    """Before the card check at export, a card was saved as the client's `String(value)`; a re-run of either form gives the number."""
+    assert conv.savedVerdict(_card(text), _card(value)) == ("match", None)
+    assert conv.verdictOf(_card(text), _card(value))[0] == "differ"
+
+
+@pytest.mark.parametrize("text, value", [
+    ("36", 37), ("036", 36), ("36.0", 36), (" 36", 36), ("3.6e1", 36), ("abc", 36), ("", 0), ("true", True), ("1", True), ("nan", float("nan")),
+    ("36", "36.0"), ("36", None), ("36", [36]),
+])
+def test_aCardWhoseTextIsNotItsNumberStillDiffers(text, value):
+    assert conv.savedVerdict(_card(text), _card(value)) == ("differ", "data")
+
+
+def test_aCardSavedAsTextWhoseQueryGivesTheSameTextMatches():
+    assert conv.savedVerdict(_card("2024"), _card("2024")) == ("match", None)
+
+
+def test_onlyACardsTextIsReadAsANumber():
+    table = {"chartType": "table", "title": "t", "columns": ["n"], "data": "36"}
+    assert conv.savedVerdict(table, {**table, "data": 36})[0] == "differ"
+
+
+def _exportedJob(tmp_path, monkeypatch, filtered=None):
+    request = _request("one")
+    _Fakes(monkeypatch, plans={"Revenue by region": request}, charts={_sql("one"): SAVED}, filtered=filtered or (lambda form, widget, filters: SAVED))
+    store = _store(_config(_widget("w1", _exported(SAVED), query="Revenue by region")))
+    assert _run(tmp_path, store) == 0
+    return _report(tmp_path)["widgets"][0]
+
+
+def test_aWidgetInTheClientsExportShapeConverts(tmp_path, monkeypatch):
+    """A widget exported from the Panel and never refreshed is the usual saved widget, so it must be able to match."""
+    entry = _exportedJob(tmp_path, monkeypatch)
+    assert entry["verdict"] == "match" and entry["filtersChecked"] == 1
+
+
+def test_coloursTheSavedPythonPrintsAreCaughtByTheFilterCheck(tmp_path, monkeypatch):
+    """The saved widget's colours are set aside as the client's, so the two forms' own re-runs decide: the Python's
+    colours come back on every re-run and the request has none."""
+    coloured = copy.deepcopy(SAVED)
+    coloured["data"]["datasets"][0].update(PALETTE)
+    entry = _exportedJob(tmp_path, monkeypatch, filtered=lambda form, widget, filters: coloured if form == "python" else SAVED)
+    assert (entry["verdict"], entry["field"], entry["filterDetail"]) == ("differ", "filter", "data.datasets[0]")

@@ -22,7 +22,9 @@ fails leaves the widget as Python, with a reason:
      quantile whose input is not proven exact through every scope is refused (`floatAggregate`).
   3. The refresh-style run (unfiltered, lenient, through `renderChartRequest`, over the tables a dashboard refresh
      reads: every metadata table, active first and then inactive, `_metadataTableNames`) and the workflow's own run
-     must both strictly match the saved widget (`verdictOf`; a second render that differs is `nondeterministic`).
+     must both strictly match the saved widget (`savedVerdict`; a second render that differs is `nondeterministic`).
+     Only what the client's export alone gave the saved widget is set aside (`_withoutExportShape`): an axis label
+     as a one-item list, the palette on each dataset, and a card's number as its text.
   4. The result must be whole (`resultRefusal`): no launcher or builder cap reached or met (`truncated`), and an outer
      ORDER BY that is unique by construction (`orderIsUnique`), with key values unique across today's rows as well
      when every key is an output column (`unstableOrder`), at any row count unless the query returns at most one row
@@ -79,7 +81,7 @@ or when the write was verified but the project changed during the job; 2 for a u
 
 __all__ = [
     "aliasShadowsColumn", "floatAggregate", "main", "orderIsUnique", "orderKeys", "resultRefusal",
-    "singleRowByConstruction", "sqlRefusal", "verdictOf", "visibleDifference",
+    "savedVerdict", "singleRowByConstruction", "sqlRefusal", "verdictOf", "visibleDifference",
 ]
 
 import argparse
@@ -319,6 +321,56 @@ def verdictOf(saved: dict, new: dict) -> tuple[str, str | None]:
     if compareCharts(saved, new, relTol=REL_TOL) != "match":
         return "differ", "compareCharts"
     return "match", None
+
+
+# The client's palette, which its export puts on every dataset that has no colour of its own (`addColors`).
+_EXPORT_STYLE_KEYS = ("backgroundColor", "borderColor")
+
+
+def _isCardNumberText(text: Any, value: Any) -> bool:
+    """Whether `text` is how the client exports the number `value` (`String(value)`), by the export's own rule."""
+    if not isinstance(text, str) or isinstance(value, bool) or not isinstance(value, (int, float)):
+        return False
+    if isinstance(value, float) and not math.isfinite(value):
+        return False
+    from api.services.dashboardService import _NUMBER_TEXT
+
+    return _NUMBER_TEXT.fullmatch(text) is not None and float(text) == value
+
+
+def _withoutExportShape(saved: dict, new: dict) -> dict:
+    """A copy of the saved widget without what only the client's export gave it, to compare with a re-run's chart.
+
+    The Panel exports a chart as it drew it. Three things in it are never in a re-run's chart, while the dashboard
+    shows the two alike:
+      - an axis label as a one-item list (`toAxisLabels`); the dashboard reads the text as that same one-item list;
+      - the palette's `backgroundColor` and `borderColor` on each dataset; a refresh replaces `data` without them,
+        for the saved Python as well, and the dashboard colours a dataset that has none from the same palette;
+      - a card's number as its text (`String(value)`, before the export checked the card): set aside only when
+        `new` holds exactly that number, by the rule the export itself uses (`_exportedCardData`).
+    Colours or a text value the saved Python prints itself are not export shape. They come back on every re-run, so
+    the filter check, which compares the two forms' own re-runs with nothing set aside, refuses those.
+    """
+    shown = copy.deepcopy(saved)
+    for axis in ("xLabels", "yLabels"):
+        labels = shown.get(axis)
+        if isinstance(labels, list) and len(labels) == 1 and isinstance(labels[0], str) and labels[0]:
+            shown[axis] = labels[0]
+    data = shown.get("data")
+    datasets = data.get("datasets") if isinstance(data, dict) else None
+    if isinstance(datasets, list):
+        for dataset in datasets:
+            if isinstance(dataset, dict):
+                for key in _EXPORT_STYLE_KEYS:
+                    dataset.pop(key, None)
+    if shown.get("chartType") == "card" and isinstance(new, dict) and _isCardNumberText(data, new.get("data")):
+        shown["data"] = new["data"]
+    return shown
+
+
+def savedVerdict(saved: dict, new: dict) -> tuple[str, str | None]:
+    """`verdictOf` for a saved widget against a re-run's chart, with the client's export shape set aside."""
+    return verdictOf(_withoutExportShape(saved, new), new)
 
 
 # Refusals: what a single unfiltered match cannot prove
@@ -1614,11 +1666,11 @@ def _checkRequest(job, pageId: str, widget: dict, request: ChartRequest, finalOu
         # R1: the render read a table the SQL check did not resolve for the request. The names stay out of the report.
         entry.update(verdict="differ", field="filter", reason="unresolvedTable", reasonDetail="servedOtherTable")
         return
-    verdict, field = verdictOf(widget, chart)
+    verdict, field = savedVerdict(widget, chart)
     if verdict != "match":
         entry.update(verdict=verdict, field=field)
         return
-    if verdictOf(widget, {**finalOutput, "title": widget.get("title")})[0] != "match":
+    if savedVerdict(widget, {**finalOutput, "title": widget.get("title")})[0] != "match":
         # The workflow's own run of the same request showed something else: the SQL is not repeatable.
         entry.update(verdict="differ", field="nondeterministic")
         return
