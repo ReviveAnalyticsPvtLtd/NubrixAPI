@@ -50,6 +50,12 @@ def _python(title):
     return f"import json\ndf = fetch_data_pl('{PROJECT}', 'orders')\nprint(json.dumps({{'title': '{title}'}}))"
 
 
+@pytest.fixture(autouse=True)
+def noSettleWait(monkeypatch):
+    """The job waits before its last read of the live config; the tests that care about the wait set it themselves."""
+    monkeypatch.setattr(conv, "_SETTLE_SECONDS", 0)
+
+
 # Fakes
 
 
@@ -365,10 +371,11 @@ def test_backupBeforeWrite(tmp_path, monkeypatch):
         ("write", CONFIG, True),
         ("read", CONFIG),
         ("modifiedAt",),
+        ("read", CONFIG),
     ]
     assert store.files[BACKUP] == original and store.files[CONFIG] != original
     report = _report(tmp_path)
-    assert report["outcome"] == "written" and report["modifiedAtCheck"] == "unchanged"
+    assert report["outcome"] == "written" and report["modifiedAtCheck"] == "unchanged" and report["liveAfterWrite"] == "asWritten"
 
 
 def test_panelAndFailureWidgetsAreSkipped(tmp_path, monkeypatch):
@@ -577,6 +584,74 @@ def test_theProjectChangingDuringTheJobIsReported(tmp_path, monkeypatch, capsys)
     assert report["modifiedAtCheck"] == "changed" and report["written"] == 1 and report["backup"] == BACKUP
     out = capsys.readouterr()
     assert out.out.splitlines()[-1] == f"backup {BACKUP}" and "possibleConcurrentEdit" in out.err and BACKUP in out.err
+
+
+def _savedOverAfterTheWrite(tmp_path, monkeypatch, lastRead):
+    _Fakes(monkeypatch, plans={"q": _request("one")}, charts={_sql("one"): SAVED})
+    store = _store(_config(_widget("w1", SAVED, query="q")))
+    original = store.files[CONFIG]
+    # Reads of the config: the job's first, the check before the write, the read back, and the last look.
+    store.hooks[(CONFIG, 4)] = lambda: lastRead(original)
+    return store, _run(tmp_path, store, "--write")
+
+
+def test_aSaveThatLandsOverTheNewConfigIsReported(tmp_path, monkeypatch, capsys):
+    """A refresh does not touch `modifiedAt`. One that re-read the config just before the job wrote saves its copy
+    over the new config a moment later, which undoes every conversion while the write itself was verified."""
+    store, code = _savedOverAfterTheWrite(tmp_path, monkeypatch, lambda original: original)
+
+    assert code == 1
+    report = _report(tmp_path)
+    assert (report["outcome"], report["abortReason"], report["liveAfterWrite"]) == ("written", "changedAfterWrite", "changed")
+    assert report["modifiedAtCheck"] == "unchanged" and report["backup"] == BACKUP
+    # Nothing is written again and nothing is restored.
+    assert [entry for entry in store.writes() if entry[1] == CONFIG] == [("write", CONFIG, True)]
+    out = capsys.readouterr()
+    assert "changedAfterWrite" in out.err and BACKUP in out.err and "run the job again" in out.err
+
+
+def test_aLastReadThatFailsIsReportedToo(tmp_path, monkeypatch, capsys):
+    def gone(original):
+        raise RuntimeError("storage down")
+
+    _, code = _savedOverAfterTheWrite(tmp_path, monkeypatch, gone)
+
+    assert code == 1
+    report = _report(tmp_path)
+    assert (report["abortReason"], report["liveAfterWrite"]) == ("changedAfterWrite", "unreadable")
+    assert "unreadable" in capsys.readouterr().err
+
+
+def test_theLastReadWaitsForASaveInFlight(tmp_path, monkeypatch):
+    _Fakes(monkeypatch, plans={"q": _request("one")}, charts={_sql("one"): SAVED})
+    store = _store(_config(_widget("w1", SAVED, query="q")))
+    monkeypatch.setattr(conv, "_SETTLE_SECONDS", 7)
+    monkeypatch.setattr(conv.time, "sleep", lambda seconds: store.log.append(("wait", seconds)))
+
+    assert _run(tmp_path, store, "--write") == 0
+
+    assert store.log[-3:] == [("modifiedAt",), ("wait", 7), ("read", CONFIG)]
+
+
+def test_aChangedProjectIsStillNamedWhenTheConfigIsAsWritten(tmp_path, monkeypatch):
+    _Fakes(monkeypatch, plans={"q": _request("one")}, charts={_sql("one"): SAVED})
+    store = _store(_config(_widget("w1", SAVED, query="q")))
+    store.modifiedAt = ["2026-11-10T08:00:00+00:00", "2026-11-11T09:00:01+00:00"]
+
+    assert _run(tmp_path, store, "--write") == 1
+
+    report = _report(tmp_path)
+    assert (report["abortReason"], report["liveAfterWrite"]) == ("possibleConcurrentEdit", "asWritten")
+
+
+def test_aDryRunTakesNoLastLook(tmp_path, monkeypatch):
+    _Fakes(monkeypatch, plans={"q": _request("one")}, charts={_sql("one"): SAVED})
+    store = _store(_config(_widget("w1", SAVED, query="q")))
+    monkeypatch.setattr(conv.time, "sleep", lambda seconds: (_ for _ in ()).throw(AssertionError("waited")))
+
+    assert _run(tmp_path, store) == 0
+
+    assert store.log.count(("read", CONFIG)) == 1 and "liveAfterWrite" not in _report(tmp_path)
 
 
 def test_aProjectRowThatCannotBeReadAbortsBeforeAnything(tmp_path, monkeypatch):

@@ -61,8 +61,14 @@ request waits.
   4. the live config is read again and must still be those bytes, else the dashboard was edited meanwhile;
   5. the new config, written with the service's JSON settings, is uploaded and read back;
   6. `modifiedAt` is read again: a change means the project was edited during the job (`possibleConcurrentEdit`).
+     The service sets it on an export, a layout change, a delete and a page change, but not when a refresh saves;
+  7. so after `_SETTLE_SECONDS` the live config is read one last time and must still be the new bytes
+     (`liveAfterWrite`). A refresh that re-read the config just before step 5 saves its own copy over the new one a
+     moment later, which undoes every conversion; that is `changedAfterWrite`, and the job is run again.
 A failure at 3 or 4 aborts with the live config untouched. A failure at 5 is never restored automatically: the live
 config is read once more and reported as `writeLanded`, `writeNotApplied`, `changedBySomeoneElse` or `unreadable`.
+Storage has no conditional write, so 4 and 7 narrow the window a concurrent save can slip through and say when one
+did; they cannot close it. Run the job while the project is quiet.
 
 Nothing is charged and nothing is traced: the workflow runs with no callbacks, and Langfuse and LangSmith are off for
 the whole job even when their keys are set (`_noTracing`). No `.env` file is read. Redis is cut off for the run
@@ -76,7 +82,8 @@ and the counts. Filter values and differing fields can hold data, so they stay i
 
 Exit code: 0 when the job finished (also when nothing matched); 1 when it aborted (the project row or the config could
 not be read, the backup could not be verified, the dashboard was edited meanwhile, or the write could not be verified)
-or when the write was verified but the project changed during the job; 2 for a usage error (nothing was read).
+or when the write was verified but the project changed during the job or the live config changed again right after
+it; 2 for a usage error (nothing was read).
 """
 
 __all__ = [
@@ -126,6 +133,9 @@ CONFIG = "dashboardConfig.json"
 METADATA = "metadata.json"
 REL_TOL = 1e-9
 FAILED_CODE_PREFIX = "# Failed to generate code"
+# How long the job waits after its write before the last read of the live config: longer than a refresh takes from its
+# own re-read of the config to its save, so a save that was in flight when the job wrote has landed by then.
+_SETTLE_SECONDS = 5
 # The chart keys a refresh of a saved chart request replaces (`dashboardService._CHART_KEYS`), title aside: the
 # request carries the saved title. `columns` comes before `data` so a table's column order is named first.
 VISIBLE_KEYS = ("chartType", "xLabels", "yLabels", "label", "columns", "data", "map")
@@ -1783,7 +1793,11 @@ class StorageStore:
         self.bucket.upload(path=f"{self.project}/{name}", file=data, file_options={"upsert": "true" if overwrite else "false"})
 
     def projectModifiedAt(self):
-        """The project row's `modifiedAt`, read only. The service updates it on every dashboard edit."""
+        """The project row's `modifiedAt`, read only.
+
+        The service sets it when a widget is exported, moved or deleted and when a page is made or deleted. A refresh
+        saves the config without setting it, which is why the job also reads the live config again after its write.
+        """
         rows = self.client.table("Projects").select("modifiedAt").eq("projectId", self.project).execute().data
         if not rows:
             raise LookupError("the project row was not found")
@@ -1858,6 +1872,19 @@ def _write(store, original: bytes, newBytes: bytes, replaced: int, report: dict,
         if outcome == "writeLanded":
             report["written"] = replaced
         raise _Abort("writeNotVerified")
+
+
+def _liveAfterWrite(store, newBytes: bytes) -> str:
+    """Whether the live config is still what the job wrote, a moment later: `asWritten`, `changed` or `unreadable`.
+
+    The one writer `modifiedAt` cannot show is a refresh. It re-reads the config, merges its new chart data and saves;
+    one that re-read before the job wrote saves the old `generatedCode` over the new. The wait lets such a save land.
+    """
+    time.sleep(_SETTLE_SECONDS)
+    try:
+        return "asWritten" if bytes(store.read(CONFIG)) == newBytes else "changed"
+    except Exception:
+        return "unreadable"
 
 
 # The job
@@ -1936,7 +1963,8 @@ def _convert(args, store, stub: dict | None, report: dict, save) -> None:
     if not replaced:
         report["outcome"] = "nothingToWrite"
         return
-    _write(store, original, _configBytes(updated), replaced, report, save)
+    newBytes = _configBytes(updated)
+    _write(store, original, newBytes, replaced, report, save)
     report.update(outcome="written", written=replaced)
     try:
         modifiedAfter = store.projectModifiedAt()
@@ -1944,6 +1972,10 @@ def _convert(args, store, stub: dict | None, report: dict, save) -> None:
         report["modifiedAtCheck"] = "unchanged" if modifiedAfter == modifiedBefore else "changed"
     except Exception:
         report["modifiedAtCheck"] = "unreadable"
+    report["liveAfterWrite"] = _liveAfterWrite(store, newBytes)
+    save()
+    if report["liveAfterWrite"] != "asWritten":
+        raise _Abort("changedAfterWrite")
     if report["modifiedAtCheck"] != "unchanged":
         raise _Abort("possibleConcurrentEdit")
 
@@ -1974,6 +2006,10 @@ def _abortMessage(prog: str, report: dict) -> str:
     if reason == "possibleConcurrentEdit":
         return (f"{prog}: the new config was written and verified, but the project changed during the job "
                 f"(possibleConcurrentEdit, modifiedAt {report['modifiedAtCheck']}); compare the live config with the backup {backup}.")
+    if reason == "changedAfterWrite":
+        return (f"{prog}: the new config was written and verified, but the live config was {report['liveAfterWrite']} a moment later "
+                f"(changedAfterWrite): something saved over it, so the conversions may not be live. Nothing was restored; "
+                f"compare the live config with the backup {backup}, then run the job again.")
     if reason == "writeNotVerified":
         return (f"{prog}: aborted (writeNotVerified: {report.get('writeOutcome')}); nothing was restored; "
                 f"compare the live config with the backup {backup}.")
