@@ -202,10 +202,24 @@ def test_aMarkedTablesSchemaIsReadByHeadAndRangeOnly(monkeypatch):
     assert ranged and all(entry["range"] and entry["status"] == 206 for entry in ranged)
 
 
-def test_aTableWithoutAValidMarkerIsDownloadedWhole(monkeypatch):
-    # The same files under another key: the markers do not match, so the footer read falls back to a full download.
+def test_aTableWithoutAValidMarkerIsStillReadByRangeThroughTheReaderChild(monkeypatch):
+    # The same files under another key: the markers do not match, so the footer goes to the reader child. That costs a
+    # sandbox run per table, which is why the harness serves the fixtures with their own key. Nothing is downloaded whole.
+    from utils import sandboxRunner
+
+    reads = []
+    realRun = sandboxRunner.runTrustedSandbox
+
+    def spy(launcherName, projectId, inputBytes, request, *args, **kwargs):
+        reads.append(request["op"])
+        return realRun(launcherName, projectId, inputBytes, request, *args, **kwargs)
+
+    monkeypatch.setattr(sandboxRunner, "runTrustedSandbox", spy)
     requests = _schemaRequests(monkeypatch, "some-other-key")
-    assert any(entry["method"] == "GET" and entry["range"] is None for entry in requests)
+    assert reads == ["schema"]
+    assert sum(entry["method"] == "HEAD" for entry in requests) == 1
+    ranged = [entry for entry in requests if entry["method"] == "GET"]
+    assert ranged and all(entry["range"] and entry["status"] == 206 for entry in ranged)
 
 
 def test_theFixturesAreByteDeterministicAndMarkedByTheApiWriter(tmp_path):
