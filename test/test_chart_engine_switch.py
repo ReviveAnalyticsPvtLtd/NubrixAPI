@@ -1059,7 +1059,7 @@ def _realSqlWorkflowBehindTheService(env, monkeypatch):
 
     rows = pa.table({"a": ["x"], "total": [3]})
     sink = io.BytesIO()
-    with pa.ipc.new_file(sink, rows.schema) as writer:
+    with pa.ipc.new_stream(sink, rows.schema) as writer:
         writer.write_table(rows)
     sandboxRuns = []
 
