@@ -4,8 +4,8 @@ Invented names and values, no randomness: running it again gives the same bytes.
 
 The tables are written by the API's own writer (`utils.storedTables.writeStoredTable`), so each carries the marker the
 API gives a table it stored, and a marked table's footer is read by HEAD and Range requests. The marker is derived
-from a key, so the harness has to serve these files with the same key: `--storage-key` takes FIXTURE_KEY. It is a
-made-up value that protects nothing.
+from a key, so the harness has to serve these files with the same key: set the environment variable
+`CHART_EVAL_STORAGE_KEY` to FIXTURE_KEY (the harness has no argument for it). It is a made-up value that protects nothing.
 
 Usage (from the repo root): python test/fixtures/chart_eval/buildFixtures.py
 """
