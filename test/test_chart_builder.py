@@ -6,6 +6,7 @@ from decimal import Decimal
 import pyarrow as pa
 import pytest
 
+from nubrix.components import chartBuilder
 from nubrix.components.chartBuilder import ChartBuildError, buildChart, emptyChart, readableLabel
 from nubrix.components.chartContract import contractErrors
 from nubrix.components.chartRequest import CHART_TYPES, LABEL_CAP, ChartRequest
@@ -21,6 +22,28 @@ def build(request, table, **kwargs):
     chart = buildChart(request, table, **kwargs)
     assert contractErrors(chart) == []
     return chart
+
+
+@pytest.fixture
+def warnings(monkeypatch):
+    """Warnings the builder logs. Loguru does not reach caplog, and other tests replace `utils.logger`."""
+
+    class Recorder:
+        def __init__(self):
+            self.lines: list[str] = []
+
+        def warning(self, message, *args, **kwargs):
+            assert not args and not kwargs
+            self.lines.append(message)
+
+    recorder = Recorder()
+    monkeypatch.setattr(chartBuilder, "logger", recorder)
+    return recorder.lines
+
+
+def test_theBuilderLogsThroughTheAppLogger():
+    """Nothing forwards stdlib logging to the app's sinks, so a stdlib logger's lines are lost."""
+    assert not isinstance(chartBuilder.logger, logging.Logger)
 
 
 def test_readableLabel():
@@ -361,7 +384,7 @@ def test_categoryValuesAreJsonSafeAndLabelsAreText():
 
 
 @pytest.mark.parametrize("withSeries", [False, True])
-def test_categoryOverLabelCapRaisesWhenStrictAndTruncatesWhenLenient(withSeries, caplog):
+def test_categoryOverLabelCapRaisesWhenStrictAndTruncatesWhenLenient(withSeries, warnings):
     count = LABEL_CAP + 1
     columns = {"x": [f"l{i}" for i in range(count)], "y": list(range(count))}
     encoding = {"x": "x", "y": "y"}
@@ -372,11 +395,10 @@ def test_categoryOverLabelCapRaisesWhenStrictAndTruncatesWhenLenient(withSeries,
     table = pa.table(columns)
     with pytest.raises(ChartBuildError, match=f"LIMIT {LABEL_CAP}"):
         buildChart(request, table)
-    with caplog.at_level(logging.WARNING):
-        chart = build(request, table, lenient=True)
+    chart = build(request, table, lenient=True)
     assert chart["data"]["labels"] == [f"l{i}" for i in range(LABEL_CAP)]
     assert chart["data"]["datasets"][0]["data"] == list(range(LABEL_CAP))
-    assert "keeping the first 500 labels" in caplog.text
+    assert warnings == ["The bar chart has 501 labels; keeping the first 500 labels"]
 
 
 def test_categoryAtLabelCapIsFine():
@@ -385,14 +407,13 @@ def test_categoryAtLabelCapIsFine():
     assert len(build(request, table)["data"]["labels"]) == LABEL_CAP
 
 
-def test_categoryTruncatedFollowsTheSameRule(caplog):
+def test_categoryTruncatedFollowsTheSameRule(warnings):
     request = makeRequest("bar", {"x": "x", "y": "y"})
     table = pa.table({"x": ["a", "b"], "y": [1, 2]})
     with pytest.raises(ChartBuildError, match="ORDER BY"):
         buildChart(request, table, truncated=True)
-    with caplog.at_level(logging.WARNING):
-        assert build(request, table, truncated=True, lenient=True)["data"]["labels"] == ["a", "b"]
-    assert caplog.text
+    assert build(request, table, truncated=True, lenient=True)["data"]["labels"] == ["a", "b"]
+    assert len(warnings) == 1
 
 
 @pytest.mark.parametrize("chartType", ["table", "geoMap", "scatter", "bubble"])
@@ -534,12 +555,10 @@ def test_integerValuedDecimalActsLikeAnInt():
     assert build(card, table.select(["big"]))["data"] == "9007199254740993"
 
 
-def test_lenientTruncatedWithinCapSaysDataIsIncomplete(caplog):
+def test_lenientTruncatedWithinCapSaysDataIsIncomplete(warnings):
     request = makeRequest("bar", {"x": "x", "y": "y"})
-    with caplog.at_level(logging.WARNING):
-        buildChart(request, pa.table({"x": ["a"], "y": [1]}), truncated=True, lenient=True)
-    assert "incomplete" in caplog.text
-    assert "keeping the first" not in caplog.text
+    buildChart(request, pa.table({"x": ["a"], "y": [1]}), truncated=True, lenient=True)
+    assert warnings == ["The query returned more rows than a bar chart can use; the data is incomplete"]
 
 
 def pivotLong(rowName, columnName, pairs):

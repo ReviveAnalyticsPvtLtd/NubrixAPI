@@ -12,7 +12,6 @@ __author__ = "Rohit Mishra"
 __all__ = ["ChartBuildError", "buildChart", "emptyChart", "readableLabel"]
 
 import heapq
-import logging
 import math
 import re
 from decimal import Decimal
@@ -26,8 +25,7 @@ from nubrix.components.chartRequest import (
     ChartRequest,
     requiredColumns,
 )
-
-logger = logging.getLogger(__name__)
+from utils.logger import logger
 
 MAX_EXACT_INT = 2**53
 EMPTY_LEVEL = "\u2014"
@@ -176,9 +174,9 @@ def _checkLabelCount(request: ChartRequest, count: int, truncated: bool, lenient
         problem = f"query returned more rows than a {request.chartType} chart can use"
     if lenient:
         if count > LABEL_CAP:
-            logger.warning("The %s; keeping the first %d labels", problem, LABEL_CAP)
+            logger.warning(f"The {problem}; keeping the first {LABEL_CAP} labels")
         else:
-            logger.warning("The %s; the data is incomplete", problem)
+            logger.warning(f"The {problem}; the data is incomplete")
         return
     raise ChartBuildError(
         f"The {problem} (limit {LABEL_CAP}). Aggregate further, and add ORDER BY and LIMIT {LABEL_CAP}."
