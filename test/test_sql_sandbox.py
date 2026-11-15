@@ -16,7 +16,7 @@ from nubrix.components.sqlCheck import checkSql
 from test.test_sandbox_storage_reads import PROJECT, _arrowStream, _liveRunUidProcesses, separateUids, sharedFoldersOpen, storage  # noqa: F401
 from utils import codeExecutor, initMethods, sandboxRunner
 from utils.sandboxLimits import currentRunLimits
-from utils.sqlRunner import runChartQuery
+from utils.sqlRunner import ChartRunError, _readTable, runChartQuery
 
 MIB = 1024**2
 STATES = ["SP", "SP", "SP", "RJ", "RJ", "MG"]
@@ -56,7 +56,8 @@ def _run(request, timeoutSeconds=60):
     if not reply["ok"]:
         assert result.resultBytes is None
         return reply, None
-    return reply, pa.ipc.open_file(pa.BufferReader(result.resultBytes)).read_all()
+    # Through the API's own reader, so every run here also shows that it accepts what the launcher writes.
+    return reply, _readTable(result.resultBytes, request["rowLimit"])
 
 
 def _scalar(sql, **kwargs):
@@ -80,10 +81,38 @@ def test_simpleGroupByReturnsRows(orders):
     assert table.to_pylist() == [{"state": "MG", "total": 60}, {"state": "RJ", "total": 90}, {"state": "SP", "total": 60}]
 
 
-def test_resultFileIsAnArrowIpcFile(orders):
+def test_resultFileIsAnArrowStreamTheApiReads(orders):
     result = sandboxRunner.runSqlSandbox(PROJECT, _request("SELECT state FROM orders"), 60)
 
-    assert result.resultBytes.startswith(b"ARROW1")
+    assert sorted(pa.ipc.open_stream(pa.BufferReader(result.resultBytes)).read_all().column("state").to_pylist()) == sorted(STATES)
+    assert _readTable(result.resultBytes, 100).num_rows == 6
+
+
+def test_theApiReadsTheTypesDuckDbReturns(storage):
+    """The API only reads types whose values have bytes of their own, so what DuckDB gives for its types is pinned here."""
+    columns = [
+        "1::HUGEINT AS huge", "2::UHUGEINT AS uhuge", "INTERVAL 1 DAY AS span", "uuid() AS id", "[1, 2] AS items", "[NULL, NULL] AS nulls",
+        "{'a': 1, 'b': 'x'} AS pair", "MAP {'k': 1} AS lookup", "TIMESTAMPTZ '2024-01-01 00:00:00+00' AS at", "TIME '10:00:00' AS clock",
+        "'ab'::BLOB AS raw", "'101'::BIT AS bits", "1.50::DECIMAL(10, 2) AS price", "DATE '2024-01-02' AS day", "NULL AS nothing",
+        "true AS flag", "array_value(1, 2) AS fixed", "1.5::FLOAT AS small", "TIMESTAMP_NS '2024-01-01 00:00:00' AS nanos",
+        "'{\"a\": 1}'::JSON AS doc", "list(NULL) AS gathered",
+    ]
+
+    reply, table = _run(_request("SELECT " + ", ".join(columns), tables=[]))
+
+    assert reply["ok"], reply
+    assert (table.num_rows, table.num_columns) == (1, len(columns))
+    assert table.column("items").to_pylist() == [[1, 2]]
+
+
+@pytest.mark.parametrize("sql", ["SELECT 'a'::ENUM('a', 'b') AS level", "SELECT union_value(n := 1) AS either"])
+def test_enumAndUnionResultsAreRefusedWithTheFix(storage, sql):
+    """DuckDB hands these over as a dictionary and a union, whose rows can share bytes; the message says what to write instead."""
+    result = sandboxRunner.runSqlSandbox(PROJECT, _request(sql, tables=[]), 60)
+
+    assert json.loads(result.stdout)["ok"] is True
+    with pytest.raises(ChartRunError, match="Cast ENUM and UNION columns to VARCHAR"):
+        _readTable(result.resultBytes, 100)
 
 
 def test_quotedAndMixedCaseTableNamesRun(storage):
@@ -405,6 +434,41 @@ def test_underSeccomp(orders):
     assert reply == {"ok": True, "truncated": False, "rows": 3}
     assert table.column("total").to_pylist() == [60, 90, 60]
     assert _liveRunUidProcesses() == []
+
+
+def test_theThreadPoolIsSizedWhenTheConnectionIsMade(monkeypatch):
+    """`SET threads` after a plain connect leaves a CPU-sized pool, which a run's process limit refuses.
+
+    The test under a tight limit below needs more CPUs than the test machines have, so the call is pinned here;
+    `test_limitsSizeTheDuckDbSettings` shows a run reads its thread count from this connection alone.
+    """
+    from utils import sql_launcher
+
+    calls = []
+    monkeypatch.setattr(sql_launcher.duckdb, "connect", lambda *args, **kwargs: calls.append((args, kwargs)))
+
+    sql_launcher._connect(2)
+    sql_launcher._connect(0)
+
+    assert calls == [((":memory:",), {"config": {"threads": 2}}), ((":memory:",), {})]
+
+
+def test_configureLeavesTheThreadCountToTheConnection():
+    """Were `_configure` to set it too, the settings test would pass with a pool sized by the CPU count."""
+    import dataclasses
+
+    import duckdb
+
+    from utils import sql_launcher
+
+    statements = []
+    con = MagicMock(spec=duckdb.DuckDBPyConnection)
+    con.execute.side_effect = lambda statement: statements.append(statement)
+
+    sql_launcher._configure(con, dataclasses.replace(currentRunLimits(), threads=2), "tmp")
+
+    assert statements[-2:] == ["SET enable_external_access=false", "SET lock_configuration=true"]
+    assert not any("threads" in statement for statement in statements)
 
 
 @separateUids
