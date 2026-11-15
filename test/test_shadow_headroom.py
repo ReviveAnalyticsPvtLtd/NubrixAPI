@@ -256,16 +256,35 @@ def test_shadowGroundingReadTakesItsSlotWithoutWaiting(readerRun, monkeypatch):
 
 
 def _unmarkedTableInStorage(monkeypatch):
-    """Storage holds a table with no marker, so its schema is a reader-child read; the child's answer reads as "schema"."""
+    """Storage holds a table with no marker, so its schema is a reader-child read; the child's answer reads as "schema".
+
+    Returns the reads made of the stored file, as (position, length).
+    """
+    import pyarrow as pa
+    import pyarrow.parquet as pq
+
     from utils import projectStorage, storedTables
+
+    sink = io.BytesIO()
+    pq.write_table(pa.table({"a": [1, 2, 3]}), sink)
+    reads = []
+
+    class Stored(io.BytesIO):
+        def read(self, size=-1):
+            reads.append((self.tell(), size))
+            return super().read(size)
 
     @contextmanager
     def openTableFile(projectId, tableName):
-        yield io.BytesIO(b"x")
+        yield Stored(sink.getvalue())
+
+    def readTableBytes(projectId, tableName):
+        raise AssertionError("downloaded the whole table")
 
     monkeypatch.setattr(projectStorage, "openTableFile", openTableFile)
-    monkeypatch.setattr(projectStorage, "readTableBytes", lambda p, t: b"x")
+    monkeypatch.setattr(projectStorage, "readTableBytes", readTableBytes)
     monkeypatch.setattr(storedTables, "_ipcSchema", lambda projectId, tableName, answer: "schema")
+    return reads
 
 
 def _readSchema(**kwargs):
@@ -286,20 +305,21 @@ def test_shadowSchemaReadOfAnUnmarkedTableWithTooFewFreeSlotsIsBusyAndStartsNoRe
     assert freeRunSlots(str(tmp_path), 4) == 4
 
 
-def test_shadowSchemaReadRefusedForHeadroomDownloadsNothing(readerRun, monkeypatch, tmp_path):
-    from utils import projectStorage
+def test_shadowSchemaReadRefusedForHeadroomReadsOnlyTheTail(readerRun, monkeypatch, tmp_path):
+    from utils import storedTables
 
-    _unmarkedTableInStorage(monkeypatch)
-    downloads = []
-    monkeypatch.setattr(projectStorage, "readTableBytes", lambda p, t: downloads.append((p, t)) or b"x")
+    reads = _unmarkedTableInStorage(monkeypatch)
+    # A footer too long to parse here is fetched for the child, and only once the sandbox has room for that child.
+    monkeypatch.setattr(storedTables, "MAX_INPROCESS_FOOTER_BYTES", 16)
+    monkeypatch.setattr(storedTables, "_TAIL_READ_BYTES", 12)
     held = _hold(tmp_path, 4, 3)
     try:
         with pytest.raises(SandboxBusyError):
             _readSchema(leaveHeadroom=True)
-        assert downloads == []
+        assert [length for _, length in reads] == [12]
         assert readerRun == []
-        assert _readSchema() == "schema"  # a served read with the same state downloads and reads as before
-        assert downloads == [("p1", "t")]
+        assert _readSchema() == "schema"  # a served read with the same state fetches the footer and reads as before
+        assert len(reads) == 3 and len(readerRun) == 1
     finally:
         _release(held)
 
