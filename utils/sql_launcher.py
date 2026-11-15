@@ -7,7 +7,8 @@ The API checked the query before it got here, but nothing below relies on that: 
 every table already registered and file access locked off.
 
 Prints exactly one JSON line and exits 0:
-  {"ok": true, "truncated": bool, "rows": int} after writing the result to result_path as an Arrow IPC file, or
+  {"ok": true, "truncated": bool, "rows": int} after writing the result to result_path as an uncompressed Arrow
+  IPC stream (the API refuses a compressed one), or
   {"ok": false, "stage": "bind" | "run", "message": str} for a failure the model can repair.
 Anything else (a bad input, a crash) writes to stderr and exits 1.
 """
@@ -52,14 +53,23 @@ def _quoted(text: str) -> str:
     return "'" + text.replace("'", "''") + "'"
 
 
+def _connect(threads: int) -> duckdb.DuckDBPyConnection:
+    """An in-memory DuckDB whose thread pool has its size from the start (`threads` of 0 means no limit).
+
+    `SET threads` afterwards does not shrink a pool that started at the CPU count, and every worker counts against
+    RLIMIT_NPROC. DuckDB rejects config=None, so with no limit the argument is left out.
+    """
+    if threads > 0:
+        return duckdb.connect(":memory:", config={"threads": threads})
+    return duckdb.connect(":memory:")
+
+
 def _configure(con: duckdb.DuckDBPyConnection, limits: RunLimits, tempFolder: str) -> None:
     """Size DuckDB from the run's limits (a limit of 0 means none), then lock the connection.
 
     The order matters: external access goes off before the configuration locks. `disabled_filesystems` is left
-    alone on purpose, as it would also block the spill files.
+    alone on purpose, as it would also block the spill files. The thread count is `_connect`'s alone.
     """
-    if limits.threads > 0:
-        con.execute(f"SET threads={limits.threads}")
     if limits.maxRunMemory > 0:
         con.execute(f"SET memory_limit='{limits.maxRunMemory * _MEMORY_PERCENT // 100}B'")
     con.execute(f"SET temp_directory={_quoted(tempFolder)}")
@@ -116,8 +126,9 @@ def _runQuery(con: duckdb.DuckDBPyConnection, select, rowLimit: int) -> tuple[pa
 
 
 def _writeResult(table: pa.Table, path: str) -> None:
+    options = pa.ipc.IpcWriteOptions(compression=None)
     with pa.OSFile(path, "wb") as sink:
-        with pa.ipc.new_file(sink, table.schema) as writer:
+        with pa.ipc.new_stream(sink, table.schema, options=options) as writer:
             writer.write_table(table)
 
 
@@ -138,13 +149,7 @@ def main() -> None:
 
     enterSandbox(channel)
     limits = RunLimits.fromChannel(channel["limits"])
-    # Size the pool at connect time: SET threads afterwards does not shrink a CPU-sized pool, and each
-    # worker counts against RLIMIT_NPROC. Omit config when threads is 0 (DuckDB rejects config=None).
-    con = (
-        duckdb.connect(":memory:", config={"threads": limits.threads})
-        if limits.threads > 0
-        else duckdb.connect(":memory:")
-    )
+    con = _connect(limits.threads)
     try:
         for name in tables:
             # The exact name the project gives it, so DuckDB's own case rules decide what the query's text matches.
