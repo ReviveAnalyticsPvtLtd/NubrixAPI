@@ -1,7 +1,7 @@
 """The verified conversion of saved dashboard widgets: a one-off operator job, run only with its own approval.
 
     python -m scripts.convertSavedWidgets --project ID --out REPORT            (dry run: writes nothing)
-    python -m scripts.convertSavedWidgets --project ID --out REPORT --write
+    python -m scripts.convertSavedWidgets --project ID --out REPORT --write --accept-rollback-rule
     python -m scripts.convertSavedWidgets ... --model-stub STUB.jsonl          (tests: recorded model replies)
 
 It reads the project's `dashboardConfig.json` and takes every saved widget whose `generatedCode` is model-written
@@ -52,6 +52,14 @@ Candidates: a widget whose `decodeGeneratedCode` is None, that is not a `panelCh
 `# Failed to generate code` card, and has code. Every other widget is skipped with a reason. A doubt, a failure, a
 timeout or a busy sandbox is that widget's verdict and leaves it as it is. A sandbox slot is waited for as a served
 request waits.
+
+The rollback rule. A converted widget's `generatedCode` is a chart request, and only code that has
+`dashboardService._rerunWidgetProduced` can re-run one. Older code treats it as Python: a filter empties the widget
+and a refresh saves it back rewritten, so the chart request is lost for good and only the backup has the widget. So
+from the first write on, rolling back is `CHART_ENGINE=off`, a deployment rollback may only go to a commit that has
+that function, and any older rollback deployment is retired. `--write` is refused, before anything is read, without
+`--accept-rollback-rule`, which says the deployed code can re-run chart requests and nothing older will be deployed
+again.
 
 `--write` changes the live config only when at least one widget matched, in this order:
   1. the project row's `modifiedAt` is read (read only) before the config is read;
@@ -133,6 +141,12 @@ CONFIG = "dashboardConfig.json"
 METADATA = "metadata.json"
 REL_TOL = 1e-9
 FAILED_CODE_PREFIX = "# Failed to generate code"
+_ROLLBACK_RULE = (
+    "--write needs --accept-rollback-rule. A converted widget can only be re-run by code that has "
+    "dashboardService._rerunWidgetProduced; older code empties it and saves it back rewritten. Pass the flag once the "
+    "deployed code has that function and no older deployment will be rolled back to: from this write on, rolling back "
+    "is CHART_ENGINE=off."
+)
 # How long the job waits after its write before the last read of the live config: longer than a refresh takes from its
 # own re-read of the config to its save, so a save that was in flight when the job wrote has landed by then.
 _SETTLE_SECONDS = 5
@@ -1985,6 +1999,8 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--project", required=True, help="the project id")
     parser.add_argument("--out", required=True, help="path of the local JSON report")
     parser.add_argument("--write", action="store_true", help="replace the matched widgets' generatedCode (default: dry run)")
+    parser.add_argument("--accept-rollback-rule", action="store_true",
+                        help="with --write: the deployed code can re-run chart request widgets, and no older code will be deployed again")
     parser.add_argument("--model-stub", help="JSONL of recorded model replies by widget id (tests)")
     return parser
 
@@ -1996,6 +2012,10 @@ def _validate(args) -> dict | None:
         _pathSegment(args.project)
     except ValueError:
         raise _UsageError("--project is not a valid project id")
+    if args.write and not args.accept_rollback_rule:
+        raise _UsageError(_ROLLBACK_RULE)
+    if args.accept_rollback_rule and not args.write:
+        raise _UsageError("--accept-rollback-rule only goes with --write")
     if not Path(args.out).resolve().parent.is_dir():
         raise _UsageError("--out must be in an existing folder")
     return _loadStub(args.model_stub) if args.model_stub else None
@@ -2031,6 +2051,7 @@ def main(argv: list[str] | None = None, store=None) -> int:
 
     report: dict = {
         "gitSha": chartEval._gitSha(), "project": args.project, "mode": "write" if args.write else "dryRun",
+        "rollbackRuleAccepted": bool(args.accept_rollback_rule),
         "modelStub": stub is not None, "startedAt": _utcNow().isoformat(), "outcome": None, "abortReason": None,
         "backup": None, "written": 0, "counts": None, "widgets": [],
     }

@@ -255,7 +255,9 @@ def _emptySpool(projectId, tableName, path, runEnded):
 
 
 def _run(tmp_path, store, *extra):
-    return conv.main(["--project", PROJECT, "--out", str(tmp_path / "report.json"), *extra], store=store)
+    # Every write here is made with the rollback rule accepted; the tests of the flag itself call `main` directly.
+    accepted = ["--accept-rollback-rule"] if "--write" in extra else []
+    return conv.main(["--project", PROJECT, "--out", str(tmp_path / "report.json"), *extra, *accepted], store=store)
 
 
 def _report(tmp_path):
@@ -2532,3 +2534,38 @@ def test_coloursTheSavedPythonPrintsAreCaughtByTheFilterCheck(tmp_path, monkeypa
     coloured["data"]["datasets"][0].update(PALETTE)
     entry = _exportedJob(tmp_path, monkeypatch, filtered=lambda form, widget, filters: coloured if form == "python" else SAVED)
     assert (entry["verdict"], entry["field"], entry["filterDetail"]) == ("differ", "filter", "data.datasets[0]")
+
+
+# The rollback rule: a write is the point after which older code must not be deployed again
+
+
+def test_aWriteWithoutTheRollbackRuleAcceptedReadsNothing(tmp_path, monkeypatch, capsys):
+    """Code from before the dashboard could re-run a chart request empties a converted widget and saves it back
+    rewritten, so the operator has to say that such code will not be deployed again."""
+    fakes = _Fakes(monkeypatch, plans={"q": _request("one")}, charts={_sql("one"): SAVED})
+    store = _store(_config(_widget("w1", SAVED, query="q")))
+
+    assert conv.main(["--project", PROJECT, "--out", str(tmp_path / "report.json"), "--write"], store=store) == 2
+
+    assert store.log == [] and fakes.prompts == [] and not (tmp_path / "report.json").exists()
+    error = capsys.readouterr().err
+    assert "--accept-rollback-rule" in error and "CHART_ENGINE=off" in error
+
+
+def test_theRollbackRuleIsOnlyAcceptedForAWrite(tmp_path, monkeypatch, capsys):
+    _Fakes(monkeypatch, plans={"q": _request("one")}, charts={_sql("one"): SAVED})
+    store = _store(_config(_widget("w1", SAVED, query="q")))
+
+    assert conv.main(["--project", PROJECT, "--out", str(tmp_path / "report.json"), "--accept-rollback-rule"], store=store) == 2
+
+    assert store.log == [] and "--write" in capsys.readouterr().err
+
+
+def test_anAcceptedWriteSaysSoInTheReport(tmp_path, monkeypatch):
+    _Fakes(monkeypatch, plans={"q": _request("one")}, charts={_sql("one"): SAVED})
+    store = _store(_config(_widget("w1", SAVED, query="q")))
+
+    assert _run(tmp_path, store, "--write") == 0
+    assert _report(tmp_path)["rollbackRuleAccepted"] is True
+    assert _run(tmp_path, store) == 0
+    assert _report(tmp_path)["rollbackRuleAccepted"] is False
