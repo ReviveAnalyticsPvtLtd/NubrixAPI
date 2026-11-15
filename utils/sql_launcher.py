@@ -7,7 +7,8 @@ The API checked the query before it got here, but nothing below relies on that: 
 every table already registered and file access locked off.
 
 Prints exactly one JSON line and exits 0:
-  {"ok": true, "truncated": bool, "rows": int} after writing the result to result_path as an Arrow IPC file, or
+  {"ok": true, "truncated": bool, "rows": int} after writing the result to result_path as an uncompressed Arrow
+  IPC stream (the API refuses a compressed one), or
   {"ok": false, "stage": "bind" | "run", "message": str} for a failure the model can repair.
 Anything else (a bad input, a crash) writes to stderr and exits 1.
 """
@@ -116,8 +117,9 @@ def _runQuery(con: duckdb.DuckDBPyConnection, select, rowLimit: int) -> tuple[pa
 
 
 def _writeResult(table: pa.Table, path: str) -> None:
+    options = pa.ipc.IpcWriteOptions(compression=None)
     with pa.OSFile(path, "wb") as sink:
-        with pa.ipc.new_file(sink, table.schema) as writer:
+        with pa.ipc.new_stream(sink, table.schema, options=options) as writer:
             writer.write_table(table)
 
 
