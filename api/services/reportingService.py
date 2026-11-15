@@ -65,22 +65,21 @@ def _reporting_redis_pool() -> redis.ConnectionPool:
 threadLocal = threading.local()
 
 def initWorkflow():
-    logger.disable("")
-    try:
+    # Mutes this thread's build lines only (the sinks' `_notQuiet` filter). `logger.disable` would mute the process.
+    with logger.contextualize(quiet=True):
         threadLocal.workflow = buildReportingWorkflow()
-    finally:
-        logger.enable("")
 
 def initParallelWorkflow(mode: str | None = None):
-    """Builds this thread's parallel workflow for `mode` (the engine mode when not given), as the pool initializer."""
-    logger.disable("")
-    try:
+    """Builds this thread's parallel workflow for `mode` (the engine mode when not given), as the pool initializer.
+
+    The build's own log lines are muted for this thread alone. Other threads log chart_failure and chart_shadow lines
+    while a batch's workflows build, and `logger.disable` would drop those too.
+    """
+    with logger.contextualize(quiet=True):
         if (mode or chartEngineMode()) == "on":
             threadLocal.sqlParallelWorkflow = buildSqlChartWorkflow(parallel=True)
         else:
             threadLocal.parallelWorkflow = buildParallelReportingWorkflow()
-    finally:
-        logger.enable("")
 
 
 # The SQL chart engine (CHART_ENGINE=on serves it, shadow runs it after the Python response).
