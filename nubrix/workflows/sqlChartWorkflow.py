@@ -437,7 +437,11 @@ class SqlChartWorkflow:
         return {"rephrasedQuery": {**(rephrased if isinstance(rephrased, dict) else {}), "doubt": doubt}, "chart": None}
 
     def _runProbes(self, probes: list[PeriodProbe], state: State, config: RunnableConfig) -> list[tuple[bool, Any]]:
-        """(ended before, last value) per probe, from one sandbox run the way the chart ran."""
+        """(ended before, last value) per probe, from one sandbox run.
+
+        The chart is already in hand and a busy sandbox only means "keep the chart", so the run makes one attempt at each
+        slot instead of waiting as the chart's own run did.
+        """
         try:
             request = ChartRequest(chartType="table", title=_PROBE_TITLE, sql=combinedProbeSql(probes), encoding={})
             chart = renderChartRequest(
@@ -445,6 +449,7 @@ class SqlChartWorkflow:
                 state["projectId"],
                 request,
                 state["tables"],
+                waitForSlot=False,
                 shadow=_isShadow(config),
             )
         except ChartFailure as error:

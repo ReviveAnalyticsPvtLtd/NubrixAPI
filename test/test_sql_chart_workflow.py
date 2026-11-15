@@ -620,7 +620,8 @@ def test_dataThatEndsBeforeThePeriodAsksWhichPeriod(harness):
     assert probe.args[2].chartType == "table"
     assert probe.args[2].sql == PROBE_SQL
     assert list(probe.args[3]) == ["orders"]
-    assert probe.kwargs["shadow"] is False and probe.kwargs.get("waitForSlot", True) is True
+    # The chart is already in hand, so the probe makes one attempt at a slot and never holds the answer up.
+    assert probe.kwargs["waitForSlot"] is False and probe.kwargs["shadow"] is False
     assert harness.logs == []
     harness.repair.invoke.assert_not_called()
 
@@ -772,7 +773,7 @@ def test_aShadowRunProbesWithoutWaitingAndCountsNoOutcome(harness):
     _withProbe(harness, ZERO_CHART, _probeAnswer(("2019-06-30", True)))
     state = harness.run(config={"configurable": {"shadow": True, "outcome": outcome}})
     assert state["finalOutput"] == {"response": _periodQuestion("the data ends on 2019-06-30")}
-    assert _probeCalls(harness)[0].kwargs["shadow"] is True
+    assert _probeCalls(harness)[0].kwargs["waitForSlot"] is False and _probeCalls(harness)[0].kwargs["shadow"] is True
     assert outcome == {}
     assert harness.failureRecords() == []
 
