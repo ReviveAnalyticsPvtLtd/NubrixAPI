@@ -31,6 +31,9 @@ from utils.sandboxSlots import SandboxBusyError, requireHeadroom
 
 MARKER_KEY = b"nubrix.stored-table"
 MAX_INPROCESS_FOOTER_BYTES = 1 << 20
+# The longest footer fetched for the reader child. A file states its own footer length, so this is what stops a file
+# built for it from being fetched whole; no writer the API has used comes near it.
+MAX_UNTRUSTED_FOOTER_BYTES = 64 * 1024 * 1024
 _MAX_FOOTER_CONTAINER = 100_000
 _DEFAULT_MAX_DECODED_BYTES = 2147483648
 _DEFAULT_READER_MEMORY_BYTES = 4294967296
@@ -563,11 +566,10 @@ def readUntrustedInfo(projectId: str, tableName: str, data: bytes) -> dict:
 # ---- The choke point: the only way API code decodes a stored table ----
 
 
-def readTailFooter(tableFile) -> "pq.FileMetaData | None":
-    """Parse the footer of a seekable stored file from its end, as `readFooter` does for whole bytes.
+def _readTail(tableFile) -> tuple[int, bytes, int] | None:
+    """(size, last 64 KiB, footer length) of a seekable stored file that ends as a Parquet file does; None for any other.
 
-    Reads the last 64 KiB, and then the rest of the footer when it is longer, only for a footer of at most 1 MiB.
-    None for anything else; a failed read of the file itself raises.
+    The footer length is the file's own claim, checked only against the file's size. A failed read raises.
     """
     size = tableFile.seek(0, io.SEEK_END)
     if size < 12:
@@ -578,15 +580,32 @@ def readTailFooter(tableFile) -> "pq.FileMetaData | None":
     if len(tail) != tailLength or tail[-4:] != _PARQUET_MAGIC:
         return None
     footerLength = int.from_bytes(tail[-8:-4], "little")
-    if footerLength == 0 or footerLength > MAX_INPROCESS_FOOTER_BYTES or footerLength > size - 12:
+    if footerLength == 0 or footerLength > size - 12:
         return None
-    if footerLength + 8 <= tailLength:
-        footer = tail[-(footerLength + 8):]
-    else:
-        tableFile.seek(size - 8 - footerLength)
-        footer = tableFile.read(footerLength) + tail[-8:]
-    # The footer alone is a file readFooter can check: the row groups' offsets are only read when they are decoded.
-    return readFooter(_PARQUET_MAGIC + footer)
+    return size, tail, footerLength
+
+
+def _footerFile(tableFile, size: int, tail: bytes, footerLength: int) -> bytes:
+    """The footer as a Parquet file of its own, fetching what `tail` does not hold.
+
+    The footer alone is a file a reader can open: the row groups' offsets are only read when they are decoded.
+    """
+    if footerLength + 8 <= len(tail):
+        return _PARQUET_MAGIC + tail[-(footerLength + 8):]
+    tableFile.seek(size - 8 - footerLength)
+    return _PARQUET_MAGIC + tableFile.read(footerLength) + tail[-8:]
+
+
+def readTailFooter(tableFile) -> "pq.FileMetaData | None":
+    """Parse the footer of a seekable stored file from its end, as `readFooter` does for whole bytes.
+
+    Reads the last 64 KiB, and then the rest of the footer when it is longer, only for a footer of at most 1 MiB.
+    None for anything else; a failed read of the file itself raises.
+    """
+    found = _readTail(tableFile)
+    if found is None or found[2] > MAX_INPROCESS_FOOTER_BYTES:
+        return None
+    return readFooter(_footerFile(tableFile, *found))
 
 
 def _trustedFooter(projectId: str, tableName: str, metadata: "pq.FileMetaData | None", what: str) -> "pq.FileMetaData | None":
@@ -634,23 +653,39 @@ def readStoredTablePage(projectId: str, tableName: str, offset: int, limit: int)
 def storedTableSchema(projectId: str, tableName: str, leaveHeadroom: bool = False) -> "pa.Schema":
     """A stored table's Arrow schema, for the chart generator's grounding; the table itself is never decoded here.
 
-    A table the API wrote is read as the data grid reads it: by ranged reads of its footer only, never the whole
-    object. Any other table is downloaded and its footer read by `readUntrustedSchema` in the reader child. Either way
-    every type is plain (`plainType`) and there is no metadata, as the reader child's decode gives them. Raises as
-    `decodeStoredTable` does, and StorageReadError when storage fails. `leaveHeadroom` only matters for the reader
-    child, as in `readUntrustedTable`.
+    Only the footer is ever fetched, by ranged reads, never the whole object: every chart thread reads the schema of
+    every table it may use, and a table can be far larger than a worker should hold. A table the API wrote has its
+    footer parsed here, as the data grid does. Any other table's footer goes to `readUntrustedSchema` in the reader
+    child, as a Parquet file of its own, and so does a footer too long to parse here (it cannot show its marker). The
+    file says how long its footer is, so one over `MAX_UNTRUSTED_FOOTER_BYTES` is refused unread, and so is a file
+    that does not end as a Parquet file does (both TableUnreadableError). Either way every type is plain (`plainType`)
+    and there is no metadata, as the reader child's decode gives them. Raises as `decodeStoredTable` does, and
+    StorageReadError when storage fails. `leaveHeadroom` only matters for the reader child, as in `readUntrustedTable`.
     """
-    from utils.projectStorage import openTableFile, readTableBytes
+    from utils.projectStorage import openTableFile
 
+    what = "Reading a table (schema)"
     with openTableFile(projectId, tableName) as tableFile:
-        metadata = _trustedFooter(projectId, tableName, readTailFooter(tableFile), "Reading a table (schema)")
-    if metadata is not None:
-        return plainSchema(metadata.schema.to_arrow_schema())
-    if leaveHeadroom and readerMemoryBytes():
-        # Refuse before downloading: the reader child would refuse the same way, but only after the whole object is here.
-        requireHeadroom(os.environ.get("SANDBOX_RUN_ROOT"), currentRunLimits().maxConcurrentRuns)
-    data = readTableBytes(projectId, tableName)
-    return readUntrustedSchema(projectId, tableName, data, leaveHeadroom) if leaveHeadroom else readUntrustedSchema(projectId, tableName, data)
+        found = _readTail(tableFile)
+        if found is None:
+            _logChildFailure(what, projectId, tableName, error=ValueError("The file does not end as a Parquet file does."))
+            raise TableUnreadableError(_READ_FAILED)
+        footerLength = found[2]
+        footer = None
+        if footerLength <= MAX_INPROCESS_FOOTER_BYTES:
+            footer = _footerFile(tableFile, *found)
+            metadata = _trustedFooter(projectId, tableName, readFooter(footer), what)
+            if metadata is not None:
+                return plainSchema(metadata.schema.to_arrow_schema())
+        if footerLength > MAX_UNTRUSTED_FOOTER_BYTES:
+            _logTooLarge(what + ", its footer", projectId, tableName, MAX_UNTRUSTED_FOOTER_BYTES)
+            raise TableUnreadableError(_READ_FAILED)
+        if leaveHeadroom and readerMemoryBytes():
+            # Refuse before fetching a long footer: the reader child would refuse the same way, but only once it is here.
+            requireHeadroom(os.environ.get("SANDBOX_RUN_ROOT"), currentRunLimits().maxConcurrentRuns)
+        if footer is None:
+            footer = _footerFile(tableFile, *found)
+    return readUntrustedSchema(projectId, tableName, footer, leaveHeadroom) if leaveHeadroom else readUntrustedSchema(projectId, tableName, footer)
 
 
 def storedTableInfo(projectId: str, tableName: str, data: bytes) -> dict:

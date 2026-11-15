@@ -887,3 +887,20 @@ def test_thePythonEnginesStateCarriesTheKnownMetadataAndTheSqlEnginesDoesNot():
         engine.invoke({"t": {}}, "prompt", "p1")
     assert seen[0]["knownMetadata"] == {"t": {"shape": [1, 1]}} and seen[0]["projectId"] == "p1"
     assert "knownMetadata" not in seen[1]
+
+
+def test_liveRunsAreTracedUnderTheirOwnName(monkeypatch):
+    """Real traffic is counted from the served trace names, so an evaluation run must not carry one of them."""
+    from unittest import mock
+
+    import utils.llm
+
+    seen = []
+    monkeypatch.setattr(utils.llm, "getLangfuseConfig", lambda **kwargs: seen.append(kwargs))
+    engine = object.__new__(chartEval._Engine)
+    engine.engine, engine.replay, engine.failure, engine.knownMetadata = "python", None, None, None
+    engine.workflow = mock.Mock(invoke=lambda state, config=None: {"ok": True})
+
+    assert engine.invoke({}, "question", "p1") == {"ok": True}
+    assert [kwargs["trace_name"] for kwargs in seen] == ["ReportingWorkflowEvaluation"]
+    assert seen[0]["tags"] == ["reporting", "evaluation"]

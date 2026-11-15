@@ -45,14 +45,20 @@ def renderChartRequest(
     filters: list | None = None,
     lenient: bool = False,
     waitForSlot: bool = True,
+    shadow: bool = False,
 ) -> dict:
-    """Check, run and build one chart. Nothing runs when the check fails."""
+    """Check, run and build one chart. Nothing runs when the check fails.
+
+    `waitForSlot` False makes one attempt at each slot. `shadow` is for a shadow run only: it also needs the project
+    idle and the sandbox with slots to spare (`REPLManager.runSql`).
+    """
     try:
         checked = checkSql(request.sql, activeTables)
     except SqlCheckError as error:
         raise ChartFailure("check", str(error)) from error
     try:
-        result = runChartQuery(manager, projectId, checked, request, filters, waitForSlot=waitForSlot)
+        # Only a shadow run names the argument, so every other run calls exactly as before.
+        result = runChartQuery(manager, projectId, checked, request, filters, waitForSlot=waitForSlot, **({"shadow": True} if shadow else {}))
     except ChartRunError as error:
         raise ChartFailure(error.stage, error.message) from error
     try:

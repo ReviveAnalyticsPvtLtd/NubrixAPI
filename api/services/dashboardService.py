@@ -422,7 +422,7 @@ class DashboardService:
         """
         The value to save for an exported card: the number its query gives, when the client sent it as that number's text.
 
-        The client exports a card's value with `String(value)`, so the number 99441 and a text value "99441" (a year or
+        The client exports a card's value with `String(value)`, so the number 48213 and a text value "48213" (a year or
         an id the query returns as text) arrive the same way. A re-run returns the query's own type, and the client shows
         a number with thousands separators and text as it is. So a card whose text could be a number is run once, the way
         a filter re-runs it but with no filters, and the number is saved only when the run gives a number equal to the

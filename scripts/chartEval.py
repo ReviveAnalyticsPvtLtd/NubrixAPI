@@ -753,8 +753,9 @@ class _Engine:
         if self.replay is None:
             from utils.llm import getLangfuseConfig
 
+            # Its own name: real traffic is counted from the served names (`ReportingWorkflow`, `ParallelReportingWorkflow`).
             config = getLangfuseConfig(
-                trace_name="ReportingWorkflow", projectId=project, tags=["reporting", "evaluation"], perRequestHandler=True,
+                trace_name="ReportingWorkflowEvaluation", projectId=project, tags=["reporting", "evaluation"], perRequestHandler=True,
             ) or None
         state = {"metadata": metadata, "inputQuery": prompt, "projectId": project}
         if self.engine == "python" and self.knownMetadata is not None:

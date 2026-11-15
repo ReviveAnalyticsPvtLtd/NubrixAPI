@@ -172,7 +172,7 @@ def test_shadowWhileTheProjectHasARunningTaskIsBusyAndStartsNothing(monkeypatch)
     sql = MagicMock(return_value=OK)
     monkeypatch.setattr(codeExecutor, "runSqlSandbox", sql)
     with pytest.raises(SandboxBusyError):
-        manager.runSql({"sql": "x"}, "p1", waitForSlot=False)
+        manager.runSql({"sql": "x"}, "p1", shadow=True)
     sql.assert_not_called()
 
 
@@ -180,7 +180,7 @@ def test_shadowOnAnIdleProjectAsksForHeadroom(monkeypatch):
     manager = _manager(monkeypatch, _Redis(count=0))
     sql = MagicMock(return_value=OK)
     monkeypatch.setattr(codeExecutor, "runSqlSandbox", sql)
-    assert manager.runSql({"sql": "x"}, "p1", waitForSlot=False) is OK
+    assert manager.runSql({"sql": "x"}, "p1", shadow=True) is OK
     assert sql.call_args.kwargs["requireHeadroom"] is True and sql.call_args.kwargs["slotWaitSeconds"] == 0
 
 
@@ -256,16 +256,35 @@ def test_shadowGroundingReadTakesItsSlotWithoutWaiting(readerRun, monkeypatch):
 
 
 def _unmarkedTableInStorage(monkeypatch):
-    """Storage holds a table with no marker, so its schema is a reader-child read; the child's answer reads as "schema"."""
+    """Storage holds a table with no marker, so its schema is a reader-child read; the child's answer reads as "schema".
+
+    Returns the reads made of the stored file, as (position, length).
+    """
+    import pyarrow as pa
+    import pyarrow.parquet as pq
+
     from utils import projectStorage, storedTables
+
+    sink = io.BytesIO()
+    pq.write_table(pa.table({"a": [1, 2, 3]}), sink)
+    reads = []
+
+    class Stored(io.BytesIO):
+        def read(self, size=-1):
+            reads.append((self.tell(), size))
+            return super().read(size)
 
     @contextmanager
     def openTableFile(projectId, tableName):
-        yield io.BytesIO(b"x")
+        yield Stored(sink.getvalue())
+
+    def readTableBytes(projectId, tableName):
+        raise AssertionError("downloaded the whole table")
 
     monkeypatch.setattr(projectStorage, "openTableFile", openTableFile)
-    monkeypatch.setattr(projectStorage, "readTableBytes", lambda p, t: b"x")
+    monkeypatch.setattr(projectStorage, "readTableBytes", readTableBytes)
     monkeypatch.setattr(storedTables, "_ipcSchema", lambda projectId, tableName, answer: "schema")
+    return reads
 
 
 def _readSchema(**kwargs):
@@ -286,20 +305,21 @@ def test_shadowSchemaReadOfAnUnmarkedTableWithTooFewFreeSlotsIsBusyAndStartsNoRe
     assert freeRunSlots(str(tmp_path), 4) == 4
 
 
-def test_shadowSchemaReadRefusedForHeadroomDownloadsNothing(readerRun, monkeypatch, tmp_path):
-    from utils import projectStorage
+def test_shadowSchemaReadRefusedForHeadroomReadsOnlyTheTail(readerRun, monkeypatch, tmp_path):
+    from utils import storedTables
 
-    _unmarkedTableInStorage(monkeypatch)
-    downloads = []
-    monkeypatch.setattr(projectStorage, "readTableBytes", lambda p, t: downloads.append((p, t)) or b"x")
+    reads = _unmarkedTableInStorage(monkeypatch)
+    # A footer too long to parse here is fetched for the child, and only once the sandbox has room for that child.
+    monkeypatch.setattr(storedTables, "MAX_INPROCESS_FOOTER_BYTES", 16)
+    monkeypatch.setattr(storedTables, "_TAIL_READ_BYTES", 12)
     held = _hold(tmp_path, 4, 3)
     try:
         with pytest.raises(SandboxBusyError):
             _readSchema(leaveHeadroom=True)
-        assert downloads == []
+        assert [length for _, length in reads] == [12]
         assert readerRun == []
-        assert _readSchema() == "schema"  # a served read with the same state downloads and reads as before
-        assert downloads == [("p1", "t")]
+        assert _readSchema() == "schema"  # a served read with the same state fetches the footer and reads as before
+        assert len(reads) == 3 and len(readerRun) == 1
     finally:
         _release(held)
 
@@ -438,7 +458,7 @@ def test_aShadowOnAnIdleProjectRunsAndGivesItsEntryBack(monkeypatch):
     redis = ZsetRedis()
     manager = _manager(monkeypatch, redis)
     calls = _sqlSpy(monkeypatch, redis)
-    assert manager.runSql({"sql": "x"}, "p1", waitForSlot=False) is OK
+    assert manager.runSql({"sql": "x"}, "p1", shadow=True) is OK
     [(kwargs, entriesDuringTheRun)] = calls
     assert kwargs["requireHeadroom"] is True and kwargs["slotWaitSeconds"] == 0
     assert entriesDuringTheRun == 1
@@ -453,7 +473,7 @@ def test_aShadowOnABusyProjectIsRefusedAndLeavesTheOtherEntry(monkeypatch):
     manager = _manager(monkeypatch, redis)
     calls = _sqlSpy(monkeypatch, redis)
     with pytest.raises(SandboxBusyError):
-        manager.runSql({"sql": "x"}, "p1", waitForSlot=False)
+        manager.runSql({"sql": "x"}, "p1", shadow=True)
     assert calls == []
     assert redis.sets["semaphore:p1"].keys() == {"a-served-run"}
     # A served run of the same project still runs beside it, as before.
@@ -467,7 +487,7 @@ def test_aStaleEntryDoesNotKeepAProjectBusy(monkeypatch):
     redis.zadd("semaphore:p1", {"a-run-that-died": 0.0})
     manager = _manager(monkeypatch, redis)
     calls = _sqlSpy(monkeypatch, redis)
-    assert manager.runSql({"sql": "x"}, "p1", waitForSlot=False) is OK
+    assert manager.runSql({"sql": "x"}, "p1", shadow=True) is OK
     assert calls[0][1] == 1 and redis.zcard("semaphore:p1") == 0
 
 
@@ -479,12 +499,12 @@ def test_aRunningShadowMakesASecondShadowOfTheProjectBusy(monkeypatch):
     def run(projectId, **kwargs):
         if projectId == "p1":
             with pytest.raises(SandboxBusyError):
-                manager.runSql({"sql": "y"}, "p1", waitForSlot=False)
-            nested.append(manager.runSql({"sql": "z"}, "p2", waitForSlot=False))  # another project is idle
+                manager.runSql({"sql": "y"}, "p1", shadow=True)
+            nested.append(manager.runSql({"sql": "z"}, "p2", shadow=True))  # another project is idle
         return OK
 
     monkeypatch.setattr(codeExecutor, "runSqlSandbox", run)
-    assert manager.runSql({"sql": "x"}, "p1", waitForSlot=False) is OK
+    assert manager.runSql({"sql": "x"}, "p1", shadow=True) is OK
     assert nested == [OK]
     assert redis.sets == {}
 
@@ -493,7 +513,7 @@ def test_withRedisDownAShadowRunsAsAServedRunDoes(monkeypatch):
     redis = ZsetRedis(down=True)
     manager = _manager(monkeypatch, redis)
     calls = _sqlSpy(monkeypatch, redis)
-    assert manager.runSql({"sql": "x"}, "p1", waitForSlot=False) is OK
+    assert manager.runSql({"sql": "x"}, "p1", shadow=True) is OK
     assert manager.runSql({"sql": "x"}, "p1") is OK
     assert len(calls) == 2
     assert calls[0][0]["requireHeadroom"] is True and "requireHeadroom" not in calls[1][0]
