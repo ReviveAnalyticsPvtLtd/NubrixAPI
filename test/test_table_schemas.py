@@ -407,3 +407,135 @@ def test_aDropNeverRaisesWhenRedisFails(redisFake):
     redisFake.delete = mock.Mock(side_effect=ConnectionError("down"))
     tableSchemas.dropSchemas("p1", "sales")
     tableSchemas.dropSchemas("p1")
+
+
+# ---- Threads that miss together share one read ----
+
+
+def _noRedis(monkeypatch):
+    monkeypatch.setattr(tableSchemas, "_client", lambda: (_ for _ in ()).throw(ConnectionError("no redis")))
+
+
+def _waitFor(condition):
+    import time
+
+    deadline = time.monotonic() + 10
+    while not condition():
+        assert time.monotonic() < deadline, "the threads never got there"
+        time.sleep(0.005)
+
+
+def _inThreads(count, call):
+    """Run `call` in `count` threads; returns the threads and the list each appends its answer or error to."""
+    import threading
+
+    answers = []
+
+    def run():
+        try:
+            answers.append(call())
+        except Exception as error:
+            answers.append(error)
+
+    threads = [threading.Thread(target=run) for _ in range(count)]
+    for thread in threads:
+        thread.start()
+    return threads, answers
+
+
+def test_threadsThatMissTogetherShareOneRead(monkeypatch):
+    """A batch's chart threads all miss a cold cache at once; each read is a storage fetch and can be a reader run holding a slot."""
+    import threading
+
+    _noRedis(monkeypatch)
+    schema = pa.schema([("a", pa.int64())])
+    release, reads = threading.Event(), []
+
+    def read(projectId, tableName, **kwargs):
+        reads.append((projectId, tableName))
+        release.wait(10)
+        return schema
+
+    monkeypatch.setattr(tableSchemas, "storedTableSchema", read)
+    threads, answers = _inThreads(6, lambda: tableSchemas.tableSchemas("p1", ["orders"]))
+    _waitFor(lambda: any(inFlight.waiting == 5 for inFlight in list(tableSchemas._reads.values())))
+    release.set()
+    for thread in threads:
+        thread.join(10)
+
+    assert reads == [("p1", "orders")]
+    assert answers == [{"orders": schema}] * 6
+    assert tableSchemas._reads == {}
+    assert tableSchemas.tableSchemas("p1", ["orders"]) == {"orders": schema}  # nothing is kept: a later call reads again
+    assert len(reads) == 2
+
+
+def test_aSharedReadThatFailsFailsForEveryThreadAndIsNotKept(monkeypatch):
+    import threading
+
+    _noRedis(monkeypatch)
+    release, reads = threading.Event(), []
+
+    def read(projectId, tableName, **kwargs):
+        reads.append(tableName)
+        release.wait(10)
+        raise OSError("storage said no")
+
+    monkeypatch.setattr(tableSchemas, "storedTableSchema", read)
+    threads, answers = _inThreads(3, lambda: tableSchemas.tableSchemas("p1", ["orders"]))
+    _waitFor(lambda: any(inFlight.waiting == 2 for inFlight in list(tableSchemas._reads.values())))
+    release.set()
+    for thread in threads:
+        thread.join(10)
+
+    assert reads == ["orders"]
+    assert [type(answer) for answer in answers] == [OSError] * 3
+    assert tableSchemas._reads == {}
+
+
+def test_aShadowReadAndAServedReadAreNotShared(monkeypatch):
+    """A shadow read gives up where a served one waits for a slot, so neither may stand in for the other."""
+    import threading
+
+    _noRedis(monkeypatch)
+    schema = pa.schema([("a", pa.int64())])
+    release, reads = threading.Event(), []
+
+    def read(projectId, tableName, **kwargs):
+        reads.append(kwargs)
+        release.wait(10)
+        return schema
+
+    monkeypatch.setattr(tableSchemas, "storedTableSchema", read)
+    served, servedAnswers = _inThreads(1, lambda: tableSchemas.tableSchemas("p1", ["orders"]))
+    shadow, shadowAnswers = _inThreads(1, lambda: tableSchemas.tableSchemas("p1", ["orders"], leaveHeadroom=True))
+    _waitFor(lambda: len(reads) == 2)
+    release.set()
+    for thread in served + shadow:
+        thread.join(10)
+
+    assert sorted(reads, key=len) == [{}, {"leaveHeadroom": True}]
+    assert servedAnswers == shadowAnswers == [{"orders": schema}]
+
+
+def test_readsOfDifferentTablesAndProjectsRunSideBySide(monkeypatch):
+    import threading
+
+    _noRedis(monkeypatch)
+    schema = pa.schema([("a", pa.int64())])
+    release, reads = threading.Event(), []
+
+    def read(projectId, tableName, **kwargs):
+        reads.append((projectId, tableName))
+        release.wait(10)
+        return schema
+
+    monkeypatch.setattr(tableSchemas, "storedTableSchema", read)
+    calls = [("p1", "orders"), ("p1", "items"), ("p2", "orders")]
+    started = [_inThreads(1, lambda project=project, table=table: tableSchemas.tableSchemas(project, [table])) for project, table in calls]
+    _waitFor(lambda: len(reads) == 3)
+    release.set()
+    for threads, _ in started:
+        threads[0].join(10)
+
+    assert sorted(reads) == sorted(calls)
