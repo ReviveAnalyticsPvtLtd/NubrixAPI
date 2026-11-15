@@ -1876,6 +1876,9 @@ _DECODERS = {
     "utils/storedTables.py": None,
     # sandboxRunner's child-side readTable: a run decodes the tables it was served, under its own limits.
     "utils/sandboxRunner.py": {"return pq.read_table(path)"},
+    # A SQL run's result: an Arrow stream the run's child wrote, not a stored table. This is its schema message alone;
+    # `_readTable` bounds what the batches may hold before it reads them.
+    "utils/sqlRunner.py": {"schema = pa.ipc.read_schema(first)"},
     # Only the type annotations of the shared filter use the module; it decodes nothing.
     "utils/runFilters.py": {"import pyarrow.dataset as ds"},
 }
