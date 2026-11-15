@@ -436,6 +436,41 @@ def test_underSeccomp(orders):
     assert _liveRunUidProcesses() == []
 
 
+def test_theThreadPoolIsSizedWhenTheConnectionIsMade(monkeypatch):
+    """`SET threads` after a plain connect leaves a CPU-sized pool, which a run's process limit refuses.
+
+    The test under a tight limit below needs more CPUs than the test machines have, so the call is pinned here;
+    `test_limitsSizeTheDuckDbSettings` shows a run reads its thread count from this connection alone.
+    """
+    from utils import sql_launcher
+
+    calls = []
+    monkeypatch.setattr(sql_launcher.duckdb, "connect", lambda *args, **kwargs: calls.append((args, kwargs)))
+
+    sql_launcher._connect(2)
+    sql_launcher._connect(0)
+
+    assert calls == [((":memory:",), {"config": {"threads": 2}}), ((":memory:",), {})]
+
+
+def test_configureLeavesTheThreadCountToTheConnection():
+    """Were `_configure` to set it too, the settings test would pass with a pool sized by the CPU count."""
+    import dataclasses
+
+    import duckdb
+
+    from utils import sql_launcher
+
+    statements = []
+    con = MagicMock(spec=duckdb.DuckDBPyConnection)
+    con.execute.side_effect = lambda statement: statements.append(statement)
+
+    sql_launcher._configure(con, dataclasses.replace(currentRunLimits(), threads=2), "tmp")
+
+    assert statements[-2:] == ["SET enable_external_access=false", "SET lock_configuration=true"]
+    assert not any("threads" in statement for statement in statements)
+
+
 @separateUids
 def test_duckdbThreadPoolFitsUnderATightProcessLimit(orders, monkeypatch):
     """Connect-time threads must be capped: a CPU-sized pool would exceed NPROC; the run's capped pool must fit."""
