@@ -57,9 +57,11 @@ class _Manager(REPLManager):
         super().__init__(timeoutSeconds=5)
         self.answer = answer
         self.calls = []
+        self.shadows = []
 
-    def runSql(self, request, projectId, waitForSlot=True):
+    def runSql(self, request, projectId, waitForSlot=True, shadow=False):
         self.calls.append((request, projectId, waitForSlot))
+        self.shadows.append(shadow)
         if isinstance(self.answer, Exception):
             raise self.answer
         return self.answer
@@ -90,6 +92,16 @@ def test_childRequestCarriesTheCheckedQueryTheFiltersAndTheCaps():
     request, projectId, waitForSlot = manager.calls[0]
     assert request == {"sql": BAR_SQL, "tables": ["sales"], "filters": filters, "requiredColumns": ["state", "total"], "rowLimit": 5000}
     assert (projectId, waitForSlot) == (PROJECT, False)
+
+
+def test_onlyAShadowRunIsRunAsOne():
+    manager = _Manager(_success(pa.table({"state": ["SP"], "total": [3]})))
+
+    renderChartRequest(manager, PROJECT, _bar(), TABLES)
+    renderChartRequest(manager, PROJECT, _bar(), TABLES, waitForSlot=False)
+    renderChartRequest(manager, PROJECT, _bar(), TABLES, shadow=True)
+
+    assert manager.shadows == [False, False, True]
 
 
 def test_tablesAreSentWithTheirProjectNames():

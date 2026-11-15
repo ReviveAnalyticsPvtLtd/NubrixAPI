@@ -154,6 +154,16 @@ def test_runSqlWithoutWaitAsksForNoSlotWait(monkeypatch):
     assert sql.call_args.kwargs.get("slotWaitSeconds") is None
 
 
+def test_runSqlWithoutWaitRunsBesideOtherRunsOfTheProject(monkeypatch):
+    """One attempt at the project's usual cap. Only a shadow run needs the project idle and the sandbox half free."""
+    manager = _manager(monkeypatch, _FakeRedis(count=1))
+    sql = MagicMock(return_value=OK)
+    monkeypatch.setattr(codeExecutor, "runSqlSandbox", sql)
+    assert manager.runSql({"sql": "x"}, "p1", waitForSlot=False) is OK
+    assert sql.call_args.kwargs["slotWaitSeconds"] == 0
+    assert "requireHeadroom" not in sql.call_args.kwargs
+
+
 def test_runSqlReleasesTheSemaphore(monkeypatch):
     redis = _FakeRedis()
     manager = _manager(monkeypatch, redis)

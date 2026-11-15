@@ -68,6 +68,56 @@ def _setup(monkeypatch, value=None, run=None, render=None, metadata=None):
     return service, manager, renderer, events
 
 
+def test_aRequestCardIsCheckedWhileTheProjectHasOtherRuns(monkeypatch):
+    """The check makes one attempt at each slot. It does not need the project idle or the sandbox half free: that is
+    a shadow run's rule, and on a busy project it would leave the card saved as text."""
+    import time
+
+    import pyarrow as pa
+
+    from api.services import dashboardService as module
+    from utils import codeExecutor
+    from utils.sandboxRunner import SandboxResult
+
+    class OneOtherRun:
+        def __init__(self):
+            self.entries = {"another-run": time.time()}
+
+        def zremrangebyscore(self, *args):
+            pass
+
+        def zcard(self, key):
+            return len(self.entries)
+
+        def zadd(self, key, mapping):
+            self.entries.update(mapping)
+
+        def expire(self, *args):
+            pass
+
+        def zrem(self, key, member):
+            self.entries.pop(member, None)
+
+    redis, runs = OneOtherRun(), []
+    sink = pa.BufferOutputStream()
+    table = pa.table({"n": [48213]})
+    with pa.ipc.new_stream(sink, table.schema) as writer:
+        writer.write_table(table)
+
+    def runSqlSandbox(**kwargs):
+        runs.append((kwargs["slotWaitSeconds"], kwargs.get("requireHeadroom", False), len(redis.entries)))
+        return SandboxResult(json.dumps({"ok": True, "truncated": False, "rows": 1}) + "\n", "", 0, sink.getvalue().to_pybytes())
+
+    monkeypatch.setattr(codeExecutor.creditService, "_redis", lambda: redis)
+    monkeypatch.setattr(codeExecutor, "runSqlSandbox", runSqlSandbox)
+    monkeypatch.setattr(module, "readJson", lambda projectId, name: copy.deepcopy(METADATA))
+    service = module.DashboardService.__new__(module.DashboardService)
+
+    assert service._exportedCardData(_details("48213"), "w1") == 48213
+    assert runs == [(0, False, 2)]
+    assert list(redis.entries) == ["another-run"]
+
+
 def _saved(service) -> dict:
     upload = service.client.storage.from_.return_value.upload
     return json.loads(upload.call_args.kwargs["file"].decode("utf-8"))["pg"]["widgets"][-1]

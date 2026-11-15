@@ -172,7 +172,7 @@ def test_shadowWhileTheProjectHasARunningTaskIsBusyAndStartsNothing(monkeypatch)
     sql = MagicMock(return_value=OK)
     monkeypatch.setattr(codeExecutor, "runSqlSandbox", sql)
     with pytest.raises(SandboxBusyError):
-        manager.runSql({"sql": "x"}, "p1", waitForSlot=False)
+        manager.runSql({"sql": "x"}, "p1", shadow=True)
     sql.assert_not_called()
 
 
@@ -180,7 +180,7 @@ def test_shadowOnAnIdleProjectAsksForHeadroom(monkeypatch):
     manager = _manager(monkeypatch, _Redis(count=0))
     sql = MagicMock(return_value=OK)
     monkeypatch.setattr(codeExecutor, "runSqlSandbox", sql)
-    assert manager.runSql({"sql": "x"}, "p1", waitForSlot=False) is OK
+    assert manager.runSql({"sql": "x"}, "p1", shadow=True) is OK
     assert sql.call_args.kwargs["requireHeadroom"] is True and sql.call_args.kwargs["slotWaitSeconds"] == 0
 
 
@@ -438,7 +438,7 @@ def test_aShadowOnAnIdleProjectRunsAndGivesItsEntryBack(monkeypatch):
     redis = ZsetRedis()
     manager = _manager(monkeypatch, redis)
     calls = _sqlSpy(monkeypatch, redis)
-    assert manager.runSql({"sql": "x"}, "p1", waitForSlot=False) is OK
+    assert manager.runSql({"sql": "x"}, "p1", shadow=True) is OK
     [(kwargs, entriesDuringTheRun)] = calls
     assert kwargs["requireHeadroom"] is True and kwargs["slotWaitSeconds"] == 0
     assert entriesDuringTheRun == 1
@@ -453,7 +453,7 @@ def test_aShadowOnABusyProjectIsRefusedAndLeavesTheOtherEntry(monkeypatch):
     manager = _manager(monkeypatch, redis)
     calls = _sqlSpy(monkeypatch, redis)
     with pytest.raises(SandboxBusyError):
-        manager.runSql({"sql": "x"}, "p1", waitForSlot=False)
+        manager.runSql({"sql": "x"}, "p1", shadow=True)
     assert calls == []
     assert redis.sets["semaphore:p1"].keys() == {"a-served-run"}
     # A served run of the same project still runs beside it, as before.
@@ -467,7 +467,7 @@ def test_aStaleEntryDoesNotKeepAProjectBusy(monkeypatch):
     redis.zadd("semaphore:p1", {"a-run-that-died": 0.0})
     manager = _manager(monkeypatch, redis)
     calls = _sqlSpy(monkeypatch, redis)
-    assert manager.runSql({"sql": "x"}, "p1", waitForSlot=False) is OK
+    assert manager.runSql({"sql": "x"}, "p1", shadow=True) is OK
     assert calls[0][1] == 1 and redis.zcard("semaphore:p1") == 0
 
 
@@ -479,12 +479,12 @@ def test_aRunningShadowMakesASecondShadowOfTheProjectBusy(monkeypatch):
     def run(projectId, **kwargs):
         if projectId == "p1":
             with pytest.raises(SandboxBusyError):
-                manager.runSql({"sql": "y"}, "p1", waitForSlot=False)
-            nested.append(manager.runSql({"sql": "z"}, "p2", waitForSlot=False))  # another project is idle
+                manager.runSql({"sql": "y"}, "p1", shadow=True)
+            nested.append(manager.runSql({"sql": "z"}, "p2", shadow=True))  # another project is idle
         return OK
 
     monkeypatch.setattr(codeExecutor, "runSqlSandbox", run)
-    assert manager.runSql({"sql": "x"}, "p1", waitForSlot=False) is OK
+    assert manager.runSql({"sql": "x"}, "p1", shadow=True) is OK
     assert nested == [OK]
     assert redis.sets == {}
 
@@ -493,7 +493,7 @@ def test_withRedisDownAShadowRunsAsAServedRunDoes(monkeypatch):
     redis = ZsetRedis(down=True)
     manager = _manager(monkeypatch, redis)
     calls = _sqlSpy(monkeypatch, redis)
-    assert manager.runSql({"sql": "x"}, "p1", waitForSlot=False) is OK
+    assert manager.runSql({"sql": "x"}, "p1", shadow=True) is OK
     assert manager.runSql({"sql": "x"}, "p1") is OK
     assert len(calls) == 2
     assert calls[0][0]["requireHeadroom"] is True and "requireHeadroom" not in calls[1][0]

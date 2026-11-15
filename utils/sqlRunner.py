@@ -162,8 +162,13 @@ def _readTable(resultBytes: bytes | None, maxRows: int) -> pa.Table:
     return table
 
 
-def runChartQuery(manager: REPLManager, projectId: str, checked: CheckedSql, request: ChartRequest, filters: list | None, waitForSlot: bool = True) -> QueryResult:
-    """Run a checked query in the sandbox. Raises ChartRunError, or SandboxBusyError when no slot is free."""
+def runChartQuery(
+    manager: REPLManager, projectId: str, checked: CheckedSql, request: ChartRequest, filters: list | None, waitForSlot: bool = True, shadow: bool = False
+) -> QueryResult:
+    """Run a checked query in the sandbox. Raises ChartRunError, or SandboxBusyError when no slot is free.
+
+    `waitForSlot` and `shadow` are `REPLManager.runSql`'s; each is passed on only when it is not the default.
+    """
     childRequest = {
         "sql": checked.sql,
         "tables": list(checked.tables),
@@ -172,7 +177,7 @@ def runChartQuery(manager: REPLManager, projectId: str, checked: CheckedSql, req
         "rowLimit": rowLimit(request.chartType),
     }
     try:
-        result = manager.runSql(childRequest, projectId, waitForSlot=waitForSlot)
+        result = manager.runSql(childRequest, projectId, waitForSlot=waitForSlot, **({"shadow": True} if shadow else {}))
     except ResultTooLargeError as error:
         raise ChartRunError("run", _TOO_LARGE) from error
     if result.stopped:

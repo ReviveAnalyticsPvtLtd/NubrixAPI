@@ -343,7 +343,7 @@ class SqlChartWorkflow:
                 state["projectId"],
                 request,
                 state["tables"],
-                waitForSlot=not _isShadow(config),
+                shadow=_isShadow(config),
             )
         except ChartFailure as error:
             return {"chart": None, "failure": {"stage": error.stage, "message": error.message, "error": error}}
@@ -445,7 +445,7 @@ class SqlChartWorkflow:
                 state["projectId"],
                 request,
                 state["tables"],
-                waitForSlot=not _isShadow(config),
+                shadow=_isShadow(config),
             )
         except ChartFailure as error:
             raise _ProbeFailed(error.stage, error) from error
