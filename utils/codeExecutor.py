@@ -82,18 +82,22 @@ class REPLManager:
                 except Exception as e:
                     logger.warning(f"Failed to release semaphore for project {projectId}: {e}")
 
-    def runSql(self, request: dict, projectId: str, waitForSlot: bool = True) -> SandboxResult:
+    def runSql(self, request: dict, projectId: str, waitForSlot: bool = True, shadow: bool = False) -> SandboxResult:
         """Run one SQL chart query under the project's semaphore. Raises SandboxBusyError when the project or the sandbox is full.
 
-        With `waitForSlot` False (a shadow run) it makes one attempt at each, so a caller that can retry later is never held
-        up, and it runs only while the project has nothing else running and the sandbox has slots to spare.
+        With `waitForSlot` False it makes one attempt at the semaphore and one at a sandbox slot, so a caller that can do
+        without the run is never held up. `shadow` (a shadow run) does not wait either, and it runs only while the project
+        has nothing else running and the sandbox has slots to spare. That rule is the shadow's alone: a served caller that
+        does not wait, such as the card check at export, still runs beside the project's other runs.
         """
-        with self._projectSlot(projectId, 30.0 if waitForSlot else 0, onlyIfIdle=not waitForSlot) as acquired:
+        wait = waitForSlot and not shadow
+        with self._projectSlot(projectId, 30.0 if wait else 0, onlyIfIdle=shadow) as acquired:
             if not acquired:
                 raise SandboxBusyError(f"Too many running code execution tasks for project '{projectId}'.")
-            if waitForSlot:
+            if wait:
                 return runSqlSandbox(projectId=projectId, request=request, timeoutSeconds=self.timeoutSeconds)
-            return runSqlSandbox(projectId=projectId, request=request, timeoutSeconds=self.timeoutSeconds, slotWaitSeconds=0, requireHeadroom=True)
+            headroom = {"requireHeadroom": True} if shadow else {}
+            return runSqlSandbox(projectId=projectId, request=request, timeoutSeconds=self.timeoutSeconds, slotWaitSeconds=0, **headroom)
 
     def run(self, codeString: str, projectId: str = None, filters: list | None = None, waitForSlot: bool = True) -> str:
         """Run generated code in the sandbox and return its output (or the reason it stopped).

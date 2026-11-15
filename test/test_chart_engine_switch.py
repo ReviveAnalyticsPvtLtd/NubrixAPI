@@ -925,6 +925,43 @@ def test_parallelHelpersTakeTheModeFromTheirCaller(env):
     assert len(env.sql.calls) == 1 and env.python.calls == []
 
 
+@pytest.mark.parametrize("mode", ["on", "off"])
+def test_buildingABatchWorkflowMutesOnlyTheThreadThatBuilds(monkeypatch, mode):
+    """The build's own lines are noise, but `logger.disable` is process-wide: it also dropped the chart_failure and
+    chart_shadow lines other threads wrote during a build, and the cutover is decided from those lines."""
+    import uuid
+    from pathlib import Path
+
+    marker = uuid.uuid4().hex
+    building, finish = threading.Event(), threading.Event()
+
+    def build(*args, **kwargs):
+        rs.logger.info(f"build noise before {marker}")
+        building.set()
+        finish.wait(10)
+        rs.logger.info(f"build noise after {marker}")
+        return object()
+
+    # The real logger and its sinks: `env` would replace its methods.
+    monkeypatch.setattr(rs, "buildSqlChartWorkflow", build)
+    monkeypatch.setattr(rs, "buildParallelReportingWorkflow", build)
+
+    def work():
+        rs.initParallelWorkflow(mode)
+        rs.logger.info(f"the builder's next line {marker}")
+
+    thread = threading.Thread(target=work)
+    thread.start()
+    assert building.wait(10)
+    rs.logger.warning(f"chart_shadow from another thread {marker}")
+    finish.set()
+    thread.join(10)
+
+    written = "".join(path.read_text(encoding="utf-8", errors="replace") for path in sorted(Path("logs").glob("runLogs*.log")))
+    kept = [line.rpartition(" - ")[2].replace(f" {marker}", "") for line in written.splitlines() if marker in line]
+    assert sorted(kept) == ["chart_shadow from another thread", "the builder's next line"]
+
+
 # Shutdown
 
 def _startFourShadowRuns(env):
@@ -1059,7 +1096,7 @@ def _realSqlWorkflowBehindTheService(env, monkeypatch):
 
     rows = pa.table({"a": ["x"], "total": [3]})
     sink = io.BytesIO()
-    with pa.ipc.new_file(sink, rows.schema) as writer:
+    with pa.ipc.new_stream(sink, rows.schema) as writer:
         writer.write_table(rows)
     sandboxRuns = []
 

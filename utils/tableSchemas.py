@@ -5,9 +5,11 @@ written and ``schema.serialize()`` bytes. An entry older than the table data cac
 invalidation or a read/write race heals as fast as the data cache does, and every write also sets the hash's own
 expiry to that TTL. `invalidate_data_cache` and `forget_table` drop one field (HDEL) or the whole hash (DEL), so no
 drop ever scans the keyspace. A Redis failure means reading without the cache. A miss reads only the schema
-(`storedTableSchema`): a table's footer, never a whole-table decode in this process.
+(`storedTableSchema`): a table's footer, never a whole-table decode in this process. Threads of this process that miss
+the same table at the same time share one such read (`_readSchema`).
 """
 
+import threading
 import time
 from collections.abc import Iterable
 
@@ -19,6 +21,54 @@ from utils.storedTables import storedTableSchema
 
 # Separates an entry's write time from its schema bytes.
 _TIME_SEPARATOR = b":"
+
+
+class _Read:
+    """One read of a table's schema in flight, and what it gave to the threads waiting for it."""
+
+    def __init__(self):
+        self.done = threading.Event()
+        self.waiting = 0
+        self.schema: pa.Schema | None = None
+        self.error: BaseException | None = None
+
+
+# The reads in flight in this process, by (project, table, leaveHeadroom).
+_reads: dict[tuple[str, str, bool], _Read] = {}
+_readsLock = threading.Lock()
+
+
+def _readSchema(projectId: str, tableName: str, leaveHeadroom: bool) -> pa.Schema:
+    """`storedTableSchema`, with at most one read of a table in flight in this process.
+
+    The chart threads of one batch miss a cold cache together. Each read fetches the table's footer and, for a table
+    the API did not write, is a reader run that holds a sandbox slot, so a thread that arrives while a read is in
+    flight waits for it and gets its schema, or its error. Nothing is kept once the read is over: the cache is Redis.
+    A shadow read (`leaveHeadroom`) and a served one are never shared, as a shadow gives up where a served read waits.
+    """
+    key = (projectId, tableName, leaveHeadroom)
+    with _readsLock:
+        read = _reads.get(key)
+        mine = read is None
+        if mine:
+            read = _reads[key] = _Read()
+        else:
+            read.waiting += 1
+    if not mine:
+        read.done.wait()
+        if read.error is not None:
+            raise read.error
+        return read.schema
+    try:
+        read.schema = storedTableSchema(projectId, tableName, leaveHeadroom=True) if leaveHeadroom else storedTableSchema(projectId, tableName)
+        return read.schema
+    except BaseException as error:
+        read.error = error
+        raise
+    finally:
+        with _readsLock:
+            del _reads[key]
+        read.done.set()
 
 
 def schemasKey(projectId: str) -> str:
@@ -110,7 +160,7 @@ def tableSchemas(projectId: str, tableNames: Iterable[str], skipUnreadable: bool
             schema = cached.get(tableName)
             if schema is None:
                 try:
-                    schema = storedTableSchema(projectId, tableName, leaveHeadroom=True) if leaveHeadroom else storedTableSchema(projectId, tableName)
+                    schema = _readSchema(projectId, tableName, leaveHeadroom)
                 except Exception as exc:
                     if not skipUnreadable or isBusy(exc):
                         raise
