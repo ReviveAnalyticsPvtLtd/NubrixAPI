@@ -2237,6 +2237,8 @@ sqlQueryRephraserAgentPrompt: |
     - If the chart type is not stated but can be inferred from the data and intent → **infer it and generate rephrasedOutput**
     - If the user's wording is imprecise but the calculation is clear → **execute**
     - If the question could mean two things → **pick the more likely interpretation and execute**
+    - If the calculation needs several steps (a running total, a moving average, a growth rate, a rank, a share of the total, a cumulative share, a per-customer rollup) → **plan the steps and execute**: the next step writes DuckDB SQL with CTEs and window functions, so all of these are possible
+    - If the question names a standard business metric without defining it (repeat customer rate, average order value, conversion rate) → **use its usual definition, state it in the plan, and execute**
     - **ONLY issue a doubt when execution is genuinely IMPOSSIBLE, not merely imperfect**
     - **When in doubt about whether to doubt → EXECUTE**
 
@@ -2256,6 +2258,8 @@ sqlQueryRephraserAgentPrompt: |
     | Chart type not stated but inferable from data and intent | NO → Infer and execute |
     | Measure and chart are clear but wording is imprecise | NO → Execute |
     | Question could mean two things | NO → Pick the more likely one and execute |
+    | The calculation needs several steps (a running total, a moving average, a growth rate, a rank, a cumulative share) | NO → Execute: the SQL step supports CTEs and window functions |
+    | A standard business metric is named without its definition (repeat customer rate, average order value) | NO → Use its usual definition and state it in the plan |
 
     ---
 
@@ -2282,6 +2286,7 @@ sqlQueryRephraserAgentPrompt: |
     - Use the exact table and column names from the metadata (case and spaces included), and say which table each column comes from.
     - Only combine tables when the question needs columns from more than one. Name the tables and the column that connects them (usually a shared id column with the same name in both).
     - When a column name exists in both joined tables (other than the join key), say which table's column to use, e.g. "use the region of customers, not the region of orders".
+    - To count or group people or things (customers, sellers, products), use the column the metadata describes as their unique identifier. A key described as belonging to one order or one transaction identifies that order: counting it counts orders, not customers.
     - Metadata type names come from the upload step (object means text, int64 / float64 mean numbers, datetime64 means a date or timestamp). The next step sees the exact column types; you only need to say what each column is used for.
 
     ### **3. FILTERS**
@@ -2292,6 +2297,8 @@ sqlQueryRephraserAgentPrompt: |
     - Name the aggregation: sum, average, count of rows, count of distinct values, minimum, maximum, median, a ratio or a percentage (say numerator and denominator).
     - For time trends, name the bucket (day, week, month, quarter, year). Default to month, or to day when the data covers only a few weeks.
     - Name the grouping columns. For a measure split by a second category, say that each category value becomes its own dataset.
+    - Multi-step calculations are fine: the next step writes DuckDB SQL with CTEs and window functions. Describe the steps: running totals and moving averages (a window over the time bucket), growth against the previous period, ranks, shares of the total, cumulative shares (sort by the measure, then a running sum divided by the total), and rollups per customer or per order before a second aggregation.
+    - A standard business metric uses its usual definition, stated in the plan: repeat customer rate is the share of customers with more than one order; average order value is revenue divided by the number of orders.
 
     ### **5. ORDER AND SIZE**
     - Say how the result is sorted: time ascending for trends, natural order for weekdays, months or bins, otherwise by the measure descending.
@@ -2356,6 +2363,8 @@ sqlQueryRephraserAgentPrompt: |
     **UNACCEPTABLE DOUBT EXAMPLES:**
     - "The join will fail because the key columns have different data types."
     - "Your query requires complex data preprocessing that involves multiple steps."
+    - "Moving averages require complex calculations beyond standard chart aggregation."
+    - "Please define what counts as a repeat customer." ← (use the usual definition and state it)
     - "Please clarify which time period to use." ← (if a date column exists and monthly grouping is inferable)
 
     ---
@@ -2630,6 +2639,7 @@ parallelSqlQueryRephraserAgentPrompt: |
     - Use the exact table and column names from the metadata (case and spaces included), and say which table each column comes from.
     - Only combine tables when the question needs columns from more than one. Name the tables and the column that connects them (usually a shared id column with the same name in both).
     - When a column name exists in both joined tables (other than the join key), say which table's column to use, e.g. "use the region of customers, not the region of orders".
+    - To count or group people or things (customers, sellers, products), use the column the metadata describes as their unique identifier. A key described as belonging to one order or one transaction identifies that order: counting it counts orders, not customers.
     - Metadata type names come from the upload step (object means text, int64 / float64 mean numbers, datetime64 means a date or timestamp). The next step sees the exact column types; you only need to say what each column is used for.
 
     ### **3. FILTERS**
@@ -2640,6 +2650,8 @@ parallelSqlQueryRephraserAgentPrompt: |
     - Name the aggregation: sum, average, count of rows, count of distinct values, minimum, maximum, median, a ratio or a percentage (say numerator and denominator).
     - For time trends, name the bucket (day, week, month, quarter, year). Default to month, or to day when the data covers only a few weeks.
     - Name the grouping columns. For a measure split by a second category, say that each category value becomes its own dataset.
+    - Multi-step calculations are fine: the next step writes DuckDB SQL with CTEs and window functions. Describe the steps: running totals and moving averages (a window over the time bucket), growth against the previous period, ranks, shares of the total, cumulative shares (sort by the measure, then a running sum divided by the total), and rollups per customer or per order before a second aggregation.
+    - A standard business metric uses its usual definition, stated in the plan: repeat customer rate is the share of customers with more than one order; average order value is revenue divided by the number of orders.
 
     ### **5. ORDER AND SIZE**
     - Say how the result is sorted: time ascending for trends, natural order for weekdays, months or bins, otherwise by the measure descending.
@@ -2866,11 +2878,13 @@ sqlChartGeneratorPrompt: |
        - prefer TRY_CAST over CAST, so one bad value becomes NULL instead of failing the query.
     5. Match text the user typed (a city, category, product, name or status) case-insensitively: "col" ILIKE 'electronics' for a whole value, "col" ILIKE '%garden%' for part of one, lower("col") IN ('north', 'south') for a list. Use the sample values to guess how values are stored. Double a single quote inside a literal: 'O''Neil'.
     6. Aggregate with SUM, AVG, COUNT(*), COUNT(DISTINCT ...), MIN, MAX, median(...), quantile_cont(..., 0.9), stddev(...), arg_max(..., ...). GROUP BY ALL groups by every SELECT column that is not an aggregate. List the grouping columns yourself when the key is not shown, for example GROUP BY p."product_id", p."list_price" so two products with the same price stay separate.
+       - Count people or things (customers, sellers, products) by the column the schema describes as their unique identifier; a key described as belonging to one order or transaction counts orders, not people.
     7. Joins: join on a key that identifies one row on at least one side.
        - When a table has many rows per join key (many location rows per postal code or region, many reviews or payments per order), first aggregate it to one row per key in a CTE, then join the CTE. Joining two tables on a key that repeats on both sides multiplies the rows, inflates sums and averages, and can run past the time limit. When you will later average that table's own values (review scores, item prices), put SUM(x) AS x_sum and COUNT(x) AS x_count in the CTE instead of AVG(x), and divide at the end with SUM(x_sum) / NULLIF(SUM(x_count), 0): an average of per-key averages counts each key once, not each row.
        - Average over what the question names. "Average payment value per order" or "average order value" totals each order once, then averages those totals. "Average review score", "average item price" or "average freight per order item" averages the review or item rows themselves, also when they are grouped by state or status.
        - Measure what the question names: "the average over all location rows in each region" aggregates that table by region, not only the rows that also match another table.
        - Count every entity the question is about: LEFT JOIN a table some of them lack (orders with no payment), so they still count.
+       - Rows with no match in another table ("orders whose restaurant is not in the restaurant list", "customers who never ordered"): use NOT EXISTS (SELECT 1 FROM ... WHERE the keys are equal) or a LEFT JOIN with WHERE the other table's key IS NULL. Never use NOT IN (SELECT ...): a NULL key on either side makes it match no row, so the answer comes out empty or 0.
     8. Conditional measures: SUM(x) FILTER (WHERE ...), COUNT(*) FILTER (WHERE ...) or CASE WHEN ... THEN ... ELSE ... END. Ratios and percentages: 100.0 * a / NULLIF(b, 0); never divide by something that can be zero without NULLIF. In DuckDB / always gives a fractional result; use // for whole-number division.
     9. Missing values: COALESCE(SUM(x), 0) for a total that may be empty, COALESCE("segment", 'Unknown') for a missing category, or IS NOT NULL to leave out rows whose value is not meaningful.
     10. Round averages, ratios and amounts computed from DOUBLE columns with round(x, 2), and percentages with round(x, 1).
@@ -3149,11 +3163,13 @@ sqlChartRepairPrompt: |
        - prefer TRY_CAST over CAST, so one bad value becomes NULL instead of failing the query.
     5. Match text the user typed (a city, category, product, name or status) case-insensitively: "col" ILIKE 'electronics' for a whole value, "col" ILIKE '%garden%' for part of one, lower("col") IN ('north', 'south') for a list. Use the sample values to guess how values are stored. Double a single quote inside a literal: 'O''Neil'.
     6. Aggregate with SUM, AVG, COUNT(*), COUNT(DISTINCT ...), MIN, MAX, median(...), quantile_cont(..., 0.9), stddev(...), arg_max(..., ...). GROUP BY ALL groups by every SELECT column that is not an aggregate. List the grouping columns yourself when the key is not shown, for example GROUP BY p."product_id", p."list_price" so two products with the same price stay separate.
+       - Count people or things (customers, sellers, products) by the column the schema describes as their unique identifier; a key described as belonging to one order or transaction counts orders, not people.
     7. Joins: join on a key that identifies one row on at least one side.
        - When a table has many rows per join key (many location rows per postal code or region, many reviews or payments per order), first aggregate it to one row per key in a CTE, then join the CTE. Joining two tables on a key that repeats on both sides multiplies the rows, inflates sums and averages, and can run past the time limit. When you will later average that table's own values (review scores, item prices), put SUM(x) AS x_sum and COUNT(x) AS x_count in the CTE instead of AVG(x), and divide at the end with SUM(x_sum) / NULLIF(SUM(x_count), 0): an average of per-key averages counts each key once, not each row.
        - Average over what the question names. "Average payment value per order" or "average order value" totals each order once, then averages those totals. "Average review score", "average item price" or "average freight per order item" averages the review or item rows themselves, also when they are grouped by state or status.
        - Measure what the question names: "the average over all location rows in each region" aggregates that table by region, not only the rows that also match another table.
        - Count every entity the question is about: LEFT JOIN a table some of them lack (orders with no payment), so they still count.
+       - Rows with no match in another table ("orders whose restaurant is not in the restaurant list", "customers who never ordered"): use NOT EXISTS (SELECT 1 FROM ... WHERE the keys are equal) or a LEFT JOIN with WHERE the other table's key IS NULL. Never use NOT IN (SELECT ...): a NULL key on either side makes it match no row, so the answer comes out empty or 0.
     8. Conditional measures: SUM(x) FILTER (WHERE ...), COUNT(*) FILTER (WHERE ...) or CASE WHEN ... THEN ... ELSE ... END. Ratios and percentages: 100.0 * a / NULLIF(b, 0); never divide by something that can be zero without NULLIF. In DuckDB / always gives a fractional result; use // for whole-number division.
     9. Missing values: COALESCE(SUM(x), 0) for a total that may be empty, COALESCE("segment", 'Unknown') for a missing category, or IS NOT NULL to leave out rows whose value is not meaningful.
     10. Round averages, ratios and amounts computed from DOUBLE columns with round(x, 2), and percentages with round(x, 1).

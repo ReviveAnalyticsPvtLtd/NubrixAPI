@@ -1171,3 +1171,72 @@ def test_noExampleAliasesAComputedColumnWithASortedSourceColumnName():
                     offenders.append((request.chartType, projection.alias))
 
     assert offenders == []
+
+
+# ---------------------------------------------------------------------------
+# Rules added after the user-perspective benchmark
+# ---------------------------------------------------------------------------
+
+BENCHMARK_CHART_RULES = {
+    "countPeopleByTheirUniqueIdentifier": (
+        "Count people or things (customers, sellers, products) by the column the schema describes as their unique "
+        "identifier; a key described as belonging to one order or transaction counts orders, not people."
+    ),
+    "neverNotInASubquery": (
+        "Never use NOT IN (SELECT ...): a NULL key on either side makes it match no row, so the answer comes out empty or 0."
+    ),
+    "unmatchedRowsWithNotExists": "use NOT EXISTS (SELECT 1 FROM ... WHERE the keys are equal) or a LEFT JOIN with WHERE the other table's key IS NULL.",
+}
+REPHRASER_KEYS = ["sqlQueryRephraserAgentPrompt", "parallelSqlQueryRephraserAgentPrompt"]
+BENCHMARK_PLAN_RULES = {
+    "uniqueIdentifier": "use the column the metadata describes as their unique identifier. A key described as belonging to one order or one transaction identifies that order",
+    "multiStepIsFine": "Multi-step calculations are fine: the next step writes DuckDB SQL with CTEs and window functions.",
+    "standardMetrics": "repeat customer rate is the share of customers with more than one order; average order value is revenue divided by the number of orders.",
+}
+
+
+@pytest.mark.parametrize("key", CHART_PROMPT_KEYS)
+@pytest.mark.parametrize("rule", sorted(BENCHMARK_CHART_RULES))
+def test_benchmarkRulesAreInBothChartPrompts(key, rule):
+    assert BENCHMARK_CHART_RULES[rule] in _formatted(key)
+
+
+@pytest.mark.parametrize("key", REPHRASER_KEYS)
+@pytest.mark.parametrize("rule", sorted(BENCHMARK_PLAN_RULES))
+def test_benchmarkPlanRulesAreInBothSqlRephrasers(key, rule):
+    assert BENCHMARK_PLAN_RULES[rule] in _prompts()[key]
+
+
+def test_theRephraserNeverDoubtsAMultiStepCalculationOrAStandardMetric():
+    text = _prompts()["sqlQueryRephraserAgentPrompt"]
+
+    assert "| The calculation needs several steps (a running total, a moving average, a growth rate, a rank, a cumulative share) | NO → Execute: the SQL step supports CTEs and window functions |" in text
+    assert "| A standard business metric is named without its definition (repeat customer rate, average order value) | NO → Use its usual definition and state it in the plan |" in text
+    assert '- "Moving averages require complex calculations beyond standard chart aggregation."' in text
+    # The parallel rephraser never doubts, so it has no gate to extend.
+    assert "NO → Execute: the SQL step supports CTEs and window functions" not in _prompts()["parallelSqlQueryRephraserAgentPrompt"]
+
+
+def test_theHistogramRuleAndTheGuardAgreeOnTheBinLimit():
+    from nubrix.components.chartGuards import MAX_HISTOGRAM_BINS
+
+    for key in CHART_PROMPT_KEYS:
+        assert f"widen the bins so there are at most {MAX_HISTOGRAM_BINS}" in _formatted(key)
+
+
+UNLISTED = {
+    "orders": pa.table({"order_id": [1, 2, 3, 4], "shop_id": pa.array([10, 11, None, 99], pa.int64()), "amount": [5, 7, 11, 13]}),
+    "shops": pa.table({"id": pa.array([10, 11, None], pa.int64())}),
+}
+
+
+def test_notInFindsNothingWhereNotExistsAndALeftJoinFindTheUnmatchedRows():
+    """The rule's claim on the pinned DuckDB: a NULL on either side empties NOT IN."""
+    notIn = 'SELECT COALESCE(SUM("amount"), 0) FROM "orders" WHERE "shop_id" NOT IN (SELECT "id" FROM "shops")'
+    notExists = 'SELECT SUM(o."amount") FROM "orders" o WHERE NOT EXISTS (SELECT 1 FROM "shops" s WHERE s."id" = o."shop_id")'
+    leftJoin = 'SELECT SUM(o."amount") FROM "orders" o LEFT JOIN "shops" s ON s."id" = o."shop_id" WHERE s."id" IS NULL'
+
+    assert _query(notIn, UNLISTED) == [(0,)]
+    # Order 3 has no shop at all and order 4 a shop that is not listed: both are unmatched.
+    assert _query(notExists, UNLISTED) == [(24,)]
+    assert _query(leftJoin, UNLISTED) == [(24,)]
