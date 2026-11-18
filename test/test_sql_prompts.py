@@ -947,7 +947,13 @@ EVALUATION_RULE_SENTENCES = {
     "mapLabelIsWhatTheUserAsks": '"labelled with the postal code" means the code alone',
     "joinOnAKeyThatIsUniqueOnOneSide": "join on a key that identifies one row on at least one side.",
     "aggregateTheManySideFirst": "first aggregate it to one row per key in a CTE, then join the CTE.",
-    "perEntityMeasureOnce": "Compute a per-entity measure (a total per order, a score per order) once per entity before averaging across entities.",
+    "averageOverWhatTheQuestionNames": (
+        '"Average review score", "average item price" or "average freight per order item" averages the review or item '
+        "rows themselves, also when they are grouped by state or status."
+    ),
+    "perOrderTotalsBeforeAveraging": '"Average payment value per order" or "average order value" totals each order once, then averages those totals.',
+    "carrySumAndCountThroughTheCte": "put SUM(x) AS x_sum and COUNT(x) AS x_count in the CTE instead of AVG(x), and divide at the end with SUM(x_sum) / NULLIF(SUM(x_count), 0)",
+    "namedSliceCount": "keep that many named slices and put 'Other' after them: rn <= N OR n <= N + 1.",
     "measureWhatTheQuestionNames": "aggregates that table by region, not only the rows that also match another table.",
     "countEveryEntity": "LEFT JOIN a table some of them lack (orders with no payment), so they still count.",
     "fixedLabelOrder": "DuckDB 1.3 refuses ORDER BY CASE <alias> ... together with GROUP BY ALL",
@@ -1111,6 +1117,30 @@ def test_otherSliceNeedsANumericLabelCastToText():
         connection.execute(bare).fetchall()
     rows = connection.execute(cast).fetchall()
     assert rows[0] == ("2000", 1.0) and rows[-1] == ("Other", 3.0)
+
+
+def test_theNamedSliceCountKeepsThatManySlicesThenOther():
+    connection = duckdb.connect()
+    connection.register("slices", pa.table({"label": list("abcdefgh"), "m": [8.0, 7.0, 6.0, 5.0, 4.0, 3.0, 2.0, 1.0]}))
+    ranked = "WITH ranked AS (SELECT label, m, row_number() OVER (ORDER BY m DESC, label) AS rn, COUNT(*) OVER () AS n FROM slices)"
+    sql = ranked + " SELECT CASE WHEN rn <= 5 OR n <= 6 THEN label ELSE 'Other' END AS label, SUM(m) AS m FROM ranked GROUP BY ALL ORDER BY MIN(rn)"
+    rows = connection.execute(sql).fetchall()
+    assert [label for label, _ in rows] == ["a", "b", "c", "d", "e", "Other"] and rows[-1][1] == 6.0
+
+
+def test_carriedSumAndCountGiveTheRowAverageWhereAnAverageOfAveragesDoesNot():
+    connection = duckdb.connect()
+    # Order 1 has three reviews, order 2 has one: the row average is 2.0, the average of per-order averages 3.0.
+    connection.register("reviews", pa.table({"order_id": [1, 1, 1, 2], "score": [1.0, 1.0, 1.0, 5.0]}))
+    perOrder = "WITH per_order AS (SELECT order_id, SUM(score) AS score_sum, COUNT(score) AS score_count, AVG(score) AS score_avg FROM reviews GROUP BY order_id)"
+    carried = connection.execute(perOrder + " SELECT SUM(score_sum) / NULLIF(SUM(score_count), 0) FROM per_order").fetchone()[0]
+    averaged = connection.execute(perOrder + " SELECT AVG(score_avg) FROM per_order").fetchone()[0]
+    assert (carried, averaged) == (2.0, 3.0)
+
+
+def test_theGeoMapExampleAsksForTheLabelItShows():
+    text = _formatted("sqlChartGeneratorPrompt")
+    assert "Question: Map our stores, each labelled with the store name and its 2024 revenue" in text
 
 
 def test_slicesRuleAndLabelRuleAgreeOnTheOtherSlice():
