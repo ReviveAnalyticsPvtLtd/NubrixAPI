@@ -1,7 +1,7 @@
 """
 chartGuards.py
 
-Checks on a chart the SQL chart workflow has just built, for two habits the model keeps despite the prompt rules:
+Checks on a chart the SQL chart workflow has just built, for habits the model keeps despite the prompt rules:
 
 - a number label cast to text under its own name (`CAST("n" AS VARCHAR) AS n ... ORDER BY "n"`). It fires only when
   the label's own order or scale shows the cast: the query orders by the label first and its labels come out in text
@@ -10,7 +10,13 @@ Checks on a chart the SQL chart workflow has just built, for two habits the mode
   display (1.0, 1.5, 2.0) and an inner level of a pivot key (it restarts per group) are not read as the cast;
 - a scatter or bubble chart with more than MAX_NAMED_POINTS points that gives every point its own `series` value, so
   every point becomes its own dataset and legend entry. Up to MAX_NAMED_POINTS points (4 regions, one point each) a
-  series per point names each point in the legend, so it is kept.
+  series per point names each point in the legend, so it is kept;
+- a histogram with more than MAX_HISTOGRAM_BINS bins (a fixed bin width over a long tail), which the prompts forbid;
+- a category or slice chart whose every label is empty: the label column is NULL in every row, so all rows fall into one
+  blank group (a cast or a pattern that matched none of the stored values);
+- a chart without data whose query converts or pattern-matches text (TRY_CAST, a regular expression), when no bound
+  counts from today: the conversion most likely rejected every stored value. A query with such a bound is left to the
+  period probe, and a repair that still finds nothing serves the empty chart as before.
 
 A guard returns a message for the repair prompt, or None. It fires only when it can decide: anything it cannot read
 (SQL that does not parse, a projection it cannot match to the label, a chart of an unexpected shape) declines.
@@ -18,11 +24,18 @@ Pure: no sandbox, no model. Only new chart generation calls it; saved widgets re
 """
 
 __all__ = [
+    "BLANK_LABELS_MESSAGE",
+    "EMPTY_CONVERSION_MESSAGE",
+    "MAX_HISTOGRAM_BINS",
     "MAX_NAMED_POINTS",
     "POINT_SERIES_MESSAGE",
+    "blankLabelsMessage",
     "castLabelMessage",
     "castLabelText",
+    "emptyConversionMessage",
     "guardMessage",
+    "histogramBinsMessage",
+    "histogramBinsText",
     "pointSeriesMessage",
 ]
 
@@ -33,6 +46,7 @@ from sqlglot import exp
 
 from nubrix.components.chartBuilder import EMPTY_LEVEL
 from nubrix.components.chartRequest import ChartRequest
+from nubrix.components.periodProbe import chartHasNoData
 
 # The most points a scatter or bubble may name one by one, each its own series and legend entry. It matches the most
 # slices a pie or doughnut shows before the rest becomes 'Other' (the SQL chart prompts' rule).
@@ -43,6 +57,22 @@ POINT_SERIES_MESSAGE = (
     f"dataset and legend entry. Leave `series` out and keep every row: never drop rows to get down to "
     f"{MAX_NAMED_POINTS} points. Use `series` only to group many points into a few datasets, such as a category or a "
     "region."
+)
+
+# The most bins a histogram may have: the SQL chart prompts' rule ("widen the bins so there are at most 50").
+MAX_HISTOGRAM_BINS = 50
+
+BLANK_LABELS_MESSAGE = (
+    "Every label is empty: the label column is NULL in every row, so all rows fall into one blank group. A cast or a "
+    "pattern that matches none of the stored values usually does this. Check the column's sample values and build the "
+    "label from the values as they are stored; when they are text categories (such as '100+ reviews'), use them as they "
+    "are."
+)
+EMPTY_CONVERSION_MESSAGE = (
+    "The query returned no rows, and it converts or pattern-matches text (TRY_CAST or a regular expression). Check "
+    "against the column's sample values that the conversion or the pattern accepts the values as they are stored; when "
+    "the stored values are text categories (such as '100+ reviews'), use them as they are instead of converting them. If "
+    "the question's own filters really match nothing, keep them: an empty chart is then the right answer."
 )
 
 _AXIS_LABEL_TYPES = ("bar", "line", "area", "histogram", "radar")
@@ -61,11 +91,20 @@ _WHOLE_NUMBER = re.compile(r"-?(0|[1-9][0-9]*)(\.0+)?")
 _ASCII_FOLD = str.maketrans("ABCDEFGHIJKLMNOPQRSTUVWXYZ", "abcdefghijklmnopqrstuvwxyz")
 # Labels quoted in the message.
 _QUOTED_LABELS = 4
+# A text conversion or a pattern match: TRY_CAST, a regexp_* function, SIMILAR TO, or the ~ match operator (not ~~,
+# DuckDB's LIKE, and not !~~).
+_CONVERTS_TEXT = re.compile(r"\btry_cast\s*\(|\bregexp_\w+\s*\(|\bsimilar\s+to\b|(?<![~!])~(?!~)", re.IGNORECASE)
+# A bound counted from today: such an empty chart belongs to the period probe, which asks which period to chart.
+_COUNTS_FROM_TODAY = re.compile(
+    r"\b(current_date|current_timestamp|current_localtimestamp|now|today|get_current_timestamp|get_current_time|transaction_timestamp)\b",
+    re.IGNORECASE,
+)
+_STRING_LITERAL = re.compile(r"'(?:[^']|'')*'")
 
 
 def guardMessage(request: ChartRequest, sql: str, chart: object) -> str | None:
     """The first guard that fires on this built chart, as its repair message; None when none fires or any is unsure."""
-    for guard in (castLabelMessage, pointSeriesMessage):
+    for guard in (castLabelMessage, pointSeriesMessage, histogramBinsMessage, blankLabelsMessage, emptyConversionMessage):
         try:
             message = guard(request, sql, chart)
         except Exception:
@@ -171,6 +210,46 @@ def pointSeriesMessage(request: ChartRequest, sql: str, chart: object) -> str | 
         if not isinstance(points, list) or len(points) != 1:
             return None
     return POINT_SERIES_MESSAGE
+
+
+def histogramBinsMessage(request: ChartRequest, sql: str, chart: object) -> str | None:
+    """A histogram with more than MAX_HISTOGRAM_BINS bins."""
+    if request.chartType != "histogram":
+        return None
+    labels = _categoryLabels(chart)
+    if labels is None or len(labels) <= MAX_HISTOGRAM_BINS:
+        return None
+    return histogramBinsText(len(labels))
+
+
+def histogramBinsText(count: int) -> str:
+    """The repair message for a histogram of `count` bins."""
+    return (
+        f"The histogram has {count} bins, more than {MAX_HISTOGRAM_BINS}. Widen the bins so there are at most "
+        f"{MAX_HISTOGRAM_BINS}: choose the bin width from the range of the values, or end with one open bin for the long "
+        "tail, such as '1000 or more'. Every row must still fall in a bin, so the bars add up to the same total."
+    )
+
+
+def blankLabelsMessage(request: ChartRequest, sql: str, chart: object) -> str | None:
+    """A category or slice chart with at least one label, every one of them empty."""
+    if request.chartType not in _AXIS_LABEL_TYPES + _SLICE_TYPES:
+        return None
+    labels = _categoryLabels(chart)
+    if not labels or any(label not in ("", None) for label in labels):
+        return None
+    return BLANK_LABELS_MESSAGE
+
+
+def emptyConversionMessage(request: ChartRequest, sql: str, chart: object) -> str | None:
+    """A chart without data whose query converts or pattern-matches text and has no bound counted from today."""
+    if not chartHasNoData(chart) or not isinstance(sql, str):
+        return None
+    # A literal can hold anything, a '~' or the word now, so only the query's own text is read.
+    code = _STRING_LITERAL.sub("''", sql)
+    if not _CONVERTS_TEXT.search(code) or _COUNTS_FROM_TODAY.search(code):
+        return None
+    return EMPTY_CONVERSION_MESSAGE
 
 
 def _outerSelect(sql: str) -> exp.Select | None:

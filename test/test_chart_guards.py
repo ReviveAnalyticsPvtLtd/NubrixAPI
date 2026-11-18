@@ -399,7 +399,8 @@ def test_anUnaliasedCastDeclines():
 def test_onlyNumberLabelsInTextOrderOrWithAWholeDecimalFire(labels, fires):
     request = ChartRequest.model_validate({"chartType": "bar", "title": "T", "sql": CAST_ITEMS, "encoding": {"x": "items", "y": ["n"]}})
     chart = {"chartType": "bar", "title": "T", "data": {"labels": labels, "datasets": [{"label": "N", "data": [1] * len(labels)}]}}
-    assert (chartGuards.guardMessage(request, CAST_ITEMS, chart) is not None) is fires
+    # The cast guard alone: an all-blank chart is the blank-label guard's (see the benchmark round below).
+    assert (chartGuards.castLabelMessage(request, CAST_ITEMS, chart) is not None) is fires
 
 
 def test_aChartOfAnUnexpectedShapeDeclines():
@@ -524,3 +525,93 @@ def test_theBuilderShowsANumberLabelAsTheMessageSays():
     sql = 'SELECT CAST("amount" AS DOUBLE) AS amount, COUNT(*) AS n FROM "orders" GROUP BY ALL ORDER BY amount DESC'
     _, chart = _chart("bar", sql, {"x": "amount", "y": ["n"]})
     assert chart["data"]["labels"] == ["51", "40", "3", "2", "1"]
+
+
+# Benchmark round: a histogram over the bin limit, a chart whose every label is empty, and no data from a query that
+# converts or pattern-matches text.
+
+
+def _bins(count):
+    return f"SELECT i * 10 AS bin, 1 AS n FROM range({count}) AS t(i) ORDER BY bin"
+
+
+def test_aHistogramOverTheBinLimitFires():
+    assert chartGuards.MAX_HISTOGRAM_BINS == 50
+    assert _message("histogram", _bins(51), {"x": "bin", "y": ["n"]}) == chartGuards.histogramBinsText(51)
+
+
+@pytest.mark.parametrize("chartType,count", [("histogram", 50), ("histogram", 3), ("bar", 80), ("line", 80)])
+def test_aHistogramAtTheLimitOrAnotherChartTypeDoesNotFireTheBinGuard(chartType, count):
+    assert _message(chartType, _bins(count), {"x": "bin", "y": ["n"]}) is None
+
+
+BLANK = 'SELECT CAST(NULL AS VARCHAR) AS label, COUNT(*) AS n FROM "orders"'
+
+
+@pytest.mark.parametrize("chartType,encoding", [
+    ("bar", {"x": "label", "y": ["n"]}),
+    ("histogram", {"x": "label", "y": ["n"]}),
+    ("pie", {"label": "label", "value": "n"}),
+])
+def test_aChartWhoseEveryLabelIsEmptyFires(chartType, encoding):
+    request, chart = _chart(chartType, BLANK, encoding)
+    assert chart["data"]["labels"] == [""]
+
+    assert chartGuards.guardMessage(request, BLANK, chart) == chartGuards.BLANK_LABELS_MESSAGE
+
+
+def test_oneEmptyLabelAmongOthersDoesNotFire():
+    sql = 'SELECT CASE WHEN "region" = \'east\' THEN NULL ELSE "region" END AS label, COUNT(*) AS n FROM "orders" GROUP BY ALL ORDER BY n DESC, label'
+    request, chart = _chart("bar", sql, {"x": "label", "y": ["n"]})
+    assert "" in chart["data"]["labels"] and len(chart["data"]["labels"]) > 1
+
+    assert chartGuards.guardMessage(request, sql, chart) is None
+
+
+@pytest.mark.parametrize("where", [
+    'TRY_CAST("region" AS DOUBLE) IS NOT NULL',
+    "\"region\" ~ '^[0-9]+$'",
+    "regexp_matches(\"region\", '^[0-9]+$')",
+    "\"region\" SIMILAR TO '[0-9]+'",
+])
+def test_noDataFromAQueryThatConvertsOrMatchesTextFires(where):
+    sql = f'SELECT "region" AS region, COUNT(*) AS n FROM "orders" WHERE {where} GROUP BY ALL ORDER BY n DESC'
+    request, chart = _chart("bar", sql, {"x": "region", "y": ["n"]})
+    assert chart["data"]["labels"] == []
+
+    assert chartGuards.guardMessage(request, sql, chart) == chartGuards.EMPTY_CONVERSION_MESSAGE
+
+
+@pytest.mark.parametrize("sql", [
+    # No conversion: the question's own filter matches nothing, and an empty chart is the answer.
+    'SELECT "region" AS region, COUNT(*) AS n FROM "orders" WHERE "region" ILIKE \'nowhere\' GROUP BY ALL',
+    # A ~ or a function name inside a literal is not the query's own.
+    'SELECT "region" AS region, COUNT(*) AS n FROM "orders" WHERE "region" = \'a~b try_cast(\' GROUP BY ALL',
+    # ~~ is LIKE.
+    'SELECT "region" AS region, COUNT(*) AS n FROM "orders" WHERE "region" ~~ \'nowhere%\' GROUP BY ALL',
+    # A bound counted from today: the period probe asks about it.
+    'SELECT "region" AS region, COUNT(*) AS n FROM "orders" WHERE TRY_CAST("ordered_at" AS DATE) >= CURRENT_DATE - 30 GROUP BY ALL',
+    'SELECT "region" AS region, COUNT(*) AS n FROM "orders" WHERE TRY_CAST("ordered_at" AS DATE) >= now() - INTERVAL 30 DAY GROUP BY ALL',
+    # Data: nothing to repair.
+    'SELECT "region" AS region, COUNT(*) AS n FROM "orders" WHERE TRY_CAST("items" AS DOUBLE) > 1 GROUP BY ALL ORDER BY n DESC, region',
+])
+def test_theEmptyConversionGuardDeclines(sql):
+    assert _message("bar", sql, {"x": "region", "y": ["n"]}) is None
+
+
+def test_aZeroCardFromAConversionFiresAndATableWithoutRowsToo():
+    card = 'SELECT COUNT(*) AS n FROM "orders" WHERE TRY_CAST("region" AS DOUBLE) IS NOT NULL'
+    assert _message("card", card, {"value": "n"}) == chartGuards.EMPTY_CONVERSION_MESSAGE
+    table = 'SELECT "region", "amount" FROM "orders" WHERE TRY_CAST("region" AS DOUBLE) IS NOT NULL'
+    assert _message("table", table, {"columns": ["region", "amount"]}) == chartGuards.EMPTY_CONVERSION_MESSAGE
+
+
+def test_theNewMessagesNameWhatTheGuardSawAndTheFix():
+    assert chartGuards.histogramBinsText(87) == (
+        "The histogram has 87 bins, more than 50. Widen the bins so there are at most 50: choose the bin width from the "
+        "range of the values, or end with one open bin for the long tail, such as '1000 or more'. Every row must still "
+        "fall in a bin, so the bars add up to the same total."
+    )
+    # The empty-chart message never asks to drop the question's own filters.
+    assert "keep them: an empty chart is then the right answer." in chartGuards.EMPTY_CONVERSION_MESSAGE
+    assert "use them as they are" in chartGuards.BLANK_LABELS_MESSAGE

@@ -15,7 +15,8 @@ provably holds no project data does the response become a question about the per
 rephraser's doubt. Anything else, including a probe that fails, keeps the chart.
 
 A chart that renders is checked by the generation guards (chartGuards.py: a number label cast to text, every point of
-a scatter with more than 10 points its own series). The first time one fires in a request, and a repair is left, the
+a scatter with more than 10 points its own series, a histogram of more than 50 bins, every label empty, no data from a
+query that converts or pattern-matches text). The first time one fires in a request, and a repair is left, the
 chart and its request are kept as the fallback and the guard's message goes to the repair. A later chart that passes
 the guards is served. When a later chart trips a guard again, shows no data while the fallback does, or the request
 would end on a failure (repairs run out, a timeout, a busy sandbox, a run that broke, a repair whose model call

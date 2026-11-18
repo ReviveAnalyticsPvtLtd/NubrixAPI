@@ -9,7 +9,7 @@ import pyarrow as pa
 import pytest
 from langchain_core.callbacks import BaseCallbackHandler
 
-from nubrix.components import chartFailureLog
+from nubrix.components import chartFailureLog, chartGuards
 from nubrix.components.chartBuilder import ChartBuildError
 from nubrix.components.chartEngine import ChartFailure
 from nubrix.components.chartRequest import decodeGeneratedCode
@@ -1474,3 +1474,42 @@ def test_whenBothChartsShowNoDataTheRepairedChartIsServed(harness):
     state = harness.run(metadata=GUARD_METADATA)
     assert state["finalOutput"] == ZERO_NUMBER_CHART
     assert decodeGeneratedCode(state["generatedCode"]).sql == NUMBER_REQUEST["sql"]
+
+
+# Benchmark round: an empty chart from a query that converts text goes back for one repair; a repair that still finds
+# nothing serves the empty chart, as before the guard.
+
+CONVERT_REQUEST = {
+    "chartType": "bar",
+    "title": "Restaurants by rating count",
+    "sql": 'SELECT TRY_CAST("items" AS BIGINT) AS items, COUNT(*) AS n FROM "orders" WHERE TRY_CAST("items" AS BIGINT) IS NOT NULL GROUP BY ALL ORDER BY items',
+    "encoding": {"x": "items", "y": ["n"]},
+}
+TEXT_REQUEST = dict(CONVERT_REQUEST, sql='SELECT "items" AS items, COUNT(*) AS n FROM "orders" GROUP BY ALL ORDER BY n DESC, items')
+BUCKET_CHART = {"chartType": "bar", "title": "Restaurants by rating count", "xLabels": "Items", "yLabels": "N", "data": {"labels": ["20+", "50+"], "datasets": [{"label": "N", "data": [3, 2]}]}}
+
+
+def test_anEmptyChartFromATextConversionIsRepairedOnce(harness):
+    _guarded(harness, EMPTY_CHART, BUCKET_CHART, generated=CONVERT_REQUEST)
+    harness.repair.invoke.return_value = json.dumps(TEXT_REQUEST)
+
+    state = harness.run(metadata=GUARD_METADATA)
+
+    assert state["finalOutput"] == BUCKET_CHART
+    assert state["debugAttempts"] == 1
+    given = harness.repair.invoke.call_args.args[0]
+    assert given["error"] == f"{chartGuards.EMPTY_CONVERSION_MESSAGE} {module.GUARD_REPAIR_KEEP}"
+    assert harness.logs == []
+
+
+def test_aRepairThatStillFindsNothingServesTheEmptyChart(harness):
+    _guarded(harness, EMPTY_CHART, EMPTY_CHART, generated=CONVERT_REQUEST)
+    harness.repair.invoke.return_value = json.dumps(CONVERT_REQUEST)
+
+    state = harness.run(metadata=GUARD_METADATA)
+
+    assert state["finalOutput"] == EMPTY_CHART
+    assert state["debugAttempts"] == 1
+    assert harness.repair.invoke.call_count == 1
+    # The query counts nothing back from today, so the period probe keeps the chart without a run of its own.
+    assert harness.render.call_count == 2
