@@ -196,14 +196,49 @@ def test_modelFailureLogNamesTheErrorTypes(harness):
     assert "extraKey" not in error and "Secret Corp" not in error and "nope" not in error
 
 
-def test_timeoutSkipsRepair(harness):
-    harness.render.side_effect = ChartFailure("timeout", "Execution timed out after 35 seconds")
+TIMEOUT = "Execution timed out after 35 seconds."
+
+
+def test_aTimeoutGetsOneRepairThatNamesTheJoin(harness):
+    harness.render.side_effect = [ChartFailure("timeout", TIMEOUT), CHART]
     state = harness.run()
-    assert harness.render.call_count == 1
-    harness.repair.invoke.assert_not_called()
-    assert state["finalOutput"] == {"error": "Execution timed out after 35 seconds"}
-    assert state["debugAttempts"] == 0
+    assert harness.render.call_count == 2
+    assert harness.repair.invoke.call_count == 1
+    assert harness.repair.invoke.call_args.args[0]["error"] == f"{TIMEOUT} {module.TIMEOUT_REPAIR_TEXT}"
+    assert state["finalOutput"] == CHART
+    assert state["debugAttempts"] == 1
+    assert harness.failureRecords() == []
+
+
+def test_aSecondTimeoutEndsTheRequestWithTheRunnersMessage(harness):
+    harness.render.side_effect = ChartFailure("timeout", TIMEOUT)
+    state = harness.run()
+    assert harness.render.call_count == 2
+    assert harness.repair.invoke.call_count == 1
+    assert state["finalOutput"] == {"error": TIMEOUT}
+    assert state["debugAttempts"] == 1
     assert [record["stage"] for record in harness.failureRecords()] == ["timeout"]
+
+
+def test_aTimeoutAfterAnotherRepairStillGetsItsRepair(harness):
+    harness.render.side_effect = [ChartFailure("bind", "Binder Error: one"), ChartFailure("timeout", TIMEOUT), CHART]
+    state = harness.run()
+    assert harness.repair.invoke.call_count == 2
+    assert harness.repair.invoke.call_args_list[1].args[0]["error"] == f"{TIMEOUT} {module.TIMEOUT_REPAIR_TEXT}"
+    assert state["finalOutput"] == CHART
+    assert state["debugAttempts"] == 2
+
+
+def test_aTimeoutWithNoRepairLeftEndsTheRequest(harness):
+    harness.render.side_effect = [ChartFailure("bind", "Binder Error: one"), ChartFailure("bind", "Binder Error: two"), ChartFailure("timeout", TIMEOUT)]
+    state = harness.run()
+    assert harness.repair.invoke.call_count == module.MAX_REPAIRS
+    assert state["finalOutput"] == {"error": TIMEOUT}
+
+
+def test_theTimeoutTextNamesTheJoinNotTheData():
+    text = module.TIMEOUT_REPAIR_TEXT
+    assert "one row per key in a CTE" in text and "Keep the question's filters" in text
 
 
 def test_busySkipsRepairAndShowsBusyMessage(harness):
@@ -1125,6 +1160,8 @@ CAST_MESSAGE = (
     "the CAST (also where the ORDER BY repeats it) and keep the ORDER BY: without the cast the same ORDER BY sorts the "
     "numbers as numbers. The backend shows a number label as text and keeps the query's row order."
 )
+# What the repair is told after the cast guard fires: the guard's message, then the "keep everything else" sentence.
+GUARDED_CAST_MESSAGE = f"{CAST_MESSAGE} {module.GUARD_REPAIR_KEEP}"
 GUARD_METADATA = {"orders": {"columns": [{"name": "items"}, {"name": "b"}]}}
 
 
@@ -1155,7 +1192,7 @@ def test_aGuardRepairThatPassesIsServed(harness):
     assert decodeGeneratedCode(state["generatedCode"]).sql == NUMBER_REQUEST["sql"]
     assert state["debugAttempts"] == 1
     given = harness.repair.invoke.call_args.args[0]
-    assert given["error"] == CAST_MESSAGE
+    assert given["error"] == GUARDED_CAST_MESSAGE
     assert json.loads(given["previous_request"])["sql"] == CAST_REQUEST["sql"]
     assert _modelCalls(harness) <= 1 + module.MAX_REPAIRS
     assert harness.logs == []
@@ -1240,7 +1277,7 @@ def test_aGuardAfterAnOrdinaryRepairStillGetsItsRepair(harness):
     state = harness.run(metadata=GUARD_METADATA)
     assert state["finalOutput"] == NUMBER_CHART
     assert state["debugAttempts"] == 2
-    assert harness.repair.invoke.call_args_list[1].args[0]["error"] == CAST_MESSAGE
+    assert harness.repair.invoke.call_args_list[1].args[0]["error"] == GUARDED_CAST_MESSAGE
     assert _modelCalls(harness) == 1 + module.MAX_REPAIRS
 
 
@@ -1325,7 +1362,7 @@ def test_theParallelWorkflowGuardsTheSameWay(monkeypatch, repairPasses):
     state = harness.run(metadata=GUARD_METADATA)
     assert state["finalOutput"] == (NUMBER_CHART if repairPasses else CAST_CHART)
     assert decodeGeneratedCode(state["generatedCode"]).sql == (NUMBER_REQUEST if repairPasses else CAST_REQUEST)["sql"]
-    assert harness.repair.invoke.call_args.args[0]["error"] == CAST_MESSAGE
+    assert harness.repair.invoke.call_args.args[0]["error"] == GUARDED_CAST_MESSAGE
     assert state["debugAttempts"] == 1
     assert _modelCalls(harness) <= 1 + module.MAX_REPAIRS
 
@@ -1361,7 +1398,7 @@ def test_aServedGuardedChartWithoutDataGoesThroughThePeriodProbe(harness):
     state = harness.run(metadata=GUARD_METADATA)
     assert state["finalOutput"] == {"response": _periodQuestion("the data ends on 2019-06-30")}
     assert state["debugAttempts"] == 1
-    assert harness.repair.invoke.call_args.args[0]["error"] == CAST_MESSAGE
+    assert harness.repair.invoke.call_args.args[0]["error"] == GUARDED_CAST_MESSAGE
     probes = _probeCalls(harness)
     assert len(probes) == 1
     # The probe reads the served (first) request's bound.

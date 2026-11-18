@@ -3,7 +3,8 @@ sqlChartWorkflow.py
 
 The SQL chart workflow: rephrase the question, describe the project's tables, have the model write a chart request
 (one DuckDB SELECT plus an encoding), check and run it in the sandbox, build the chart, and repair the request
-with the exact error (at most twice) when a step fails.
+with the exact error (at most twice) when a step fails. A busy sandbox is never repaired. A query that runs past the
+time limit is repaired once, with TIMEOUT_REPAIR_TEXT after the runner's message; a second timeout ends the request.
 
 The response keeps the keys of the Python chart workflows. Everything else stays in internal state.
 
@@ -59,7 +60,21 @@ from utils.tableSchemas import tableSchemas
 MAX_REPAIRS = 2
 RUN_TIMEOUT_SECONDS = 35
 _MODEL_LOG_MESSAGE = "The model reply is not a valid chart request."
-_TERMINAL_STAGES = ("timeout", "busy")
+_TERMINAL_STAGES = ("busy",)
+# Told to the repair after the runner's timeout message. In practice a timeout is a join that multiplies rows: a key
+# that repeats on both sides (many location rows per region, many reviews per order). The user never sees this text.
+TIMEOUT_REPAIR_TEXT = (
+    "A query this slow almost always joins tables on a key that repeats on both sides, which multiplies the rows. "
+    "Aggregate each table that has many rows per join key (location rows per region or postal code, reviews, payments "
+    "or items per order) to one row per key in a CTE, then join the CTEs. Keep the question's filters, measures and "
+    "output columns."
+)
+# Told to the repair after a guard's message: a guard names one habit, and a repair that rewrites the whole query can
+# lose a filter the question asked for (a range "from 1 to 12").
+GUARD_REPAIR_KEEP = (
+    "Change only that. Keep every other part of the query as it is: its filters (WHERE and HAVING, including a range "
+    "the question names), joins, measures, LIMIT and ORDER BY."
+)
 _UNEXPECTED_MESSAGE = "The chart query could not be run."
 
 # The question asked when the data a chart's period filters on ends before that period: `question` with one `reason`.
@@ -113,6 +128,8 @@ class State(OutputState, total=False):
     # {chart, chartRequest}: the chart a guard fired on and its request, served when the guard's repair gives nothing
     # better. Set at most once per request, so a request makes at most one guard repair.
     fallback: dict | None
+    # Set by the repair of a timeout, so a second timeout ends the request.
+    timeoutRepaired: bool
     grounding: str
     tables: list[str]
     rawText: str
@@ -311,6 +328,8 @@ class SqlChartWorkflow:
 
     def _repair(self, state: State, config: RunnableConfig):
         previous = json.dumps(state["lastRequest"], ensure_ascii=False) if state.get("lastRequest") else state.get("rawText", "")
+        timedOut = state["failure"]["stage"] == "timeout"
+        error = f"{state['failure']['message']} {TIMEOUT_REPAIR_TEXT}" if timedOut else state["failure"]["message"]
         try:
             text = self.repairChain.invoke(
                 {
@@ -318,7 +337,7 @@ class SqlChartWorkflow:
                     "plan": self._plan(state),
                     "grounding": state["grounding"],
                     "previous_request": previous,
-                    "error": state["failure"]["message"],
+                    "error": error,
                 },
                 config,
             )
@@ -333,6 +352,8 @@ class SqlChartWorkflow:
             return {"chart": None, "failure": {"stage": "model", "message": _UNEXPECTED_MESSAGE, "error": failure, "repairable": False}}
         update = self._withMessage(_withPlanSliceType(self._parse(str(text)), self._plan(state)))
         update["debugAttempts"] = state.get("debugAttempts", 0) + 1
+        if timedOut:
+            update["timeoutRepaired"] = True
         return update
 
     def _evaluate(self, state: State, config: RunnableConfig):
@@ -374,6 +395,7 @@ class SqlChartWorkflow:
         if message is None:
             return {"chart": chart, "failure": None}
         # A guard failure always goes to repair (a repair is left), which replaces it, so it is never logged.
+        message = f"{message} {GUARD_REPAIR_KEEP}"
         failure = ChartFailure("build", message)
         return {
             "chart": None,
@@ -397,7 +419,14 @@ class SqlChartWorkflow:
         failure = state.get("failure")
         if failure is None:
             return "evaluate"
-        if failure["stage"] in _TERMINAL_STAGES or failure.get("repairable") is False or state.get("debugAttempts", 0) >= MAX_REPAIRS:
+        # A timeout is repaired once, and only without a guard's chart in hand: that chart is served instead.
+        timeoutEnds = failure["stage"] == "timeout" and (state.get("timeoutRepaired") or state.get("fallback"))
+        if (
+            failure["stage"] in _TERMINAL_STAGES
+            or timeoutEnds
+            or failure.get("repairable") is False
+            or state.get("debugAttempts", 0) >= MAX_REPAIRS
+        ):
             return "fallback" if state.get("fallback") else "format"
         return "repair"
 
