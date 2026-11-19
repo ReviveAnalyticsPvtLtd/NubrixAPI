@@ -1186,12 +1186,20 @@ BENCHMARK_CHART_RULES = {
         "Never use NOT IN (SELECT ...): a NULL key on either side makes it match no row, so the answer comes out empty or 0."
     ),
     "unmatchedRowsWithNotExists": "use NOT EXISTS (SELECT 1 FROM ... WHERE the keys are equal) or a LEFT JOIN with WHERE the other table's key IS NULL.",
+    "everyMeansNoLimit": '"Every", "all" or "each" with a category ("every product", "all cities") asks for more: no LIMIT 50, up to 500 labels.',
+    "numberAxisIsNeverCut": "A number x axis (age, tenure, a score) is never cut: keep every value in order.",
 }
 REPHRASER_KEYS = ["sqlQueryRephraserAgentPrompt", "parallelSqlQueryRephraserAgentPrompt"]
 BENCHMARK_PLAN_RULES = {
     "uniqueIdentifier": "use the column the metadata describes as their unique identifier. A key described as belonging to one order or one transaction identifies that order",
     "multiStepIsFine": "Multi-step calculations are fine: the next step writes DuckDB SQL with CTEs and window functions.",
     "standardMetrics": "repeat customer rate is the share of customers with more than one order; average order value is revenue divided by the number of orders.",
+    "everyMeansAll": '"Every", "all" or "each" with a category ("every product", "all cities") asks for every value: keep them all, with no top-50 cut.',
+    "numberAxisIsNeverCut": "A number axis (age, tenure, a score, a count of items) is ordered like time: keep every value in ascending order, never the top 50.",
+    "oneMeasureIsACard": "One measure with no grouping named is one number → `card`: never split it by a category the user did not name.",
+    "amongIsAFilter": '"Among X", "of X" and "for X" are filters, not groupings: "churn rate among seniors" is one rate over the seniors.',
+    "averagePerIsOneAverage": '"Average X per customer" (per order, per unit) is one average over all of them; "X per month" or "X per state" is a grouping.',
+    "oneShareIsACard": '"What share of X are Y" is one percentage → `card`; use a pie only when the user asks how the whole splits.',
 }
 
 
@@ -1215,6 +1223,28 @@ def test_theRephraserNeverDoubtsAMultiStepCalculationOrAStandardMetric():
     assert '- "Moving averages require complex calculations beyond standard chart aggregation."' in text
     # The parallel rephraser never doubts, so it has no gate to extend.
     assert "NO → Execute: the SQL step supports CTEs and window functions" not in _prompts()["parallelSqlQueryRephraserAgentPrompt"]
+
+
+ONE_TOTAL_EXAMPLE = (
+    "Card showing total shipping cost. Steps: 1) From table 'shipments', sum 'shipping_cost' over all rows. "
+    "2) Return one row with the total, labelled 'Total Shipping Cost'. 'carrier' is not split out: the question asks for "
+    "one total. Result columns: total_shipping_cost."
+)
+
+
+@pytest.mark.parametrize("key", REPHRASER_KEYS)
+def test_bothRephrasersShowATotalThatIsNotSplitByANearbyCategory(key):
+    text = _prompts()[key]
+    assert '**User Query:** "How much have we spent on shipping?"' in text
+    assert ONE_TOTAL_EXAMPLE in text
+
+
+def test_theEveryRuleAndTheBuilderAgreeOnTheLabelCap():
+    from nubrix.components.chartRequest import LABEL_CAP
+
+    for key in CHART_PROMPT_KEYS:
+        sizeRule = next(line for line in _formatted(key).splitlines() if "at most 50 categories" in line)
+        assert f"no LIMIT 50, up to {LABEL_CAP} labels" in sizeRule, key
 
 
 def test_theHistogramRuleAndTheGuardAgreeOnTheBinLimit():

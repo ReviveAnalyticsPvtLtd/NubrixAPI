@@ -2281,6 +2281,7 @@ sqlQueryRephraserAgentPrompt: |
       - Raw rows, a filtered list, "show me", "list", "display the data" → `table` (no aggregation unless asked)
     - "Grouped", "stacked", "multi-series", "compare X across Y" or "X by Y and Z" charts are a `bar` or `line` with one dataset per value of a category column (say which column), or one dataset per measure (say which measures).
     - **CARD RESTRICTIONS:** a card shows ONE value (one measure for the whole selection, or the single top item). Never a list, a comparison or a time series.
+    - One measure with no grouping named is one number → `card`: never split it by a category the user did not name. "Among X", "of X" and "for X" are filters, not groupings: "churn rate among seniors" is one rate over the seniors. "Average X per customer" (per order, per unit) is one average over all of them; "X per month" or "X per state" is a grouping. "What share of X are Y" is one percentage → `card`; use a pie only when the user asks how the whole splits.
 
     ### **2. TABLES, COLUMNS AND JOINS**
     - Use the exact table and column names from the metadata (case and spaces included), and say which table each column comes from.
@@ -2302,7 +2303,7 @@ sqlQueryRephraserAgentPrompt: |
 
     ### **5. ORDER AND SIZE**
     - Say how the result is sorted: time ascending for trends, natural order for weekdays, months or bins, otherwise by the measure descending.
-    - Top or bottom N: say N. Category charts show at most 50 categories unless the user asks for more: keep the top 50 by the measure. With one dataset per category, the top N picks the categories and every period stays.
+    - Top or bottom N: say N. Category charts show at most 50 categories unless the user asks for more: keep the top 50 by the measure. "Every", "all" or "each" with a category ("every product", "all cities") asks for every value: keep them all, with no top-50 cut. A number axis (age, tenure, a score, a count of items) is ordered like time: keep every value in ascending order, never the top 50. With one dataset per category, the top N picks the categories and every period stays.
     - A time axis is never cut to a number of periods: choose a coarser time bucket instead.
     - Pie, doughnut and polarArea always show the whole: with more than 10 slices, keep the top 9 and group the rest as 'Other'.
     - Tables: say which columns to show; return every matching row unless the user asks for a number of rows.
@@ -2433,6 +2434,16 @@ sqlQueryRephraserAgentPrompt: |
     ```json
     {{
     "rephrasedOutput": "Card showing total revenue. Steps: 1) From table 'revenue', sum 'amount' over all rows. 2) Return one row with the total, labelled 'Total Revenue'. Result columns: total_revenue.",
+    "doubt": null
+    }}
+    ```
+
+    #### Example 3b: A Total Asked as a Question
+    **User Query:** "How much have we spent on shipping?"
+    **Metadata:** "shipments" with columns: carrier (object), shipping_cost (float64)
+    ```json
+    {{
+    "rephrasedOutput": "Card showing total shipping cost. Steps: 1) From table 'shipments', sum 'shipping_cost' over all rows. 2) Return one row with the total, labelled 'Total Shipping Cost'. 'carrier' is not split out: the question asks for one total. Result columns: total_shipping_cost.",
     "doubt": null
     }}
     ```
@@ -2634,6 +2645,7 @@ parallelSqlQueryRephraserAgentPrompt: |
       - Raw rows, a filtered list, "show me", "list", "display the data" → `table` (no aggregation unless asked)
     - "Grouped", "stacked", "multi-series", "compare X across Y" or "X by Y and Z" charts are a `bar` or `line` with one dataset per value of a category column (say which column), or one dataset per measure (say which measures).
     - **CARD RESTRICTIONS:** a card shows ONE value (one measure for the whole selection, or the single top item). If a card would show several values, switch to `bar`.
+    - One measure with no grouping named is one number → `card`: never split it by a category the user did not name. "Among X", "of X" and "for X" are filters, not groupings: "churn rate among seniors" is one rate over the seniors. "Average X per customer" (per order, per unit) is one average over all of them; "X per month" or "X per state" is a grouping. "What share of X are Y" is one percentage → `card`; use a pie only when the user asks how the whole splits.
 
     ### **2. TABLES, COLUMNS AND JOINS**
     - Use the exact table and column names from the metadata (case and spaces included), and say which table each column comes from.
@@ -2655,7 +2667,7 @@ parallelSqlQueryRephraserAgentPrompt: |
 
     ### **5. ORDER AND SIZE**
     - Say how the result is sorted: time ascending for trends, natural order for weekdays, months or bins, otherwise by the measure descending.
-    - Top or bottom N: say N. Category charts show at most 50 categories unless the user asks for more: keep the top 50 by the measure. With one dataset per category, the top N picks the categories and every period stays.
+    - Top or bottom N: say N. Category charts show at most 50 categories unless the user asks for more: keep the top 50 by the measure. "Every", "all" or "each" with a category ("every product", "all cities") asks for every value: keep them all, with no top-50 cut. A number axis (age, tenure, a score, a count of items) is ordered like time: keep every value in ascending order, never the top 50. With one dataset per category, the top N picks the categories and every period stays.
     - A time axis is never cut to a number of periods: choose a coarser time bucket instead.
     - Pie, doughnut and polarArea always show the whole: with more than 10 slices, keep the top 9 and group the rest as 'Other'.
     - Tables: say which columns to show; return every matching row unless the user asks for a number of rows.
@@ -2760,6 +2772,15 @@ parallelSqlQueryRephraserAgentPrompt: |
     ```json
     {{
     "rephrasedOutput": "Bar chart of total purchases by customer region, as the most informative default view of customer behavior. Steps: 1) From table 'customers', group by 'region'. 2) Sum 'purchases' per region. 3) Sort by total purchases descending; keep at most 50 regions. Result columns: region, total_purchases."
+    }}
+    ```
+
+    #### Example 3b: A Total Asked as a Question
+    **User Query:** "How much have we spent on shipping?"
+    **Metadata:** "shipments" with columns: carrier (object), shipping_cost (float64)
+    ```json
+    {{
+    "rephrasedOutput": "Card showing total shipping cost. Steps: 1) From table 'shipments', sum 'shipping_cost' over all rows. 2) Return one row with the total, labelled 'Total Shipping Cost'. 'carrier' is not split out: the question asks for one total. Result columns: total_shipping_cost."
     }}
     ```
 
@@ -2921,7 +2942,7 @@ sqlChartGeneratorPrompt: |
     - Never put LIMIT on a time axis, on a long-form query (one with a series column) or on a pivot: it silently drops periods or series.
     - A time axis is never cut: pick a bucket (day, week, month, quarter, year) that gives at most 500 periods for the range asked about.
     - pie, doughnut and polarArea show the whole, so never LIMIT them: the client's percentages are shares of the slices it gets. With more than 10 slices, keep the top 9 by the measure and sum the rest into one 'Other' slice, last: rank in a CTE with row_number() OVER (ORDER BY m DESC, label) AS rn and COUNT(*) OVER () AS n, then SELECT CASE WHEN rn <= 9 OR n <= 10 THEN label ELSE 'Other' END AS label, SUM(m) ... GROUP BY ALL ORDER BY MIN(rn). When the question names how many to show ("the 5 products with the most revenue, then the rest as Other"), keep that many named slices and put 'Other' after them: rn <= N OR n <= N + 1. 'Other' is text, so a numeric label must be CAST AS VARCHAR inside that CASE (THEN CAST(label AS VARCHAR) ELSE 'Other'): a number and 'Other' in one CASE fail to convert.
-    - A category x axis (bar and radar; line and area only when x is not a time) shows at most 50 categories unless the user asks for more. Without a series, keep the top 50 with ORDER BY the measure DESC LIMIT 50. With a series, or for a top N of the series values, rank them in a CTE and filter on it: WITH top_x AS (SELECT x FROM ... GROUP BY x ORDER BY SUM(m) DESC, x LIMIT 50) ... WHERE x IN (SELECT x FROM top_x).
+    - A category x axis (bar and radar; line and area only when x is not a time) shows at most 50 categories unless the user asks for more. Without a series, keep the top 50 with ORDER BY the measure DESC LIMIT 50. With a series, or for a top N of the series values, rank them in a CTE and filter on it: WITH top_x AS (SELECT x FROM ... GROUP BY x ORDER BY SUM(m) DESC, x LIMIT 50) ... WHERE x IN (SELECT x FROM top_x). "Every", "all" or "each" with a category ("every product", "all cities") asks for more: no LIMIT 50, up to 500 labels. A number x axis (age, tenure, a score) is never cut: keep every value in order.
     - A histogram is never cut: widen the bins so there are at most 50, and ORDER BY the bin.
     - card: aggregate without GROUP BY, or ORDER BY ... LIMIT 1 for "the top ..." questions.
     - table: no LIMIT unless the user asks for a number or a top/bottom N; then put N in the title ("Latest 20 Orders"). The backend shows at most 1000 rows. Do not aggregate unless the user asks.
@@ -3206,7 +3227,7 @@ sqlChartRepairPrompt: |
     - Never put LIMIT on a time axis, on a long-form query (one with a series column) or on a pivot: it silently drops periods or series.
     - A time axis is never cut: pick a bucket (day, week, month, quarter, year) that gives at most 500 periods for the range asked about.
     - pie, doughnut and polarArea show the whole, so never LIMIT them: the client's percentages are shares of the slices it gets. With more than 10 slices, keep the top 9 by the measure and sum the rest into one 'Other' slice, last: rank in a CTE with row_number() OVER (ORDER BY m DESC, label) AS rn and COUNT(*) OVER () AS n, then SELECT CASE WHEN rn <= 9 OR n <= 10 THEN label ELSE 'Other' END AS label, SUM(m) ... GROUP BY ALL ORDER BY MIN(rn). When the question names how many to show ("the 5 products with the most revenue, then the rest as Other"), keep that many named slices and put 'Other' after them: rn <= N OR n <= N + 1. 'Other' is text, so a numeric label must be CAST AS VARCHAR inside that CASE (THEN CAST(label AS VARCHAR) ELSE 'Other'): a number and 'Other' in one CASE fail to convert.
-    - A category x axis (bar and radar; line and area only when x is not a time) shows at most 50 categories unless the user asks for more. Without a series, keep the top 50 with ORDER BY the measure DESC LIMIT 50. With a series, or for a top N of the series values, rank them in a CTE and filter on it: WITH top_x AS (SELECT x FROM ... GROUP BY x ORDER BY SUM(m) DESC, x LIMIT 50) ... WHERE x IN (SELECT x FROM top_x).
+    - A category x axis (bar and radar; line and area only when x is not a time) shows at most 50 categories unless the user asks for more. Without a series, keep the top 50 with ORDER BY the measure DESC LIMIT 50. With a series, or for a top N of the series values, rank them in a CTE and filter on it: WITH top_x AS (SELECT x FROM ... GROUP BY x ORDER BY SUM(m) DESC, x LIMIT 50) ... WHERE x IN (SELECT x FROM top_x). "Every", "all" or "each" with a category ("every product", "all cities") asks for more: no LIMIT 50, up to 500 labels. A number x axis (age, tenure, a score) is never cut: keep every value in order.
     - A histogram is never cut: widen the bins so there are at most 50, and ORDER BY the bin.
     - card: aggregate without GROUP BY, or ORDER BY ... LIMIT 1 for "the top ..." questions.
     - table: no LIMIT unless the user asks for a number or a top/bottom N; then put N in the title ("Latest 20 Orders"). The backend shows at most 1000 rows. Do not aggregate unless the user asks.
