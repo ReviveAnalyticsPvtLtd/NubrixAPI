@@ -99,12 +99,18 @@ def test_missingObjectRaisesInsteadOfReturningTheErrorBody(storage):
         projectStorage.readBytes(PROJECT, "missing.json")
 
 
+def test_missingObjectSaysItIsNotFound(storage):
+    with pytest.raises(projectStorage.StorageObjectNotFound):
+        projectStorage.readBytes(PROJECT, "missing.json")
+
+
 def test_wrongKeyRaises(storage, monkeypatch):
     storage.put(PROJECT, "metadata.json", b"{}")
     monkeypatch.setenv("SUPABASE_KEY", "anon-key")
 
-    with pytest.raises(projectStorage.StorageReadError):
+    with pytest.raises(projectStorage.StorageReadError) as failure:
         projectStorage.readBytes(PROJECT, "metadata.json")
+    assert not isinstance(failure.value, projectStorage.StorageObjectNotFound)
 
 
 def test_redirectIsRefusedSoTheKeyNeverReachesAnotherHost(storage):

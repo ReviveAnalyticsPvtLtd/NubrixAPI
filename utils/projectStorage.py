@@ -8,7 +8,7 @@ hold no credentials, so it reads SUPABASE_URL and SUPABASE_KEY at call time and
 must not import api.commons.
 """
 
-__all__ = ["StorageReadError", "objectUrl", "authHeaders", "readBytes", "readJson", "readTableBytes", "downloadTable", "openTableFile", "readTablePage"]
+__all__ = ["StorageReadError", "StorageObjectNotFound", "objectUrl", "authHeaders", "readBytes", "readJson", "readTableBytes", "downloadTable", "openTableFile", "readTablePage"]
 
 
 import httpx
@@ -30,6 +30,10 @@ _SSL_CONTEXT: ssl.SSLContext | None = None
 
 class StorageReadError(Exception):
     """A storage read failed. Message only, so it survives the trip back from a process pool."""
+
+
+class StorageObjectNotFound(StorageReadError):
+    """The object does not exist. Every other failure, a missing bucket or a refused key included, stays a StorageReadError."""
 
 
 def _sslContext() -> ssl.SSLContext:
@@ -59,9 +63,20 @@ def authHeaders() -> dict:
     return {"apikey": key, "Authorization": f"Bearer {key}"}
 
 
+def _isMissingObject(response: httpx.Response) -> bool:
+    """Storage answers a missing object with 400 and a JSON body; a refused key says "Bucket not found" instead."""
+    if response.status_code not in (400, 404):
+        return False
+    try:
+        return response.json().get("error") == "not_found"
+    except (ValueError, AttributeError):
+        return False
+
+
 def _requireSuccess(response: httpx.Response) -> None:
     if not response.is_success:
-        raise StorageReadError(f"Storage answered {response.status_code} for {response.url.path}.")
+        error = StorageObjectNotFound if _isMissingObject(response) else StorageReadError
+        raise error(f"Storage answered {response.status_code} for {response.url.path}.")
 
 
 def readBytes(projectId: str, fileName: str) -> bytes:

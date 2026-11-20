@@ -341,6 +341,18 @@ def test_getInsights(storage, client):
     _assertAuthenticated(storage, "insights.json")
 
 
+def test_getInsightsIsEmptyBeforeKpisAreGenerated(storage, client):
+    assert managementModule.managementService.getInsights(PROJECT) == {"insights": []}
+
+
+def test_getInsightsStillFailsWhenStorageRefusesTheRead(storage, client, monkeypatch):
+    storage.putJson(PROJECT, "insights.json", {"insights": [{"id": 1}]})
+    monkeypatch.setenv("SUPABASE_KEY", "anon-key")
+
+    with pytest.raises(CustomException):
+        managementModule.managementService.getInsights(PROJECT)
+
+
 def test_generateMetadataKeepsStoredMetadataWhenNothingChanged(storage, client):
     storage.putJson(PROJECT, "metadata.json", {"sales": {"isActive": True}})
 
