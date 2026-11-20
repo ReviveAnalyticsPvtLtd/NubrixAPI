@@ -3,14 +3,16 @@ table_reader_launcher.py: trusted sandbox entry point that decodes a stored tabl
 
 Started by `storedTables.readUntrusted*` through `runTrustedSandbox`, with RLIMIT_DATA set to
 TABLE_READER_MEMORY_BYTES and no table access. Reads JSON from stdin: {"input_path": ..., "result_path": ...,
-"request": {"op": "table" | "page" | "info", "maxDecodedBytes": ..., "offset": ..., "limit": ...}, "channel": ...}.
+"request": {"op": "table" | "page" | "info" | "schema", "maxDecodedBytes": ..., "offset": ..., "limit": ...}, "channel": ...}.
 
 Before decoding, the whole table's encoded, uncompressed size is checked against `maxDecodedBytes` (0 = no limit).
-"table" and "page" then exit with `EXIT_TOO_LARGE`; "info" answers with the shape and no sample. "table" and "page"
+"table", "page" and "schema" then exit with `EXIT_TOO_LARGE`; "info" answers with the shape and no sample. "table" and "page"
 answer with an uncompressed Arrow IPC stream: dictionaries at any depth are decoded to their values here, under this
 child's limit, so the parent's result cap bounds what it holds; the schema keeps only a pandas entry that fits the
 table (and, for a page, the table's row count). "info" answers with the JSON `storedTables.tableInfo` builds, its
-sample cut to `MAX_SAMPLE_CHARS`. Any other failure exits 1 with the error on stderr.
+sample cut to `MAX_SAMPLE_CHARS`. "schema" decodes nothing: it answers with the footer's Arrow schema, serialised as
+an IPC schema message, with plain types and no metadata (`storedTables.tableSchema`). Any other failure exits 1 with
+the error on stderr.
 """
 
 import json
@@ -46,7 +48,7 @@ def _plainTable(table, extra: dict):
 def _answer(inputPath: str, resultPath: str, request: dict) -> None:
     import pyarrow as pa
 
-    from utils.storedTables import MAX_SAMPLE_CHARS, PAGE_ROWS_KEY, TableTooLargeError, decodePage, decodeTable, tableInfo
+    from utils.storedTables import MAX_SAMPLE_CHARS, PAGE_ROWS_KEY, TableTooLargeError, decodePage, decodeTable, tableInfo, tableSchema
 
     limit = int(request["maxDecodedBytes"])
     op = request["op"]
@@ -56,6 +58,10 @@ def _answer(inputPath: str, resultPath: str, request: dict) -> None:
             info["sample"] = info["sample"][:MAX_SAMPLE_CHARS]
         with open(resultPath, "w") as target:
             json.dump(info, target)
+        return
+    if op == "schema":
+        with open(resultPath, "wb") as target:
+            target.write(tableSchema(inputPath, limit).serialize().to_pybytes())
         return
     if op == "table":
         table, extra = decodeTable(inputPath, limit), {}

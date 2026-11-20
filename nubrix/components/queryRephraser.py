@@ -61,10 +61,17 @@ class QueryRephraseOutput(BaseModel):
 
 class QueryRephaser:
     """An agent that rephrases a user's query to be clearer and more specific."""
-    def __init__(self):
-        """Initializes the QueryRephaser and its configuration."""
+    def __init__(self, promptKey: str = "queryRephraserAgentPrompt"):
+        """Initializes the QueryRephaser and its configuration.
+
+        Args:
+            promptKey (str): The prompts.yaml key of the rephraser prompt. The
+                default is the Python chart engine's; the SQL chart engine
+                passes "sqlQueryRephraserAgentPrompt".
+        """
         logger.info("Initializing QueryRephaser.")
         self.queryRephraserConfig = QueryRephraserConfig()
+        self.promptKey = promptKey
 
     def _removeThinkTokens(self, inputStr: AIMessage) -> AIMessage:
         """
@@ -141,7 +148,7 @@ class QueryRephaser:
             self.config = getConfig(self.queryRephraserConfig.configPath)
             queryRephraseParser = JsonOutputParser(pydantic_object = QueryRephraseOutput)
             queryRephrasePrompt = PromptTemplate(
-                template = readYaml(self.queryRephraserConfig.yamlPath).get("queryRephraserAgentPrompt"),
+                template = readYaml(self.queryRephraserConfig.yamlPath).get(self.promptKey),
                 input_variables = ["metadata", "query"],
                 partial_variables = {"format_instructions": queryRephraseParser.get_format_instructions()}
             )
@@ -172,6 +179,10 @@ class ParallelQueryRephraseOutput(BaseModel):
 class ParallelQueryRephaser(QueryRephaser):
     """An agent that rephrases queries for parallel generation without issuing doubts."""
 
+    def __init__(self, promptKey: str = "parallelQueryRephraserAgentPrompt"):
+        """Initializes the parallel rephraser; the SQL chart engine passes "parallelSqlQueryRephraserAgentPrompt"."""
+        super().__init__(promptKey=promptKey)
+
     def _ensureParallelFields(self, parsed_dict: dict) -> dict:
         """
         Validates the parsed dictionary against ParallelQueryRephraseOutput using Pydantic,
@@ -191,7 +202,7 @@ class ParallelQueryRephaser(QueryRephaser):
             self.config = getConfig(self.queryRephraserConfig.configPath)
             queryRephraseParser = JsonOutputParser(pydantic_object = ParallelQueryRephraseOutput)
             queryRephrasePrompt = PromptTemplate(
-                template = readYaml(self.queryRephraserConfig.yamlPath).get("parallelQueryRephraserAgentPrompt"),
+                template = readYaml(self.queryRephraserConfig.yamlPath).get(self.promptKey),
                 input_variables = ["metadata", "query"],
                 partial_variables = {"format_instructions": queryRephraseParser.get_format_instructions()}
             )

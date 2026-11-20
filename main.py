@@ -149,6 +149,12 @@ async def sweepSandboxRuns():
     """Clear what a killed worker's sandbox runs left. On a thread, because a uid that won't clear takes a while."""
     threading.Thread(target=sweepOrphanedRuns, daemon=True).start()
 
+@app.on_event("shutdown")
+async def shutdownShadowCharts():
+    """Cancel the shadow chart runs still queued, so a recycled worker does not start them on its way out."""
+    from api.services.reportingService import shutdownShadow
+    shutdownShadow()
+
 app.include_router(authentication.router, prefix = "/auth", tags = ["Authentication"])
 app.include_router(manager.router, prefix = "/projects", tags = ["Project Management"])
 app.include_router(dataLoader.router, prefix = "/loaders", tags = ["Data Loader"])

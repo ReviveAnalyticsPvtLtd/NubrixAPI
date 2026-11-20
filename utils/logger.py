@@ -30,6 +30,16 @@ os.makedirs("logs", mode=0o700, exist_ok=True)
 
 logger.remove()
 
+
+def _notQuiet(record) -> bool:
+    """False for a line logged inside `logger.contextualize(quiet=True)`, which mutes the thread (or task) it is in.
+
+    `logger.disable` switches a name off for the whole process, so it also drops what every other thread logs
+    meanwhile. Every sink below takes this filter.
+    """
+    return not record["extra"].get("quiet")
+
+
 _logtail_host = os.environ.get("LOGTAIL_HOST")
 logtailHandler = LogtailHandler(
     source_token = os.environ.get("LOGTAIL_TOKEN"),
@@ -37,17 +47,20 @@ logtailHandler = LogtailHandler(
 )
 logger.add(
     logtailHandler,
-    level="INFO"
+    level="INFO",
+    filter=_notQuiet,
 )
 logger.add(
     sys.stdout,
     colorize=True,
     format="<green>{time}</green> | <level>{level}</level> | <cyan>{message}</cyan>",
     level="INFO",
+    filter=_notQuiet,
 )
 logger.add(
     "logs/runLogs.log",
     level="DEBUG",
     rotation="1 MB",
     diagnose=False,
+    filter=_notQuiet,
 )

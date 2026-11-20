@@ -11,7 +11,7 @@ can be stored, and an unmarked table is decoded by the `readUntrusted*`
 functions in a limited child too: a Parquet file can decode to far more memory
 than its size, so neither is decoded in the API's own process.
 
-`decodeStoredTable`, `readStoredTablePage` and `storedTableInfo` are the only way
+`decodeStoredTable`, `readStoredTablePage`, `storedTableInfo` and `storedTableSchema` are the only way
 API code decodes a stored table: they pick between the two.
 """
 
@@ -27,10 +27,13 @@ import pyarrow.parquet as pq
 
 from utils.logger import logger
 from utils.sandboxLimits import _formatBytes, _readBool, _readInt, currentRunLimits
-from utils.sandboxSlots import SandboxBusyError
+from utils.sandboxSlots import SandboxBusyError, requireHeadroom
 
 MARKER_KEY = b"nubrix.stored-table"
 MAX_INPROCESS_FOOTER_BYTES = 1 << 20
+# The longest footer fetched for the reader child. A file states its own footer length, so this is what stops a file
+# built for it from being fetched whole; no writer the API has used comes near it.
+MAX_UNTRUSTED_FOOTER_BYTES = 64 * 1024 * 1024
 _MAX_FOOTER_CONTAINER = 100_000
 _DEFAULT_MAX_DECODED_BYTES = 2147483648
 _DEFAULT_READER_MEMORY_BYTES = 4294967296
@@ -45,8 +48,10 @@ ROW_GROUP_ROWS = 1_048_576
 EXIT_TOO_LARGE = 42
 NORMALISE_BATCH_ROWS = 65536
 _MAX_PANDAS_METADATA_BYTES = 64 * 1024
-# An info answer is a schema, a shape and one row, so it has its own cap whatever the decoded-size limit is.
+# An info answer is a schema, a shape and one row, so it has its own cap whatever the decoded-size limit is. A schema
+# answer is only the schema, so it has the same cap.
 MAX_INFO_ANSWER_BYTES = 4 * 1024 * 1024
+_SMALL_ANSWER_OPS = {"info", "schema"}
 MAX_SAMPLE_CHARS = 64 * 1024
 # Carries a page's row count from the reader child; the parent removes it.
 PAGE_ROWS_KEY = b"nubrix.reader.total-rows"
@@ -307,6 +312,24 @@ def decodePage(data: "bytes | str", offset: int, limit: int, maxDecoded: int) ->
         return _readPage(parquet, offset, limit), metadata.num_rows
 
 
+def plainSchema(schema: "pa.Schema") -> "pa.Schema":
+    """`schema` with every type passed through `plainType` and no schema or field metadata."""
+    return pa.schema([pa.field(field.name, plainType(field.type), field.nullable) for field in schema])
+
+
+def tableSchema(data: "bytes | str", maxDecoded: int) -> "pa.Schema":
+    """The table's Arrow schema from its footer, as `plainSchema`; nothing is decoded.
+
+    A table over `maxDecoded` is refused as `decodeTable` refuses it, so a schema read answers as a decode would.
+    """
+    with pq.ParquetFile(_source(data)) as parquet:
+        metadata = parquet.metadata
+        schema = parquet.schema_arrow
+    if _overDecodedLimit(metadata, maxDecoded):
+        raise _tooLargeToOpen(maxDecoded)
+    return plainSchema(schema)
+
+
 def tableInfo(data: "bytes | str", maxDecoded: int) -> dict:
     """Columns, shape and a one-row sample, as metadata generation reads them.
 
@@ -384,24 +407,28 @@ def normaliseRunOutput(projectId: str, tableName: str, parquetBytes: bytes) -> b
     return result.resultBytes
 
 
-def _readInChild(projectId: str, tableName: str, data: bytes, request: dict) -> bytes:
-    """Run the reader child on `data` and return its answer, mapping every failure to the user's copy."""
+def _readInChild(projectId: str, tableName: str, data: bytes, request: dict, leaveHeadroom: bool = False) -> bytes:
+    """Run the reader child on `data` and return its answer, mapping every failure to the user's copy.
+
+    `leaveHeadroom` takes the sandbox slot only without waiting and with slots to spare, else raises SandboxBusyError.
+    """
     from utils import sandboxRunner
 
     limit = maxDecodedBytes()
-    isInfo = request["op"] == "info"
+    isSmall = request["op"] in _SMALL_ANSWER_OPS
     # With the decoded-size limit off, the answer is bounded by what the child can hold, never below the default limit.
-    cap = MAX_INFO_ANSWER_BYTES if isInfo else limit or max(readerMemoryBytes(), _DEFAULT_MAX_DECODED_BYTES)
+    cap = MAX_INFO_ANSWER_BYTES if isSmall else limit or max(readerMemoryBytes(), _DEFAULT_MAX_DECODED_BYTES)
     limits = currentRunLimits(maxProcessMemory=readerMemoryBytes())
     what = f"Reading a table ({request['op']})"
     try:
         result = sandboxRunner.runTrustedSandbox(
-            _READER_LAUNCHER, projectId, data, {**request, "maxDecodedBytes": limit}, _READER_TIMEOUT_SECONDS, cap, limits=limits
+            _READER_LAUNCHER, projectId, data, {**request, "maxDecodedBytes": limit}, _READER_TIMEOUT_SECONDS, cap, limits=limits,
+            **({"leaveHeadroom": True} if leaveHeadroom else {}),
         )
     except SandboxBusyError:
         raise
     except sandboxRunner.ResultTooLargeError as error:
-        if isInfo:  # An info answer that big is not one tableInfo builds.
+        if isSmall:  # An info or schema answer that big is not one tableInfo or tableSchema builds.
             _logChildFailure(what, projectId, tableName, error=error)
             raise TableUnreadableError(_READ_FAILED) from error
         _logTooLarge(what, projectId, tableName, cap)
@@ -440,18 +467,19 @@ def _inProcess(what: str, projectId: str, tableName: str, decode):
         raise
 
 
-def readUntrustedTable(projectId: str, tableName: str, data: bytes) -> "pa.Table":
+def readUntrustedTable(projectId: str, tableName: str, data: bytes, leaveHeadroom: bool = False) -> "pa.Table":
     """Decode a whole table that may not be the API's own, in a child limited to TABLE_READER_MEMORY_BYTES.
 
     Dictionary columns, at any depth, come back decoded and the schema keeps only a valid pandas entry. Raises
     SandboxBusyError unchanged, TableTooLargeError over STORED_TABLE_MAX_DECODED_BYTES and TableUnreadableError for
     anything the child or its answer does wrong. Errors of the sandbox itself (no free uid, a uid that could not be
     cleared, a TypeError) propagate as they do for code runs. With TABLE_READER_MEMORY_BYTES=0 the table is decoded in
-    this process as before, after the same size check.
+    this process as before, after the same size check. With `leaveHeadroom` (a shadow run's read) the child's sandbox slot
+    is taken without waiting and only while the sandbox has slots to spare, else SandboxBusyError is raised.
     """
     if not readerMemoryBytes():
         return _inProcess("Reading a table (table)", projectId, tableName, lambda limit: decodeTable(data, limit))
-    return _ipcTable(projectId, tableName, _readInChild(projectId, tableName, data, {"op": "table"}))
+    return _ipcTable(projectId, tableName, _readInChild(projectId, tableName, data, {"op": "table"}, leaveHeadroom))
 
 
 def readUntrustedPage(projectId: str, tableName: str, data: bytes, offset: int, limit: int) -> tuple["pl.DataFrame", int]:
@@ -473,6 +501,31 @@ def readUntrustedPage(projectId: str, tableName: str, data: bytes, offset: int, 
         _logChildFailure("Reading a table's page", projectId, tableName, error=ValueError("no row count"))
         raise TableUnreadableError(_READ_FAILED)
     return pl.from_arrow(table.replace_schema_metadata(metadata or None)), int(rows)
+
+
+def _ipcSchema(projectId: str, tableName: str, answer: bytes) -> "pa.Schema":
+    """Read the child's IPC schema answer. A dictionary at any depth is not one `tableSchema` builds, so it is refused."""
+    try:
+        schema = pa.ipc.read_schema(pa.py_buffer(answer))
+        if any(hasDictionary(field.type) for field in schema):
+            raise ValueError("The answer holds a dictionary column.")
+        return schema
+    except Exception as error:
+        _logChildFailure("Reading a table's schema", projectId, tableName, error=error)
+        raise TableUnreadableError(_READ_FAILED) from error
+
+
+def readUntrustedSchema(projectId: str, tableName: str, data: bytes, leaveHeadroom: bool = False) -> "pa.Schema":
+    """The schema of a table that may not be the API's own, read from its footer in the reader child; nothing is decoded.
+
+    Types are plain (`plainSchema`) and the schema carries no metadata. The answer is capped at MAX_INFO_ANSWER_BYTES;
+    a larger one is TableUnreadableError. A table over STORED_TABLE_MAX_DECODED_BYTES is TableTooLargeError, as a
+    decode of it would be. Errors, including the sandbox's own, `leaveHeadroom` and the revert (the footer is read in
+    this process) are otherwise as for `readUntrustedTable`.
+    """
+    if not readerMemoryBytes():
+        return _inProcess("Reading a table (schema)", projectId, tableName, lambda limit: tableSchema(data, limit))
+    return _ipcSchema(projectId, tableName, _readInChild(projectId, tableName, data, {"op": "schema"}, leaveHeadroom))
 
 
 def _isInfo(info) -> bool:
@@ -513,11 +566,10 @@ def readUntrustedInfo(projectId: str, tableName: str, data: bytes) -> dict:
 # ---- The choke point: the only way API code decodes a stored table ----
 
 
-def readTailFooter(tableFile) -> "pq.FileMetaData | None":
-    """Parse the footer of a seekable stored file from its end, as `readFooter` does for whole bytes.
+def _readTail(tableFile) -> tuple[int, bytes, int] | None:
+    """(size, last 64 KiB, footer length) of a seekable stored file that ends as a Parquet file does; None for any other.
 
-    Reads the last 64 KiB, and then the rest of the footer when it is longer, only for a footer of at most 1 MiB.
-    None for anything else; a failed read of the file itself raises.
+    The footer length is the file's own claim, checked only against the file's size. A failed read raises.
     """
     size = tableFile.seek(0, io.SEEK_END)
     if size < 12:
@@ -528,15 +580,32 @@ def readTailFooter(tableFile) -> "pq.FileMetaData | None":
     if len(tail) != tailLength or tail[-4:] != _PARQUET_MAGIC:
         return None
     footerLength = int.from_bytes(tail[-8:-4], "little")
-    if footerLength == 0 or footerLength > MAX_INPROCESS_FOOTER_BYTES or footerLength > size - 12:
+    if footerLength == 0 or footerLength > size - 12:
         return None
-    if footerLength + 8 <= tailLength:
-        footer = tail[-(footerLength + 8):]
-    else:
-        tableFile.seek(size - 8 - footerLength)
-        footer = tableFile.read(footerLength) + tail[-8:]
-    # The footer alone is a file readFooter can check: the row groups' offsets are only read when they are decoded.
-    return readFooter(_PARQUET_MAGIC + footer)
+    return size, tail, footerLength
+
+
+def _footerFile(tableFile, size: int, tail: bytes, footerLength: int) -> bytes:
+    """The footer as a Parquet file of its own, fetching what `tail` does not hold.
+
+    The footer alone is a file a reader can open: the row groups' offsets are only read when they are decoded.
+    """
+    if footerLength + 8 <= len(tail):
+        return _PARQUET_MAGIC + tail[-(footerLength + 8):]
+    tableFile.seek(size - 8 - footerLength)
+    return _PARQUET_MAGIC + tableFile.read(footerLength) + tail[-8:]
+
+
+def readTailFooter(tableFile) -> "pq.FileMetaData | None":
+    """Parse the footer of a seekable stored file from its end, as `readFooter` does for whole bytes.
+
+    Reads the last 64 KiB, and then the rest of the footer when it is longer, only for a footer of at most 1 MiB.
+    None for anything else; a failed read of the file itself raises.
+    """
+    found = _readTail(tableFile)
+    if found is None or found[2] > MAX_INPROCESS_FOOTER_BYTES:
+        return None
+    return readFooter(_footerFile(tableFile, *found))
 
 
 def _trustedFooter(projectId: str, tableName: str, metadata: "pq.FileMetaData | None", what: str) -> "pq.FileMetaData | None":
@@ -550,14 +619,15 @@ def _trustedFooter(projectId: str, tableName: str, metadata: "pq.FileMetaData | 
     return metadata
 
 
-def decodeStoredTable(projectId: str, tableName: str, data: bytes) -> "pa.Table":
+def decodeStoredTable(projectId: str, tableName: str, data: bytes, leaveHeadroom: bool = False) -> "pa.Table":
     """Decode a stored table: in this process when the API wrote it, else in the reader child.
 
     Raises TableTooLargeError over STORED_TABLE_MAX_DECODED_BYTES, and whatever `readUntrustedTable` raises.
+    `leaveHeadroom` only matters for the reader child, as in `readUntrustedTable`.
     """
     if _trustedFooter(projectId, tableName, readFooter(data), "Reading a table (table)") is not None:
         return pq.read_table(pa.BufferReader(data))
-    return readUntrustedTable(projectId, tableName, data)
+    return readUntrustedTable(projectId, tableName, data, leaveHeadroom) if leaveHeadroom else readUntrustedTable(projectId, tableName, data)
 
 
 def readStoredTablePage(projectId: str, tableName: str, offset: int, limit: int) -> tuple["pl.DataFrame", int]:
@@ -578,6 +648,44 @@ def readStoredTablePage(projectId: str, tableName: str, offset: int, limit: int)
             with pq.ParquetFile(tableFile, pre_buffer=True, metadata=metadata) as parquet:
                 return pl.from_arrow(_readPage(parquet, offset, limit)), metadata.num_rows
     return readUntrustedPage(projectId, tableName, readTableBytes(projectId, tableName), offset, limit)
+
+
+def storedTableSchema(projectId: str, tableName: str, leaveHeadroom: bool = False) -> "pa.Schema":
+    """A stored table's Arrow schema, for the chart generator's grounding; the table itself is never decoded here.
+
+    Only the footer is ever fetched, by ranged reads, never the whole object: every chart thread reads the schema of
+    every table it may use, and a table can be far larger than a worker should hold. A table the API wrote has its
+    footer parsed here, as the data grid does. Any other table's footer goes to `readUntrustedSchema` in the reader
+    child, as a Parquet file of its own, and so does a footer too long to parse here (it cannot show its marker). The
+    file says how long its footer is, so one over `MAX_UNTRUSTED_FOOTER_BYTES` is refused unread, and so is a file
+    that does not end as a Parquet file does (both TableUnreadableError). Either way every type is plain (`plainType`)
+    and there is no metadata, as the reader child's decode gives them. Raises as `decodeStoredTable` does, and
+    StorageReadError when storage fails. `leaveHeadroom` only matters for the reader child, as in `readUntrustedTable`.
+    """
+    from utils.projectStorage import openTableFile
+
+    what = "Reading a table (schema)"
+    with openTableFile(projectId, tableName) as tableFile:
+        found = _readTail(tableFile)
+        if found is None:
+            _logChildFailure(what, projectId, tableName, error=ValueError("The file does not end as a Parquet file does."))
+            raise TableUnreadableError(_READ_FAILED)
+        footerLength = found[2]
+        footer = None
+        if footerLength <= MAX_INPROCESS_FOOTER_BYTES:
+            footer = _footerFile(tableFile, *found)
+            metadata = _trustedFooter(projectId, tableName, readFooter(footer), what)
+            if metadata is not None:
+                return plainSchema(metadata.schema.to_arrow_schema())
+        if footerLength > MAX_UNTRUSTED_FOOTER_BYTES:
+            _logTooLarge(what + ", its footer", projectId, tableName, MAX_UNTRUSTED_FOOTER_BYTES)
+            raise TableUnreadableError(_READ_FAILED)
+        if leaveHeadroom and readerMemoryBytes():
+            # Refuse before fetching a long footer: the reader child would refuse the same way, but only once it is here.
+            requireHeadroom(os.environ.get("SANDBOX_RUN_ROOT"), currentRunLimits().maxConcurrentRuns)
+        if footer is None:
+            footer = _footerFile(tableFile, *found)
+    return readUntrustedSchema(projectId, tableName, footer, leaveHeadroom) if leaveHeadroom else readUntrustedSchema(projectId, tableName, footer)
 
 
 def storedTableInfo(projectId: str, tableName: str, data: bytes) -> dict:

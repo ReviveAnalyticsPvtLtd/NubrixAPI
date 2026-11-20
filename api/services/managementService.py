@@ -493,9 +493,8 @@ class ManagementService:
         """Return only table entries where isActive is not False.
         Tables missing the isActive key are treated as active (backward compat).
         """
-        if not isinstance(metadata, dict):
-            return {}
-        return {k: v for k, v in metadata.items() if not k.startswith("_") and v.get("isActive", True) is not False}
+        from utils.modelMetadata import activeTables
+        return activeTables(metadata)
 
     def validateTableNameAvailable(self, projectId: str, tableName: str) -> None:
         """Check that a table name does not already exist in metadata.json (active or inactive).

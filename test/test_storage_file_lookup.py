@@ -326,3 +326,37 @@ def test_refresh_refuses_a_table_over_the_size_limit_with_413():
 
     assert (caught.value.statusCode, caught.value.errorCode) == (413, "TABLE_TOO_LARGE")
     assert caught.value.uiMessage == "This table is too large to load (over 1 MiB)."
+
+
+class _SecondUploadFails(_KeepingBucket):
+    def upload(self, path, file, file_options=None):
+        if path.endswith("costs.parquet"):
+            raise RuntimeError("storage went away")
+        super().upload(path, file, file_options)
+
+
+def test_refresh_clears_cached_table_data_even_when_a_later_upload_fails():
+    bucket = _SecondUploadFails({"connections.json": {"first": {"table": "orders"}, "second": {"table": "costs"}}})
+    service = _service(DashboardService, bucket)
+    service._pullData = mock.Mock(return_value=pd.DataFrame({"id": [1]}))
+    service._updateMetadataShapes = mock.Mock()
+
+    with _storedDashboard(bucket), mock.patch("utils.initMethods.invalidate_data_cache") as invalidate:
+        with pytest.raises(Exception):
+            service.pullDataInParallel(PROJECT_ID)
+
+    assert "orders.parquet" in bucket.uploads
+    invalidate.assert_called_once_with(projectId=PROJECT_ID)
+    service._updateMetadataShapes.assert_not_called()
+
+
+def test_refresh_still_clears_cached_table_data_after_a_clean_pull():
+    bucket = _KeepingBucket({"connections.json": {"first": {"table": "orders"}}})
+    service = _service(DashboardService, bucket)
+    service._pullData = mock.Mock(return_value=pd.DataFrame({"id": [1]}))
+    service._updateMetadataShapes = mock.Mock()
+
+    with _storedDashboard(bucket), mock.patch("utils.initMethods.invalidate_data_cache") as invalidate:
+        service.pullDataInParallel(PROJECT_ID)
+
+    invalidate.assert_called_once_with(projectId=PROJECT_ID)

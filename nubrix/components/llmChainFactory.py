@@ -41,13 +41,17 @@ def _config():
     return _CONFIG
 
 
-def buildLlmChain(section: str, promptKey: str, fallbackTokens: int = 8192):
+def buildLlmChain(section: str, promptKey: str, fallbackTokens: int = 8192, jsonOutput: bool = False):
     """Build a prompt -> LLM -> cleanThinkTokens -> StrOutput chain.
 
     Args:
         section: config.ini section (e.g. "CODEGENERATOR").
         promptKey: key in prompts.yaml (e.g. "codeGeneratorAgentPrompt").
         fallbackTokens: max_tokens fallback when config omits it.
+        jsonOutput: ask Gemini for a JSON reply (`response_mime_type` set to
+            "application/json" on this chain's calls only; the cached model
+            instance is shared and left unchanged). The chain still returns
+            text, which the caller validates.
 
     Returns:
         Runnable chain.
@@ -61,6 +65,8 @@ def buildLlmChain(section: str, promptKey: str, fallbackTokens: int = 8192):
             model=config.get(section, "model"),
             max_tokens=config.getint(section, "maxTokens", fallback=fallbackTokens),
         )
+        if jsonOutput:
+            llm = llm.bind(response_mime_type="application/json")
         chain = RunnablePassthrough() | prompt | llm | RunnableLambda(cleanThinkTokens) | StrOutputParser()
         logger.info(f"LLM chain constructed: section={section}.")
         return chain
