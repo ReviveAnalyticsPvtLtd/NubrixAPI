@@ -122,6 +122,10 @@ class CreateDataBlend(BaseModel):
     tables: list[str]
     joinTypes: list[str]
 
+class DeleteDataBlend(BaseModel):
+    projectId: str
+    blendName: str
+
 class GetFieldsFromSources(BaseModel):
     projectId: str
     tableName: str
