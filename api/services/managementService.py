@@ -31,7 +31,7 @@ from api.services.subscriptions.paymentValidationService import (
     normalizeChurnedSubscription,
 )
 from concurrent.futures import ProcessPoolExecutor
-from utils.projectStorage import readJson, readTableBytes
+from utils.projectStorage import StorageObjectNotFound, readJson, readTableBytes
 from utils.sandboxSlots import isBusy
 from utils.storedTables import storedTableInfo, tableReadException
 from utils.logger import logger
@@ -770,6 +770,9 @@ class ManagementService:
         try:
             jsonData = readJson(projectId, "insights.json")
             return jsonData
+        except StorageObjectNotFound:
+            # insights.json is written only by generateKpis, so its absence means no KPIs yet.
+            return {"insights": []}
         except Exception as e:
             logger.error(CustomException(e))
             raise CustomException(e)
