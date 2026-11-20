@@ -16,7 +16,8 @@ from fastapi import APIRouter, Depends
 from api.commons import requireProductAccess, requireProjectOwner, requireTrialOrAbove, UserContext
 from api.models import (
     GetFieldsFromSources,
-    CreateDataBlend
+    CreateDataBlend,
+    DeleteDataBlend
 )
 
 router = APIRouter()
@@ -40,6 +41,25 @@ async def createDataBlend(blendDetails: CreateDataBlend, user: UserContext = Dep
     try:
         blendService.createDataBlend(blendDetails = blendDetails)
         return ORJSONResponse(status_code = 200, content = {"status": "SUCCESS", "message": "Blend created successfully."})
+    except CustomException as e:
+        raiseHttpException(e)
+
+@router.delete("/deleteDataBlend")
+async def deleteDataBlend(details: DeleteDataBlend, user: UserContext = Depends(requireProductAccess)):
+    """
+    Delete a data blend. Charts already made from it keep working.
+
+    Args:
+        details (DeleteDataBlend): The project and the name of the blend to delete.
+        user: UserContext injected after session verification.
+
+    Returns:
+        ORJSONResponse: Success, 404 when the blend does not exist, or error message.
+    """
+    await asyncio.to_thread(requireProjectOwner, details.projectId, user)
+    try:
+        blendService.deleteDataBlend(details = details)
+        return ORJSONResponse(status_code = 200, content = {"status": "SUCCESS", "message": "Blend deleted successfully."})
     except CustomException as e:
         raiseHttpException(e)
 

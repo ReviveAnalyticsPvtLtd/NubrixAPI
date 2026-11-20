@@ -126,6 +126,26 @@ def test_createDataBlendKeepsExistingBlends(storage, client):
     _assertAuthenticated(storage, "blendConfig.json")
 
 
+def test_deleteDataBlendRemovesOnlyThatBlend(storage, client):
+    storage.putJson(PROJECT, "blendConfig.json", {"keep": {"tables": ["a"]}, "drop": {"tables": ["b"]}})
+
+    blendModule.blendService.deleteDataBlend(types.SimpleNamespace(projectId=PROJECT, blendName="drop"))
+
+    assert client.uploads["blendConfig.json"] == {"keep": {"tables": ["a"]}}
+
+
+@pytest.mark.parametrize("blends", [None, {"keep": {"tables": ["a"]}}])
+def test_deleteDataBlendAnswers404ForAnUnknownBlend(storage, client, blends):
+    if blends is not None:
+        storage.putJson(PROJECT, "blendConfig.json", blends)
+
+    with pytest.raises(CustomException) as failure:
+        blendModule.blendService.deleteDataBlend(types.SimpleNamespace(projectId=PROJECT, blendName="drop"))
+
+    assert failure.value.statusCode == 404
+    assert client.uploads == {}
+
+
 def test_getDataSourcesReadsBlendsAndMetadata(storage, client):
     storage.putJson(PROJECT, "blendConfig.json", {"b1": {"tables": ["a"], "joinTypes": [], "blendOn": []}})
     storage.putJson(PROJECT, "metadata.json", {"a": {"isActive": True}})

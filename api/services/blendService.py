@@ -11,11 +11,12 @@ __all__ = ["blendService"]
 
 from api.commons import updateProjectModifiedAt
 from utils.exceptionHandler import CustomException
-from utils.projectStorage import readJson
+from utils.projectStorage import StorageObjectNotFound, readJson
 from utils.logger import logger
 from api.commons import client
 from api.models import (
     CreateDataBlend,
+    DeleteDataBlend,
     GetFieldsFromSources
 )
 import json
@@ -67,6 +68,39 @@ class BlendService:
             logger.error(exception)
             raise exception   
         
+    def deleteDataBlend(self, details: DeleteDataBlend) -> None:
+        """
+        Delete one blend from the project's blendConfig.json.
+
+        Saved charts keep their own tables and joins, so they still work after their blend is deleted.
+
+        Args:
+            details (DeleteDataBlend): The project and the name of the blend to delete.
+
+        Raises:
+            CustomException: 404 when the project has no such blend, 500 for any other failure.
+        """
+        try:
+            try:
+                blendConfig = readJson(details.projectId, "blendConfig.json")
+            except StorageObjectNotFound:
+                blendConfig = {}
+            if details.blendName not in blendConfig:
+                raise CustomException(
+                    KeyError(f"Blend '{details.blendName}' not found"),
+                    statusCode=404,
+                    uiMessage="Blend not found."
+                )
+            del blendConfig[details.blendName]
+            self.client.storage.from_("AnalyticsHub").upload(path = f"{details.projectId}/blendConfig.json", file = json.dumps(blendConfig, indent=4).encode("utf-8"), file_options = {"upsert": "true"})
+            updateProjectModifiedAt(details.projectId)
+        except CustomException:
+            raise
+        except Exception as e:
+            exception = CustomException(e)
+            logger.error(exception)
+            raise exception
+
     def getDataSources(self, projectId: str) -> dict:
         """
         Retrieve all data sources (raw tables and blends) for a given project.
