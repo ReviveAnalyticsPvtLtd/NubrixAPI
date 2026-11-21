@@ -376,6 +376,24 @@ def test_tasksRouteToImportsQueue():
         assert (task.acks_late, task.reject_on_worker_lost, task.ignore_result) == (True, True, True)
 
 
+def test_celeryAppLoadsNoImportService():
+    """The default worker and beat import the app too; the service would load the AI stack into them."""
+    import subprocess
+    import sys
+    from pathlib import Path
+
+    probe = (
+        "import json, sys; from nubrix.triggers.celery import celeryApp; "
+        "print(json.dumps([[m for m in ('api.services.managementService', 'api.services.databaseImportService') if m in sys.modules], "
+        "celeryApp.conf.task_routes]))"
+    )
+    done = subprocess.run([sys.executable, "-c", probe], capture_output=True, text=True, cwd=Path(__file__).parents[1], timeout=120)
+    assert done.returncode == 0, done.stderr[-2000:]
+    loaded, routes = json.loads(done.stdout.strip().splitlines()[-1])
+    assert loaded == []
+    assert routes == {"NubrixAI.importBatch": {"queue": "imports"}, "NubrixAI.importKpis": {"queue": "imports"}}
+
+
 REDACTED = {"argsrepr": "(redacted)", "kwargsrepr": "{}"}
 
 
@@ -522,7 +540,7 @@ def test_creditsUnavailableRetriesThenSkips(job):
 def test_unexpectedErrorFailsJobWithoutLeakingIt(job, monkeypatch):
     makeTables(job.engine, {"a": (1, 1)})
     tables, jobId = startJob(job)
-    monkeypatch.setattr(tasks, "runBatch", Mock(side_effect=RuntimeError("password=hunter2")))
+    monkeypatch.setattr(service, "runBatch", Mock(side_effect=RuntimeError("password=hunter2")))
     messages = []
     sink = logger.add(messages.append, format="{message}")
     task = _FakeTask()
