@@ -56,7 +56,8 @@ class DataLoadService:
         logger.info("Initializing Data Load Service.")
         self.client = client
 
-    def _sanitizeFileName(self, fileName: str) -> str:
+    @staticmethod
+    def _sanitizeFileName(fileName: str) -> str:
         """
         Sanitize a file name by removing the extension and replacing spaces and special characters with underscores.
 
