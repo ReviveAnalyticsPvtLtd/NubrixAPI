@@ -21,6 +21,8 @@ __all__ = [
 from fastapi import HTTPException
 import traceback
 
+from utils.logger import logger
+
 
 ACCOUNT_ACCESS_REVOKED_ERROR_CODE = "ACCOUNT_ACCESS_REVOKED"
 ACCOUNT_ACCESS_REVOKED_MESSAGE = (
@@ -66,10 +68,11 @@ class CustomException(Exception):
         super().__init__(self.customErrorMessage)
 
 def raiseHttpException(e: CustomException):
+    # The internal detail (file, line, exception text) goes to the logs, never to the browser.
+    logger.log("ERROR" if e.statusCode >= 500 else "WARNING", e.customErrorMessage)
     detail = {
         "status": e.statusCode,
         "message": e.uiMessage,
-        "backendLogMessage": e.customErrorMessage,
     }
     if e.errorCode is not None:
         detail["errorCode"] = e.errorCode
@@ -102,13 +105,14 @@ def raiseFeatureGateHttpException(
     """
     Raise a feature-gate HTTPException using the same response shape as
     raiseHttpException, plus errorCode for frontend discrimination.
+    backendLogMessage is logged, not returned.
     """
+    logger.warning(backendLogMessage)
     raise HTTPException(
         status_code=statusCode,
         detail={
             "status": statusCode,
             "message": uiMessage,
-            "backendLogMessage": backendLogMessage,
             "errorCode": errorCode,
         },
     )

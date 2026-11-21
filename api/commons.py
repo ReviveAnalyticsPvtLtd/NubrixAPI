@@ -446,7 +446,6 @@ def requireWorkspaceOwner(workspaceId: str, user: UserContext) -> None:
             errorCode="WORKSPACE_ACCESS_UNAVAILABLE",
         )
     if not rows or rows[0].get("ownerId") != user.userId:
-        logger.warning("Workspace access denied: workspaceId={}, userId={}", workspaceId, user.userId)
         raiseFeatureGateHttpException(
             statusCode=status.HTTP_404_NOT_FOUND,
             uiMessage="Workspace not found.",
@@ -480,7 +479,6 @@ def requireProjectOwner(projectId: str, user: UserContext) -> None:
             errorCode="PROJECT_ACCESS_UNAVAILABLE",
         )
     if not rows or rows[0].get("ownerUserId") != user.userId:
-        logger.warning("Project access denied: projectId={}, userId={}", projectId, user.userId)
         raiseFeatureGateHttpException(
             statusCode=status.HTTP_404_NOT_FOUND,
             uiMessage="Project not found.",

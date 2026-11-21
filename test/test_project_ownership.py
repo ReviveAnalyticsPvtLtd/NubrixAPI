@@ -131,8 +131,7 @@ def test_denial_does_not_reveal_that_the_project_exists(projects):
         commons.requireProjectOwner("no-such-project", OTHER)
     # A different status or message would confirm which project IDs are real.
     assert owned.value.status_code == missing.value.status_code
-    assert (owned.value.detail | {"backendLogMessage": ""}) == (missing.value.detail | {"backendLogMessage": ""})
-    assert OWNER.userId not in owned.value.detail["backendLogMessage"]
+    assert owned.value.detail == missing.value.detail
 
 
 def test_project_without_an_owner_is_denied(projects):

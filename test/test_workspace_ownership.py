@@ -100,8 +100,7 @@ def test_denial_does_not_reveal_that_the_workspace_exists(workspaces):
         commons.requireWorkspaceOwner("no-such-workspace", OTHER)
     # A different status or message would confirm which workspace IDs are real.
     assert owned.value.status_code == missing.value.status_code
-    assert (owned.value.detail | {"backendLogMessage": ""}) == (missing.value.detail | {"backendLogMessage": ""})
-    assert OWNER.userId not in owned.value.detail["backendLogMessage"]
+    assert owned.value.detail == missing.value.detail
 
 
 def test_failed_workspace_lookup_denies_instead_of_allowing(workspaces):
