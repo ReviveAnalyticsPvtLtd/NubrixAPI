@@ -2,6 +2,8 @@
 import socket
 from unittest.mock import Mock
 
+from fastapi.exceptions import RequestValidationError
+
 import pytest
 from fastapi import FastAPI, HTTPException
 from fastapi.responses import JSONResponse
@@ -10,6 +12,7 @@ from fastapi.testclient import TestClient
 
 import api.commons as commons
 from api.commons import UserContext
+import main
 from api.routers import dataLoader
 from api.services import databaseSources
 from api.services.importJobs import ImportJobs
@@ -58,6 +61,8 @@ def env(monkeypatch):
     tables = [("orders", None), ("a b", None), ("a_b", None), ("users", "sales"), ("t", "public")]
     monkeypatch.setattr(dataLoader, "listTables", Mock(return_value=tables))
     monkeypatch.setattr(databaseSources, "publicAddress", lambda host, port: "192.0.2.1")
+    toSource = Mock(wraps=databaseSources.toSource)
+    monkeypatch.setattr(dataLoader, "toSource", toSource)
     app = FastAPI()
     app.include_router(dataLoader.router, prefix="/loaders")
     for route in dataLoader.router.routes:
@@ -65,11 +70,13 @@ def env(monkeypatch):
             for dependency in route.dependant.dependencies:
                 app.dependency_overrides[dependency.call] = lambda: OWNER
 
+    app.add_exception_handler(RequestValidationError, main.request_validation_handler)
+
     @app.exception_handler(HTTPException)
     async def flat(_, error):
         return JSONResponse(status_code=error.status_code, content=error.detail)
 
-    return type("Env", (), {"client": TestClient(app), "owners": owners, "jobs": jobs, "send": send})
+    return type("Env", (), {"client": TestClient(app), "owners": owners, "jobs": jobs, "send": send, "toSource": toSource})
 
 
 def post(env, **changes):
@@ -151,6 +158,7 @@ def test_nonOwnerNeverTouchesTheHost(env):
     response = post(env)
     assert response.status_code == 404
     dataLoader.listTables.assert_not_called()
+    env.toSource.assert_not_called()
 
 
 def test_statusReturnsRecord(env):
@@ -169,3 +177,51 @@ def test_statusChecksOwnerFirst(env):
     env.owners.owner = "someone-else"
     assert env.client.get(f"/loaders/importStatus/{PROJECT}").status_code == 404
     assert env.owners.calls == 1
+
+
+def test_listTablesValueErrorDoesNotLeak(env, monkeypatch, caplog):
+    from utils.logger import logger
+    lines = []
+    sink = logger.add(lines.append)
+    monkeypatch.setattr(dataLoader, "listTables", Mock(side_effect=ValueError(f"'latin-1' codec can't encode {SECRET}")))
+    try:
+        response = post(env)
+    finally:
+        logger.remove(sink)
+    assert (response.status_code, response.json()["message"]) == (400, CONNECT_FAILURE)
+    assert SECRET not in response.text
+    assert SECRET not in "".join(str(line) for line in lines)
+
+
+def test_validationErrorDoesNotEchoThePassword(env):
+    body = {k: v for k, v in BODY.items() if k != "db"}
+    response = env.client.post("/loaders/importDatabase", json=body)
+    assert response.status_code == 422
+    assert SECRET not in response.text
+    assert response.json()["detail"][0]["loc"][-1] == "db"
+
+
+def test_oldLoaderValidationErrorDoesNotEchoThePassword(env):
+    response = env.client.post("/loaders/loadMySql", json={
+        "projectId": PROJECT, "host": "db.example.com", "port": 3306, "user": "u", "password": SECRET, "db": "shop"})
+    assert response.status_code == 422
+    assert SECRET not in response.text
+
+
+def test_failedEnqueueFreesTheProject(env):
+    env.send.side_effect = [RuntimeError(f"broker down {SECRET}"), None]
+    response = post(env)
+    assert (response.status_code, response.json()["message"]) == (503, "The import could not be started. Please try again.")
+    assert SECRET not in response.text
+    assert env.jobs.get(PROJECT)["state"] == "failed"
+    assert post(env).status_code == 202
+
+
+def test_mongoBodyNeverEchoesTheConnectionString(env, monkeypatch):
+    uri = "mongodb://user:" + SECRET + "@db.example.com/shop"
+    monkeypatch.setattr(databaseSources, "checkMongoUri", lambda value: None)
+    response = env.client.post("/loaders/importDatabase", json={
+        "projectId": PROJECT, "source": "mongodb", "db": "shop", "connectionString": uri})
+    assert response.status_code == 202
+    assert SECRET not in response.text
+    assert SECRET not in str(env.jobs.get(PROJECT))

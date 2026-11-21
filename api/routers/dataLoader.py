@@ -23,7 +23,6 @@ from fastapi.responses import ORJSONResponse
 from api.commons import requireProductAccess, requireCredits, requireProjectOwner, UserContext
 from typing import Annotated
 import dataclasses
-import socket
 from api.services.databaseSources import listTables, storedName, toSource
 from api.services.importJobs import importJobs
 from utils.connectionTargets import BLOCKED_ADDRESS_MESSAGE, BlockedAddressError
@@ -184,6 +183,12 @@ def _refuse(error: Exception, status: int, message: str):
     raiseHttpException(CustomException(error, statusCode=status, uiMessage=message))
 
 
+def _connectFailure(projectId: str, error: Exception):
+    # Logged by type only: a driver's message can quote the host, user or password.
+    logger.warning(f"Import in project {projectId} could not connect ({type(error).__name__}).")
+    _refuse(ConnectionError(), 400, _CONNECT_FAILURE)
+
+
 def _uniqueNames(tables: list) -> list[str]:
     """Stored names, with `_2`, `_3`, ... on the later of two tables that map to the same one."""
     taken, names = set(), []
@@ -209,15 +214,17 @@ async def importDatabase(body: ImportDatabase, user: UserContext = Depends(requi
     await asyncio.to_thread(requireProjectOwner, body.projectId, user)
     try:
         source = await asyncio.to_thread(toSource, body.source, body.model_dump())
-        tables = await asyncio.to_thread(listTables, source)
     except BlockedAddressError as e:
         _refuse(e, 400, BLOCKED_ADDRESS_MESSAGE)
     except ValueError as e:
         _refuse(e, 400, str(e))
     except Exception as e:
-        # Logged by type only: a driver's message can quote the host, user or password.
-        logger.warning(f"Import in project {body.projectId} could not connect ({type(e).__name__}).")
-        _refuse(e if isinstance(e, socket.gaierror) else ConnectionError(), 400, _CONNECT_FAILURE)
+        _connectFailure(body.projectId, e)
+    try:
+        tables = await asyncio.to_thread(listTables, source)
+    except Exception as e:
+        # a driver's ValueError can quote the password, so nothing from listTables is passed on
+        _connectFailure(body.projectId, e)
     if not tables:
         _refuse(LookupError("No tables found."), 422, "No tables found.")
     stored = _uniqueNames(tables)
@@ -228,9 +235,14 @@ async def importDatabase(body: ImportDatabase, user: UserContext = Depends(requi
         _refuse(RuntimeError("import running"), 409, "An import is already running for this project.")
     from nubrix.triggers import celery as celeryModule
     from nubrix.triggers.tasks import databaseImportTask
-    databaseImportTask.sendBatch(
-        celeryModule.celeryApp, body.projectId, user.userId, jobId, dataclasses.asdict(source),
-        [[name, schema, storedAs] for (name, schema), storedAs in zip(tables, stored)], start=0)
+    try:
+        await asyncio.to_thread(
+            databaseImportTask.sendBatch, celeryModule.celeryApp, body.projectId, user.userId, jobId,
+            dataclasses.asdict(source), [[name, schema, storedAs] for (name, schema), storedAs in zip(tables, stored)], start=0)
+    except Exception as e:
+        logger.error(f"Import job {jobId} in project {body.projectId} could not be enqueued ({type(e).__name__}).")
+        await asyncio.to_thread(importJobs.finish, body.projectId, jobId, "failed")  # frees the project's lock
+        _refuse(RuntimeError("enqueue failed"), 503, "The import could not be started. Please try again.")
     return ORJSONResponse(status_code=202, content={"jobId": jobId, "tables": stored})
 
 

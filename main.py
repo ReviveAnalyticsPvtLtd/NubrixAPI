@@ -28,7 +28,7 @@ from api.routers import (
     webhooks,
 )
 from api.adminErrors import AdminApiError, requestValidationErrors
-from fastapi.exception_handlers import request_validation_exception_handler
+from fastapi.encoders import jsonable_encoder
 from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.middleware.gzip import GZipMiddleware
@@ -71,7 +71,9 @@ async def admin_exception_handler(_request: Request, exc: AdminApiError):
 @app.exception_handler(RequestValidationError)
 async def request_validation_handler(request: Request, exc: RequestValidationError):
     if not _isAdminRequest(request):
-        return await request_validation_exception_handler(request, exc)
+        # FastAPI's default answer echoes each error's `input`, which can be the whole body with a password in it.
+        errors = [{k: v for k, v in error.items() if k not in ("input", "ctx")} for error in exc.errors()]
+        return ORJSONResponse(status_code=422, content={"detail": jsonable_encoder(errors)})
     return ORJSONResponse(
         status_code=422,
         content={
