@@ -334,6 +334,13 @@ def _appliedRow(name="summary", tableName=None, transformationId="t1", recorded=
     }
 
 
+@pytest.fixture(autouse=True)
+def publicDatabaseHosts(monkeypatch):
+    # these tests use made-up hostnames, so keep the network guard off real DNS
+    monkeypatch.setattr("api.services.dataLoadService.publicAddress", lambda host, port: "8.8.8.8")
+    monkeypatch.setattr("api.services.dataLoadService.checkMongoUri", lambda uri: None)
+
+
 @pytest.fixture
 def projectStorage():
     """Serves the project's current metadata.json the way the public file route does."""

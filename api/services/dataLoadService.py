@@ -12,6 +12,7 @@ __all__ = ["dataLoadService"]
 from nubrix.components.pdfTableExtractor import PdfTableExtractor
 from api.services.credits.creditTrackingCallback import CreditTrackingCallback
 from api.commons import giveTableNameBack, tableFileState, updateProjectModifiedAt
+from utils.connectionTargets import BLOCKED_ADDRESS_MESSAGE, BlockedAddressError, checkMongoUri, publicAddress
 from utils.exceptionHandler import CustomException
 from utils.initMethods import forget_table
 from pymongo.mongo_client import MongoClient
@@ -489,6 +490,13 @@ class DataLoadService:
             logger.error(exception)
             raise exception
 
+    @staticmethod
+    def _refuseBlocked(check) -> None:
+        try:
+            check()
+        except BlockedAddressError as e:
+            raise CustomException(e, statusCode=400, uiMessage=BLOCKED_ADDRESS_MESSAGE)
+
     def loadMySql(self, connection: LoadMySQLorPostgreSQL, userId: str | None = None) -> dict:
         """
         Load data from MySQL database and generate metadata for the loaded table.
@@ -502,11 +510,13 @@ class DataLoadService:
                     statusCode=400,
                     uiMessage="Missing required DB connection fields."
                 )
+            address = []
+            self._refuseBlocked(lambda: address.append(publicAddress(connection.host, connection.port)))
             connStr = URL.create(
                 "mysql+pymysql",
                 username=connection.user,
                 password=connection.password,
-                host=connection.host,
+                host=address[0],
                 port=connection.port,
                 database=connection.db,
             )
@@ -552,11 +562,13 @@ class DataLoadService:
                     statusCode=400,
                     uiMessage="Missing required DB connection fields."
                 )
+            address = []
+            self._refuseBlocked(lambda: address.append(publicAddress(connection.host, connection.port)))
             connStr = URL.create(
                 "postgresql+psycopg2",
                 username=connection.user,
                 password=connection.password,
-                host=connection.host,
+                host=address[0],
                 port=connection.port,
                 database=connection.db,
             )
@@ -599,6 +611,7 @@ class DataLoadService:
                     statusCode=400,
                     uiMessage="Missing required DB connection fields."
                 )
+            self._refuseBlocked(lambda: checkMongoUri(connection.connectionString))
             sanitizedCollection = self._sanitizeFileName(connection.collection)
             from api.services.managementService import managementService
 

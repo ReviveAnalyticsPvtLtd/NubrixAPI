@@ -84,6 +84,13 @@ def _assertMarked(loader, tableName: str):
     return stored
 
 
+@pytest.fixture(autouse=True)
+def publicDatabaseHosts(monkeypatch):
+    # these tests use made-up hostnames, so keep the network guard off real DNS
+    monkeypatch.setattr("api.services.dataLoadService.publicAddress", lambda host, port: "8.8.8.8")
+    monkeypatch.setattr("api.services.dataLoadService.checkMongoUri", lambda uri: None)
+
+
 def _connection(table: str):
     return mock.Mock(host="db.test", port=3306, user="u", password="p", db="shop", table=table, projectId=PROJECT)
 
