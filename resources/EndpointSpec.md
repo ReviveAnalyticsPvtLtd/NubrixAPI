@@ -1653,10 +1653,10 @@ on every route. `purchase-draft/checkout` returns:
 ```json
 { "message": "Payment service is busy. Please try again in a moment.", "errorCode": "PAYMENT_SERVICE_BUSY" }
 ```
-The other routes return the standard error body, which also carries `status` and `backendLogMessage`:
+The other routes return the standard error body, which also carries `status`:
 ```json
 { "status": 503, "message": "Payment service is busy. Please try again in a moment.",
-  "backendLogMessage": "Error encountered in line no: [...]", "errorCode": "PAYMENT_SERVICE_BUSY" }
+  "errorCode": "PAYMENT_SERVICE_BUSY" }
 ```
 
 **Payment status (`GET /api/latest/subscriptions/payment-status`, 200, `Cache-Control: private, no-store`).**
