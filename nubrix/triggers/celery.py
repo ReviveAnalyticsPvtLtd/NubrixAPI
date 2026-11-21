@@ -28,6 +28,13 @@ from nubrix.triggers.tasks.notificationDispatchTask import (
 )
 from nubrix.triggers.tasks.notificationReconciliationTask import NotificationReconciliationTask
 from nubrix.triggers.tasks.notificationCleanupTask import NotificationCleanupTask
+from nubrix.triggers.tasks.databaseImportTask import (
+    IMPORT_BATCH_TASK,
+    IMPORT_KPIS_TASK,
+    IMPORT_TASK_OPTIONS,
+    importBatch,
+    importKpis,
+)
 from celery.schedules import crontab
 from celery import Celery
 import os
@@ -114,6 +121,20 @@ def runNotificationReconciliation():
 @celeryApp.task(name=f"{APP_NAME}.notificationCleanup")
 def runNotificationCleanup():
     return NotificationCleanupTask().execute()
+
+@celeryApp.task(name=IMPORT_BATCH_TASK, **IMPORT_TASK_OPTIONS)
+def runImportBatch(self, projectId: str, userId: str, jobId: str, sourceFields: dict, tables: list, start: int):
+    importBatch(self, projectId, userId, jobId, sourceFields, tables, start)
+
+@celeryApp.task(name=IMPORT_KPIS_TASK, **IMPORT_TASK_OPTIONS)
+def runImportKpis(self, projectId: str, userId: str, jobId: str):
+    importKpis(self, projectId, userId, jobId)
+
+# Imports have their own worker program (supervisord `celery-imports`), so they never hold the default queue's workers.
+celeryApp.conf.task_routes = {
+    IMPORT_BATCH_TASK: {"queue": "imports"},
+    IMPORT_KPIS_TASK: {"queue": "imports"},
+}
 
 
 celeryApp.conf.beat_schedule = {
