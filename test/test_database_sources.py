@@ -38,18 +38,18 @@ def test_listsBaseTablesNotViews(sqliteEngine):
 
 
 def test_readChunksSplitsRows(sqliteEngine):
-    frames = list(readChunks(MYSQL, ("a", None), 2))
+    frames = list(readChunks(MYSQL, ("a", None), 2, 2000000))
     assert [len(f) for f in frames] == [2, 2, 1]
 
 
 def test_tableNamesAreQuoted(sqliteEngine):
-    assert list(readChunks(MYSQL, ("order", None), 10))[0]["n"].tolist() == [7]
-    assert list(readChunks(MYSQL, ("a b", None), 10))[0]["n"].tolist() == [8]
+    assert list(readChunks(MYSQL, ("order", None), 10, 2000000))[0]["n"].tolist() == [7]
+    assert list(readChunks(MYSQL, ("a b", None), 10, 2000000))[0]["n"].tolist() == [8]
 
 
 def test_engineDisposedWhenGeneratorAbandoned(sqliteEngine):
     with patch.object(sqliteEngine, "dispose", wraps=sqliteEngine.dispose) as dispose:
-        gen = readChunks(MYSQL, ("a", None), 2)
+        gen = readChunks(MYSQL, ("a", None), 2, 2000000)
         next(gen)
         gen.close()
     dispose.assert_called_once()
@@ -111,7 +111,7 @@ def test_readChunksDropsId():
         return made[-1]
 
     with patch.object(ds, "MongoClient", make):
-        frames = list(readChunks(MONGO, ("alpha", None), 2))
+        frames = list(readChunks(MONGO, ("alpha", None), 2, 2000000))
     assert [len(f) for f in frames] == [2, 2, 1]
     assert all("_id" not in f.columns for f in frames)
     assert made[0].closed
@@ -193,7 +193,7 @@ def _spyConnect(engine):
 def test_sqlReadStreamsAndExhaustedReadDoesNotInvalidate(sqliteEngine):
     cm, spy = _spyConnect(sqliteEngine)
     with cm:
-        list(readChunks(MYSQL, ("a", None), 2))
+        list(readChunks(MYSQL, ("a", None), 2, 2000000))
     assert {"stream_results": True} in spy["options"]
     spy["invalidate"].assert_not_called()
 
@@ -201,7 +201,7 @@ def test_sqlReadStreamsAndExhaustedReadDoesNotInvalidate(sqliteEngine):
 def test_abandonedSqlReadInvalidatesConnection(sqliteEngine):
     cm, spy = _spyConnect(sqliteEngine)
     with cm:
-        gen = readChunks(MYSQL, ("a", None), 2)
+        gen = readChunks(MYSQL, ("a", None), 2, 2000000)
         next(gen)
         gen.close()
     spy["invalidate"].assert_called_once()
@@ -217,3 +217,14 @@ def test_toSourceRejectsBadKindAndPort():
         toSource("oracle", {})
     with pytest.raises(ValueError, match="port must be a number"):
         toSource("mysql", {"host": "h", "port": "abc", "user": "u", "password": "p", "db": "d"})
+
+
+@pytest.mark.parametrize("columns, rows", [(100, 20000), (5, 50000), (5000, 1000)])
+def test_sqlChunkRowsFollowTheTableWidth(sqliteEngine, columns, rows):
+    inspector = MagicMock()
+    inspector.get_columns.return_value = [{"name": f"c{i}"} for i in range(columns)]
+    read = MagicMock(return_value=iter(()))
+    with patch("sqlalchemy.inspect", return_value=inspector), patch.object(ds.pd, "read_sql", read):
+        list(readChunks(MYSQL, ("a", "sales"), 50000, 2000000))
+    inspector.get_columns.assert_called_once_with("a", schema="sales")
+    assert read.call_args.kwargs["chunksize"] == rows

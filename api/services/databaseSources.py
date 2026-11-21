@@ -14,6 +14,7 @@ from utils.connectionTargets import checkMongoUri, publicAddress, publicServers
 
 SourceTable = tuple[str, str | None]
 _SKIPPED_SCHEMAS = ("information_schema", "pg_catalog", "pg_toast")
+_MIN_CHUNK_ROWS = 1000
 
 
 @dataclass(frozen=True, repr=False)
@@ -100,7 +101,8 @@ def storedName(table: SourceTable) -> str:
     return DataLoadService._sanitizeName(name if schema in (None, "public") else f"{schema}_{name}")
 
 
-def readChunks(source: Source, table: SourceTable, chunkRows: int) -> Iterator[pd.DataFrame]:
+def readChunks(source: Source, table: SourceTable, chunkRows: int, chunkCells: int) -> Iterator[pd.DataFrame]:
+    """The table in DataFrames of at most chunkRows rows; a SQL chunk also holds about chunkCells cells, never under 1,000 rows."""
     name, schema = table
     if source.kind == "mongodb":
         client = _mongoClient(source)
@@ -112,6 +114,8 @@ def readChunks(source: Source, table: SourceTable, chunkRows: int) -> Iterator[p
         return
     engine = _engine(source)
     try:
+        columns = len(sqlalchemy.inspect(engine).get_columns(name, schema=schema))
+        chunkRows = min(chunkRows, max(_MIN_CHUNK_ROWS, chunkCells // max(1, columns)))
         query = select(text("*")).select_from(sqlalchemy.table(name, schema=schema))
         # stream_results: without it pymysql and psycopg2 buffer the whole result before the first chunk
         conn = engine.connect().execution_options(stream_results=True)

@@ -63,7 +63,7 @@ def job(monkeypatch, tmp_path):
     monkeypatch.setenv("SUPABASE_URL", storage.url)
     monkeypatch.setenv("SUPABASE_KEY", SERVICE_KEY)
     monkeypatch.delenv("STORED_TABLE_MAX_DECODED_BYTES", raising=False)
-    for name in ("IMPORT_BATCH_TABLES", "IMPORT_BATCH_COLUMNS", "IMPORT_CHUNK_ROWS"):
+    for name in ("IMPORT_BATCH_TABLES", "IMPORT_BATCH_COLUMNS", "IMPORT_CHUNK_ROWS", "IMPORT_CHUNK_CELLS", "IMPORT_MONGO_CHUNK_ROWS"):
         monkeypatch.delenv(name, raising=False)
     client = _Client(storage)
     monkeypatch.setattr(dataLoadModule.dataLoadService, "client", client)
@@ -231,10 +231,10 @@ def test_driverErrorReasonIsGeneric(job, monkeypatch):
     tables, jobId = startJob(job)
     realRead = service.readChunks
 
-    def readChunks(source, table, chunkRows):
+    def readChunks(source, table, *sizes):
         if table[0] == "a":
             raise Exception("user=alice host=db.example")
-        return realRead(source, table, chunkRows)
+        return realRead(source, table, *sizes)
 
     monkeypatch.setattr(service, "readChunks", readChunks)
     messages = []
@@ -255,7 +255,7 @@ def test_emptyTablesLoadWithNoRows(job, monkeypatch):
     makeTables(job.engine, {"sql": (2, 0), "mongo": (1, 1)})
     tables, jobId = startJob(job)
     realRead = service.readChunks
-    monkeypatch.setattr(service, "readChunks", lambda source, table, chunkRows: iter(()) if table[0] == "mongo" else realRead(source, table, chunkRows))
+    monkeypatch.setattr(service, "readChunks", lambda source, table, *sizes: iter(()) if table[0] == "mongo" else realRead(source, table, *sizes))
 
     service.runBatch(PROJECT, USER, jobId, MYSQL, tables, 0)
 
@@ -578,3 +578,18 @@ def test_creditsAllowMatchesTheDependency(monkeypatch):
     monkeypatch.setattr(commons.subscriptionEntitlementService, "get", unavailable)
     with pytest.raises(commons.CreditsUnavailable):
         commons.creditsAllow(USER, "metadata_generation")
+
+
+MONGO = Source(kind="mongodb", connectionString="mongodb+srv://u:p@cluster.test", db="d")
+
+
+def test_chunkSizeSettingsReachTheReader(job, monkeypatch):
+    calls = []
+    monkeypatch.setattr(service, "readChunks", lambda source, table, *sizes: calls.append((source.kind, table, sizes)) or iter(()))
+    jobId = job.jobs.start(PROJECT, [("a", "a")])
+    service.runBatch(PROJECT, USER, jobId, MYSQL, [("a", None)], 0)
+    job.jobs.finish(PROJECT, jobId, "done")
+    jobId = job.jobs.start(PROJECT, [("m", "m")])
+    service.runBatch(PROJECT, USER, jobId, MONGO, [("m", None)], 0)
+
+    assert calls == [("mysql", ("a", None), (50000, 2000000)), ("mongodb", ("m", None), (5000, 2000000))]

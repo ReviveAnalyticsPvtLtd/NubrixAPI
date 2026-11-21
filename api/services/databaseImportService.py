@@ -203,7 +203,8 @@ def _loadTable(projectId, jobId, source, table, storedAs, refresh) -> tuple[dict
             refresh()  # the chunk is written once the writer asks for the next one
 
     def write(path):
-        chunks = readChunks(source, table[:2], _setting("IMPORT_CHUNK_ROWS", 50000))
+        rows = _setting("IMPORT_MONGO_CHUNK_ROWS", 5000) if source.kind == "mongodb" else _setting("IMPORT_CHUNK_ROWS", 50000)
+        chunks = readChunks(source, table[:2], rows, _setting("IMPORT_CHUNK_CELLS", 2000000))
         shape["rows"], shape["columns"] = writeStoredChunksToPath(refreshing(chunks), projectId, storedAs, path)
 
     try:
