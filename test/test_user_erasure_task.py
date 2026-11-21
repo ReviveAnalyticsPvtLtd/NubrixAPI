@@ -392,6 +392,8 @@ def test_transient_cleanup_deletes_user_and_project_keys_with_one_scan():
                 "project-1::metadata",
                 "semaphore:project-1",
                 "transformation-preview:project-1:abc",
+                "import:project-1",
+                "import:project-1:running",
                 "other-user-key",
             }
             self.scanCalls = 0
@@ -426,7 +428,7 @@ def test_transient_cleanup_deletes_user_and_project_keys_with_one_scan():
 
     result = cleanup.deleteTransientState("user-1", ["project-1"])
 
-    assert result == {"keysDeleted": 4}
+    assert result == {"keysDeleted": 6}
     assert redis.keys == {"other-user-key"}
     assert invalidated == ["project-1"]
     assert redis.scanCalls == 1
@@ -435,6 +437,10 @@ def test_transient_cleanup_deletes_user_and_project_keys_with_one_scan():
     assert set(redis.unlinkCalls[0]) == {
         "credits:v3:user-1",
         "semaphore:project-1",
+        "import:project-1",
+        "import:project-1:running",
+        "import:project-1:batch",
+        "import:project-1:next",
     }
     assert set(redis.unlinkCalls[1]) == {
         "project-1::metadata",

@@ -35,9 +35,10 @@ class FakeRedis:
         self.ttls[key] = seconds
         return 1
 
-    def delete(self, key):
-        self.ttls.pop(key, None)
-        return int(self.values.pop(key, None) is not None)
+    def delete(self, *keys):
+        for key in keys:
+            self.ttls.pop(key, None)
+        return sum(self.values.pop(key, None) is not None for key in keys)
 
 
 TABLES = [("Orders", "orders"), ("Order Items", "order_items")]
@@ -153,6 +154,35 @@ def test_getReportsFailedWhenWorkerDiedAndLockExpired():
     del redis.values["import:p1:running"]
     assert jobs.get("p1")["state"] == "failed"
     assert json.loads(redis.values["import:p1"])["state"] == "running"
+
+
+@pytest.mark.parametrize("kpis, reported", [("waiting", "failed"), ("running", "failed"), ("done", "done"), ("skipped", "skipped")])
+def test_lockExpiredJobReportsUnfinishedKpisFailed(kpis, reported):
+    jobs, redis = make()
+    jobId = jobs.start("p1", TABLES)
+    jobs.setKpis("p1", jobId, kpis)
+    del redis.values["import:p1:running"]
+    assert (jobs.get("p1")["state"], jobs.get("p1")["kpis"]) == ("failed", reported)
+    assert json.loads(redis.values["import:p1"])["kpis"] == kpis
+
+
+def test_finishedJobKeepsItsKpis():
+    jobs, _ = make()
+    jobId = jobs.start("p1", TABLES)
+    jobs.finish("p1", jobId, "done")
+    assert jobs.get("p1")["kpis"] == "waiting"
+
+
+def test_forgetRemovesEveryKeyOfTheProject():
+    jobs, redis = make()
+    jobId = jobs.start("p1", TABLES)
+    jobs.start("p2", TABLES)
+    redis.set("import:p1:batch", f"{jobId}:0")
+    redis.set("import:p1:next", f"{jobId}:8")
+    jobs.forget("p1")
+    assert sorted(redis.values) == ["import:p2", "import:p2:running"]
+    assert jobs.get("p1") is None
+    assert (jobs.setTable("p1", jobId, "orders", status="loaded"), jobs.refreshLock("p1", jobId)) == (False, False)
 
 
 def test_getUnknownProjectIsNone():

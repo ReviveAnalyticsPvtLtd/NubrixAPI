@@ -49,6 +49,16 @@ class ImportJobs:
     def _lockKey(self, projectId: str) -> str:
         return f"{self._key(projectId)}:running"
 
+    @staticmethod
+    def keys(projectId: str) -> list[str]:
+        """Every key of the project's import: the record, the lock, and the step marker and pointer of databaseImportService."""
+        key = ImportJobs._key(projectId)
+        return [key, f"{key}:running", f"{key}:batch", f"{key}:next"]
+
+    def forget(self, projectId: str) -> None:
+        """Remove the project's import; a running job's next write is refused, so it stops."""
+        self._redis.delete(*self.keys(projectId))
+
     def _read(self, projectId: str) -> dict | None:
         raw = self._redis.get(self._key(projectId))
         return None if raw is None else json.loads(raw)
@@ -92,6 +102,8 @@ class ImportJobs:
             record = self._read(projectId)  # a finish may have landed meanwhile
             if record and record["state"] == "running":
                 record["state"] = "failed"
+                if record["kpis"] in ("waiting", "running"):
+                    record["kpis"] = "failed"
         return record
 
     def setTable(self, projectId: str, jobId: str, storedAs: str, **fields) -> bool:

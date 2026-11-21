@@ -593,3 +593,56 @@ def test_chunkSizeSettingsReachTheReader(job, monkeypatch):
     service.runBatch(PROJECT, USER, jobId, MONGO, [("m", None)], 0)
 
     assert calls == [("mysql", ("a", None), (50000, 2000000)), ("mongodb", ("m", None), (5000, 2000000))]
+
+
+def test_forgottenJobStopsWithoutWritingMoreTables(job, monkeypatch):
+    makeTables(job.engine, {name: (1, 1) for name in "ab"})
+    tables, jobId = startJob(job)
+    realRead = service.readChunks
+
+    def readChunks(source, table, *sizes):
+        job.jobs.forget(PROJECT)  # the project is deleted while its first table is read
+        return realRead(source, table, *sizes)
+
+    monkeypatch.setattr(service, "readChunks", readChunks)
+    task = _FakeTask()
+    tasks.importBatch(task, PROJECT, USER, jobId, dataclasses.asdict(MYSQL), [list(t) for t in tables], 0)
+
+    assert task.sent == [] and task.retried is None
+    assert job.jobs.get(PROJECT) is None
+    assert not [key for key in job.storage.objects if key.endswith(".parquet")]
+    assert not job.metadata.called
+
+
+def _management(monkeypatch, jobs):
+    monkeypatch.setattr(managementModule, "importJobs", jobs)
+    monkeypatch.setattr(managementModule, "listProjectFiles", lambda client, projectId: [])
+    management = object.__new__(managementModule.ManagementService)
+    management.client = MagicMock()
+    return management
+
+
+def test_deleteProjectForgetsItsImport(monkeypatch):
+    jobs = ImportJobs(FakeRedis())
+    jobId = jobs.start(PROJECT, [("a", "a")])
+
+    _management(monkeypatch, jobs).deleteProject(PROJECT)
+
+    assert jobs.get(PROJECT) is None
+    assert jobs.setTable(PROJECT, jobId, "a", status="loaded") is False
+
+
+def test_deleteProjectSurvivesARedisFailure(monkeypatch):
+    jobs = Mock()
+    jobs.forget.side_effect = ConnectionError("redis://:hunter2@redis.test")
+    management = _management(monkeypatch, jobs)
+    messages = []
+    sink = logger.add(messages.append, format="{message}")
+    try:
+        management.deleteProject(PROJECT)
+    finally:
+        logger.remove(sink)
+
+    management.client.table.assert_called_with("Projects")
+    assert any("ConnectionError" in str(m) for m in messages)
+    assert not any("hunter2" in str(m) for m in messages)
