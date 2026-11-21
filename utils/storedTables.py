@@ -19,6 +19,8 @@ import hmac
 import io
 import json
 import os
+import tempfile
+from collections.abc import Iterable
 from hashlib import sha256
 
 import pandas as pd
@@ -182,6 +184,75 @@ def writeStoredTableToPath(table: "pa.Table | pd.DataFrame", projectId: str, tab
     """`writeStoredTable` into a file, for writers that upload from a path. Nothing is written for a refused table."""
     table = _markedTable(table, projectId, tableName)
     pq.write_table(table, path, **WRITE_SETTINGS, row_group_size=ROW_GROUP_ROWS)
+
+
+def _unifiedType(types: list) -> "pa.DataType":
+    """One type for a column's chunk types: widened where Arrow can, else string. A column that is only null is string."""
+    try:
+        unified = pa.unify_schemas([pa.schema([("c", t)]) for t in types], promote_options="permissive").field("c").type
+    except (pa.ArrowTypeError, pa.ArrowInvalid):
+        return pa.string()
+    return pa.string() if pa.types.is_null(unified) else unified
+
+
+def _toType(column: "pa.ChunkedArray", target: "pa.DataType") -> "pa.ChunkedArray":
+    if column.type == target:
+        return column
+    try:
+        return column.cast(target)
+    except (pa.ArrowInvalid, pa.ArrowNotImplementedError, pa.ArrowTypeError):
+        # Only a string target gets here in practice (nested or binary values Arrow will not cast).
+        return pa.chunked_array([pa.array([None if v is None else str(v) for v in column.to_pylist()], target)])
+
+
+def writeStoredChunksToPath(chunks: "Iterable[pd.DataFrame]", projectId: str, tableName: str, path: str) -> tuple[int, int]:
+    """Write DataFrame chunks as one stored table at `path`; returns (rows, columns).
+
+    Memory is bounded by one chunk: each chunk is spilled to a part file, the column types are unified across the
+    parts, then the parts are copied into one file with this table's marker. Raises TableTooLargeError once the
+    decoded bytes pass STORED_TABLE_MAX_DECODED_BYTES. `path` and the part files are removed on any error.
+    """
+    limit = maxDecodedBytes()
+    total = 0
+    with tempfile.TemporaryDirectory(prefix="stored-chunks-") as folder:
+        try:
+            parts = []
+            for chunk in chunks:
+                table = pa.Table.from_pandas(chunk, preserve_index=False)
+                total += table.nbytes
+                if limit and total > limit:
+                    raise TableTooLargeError(f"Table is over {total} bytes decoded, over the limit of {limit}.")
+                parts.append(os.path.join(folder, f"part-{len(parts)}.parquet"))
+                pq.write_table(table, parts[-1], **WRITE_SETTINGS, row_group_size=ROW_GROUP_ROWS)
+            schemas = [pq.read_schema(part) for part in parts]
+            types: dict[str, list] = {}
+            for schema in schemas:
+                for field in schema:
+                    types.setdefault(field.name, []).append(field.type)
+            schema = pa.schema([(name, _unifiedType(found)) for name, found in types.items()])
+            metadata: dict[bytes, bytes] = {}
+            pandasMetadata = (schemas[0].metadata or {}).get(b"pandas") if schemas else None
+            # Pandas metadata describes the first chunk's columns, so it is kept only while they are all still true.
+            if pandasMetadata is not None and all(s.remove_metadata().equals(schema) for s in schemas):
+                metadata[b"pandas"] = pandasMetadata
+            marker = tableMarker(projectId, tableName)
+            if marker:
+                metadata[MARKER_KEY] = marker
+            rows = 0
+            with pq.ParquetWriter(path, schema.with_metadata(metadata), **WRITE_SETTINGS) as writer:
+                for part in parts:
+                    table = pq.read_table(part)
+                    columns = [
+                        _toType(table.column(f.name), f.type) if f.name in table.column_names else pa.nulls(table.num_rows, f.type)
+                        for f in schema
+                    ]
+                    rows += table.num_rows
+                    writer.write_table(pa.Table.from_arrays(columns, schema=schema), row_group_size=ROW_GROUP_ROWS)
+            return rows, len(schema)
+        except BaseException:
+            if os.path.exists(path):
+                os.remove(path)
+            raise
 
 
 def readerMemoryBytes() -> int:
