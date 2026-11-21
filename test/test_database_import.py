@@ -107,6 +107,17 @@ def startJob(job):
     return tables, jobId
 
 
+def test_tableCarriesItsOwnStoredName(job):
+    makeTables(job.engine, {"a b": (1, 1), "a_b": (1, 2)})
+    jobId = job.jobs.start(PROJECT, [("a b", "a_b"), ("a_b", "a_b_2")])
+
+    assert service.runBatch(PROJECT, USER, jobId, MYSQL, [("a b", None, "a_b"), ("a_b", None, "a_b_2")], 0) is None
+
+    found = statuses(job)
+    assert (found["a_b"]["status"], found["a_b"]["rows"]) == ("loaded", 1)
+    assert (found["a_b_2"]["status"], found["a_b_2"]["rows"]) == ("loaded", 2)
+
+
 def statuses(job) -> dict:
     return {t["storedAs"]: t for t in job.jobs.get(PROJECT)["tables"]}
 

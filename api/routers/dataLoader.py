@@ -10,6 +10,7 @@ __all__ = ["router"]
 
 
 from api.models import (
+    ImportDatabase,
     LoadMySQLorPostgreSQL,
     LoadMongoDB,
     DeleteTable
@@ -21,6 +22,12 @@ from api.services.dataLoadService import dataLoadService
 from fastapi.responses import ORJSONResponse
 from api.commons import requireProductAccess, requireCredits, requireProjectOwner, UserContext
 from typing import Annotated
+import dataclasses
+import socket
+from api.services.databaseSources import listTables, storedName, toSource
+from api.services.importJobs import importJobs
+from utils.connectionTargets import BLOCKED_ADDRESS_MESSAGE, BlockedAddressError
+from utils.logger import logger
 
 router = APIRouter()
 """
@@ -168,3 +175,70 @@ async def deleteTable(tableDetails: DeleteTable, user: UserContext = Depends(req
         return ORJSONResponse(status_code = 200, content = {"status": "SUCCESS", "message": "Table deleted successfully"})
     except CustomException as e:
         raiseHttpException(e)
+
+
+_CONNECT_FAILURE = "Unable to connect: check host/port/credentials."
+
+
+def _refuse(error: Exception, status: int, message: str):
+    raiseHttpException(CustomException(error, statusCode=status, uiMessage=message))
+
+
+def _uniqueNames(tables: list) -> list[str]:
+    """Stored names, with `_2`, `_3`, ... on the later of two tables that map to the same one."""
+    taken, names = set(), []
+    for table in tables:
+        base = name = storedName(table)
+        n = 1
+        while name in taken:
+            n += 1
+            name = f"{base}_{n}"
+        taken.add(name)
+        names.append(name)
+    return names
+
+
+@router.post("/importDatabase", status_code=202)
+async def importDatabase(body: ImportDatabase, user: UserContext = Depends(requireCredits("metadata_generation"))):
+    """
+    Start a background import of every table of a database connection.
+
+    Returns:
+        ORJSONResponse: 202 with the jobId and the names the tables will be stored under.
+    """
+    await asyncio.to_thread(requireProjectOwner, body.projectId, user)
+    try:
+        source = await asyncio.to_thread(toSource, body.source, body.model_dump())
+        tables = await asyncio.to_thread(listTables, source)
+    except BlockedAddressError as e:
+        _refuse(e, 400, BLOCKED_ADDRESS_MESSAGE)
+    except ValueError as e:
+        _refuse(e, 400, str(e))
+    except Exception as e:
+        # Logged by type only: a driver's message can quote the host, user or password.
+        logger.warning(f"Import in project {body.projectId} could not connect ({type(e).__name__}).")
+        _refuse(e if isinstance(e, socket.gaierror) else ConnectionError(), 400, _CONNECT_FAILURE)
+    if not tables:
+        _refuse(LookupError("No tables found."), 422, "No tables found.")
+    stored = _uniqueNames(tables)
+    named = [(f"{schema}.{name}" if schema not in (None, "public") else name, storedAs)
+             for (name, schema), storedAs in zip(tables, stored)]
+    jobId = await asyncio.to_thread(importJobs.start, body.projectId, named)
+    if jobId is None:
+        _refuse(RuntimeError("import running"), 409, "An import is already running for this project.")
+    from nubrix.triggers import celery as celeryModule
+    from nubrix.triggers.tasks import databaseImportTask
+    databaseImportTask.sendBatch(
+        celeryModule.celeryApp, body.projectId, user.userId, jobId, dataclasses.asdict(source),
+        [[name, schema, storedAs] for (name, schema), storedAs in zip(tables, stored)], start=0)
+    return ORJSONResponse(status_code=202, content={"jobId": jobId, "tables": stored})
+
+
+@router.get("/importStatus/{projectId}")
+async def importStatus(projectId: str, user: UserContext = Depends(requireProductAccess)):
+    """Progress record of the project's latest database import."""
+    await asyncio.to_thread(requireProjectOwner, projectId, user)
+    record = await asyncio.to_thread(importJobs.get, projectId)
+    if record is None:
+        _refuse(LookupError("No import found."), 404, "No import found.")
+    return ORJSONResponse(status_code=200, content=record)

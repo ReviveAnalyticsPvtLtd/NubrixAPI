@@ -145,6 +145,16 @@ class LoadMongoDB(BaseModel):
     db: str
     collection: str
 
+class ImportDatabase(BaseModel):
+    projectId: str
+    source: Literal["mysql", "postgresql", "mongodb"]
+    host: str | None = None
+    port: int | None = None
+    user: str | None = None
+    password: str | None = None
+    db: str
+    connectionString: str | None = None
+
 class CreatePage(BaseModel):
     projectId: str
     pageName: str

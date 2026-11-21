@@ -53,6 +53,11 @@ def _setting(name: str, default: int) -> int:
     return max(1, _readInt(name, default))
 
 
+def _storedAs(table: tuple) -> str:
+    """The name a table is stored under: a third element when the route made names unique, else derived."""
+    return table[2] if len(table) == 3 else storedName(table)
+
+
 def _check(written: bool) -> None:
     """Every job write is refused once a newer job owns the project."""
     if not written:
@@ -130,7 +135,7 @@ def _runBatch(projectId, userId, jobId, source, tables, start, refreshMarker, sk
         skipWith = OUT_OF_CREDITS
     if skipWith is not None:
         for table in tables[start:]:
-            storedAs = storedName(table)
+            storedAs = _storedAs(table)
             if status[storedAs] in ("pending", "loading"):
                 _set(projectId, jobId, storedAs, status="skipped", reason=skipWith)
                 status[storedAs] = "skipped"
@@ -142,7 +147,7 @@ def _runBatch(projectId, userId, jobId, source, tables, start, refreshMarker, sk
     index = start
     while index < len(tables) and attempted < maxTables and columns < maxColumns:
         table, index = tables[index], index + 1
-        storedAs = storedName(table)
+        storedAs = _storedAs(table)
         state = status[storedAs]
         if state in ("skipped", "failed"):
             continue
@@ -198,7 +203,7 @@ def _loadTable(projectId, jobId, source, table, storedAs, refresh) -> tuple[dict
             refresh()  # the chunk is written once the writer asks for the next one
 
     def write(path):
-        chunks = readChunks(source, table, _setting("IMPORT_CHUNK_ROWS", 50000))
+        chunks = readChunks(source, table[:2], _setting("IMPORT_CHUNK_ROWS", 50000))
         shape["rows"], shape["columns"] = writeStoredChunksToPath(refreshing(chunks), projectId, storedAs, path)
 
     try:
