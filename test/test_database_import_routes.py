@@ -225,3 +225,7 @@ def test_mongoBodyNeverEchoesTheConnectionString(env, monkeypatch):
     assert response.status_code == 202
     assert SECRET not in response.text
     assert SECRET not in str(env.jobs.get(PROJECT))
+
+
+def test_namesWithNoWordCharactersAreStoredAsTableAndKeptApart():
+    assert dataLoader._uniqueNames([("$$$", None), ("###", None), ("table", None)]) == ["table", "table_2", "table_3"]

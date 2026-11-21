@@ -264,3 +264,19 @@ def test_postgresListingSkipsManagedPlatformSchemas():
                 "graphql_public", "supabase_functions", "supabase_migrations", "cron", "net", "pgbouncer", "_analytics"]
     found, _ = _postgres({"public": ["orders"], "app": ["users"], **{s: ["secrets"] for s in platform}}, {})
     assert found == [("users", "app"), ("orders", "public")]
+
+
+def test_readChunksReadsASchemaQualifiedTable(sqliteEngine, tmp_path):
+    sales = tmp_path / "sales.db"
+    with sqlalchemy.create_engine(f"sqlite:///{sales}").begin() as conn:
+        conn.execute(sqlalchemy.text("CREATE TABLE a (n INTEGER)"))
+        conn.execute(sqlalchemy.text("INSERT INTO a VALUES (42)"))
+    sqlalchemy.event.listen(sqliteEngine, "connect", lambda dbapi, _record: dbapi.execute(f"ATTACH DATABASE '{sales}' AS sales"))
+    sqliteEngine.dispose()  # the pool's connections were made before the listener
+
+    assert list(readChunks(MYSQL, ("a", "sales"), 10, 2000000))[0]["n"].tolist() == [42]
+
+
+def test_nameWithNoWordCharactersIsStoredAsTable():
+    assert storedName(("$$$", None)) == "table"
+    assert storedName(("###", "public")) == "table"

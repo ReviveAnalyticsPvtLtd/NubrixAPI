@@ -109,7 +109,7 @@ def listTables(source: Source) -> list[SourceTable]:
 
 def storedName(table: SourceTable) -> str:
     name, schema = table
-    return DataLoadService._sanitizeName(name if schema in (None, "public") else f"{schema}_{name}")
+    return DataLoadService._sanitizeName(name if schema in (None, "public") else f"{schema}_{name}") or "table"
 
 
 def readChunks(source: Source, table: SourceTable, chunkRows: int, chunkCells: int) -> Iterator[pd.DataFrame]:
