@@ -7,9 +7,16 @@ nubrix/triggers/tasks/databaseImportTask.py.
 
 Reasons in the record are fixed sentences, and logs carry ids and counts only: a driver's error can quote the
 connection's user, host or password, and table names are the customer's.
+
+Two Redis keys beside the job's record keep deliveries apart. `import:{projectId}:batch` is held by the delivery
+running a step (a batch or the KPI step), so a second delivery of it waits instead of running it twice.
+`import:{projectId}:next` names the step that should run next, so a late delivery of a step another delivery
+already finished does nothing.
 """
 
-__all__ = ["JobStopped", "runBatch", "runKpis", "skipRemaining", "endJob", "failJob"]
+__all__ = ["CREDITS_UNCHECKED", "BatchBusy", "JobStopped", "runBatch", "runKpis", "failJob"]
+
+from contextlib import contextmanager
 
 from api.commons import creditsAllow, tableFileState, updateProjectModifiedAt
 from api.services.databaseSources import Source, SourceTable, readChunks, storedName
@@ -28,13 +35,18 @@ TOO_LARGE = "Too large to import"
 UNREADABLE = "Could not read this table"
 DESCRIPTION_MISSING = "Description could not be generated"
 
-# Outlives a chunk by far, and runs out long before the broker's one-hour visibility timeout redelivers a crashed batch.
+# Outlives a chunk by far; a dead delivery's marker runs out well within the retries a second delivery makes.
 _MARKER_SECONDS = 900
-_DONE = {"loaded", "skipped", "failed"}
+_POINTER_SECONDS = 604800
+_KPIS = "kpis"
 
 
 class JobStopped(Exception):
-    """The job was superseded, or another delivery of this batch is running it: stop and enqueue nothing."""
+    """The job was superseded, or this step was already done by another delivery: stop and enqueue nothing."""
+
+
+class BatchBusy(Exception):
+    """Another delivery holds this step: it is running it, or it died less than _MARKER_SECONDS ago."""
 
 
 def _setting(name: str, default: int) -> int:
@@ -58,26 +70,55 @@ def _set(projectId: str, jobId: str, storedAs: str, **fields) -> None:
     _check(importJobs.setTable(projectId, jobId, storedAs, **fields))
 
 
-def runBatch(projectId: str, userId: str, jobId: str, source: Source, tables: list[SourceTable], start: int) -> int | None:
+@contextmanager
+def _holding(projectId: str, jobId: str, step):
+    """Hold the project's step marker for this delivery; yields a function that extends it."""
+    redis = importJobs._redis  # the markers sit beside the job's record
+    key, value = f"import:{projectId}:batch", f"{jobId}:{step}"
+    # acks_late delivers a step again when its worker dies, or when it runs past the visibility timeout
+    if not redis.set(key, value, nx=True, ex=_MARKER_SECONDS):
+        raise BatchBusy()
+    try:
+        yield lambda: redis.expire(key, _MARKER_SECONDS)
+    finally:
+        held = redis.get(key)
+        if held is not None and held.decode() == value:
+            redis.delete(key)
+
+
+def _nextStep(projectId: str, jobId: str):
+    """The step that should run next: a start index, or _KPIS. Missing, or another job's, means 0."""
+    raw = importJobs._redis.get(f"import:{projectId}:next")
+    owner, _, step = raw.decode().partition(":") if raw else ("", "", "")
+    if owner != jobId:
+        return 0
+    return step if step == _KPIS else int(step)
+
+
+def _advance(projectId: str, jobId: str, step) -> None:
+    _record(projectId, jobId)
+    importJobs._redis.set(f"import:{projectId}:next", f"{jobId}:{step}", ex=_POINTER_SECONDS)
+
+
+def runBatch(projectId: str, userId: str, jobId: str, source: Source, tables: list[SourceTable], start: int,
+             skipWith: str | None = None) -> int | None:
     """Load and describe the batch of tables from `start`; the next batch's start, or None when every table is done.
 
-    Raises JobStopped when the job was superseded or another delivery of this batch holds it, and
+    With `skipWith`, every table left from `start` is skipped with that reason instead. Raises JobStopped when the
+    job was superseded or this batch is already done, BatchBusy when another delivery holds it, and
     CreditsUnavailable when credits could not be checked.
     """
-    redis = importJobs._redis  # the batch marker sits beside the job's record
-    markerKey, marker = f"import:{projectId}:batch", f"{jobId}:{start}"
-    # acks_late hands a batch that runs past the visibility timeout to a second worker while the first still runs it.
-    if not redis.set(markerKey, marker, nx=True, ex=_MARKER_SECONDS):
-        raise JobStopped()
-    try:
-        return _runBatch(projectId, userId, jobId, source, tables, start, lambda: redis.expire(markerKey, _MARKER_SECONDS))
-    finally:
-        held = redis.get(markerKey)
-        if held is not None and held.decode() == marker:
-            redis.delete(markerKey)
+    with _holding(projectId, jobId, start) as refreshMarker:
+        step = _nextStep(projectId, jobId)
+        if step == _KPIS or step > start:
+            raise JobStopped()
+        nextStart = _runBatch(projectId, userId, jobId, source, tables, start, refreshMarker, skipWith)
+        # moved on before the marker is released, so a delivery waiting for it finds the batch done
+        _advance(projectId, jobId, _KPIS if nextStart is None else nextStart)
+        return nextStart
 
 
-def _runBatch(projectId, userId, jobId, source, tables, start, refreshMarker) -> int | None:
+def _runBatch(projectId, userId, jobId, source, tables, start, refreshMarker, skipWith) -> int | None:
     status = {t["storedAs"]: t["status"] for t in _record(projectId, jobId)["tables"]}
 
     def refresh():
@@ -85,40 +126,66 @@ def _runBatch(projectId, userId, jobId, source, tables, start, refreshMarker) ->
         _check(importJobs.refreshLock(projectId, jobId))
 
     _check(importJobs.refreshLock(projectId, jobId))
-    if not creditsAllow(userId, "metadata_generation"):
-        skipRemaining(projectId, jobId, tables, start, OUT_OF_CREDITS)
+    if skipWith is None and not creditsAllow(userId, "metadata_generation"):
+        skipWith = OUT_OF_CREDITS
+    if skipWith is not None:
+        for table in tables[start:]:
+            storedAs = storedName(table)
+            if status[storedAs] in ("pending", "loading"):
+                _set(projectId, jobId, storedAs, status="skipped", reason=skipWith)
+                status[storedAs] = "skipped"
         return None
     maxTables, maxColumns = _setting("IMPORT_BATCH_TABLES", 8), _setting("IMPORT_BATCH_COLUMNS", 400)
     attempted = columns = 0
     loaded = []
+    described = None  # metadata.json's tables, read when the first table an earlier delivery stored comes up
     index = start
     while index < len(tables) and attempted < maxTables and columns < maxColumns:
         table, index = tables[index], index + 1
         storedAs = storedName(table)
-        if status[storedAs] in _DONE:  # done by an earlier delivery of this batch
+        state = status[storedAs]
+        if state in ("skipped", "failed"):
             continue
-        attempted += 1
-        if status[storedAs] == "loading" and tableFileState(dataLoadService.client, projectId, storedAs) is not None:
-            # stored before that delivery stopped, and never described
-            fields, width = {"status": "loaded", "reason": DESCRIPTION_MISSING}, 0
+        if state == "loaded" or (state == "loading" and tableFileState(dataLoadService.client, projectId, storedAs) is not None):
+            # stored by an earlier delivery of this batch, which may have died before describing it
+            if described is None:
+                described = _describedTables(projectId, jobId)
+            if storedAs in described:
+                continue
+            attempted += 1  # its column count would need the file's footer read; 0 keeps the batch at least as big
+            _set(projectId, jobId, storedAs, status="loaded", reason=None)
         else:
+            attempted += 1
             _set(projectId, jobId, storedAs, status="loading")
             fields, width = _loadTable(projectId, jobId, source, table, storedAs, refresh)
-            if fields["status"] == "loaded":
-                loaded.append(storedAs)
-                columns += width
-        _set(projectId, jobId, storedAs, **fields)
-        status[storedAs] = fields["status"]
+            _set(projectId, jobId, storedAs, **fields)
+            if fields["status"] != "loaded":
+                status[storedAs] = fields["status"]
+                continue
+            columns += width
+        status[storedAs] = "loaded"
+        loaded.append(storedAs)
     if loaded:
         updateProjectModifiedAt(projectId)
-        described = _describe(projectId, jobId, userId, loaded)
+        answered = _describe(projectId, jobId, userId, loaded)
         for name in loaded:
-            if name not in described:
+            if name not in answered:
                 refresh()
                 if name not in _describe(projectId, jobId, userId, [name]):
                     _set(projectId, jobId, name, reason=DESCRIPTION_MISSING)
     logger.info(f"Import job {jobId} in project {projectId}: batch from {start} loaded {len(loaded)} of {attempted} tables.")
     return index if index < len(tables) else None
+
+
+def _describedTables(projectId: str, jobId: str) -> set[str]:
+    try:
+        return set(readJson(projectId, "metadata.json"))
+    except StorageObjectNotFound:
+        return set()
+    except Exception as e:
+        # describing a table again only costs a model call
+        logger.warning(f"Import job {jobId} in project {projectId}: metadata.json could not be read ({type(e).__name__}).")
+        return set()
 
 
 def _loadTable(projectId, jobId, source, table, storedAs, refresh) -> tuple[dict, int]:
@@ -158,33 +225,32 @@ def _describe(projectId: str, jobId: str, userId: str, names: list[str]) -> set[
         return set()
 
 
-def skipRemaining(projectId: str, jobId: str, tables: list[SourceTable], start: int, reason: str) -> None:
-    """Skip every table from `start` that is not done yet."""
-    status = {t["storedAs"]: t["status"] for t in _record(projectId, jobId)["tables"]}
-    for table in tables[start:]:
-        storedAs = storedName(table)
-        if status[storedAs] not in _DONE:
-            _set(projectId, jobId, storedAs, status="skipped", reason=reason)
-            status[storedAs] = "skipped"
+def runKpis(projectId: str, userId: str, jobId: str, skip: bool = False) -> None:
+    """Generate KPIs when the project has none yet (never, with `skip`), then end the job as done.
 
-
-def runKpis(projectId: str, userId: str, jobId: str) -> None:
-    """Generate KPIs when the project has none yet, then end the job as done.
-
-    Raises JobStopped when the job was superseded, and CreditsUnavailable when credits could not be checked.
+    Raises JobStopped when the job has ended or was superseded, BatchBusy when another delivery holds the step, and
+    CreditsUnavailable when credits could not be checked.
     """
-    kpis = _record(projectId, jobId)["kpis"]
-    if kpis in ("waiting", "running"):  # otherwise an earlier delivery stopped between the two writes of endJob
-        kpis = _generateKpis(projectId, userId, jobId)
-    endJob(projectId, jobId, kpis)
+    with _holding(projectId, jobId, _KPIS):
+        kpis = _record(projectId, jobId)["kpis"]
+        if kpis in ("waiting", "running"):  # otherwise an earlier delivery stopped between the two writes below
+            kpis = "skipped" if skip else _generateKpis(projectId, userId, jobId)
+        _check(importJobs.setKpis(projectId, jobId, kpis))
+        _check(importJobs.finish(projectId, jobId, "done"))
+
+
+def _exists(projectId: str, fileName: str) -> bool:
+    try:
+        readJson(projectId, fileName)
+        return True
+    except StorageObjectNotFound:
+        return False
 
 
 def _generateKpis(projectId: str, userId: str, jobId: str) -> str:
-    try:
-        readJson(projectId, "insights.json")
+    # skipped when the project has KPIs already, or when nothing was described to find KPIs in
+    if _exists(projectId, "insights.json") or not _exists(projectId, "metadata.json"):
         return "skipped"
-    except StorageObjectNotFound:
-        pass
     if not creditsAllow(userId, "insight_generation"):
         return "skipped"
     _check(importJobs.setKpis(projectId, jobId, "running"))
@@ -194,12 +260,6 @@ def _generateKpis(projectId: str, userId: str, jobId: str) -> str:
     except Exception as e:
         logger.warning(f"Import job {jobId} in project {projectId}: KPI generation failed ({type(e).__name__}).")
         return "failed"
-
-
-def endJob(projectId: str, jobId: str, kpis: str) -> None:
-    """Record the KPI step's outcome and end the job as done."""
-    _check(importJobs.setKpis(projectId, jobId, kpis))
-    _check(importJobs.finish(projectId, jobId, "done"))
 
 
 def failJob(projectId: str, jobId: str) -> None:

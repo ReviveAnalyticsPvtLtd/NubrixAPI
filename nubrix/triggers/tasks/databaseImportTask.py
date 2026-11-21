@@ -5,30 +5,38 @@ Celery task bodies of a database import, registered in nubrix/triggers/celery.py
 Each batch enqueues the next one at the back of the queue, so imports take turns batch by batch.
 
 sourceFields carry the connection's credentials, and a driver's error can quote them, so no exception leaves these
-tasks and logs name the exception's type only.
+tasks, logs name the exception's type only, and every message is sent with its args' repr redacted.
 """
 
-__all__ = ["IMPORT_BATCH_TASK", "IMPORT_KPIS_TASK", "IMPORT_TASK_OPTIONS", "importBatch", "importKpis"]
+__all__ = ["IMPORT_BATCH_TASK", "IMPORT_KPIS_TASK", "IMPORT_TASK_OPTIONS", "importBatch", "importKpis", "sendBatch"]
 
 from celery.exceptions import Retry
 
 from api.commons import CreditsUnavailable
-from api.services.databaseImportService import CREDITS_UNCHECKED, JobStopped, endJob, failJob, runBatch, runKpis, skipRemaining
+from api.services.databaseImportService import CREDITS_UNCHECKED, BatchBusy, JobStopped, failJob, runBatch, runKpis
 from api.services.databaseSources import Source
 from utils.logger import logger
 
 IMPORT_BATCH_TASK = "NubrixAI.importBatch"
 IMPORT_KPIS_TASK = "NubrixAI.importKpis"
-# acks_late with reject_on_worker_lost: a batch whose worker died is delivered again and resumes from the record.
+# acks_late with reject_on_worker_lost: a step whose worker died is delivered again and resumes from the record.
 IMPORT_TASK_OPTIONS = {"bind": True, "ignore_result": True, "acks_late": True, "reject_on_worker_lost": True}
-_CREDIT_RETRIES = 3
-_CREDIT_RETRY_SECONDS = 60
+# Celery puts a repr of the args in each message's headers and in its events; a retry would otherwise rebuild it.
+_REDACTED = {"argsrepr": "(redacted)", "kwargsrepr": "{}"}
+_CREDIT_RETRIES, _CREDIT_RETRY_SECONDS = 3, 60
+# A dead delivery's marker runs out after 900 s, well within these 30 minutes.
+_BUSY_RETRIES, _BUSY_RETRY_SECONDS = 6, 300
 
 
-def _retryCredits(task) -> None:
-    """Ask again in a minute, until the retries are spent."""
-    if task.request.retries < _CREDIT_RETRIES:
-        raise task.retry(countdown=_CREDIT_RETRY_SECONDS, max_retries=_CREDIT_RETRIES)
+def sendBatch(app, projectId: str, userId: str, jobId: str, sourceFields: dict, tables: list[list], start: int) -> None:
+    """Enqueue the batch at `start`; the first one is sent the same way."""
+    app.send_task(IMPORT_BATCH_TASK, args=[projectId, userId, jobId, sourceFields, tables, start], ignore_result=True, **_REDACTED)
+
+
+def _retry(task, retries: int, seconds: int) -> None:
+    """Deliver this step again in `seconds`, until `retries` are spent."""
+    if task.request.retries < retries:
+        raise task.retry(countdown=seconds, max_retries=retries, **_REDACTED)
 
 
 def _fail(projectId: str, jobId: str, error: Exception) -> None:
@@ -42,22 +50,24 @@ def _fail(projectId: str, jobId: str, error: Exception) -> None:
 def importBatch(task, projectId: str, userId: str, jobId: str, sourceFields: dict, tables: list[list], start: int) -> None:
     """Run one batch, then enqueue the next one, or the KPI step after the last."""
     try:
-        sourceTables = [tuple(t) for t in tables]
+        source, sourceTables = Source(**sourceFields), [tuple(t) for t in tables]
         try:
-            nextStart = runBatch(projectId, userId, jobId, Source(**sourceFields), sourceTables, start)
+            nextStart = runBatch(projectId, userId, jobId, source, sourceTables, start)
         except CreditsUnavailable:
-            _retryCredits(task)
-            skipRemaining(projectId, jobId, sourceTables, start, CREDITS_UNCHECKED)
-            nextStart = None
+            _retry(task, _CREDIT_RETRIES, _CREDIT_RETRY_SECONDS)
+            nextStart = runBatch(projectId, userId, jobId, source, sourceTables, start, skipWith=CREDITS_UNCHECKED)
         if nextStart is None:
-            task.app.send_task(IMPORT_KPIS_TASK, args=[projectId, userId, jobId])
+            task.app.send_task(IMPORT_KPIS_TASK, args=[projectId, userId, jobId], ignore_result=True, **_REDACTED)
         else:
-            task.app.send_task(IMPORT_BATCH_TASK, args=[projectId, userId, jobId, sourceFields, tables, nextStart])
+            sendBatch(task.app, projectId, userId, jobId, sourceFields, tables, nextStart)
         logger.info(f"Import job {jobId} in project {projectId}: batch from {start} done, next {nextStart}.")
     except Retry:
         raise
+    except BatchBusy:
+        _retry(task, _BUSY_RETRIES, _BUSY_RETRY_SECONDS)
+        logger.info(f"Import job {jobId} in project {projectId}: batch from {start} is still held by a running delivery.")
     except JobStopped:
-        logger.info(f"Import job {jobId} in project {projectId}: batch from {start} stopped, superseded or already running.")
+        logger.info(f"Import job {jobId} in project {projectId}: batch from {start} stopped, superseded or already done.")
     except Exception as e:
         _fail(projectId, jobId, e)
 
@@ -68,12 +78,15 @@ def importKpis(task, projectId: str, userId: str, jobId: str) -> None:
         try:
             runKpis(projectId, userId, jobId)
         except CreditsUnavailable:
-            _retryCredits(task)
-            endJob(projectId, jobId, "skipped")
+            _retry(task, _CREDIT_RETRIES, _CREDIT_RETRY_SECONDS)
+            runKpis(projectId, userId, jobId, skip=True)
         logger.info(f"Import job {jobId} in project {projectId} done.")
     except Retry:
         raise
+    except BatchBusy:
+        _retry(task, _BUSY_RETRIES, _BUSY_RETRY_SECONDS)
+        logger.info(f"Import job {jobId} in project {projectId}: KPI step is still held by a running delivery.")
     except JobStopped:
-        logger.info(f"Import job {jobId} in project {projectId}: KPI step stopped, superseded.")
+        logger.info(f"Import job {jobId} in project {projectId}: KPI step stopped, the job has ended or was superseded.")
     except Exception as e:
         _fail(projectId, jobId, e)
