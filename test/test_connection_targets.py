@@ -3,7 +3,7 @@ import socket
 import pytest
 
 from api.services.dataLoadService import dataLoadService
-from api.models import LoadMySQLorPostgreSQL
+from api.models import LoadMongoDB, LoadMySQLorPostgreSQL
 from utils import connectionTargets
 from utils.connectionTargets import (
     BLOCKED_ADDRESS_MESSAGE,
@@ -76,3 +76,35 @@ def test_oldLoaderRefusesPrivateHost(monkeypatch):
         dataLoadService.loadMySql(connection)
     assert caught.value.statusCode == 400
     assert caught.value.uiMessage == BLOCKED_ADDRESS_MESSAGE
+
+
+def _failToResolve(*a, **k):
+    raise socket.gaierror(11001, "getaddrinfo failed")
+
+
+def test_unresolvableHostIsNotReportedAsBlocked(monkeypatch):
+    monkeypatch.setattr(socket, "getaddrinfo", _failToResolve)
+    with pytest.raises(socket.gaierror):
+        publicAddress("typo.example.com", 3306)
+
+
+@pytest.mark.parametrize("loader,message", [
+    ("loadMySql", "Unable to connect to MySQL : check host/port/credentials."),
+    ("loadPostgreSQL", "Unable to connect to PostgreSQL: check host/port/credentials."),
+])
+def test_loaderKeepsConnectMessageForUnresolvableHost(monkeypatch, loader, message):
+    monkeypatch.setattr(socket, "getaddrinfo", _failToResolve)
+    connection = LoadMySQLorPostgreSQL(host="typo.example.com", port=3306, user="u", password="p", db="d", table="t", projectId="p1")
+    with pytest.raises(CustomException) as caught:
+        getattr(dataLoadService, loader)(connection)
+    assert caught.value.statusCode == 400
+    assert caught.value.uiMessage == message
+
+
+def test_mongoLoaderKeepsConnectMessageForUnresolvableHost(monkeypatch):
+    monkeypatch.setattr(connectionTargets, "parse_uri", lambda uri: {"nodelist": [("typo.example.com", 27017)]})
+    monkeypatch.setattr(socket, "getaddrinfo", _failToResolve)
+    with pytest.raises(CustomException) as caught:
+        dataLoadService.loadMongoDB(LoadMongoDB(projectId="p1", connectionString="mongodb://ignored", db="d", collection="c"))
+    assert caught.value.statusCode == 400
+    assert caught.value.uiMessage == "Unable to connect to MongoDB: check connection string/credentials."
