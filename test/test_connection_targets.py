@@ -1,4 +1,5 @@
 import socket
+import types
 
 import pytest
 
@@ -10,6 +11,7 @@ from utils.connectionTargets import (
     BlockedAddressError,
     checkMongoUri,
     publicAddress,
+    publicServers,
 )
 from utils.exceptionHandler import CustomException
 
@@ -108,3 +110,88 @@ def test_mongoLoaderKeepsConnectMessageForUnresolvableHost(monkeypatch):
         dataLoadService.loadMongoDB(LoadMongoDB(projectId="p1", connectionString="mongodb://ignored", db="d", collection="c"))
     assert caught.value.statusCode == 400
     assert caught.value.uiMessage == "Unable to connect to MongoDB: check connection string/credentials."
+
+
+def _server(host, port=27017):
+    return types.SimpleNamespace(address=(host, port))
+
+
+def test_serverSelectorKeepsOnlyPublicServers(monkeypatch):
+    ips = {"a.example.com": "8.8.8.8", "b.example.com": "10.0.0.5"}
+    monkeypatch.setattr(socket, "getaddrinfo", lambda host, port, *a, **k: [(socket.AF_INET, 1, 6, "", (ips[host], port))])
+    public, private = _server("a.example.com"), _server("b.example.com")
+    internal, local = _server("x.railway.internal"), _server("localhost")
+    assert publicServers([public, private, internal, local]) == [public]
+
+
+def test_serverSelectorDropsServersThatDoNotResolve(monkeypatch):
+    monkeypatch.setattr(socket, "getaddrinfo", _failToResolve)
+    assert publicServers([_server("typo.example.com")]) == []
+
+
+def _connection(**kw):
+    return LoadMySQLorPostgreSQL(**{"host": "db.example.com", "port": 3306, "user": "u", "password": "p", "db": "d", "table": "t", "projectId": "p1", **kw})
+
+
+class _Stop(Exception):
+    pass
+
+
+def _captureEngine(monkeypatch):
+    import api.services.dataLoadService as module
+    seen = {}
+
+    def fake(url, **kw):
+        seen["url"], seen["kw"] = url, kw
+        raise _Stop()
+    monkeypatch.setattr(module, "create_engine", fake)
+    _resolveTo(monkeypatch, "8.8.8.8")
+    return seen
+
+
+def test_mysqlConnectsToTheResolvedAddress(monkeypatch):
+    seen = _captureEngine(monkeypatch)
+    with pytest.raises(CustomException):
+        dataLoadService.loadMySql(_connection())
+    assert seen["url"].host == "8.8.8.8"
+
+
+def test_postgresKeepsItsNameAndPinsTheAddress(monkeypatch):
+    seen = _captureEngine(monkeypatch)
+    with pytest.raises(CustomException):
+        dataLoadService.loadPostgreSQL(_connection(port=5432))
+    assert seen["url"].host == "db.example.com"
+    assert seen["kw"]["connect_args"] == {"hostaddr": "8.8.8.8"}
+
+
+def test_postgresLoaderRefusesPrivateHost(monkeypatch):
+    seen = _captureEngine(monkeypatch)
+    _resolveTo(monkeypatch, "10.0.0.1")
+    with pytest.raises(CustomException) as caught:
+        dataLoadService.loadPostgreSQL(_connection(port=5432))
+    assert (caught.value.statusCode, caught.value.uiMessage) == (400, BLOCKED_ADDRESS_MESSAGE)
+    assert seen == {}
+
+
+def test_mongoLoaderRefusesPrivateHost(monkeypatch):
+    monkeypatch.setattr(connectionTargets, "parse_uri", lambda uri: {"nodelist": [("db.example.com", 27017)]})
+    _resolveTo(monkeypatch, "10.0.0.1")
+    with pytest.raises(CustomException) as caught:
+        dataLoadService.loadMongoDB(LoadMongoDB(projectId="p1", connectionString="mongodb://ignored", db="d", collection="c"))
+    assert (caught.value.statusCode, caught.value.uiMessage) == (400, BLOCKED_ADDRESS_MESSAGE)
+
+
+def test_mongoLoaderPassesTheServerSelector(monkeypatch):
+    import api.services.dataLoadService as module
+    monkeypatch.setattr(module, "checkMongoUri", lambda uri: None)
+    seen = {}
+
+    def fake(*a, **kw):
+        seen.update(kw)
+        raise _Stop()
+    monkeypatch.setattr(module, "MongoClient", fake)
+    monkeypatch.setattr(dataLoadService, "_acceptTableName", lambda *a: {})
+    monkeypatch.setattr(dataLoadService, "_writeTable", lambda projectId, name, claims, write: write("unused"))
+    with pytest.raises(CustomException):
+        dataLoadService.loadMongoDB(LoadMongoDB(projectId="p1", connectionString="mongodb://ignored", db="d", collection="c"))
+    assert seen["server_selector"] is publicServers

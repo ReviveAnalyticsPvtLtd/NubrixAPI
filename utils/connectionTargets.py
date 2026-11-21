@@ -24,12 +24,29 @@ def publicAddress(host: str, port: int) -> str:
     return addresses[0]
 
 
+def publicServers(server_descriptions):
+    """pymongo server_selector: keep only servers whose announced address is public.
+
+    A replica set can announce hosts the URI never named (private IPs, *.internal), and the
+    driver would connect to them.
+    """
+    kept = []
+    for description in server_descriptions:
+        try:
+            publicAddress(*description.address)
+        except (BlockedAddressError, OSError):
+            continue
+        kept.append(description)
+    return kept
+
+
 def checkMongoUri(uri: str) -> None:
     """Raise BlockedAddressError when any host in the URI (SRV included) is not public.
     A URI or name that cannot be parsed or resolved raises its own error, not BlockedAddressError.
 
-    shortcut: the driver resolves the name again when it connects, so a DNS answer that
-    changes in between is not caught; pin the address if that ever matters.
+    shortcut: the driver's own monitoring hello may still reach a discovered host before
+    publicServers excludes it, and it resolves names again when it connects (the answer can
+    change after this check); upgrade by pinning addresses if that ever matters.
     """
     for host, port in parse_uri(uri)["nodelist"]:
         publicAddress(host, port or 27017)

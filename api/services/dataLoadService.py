@@ -12,7 +12,7 @@ __all__ = ["dataLoadService"]
 from nubrix.components.pdfTableExtractor import PdfTableExtractor
 from api.services.credits.creditTrackingCallback import CreditTrackingCallback
 from api.commons import giveTableNameBack, tableFileState, updateProjectModifiedAt
-from utils.connectionTargets import BLOCKED_ADDRESS_MESSAGE, BlockedAddressError, checkMongoUri, publicAddress
+from utils.connectionTargets import BLOCKED_ADDRESS_MESSAGE, BlockedAddressError, checkMongoUri, publicAddress, publicServers
 from utils.exceptionHandler import CustomException
 from utils.initMethods import forget_table
 from pymongo.mongo_client import MongoClient
@@ -491,9 +491,9 @@ class DataLoadService:
             raise exception
 
     @staticmethod
-    def _refuseBlocked(check) -> None:
+    def _publicHost(host: str, port: int) -> str:
         try:
-            check()
+            return publicAddress(host, port)
         except BlockedAddressError as e:
             raise CustomException(e, statusCode=400, uiMessage=BLOCKED_ADDRESS_MESSAGE)
 
@@ -510,13 +510,12 @@ class DataLoadService:
                     statusCode=400,
                     uiMessage="Missing required DB connection fields."
                 )
-            address = []
-            self._refuseBlocked(lambda: address.append(publicAddress(connection.host, connection.port)))
+            address = self._publicHost(connection.host, connection.port)
             connStr = URL.create(
                 "mysql+pymysql",
                 username=connection.user,
                 password=connection.password,
-                host=address[0],
+                host=address,
                 port=connection.port,
                 database=connection.db,
             )
@@ -562,17 +561,17 @@ class DataLoadService:
                     statusCode=400,
                     uiMessage="Missing required DB connection fields."
                 )
-            address = []
-            self._refuseBlocked(lambda: address.append(publicAddress(connection.host, connection.port)))
+            address = self._publicHost(connection.host, connection.port)
             connStr = URL.create(
                 "postgresql+psycopg2",
                 username=connection.user,
                 password=connection.password,
-                host=address[0],
+                host=connection.host,
                 port=connection.port,
                 database=connection.db,
             )
-            engine = create_engine(connStr)
+            # libpq connects to hostaddr and still uses host for SNI and certificate checks
+            engine = create_engine(connStr, connect_args={"hostaddr": address})
             sanitizedTable = self._sanitizeFileName(connection.table)
             from api.services.managementService import managementService
             claims = self._acceptTableName(connection.projectId, sanitizedTable)
@@ -611,12 +610,15 @@ class DataLoadService:
                     statusCode=400,
                     uiMessage="Missing required DB connection fields."
                 )
-            self._refuseBlocked(lambda: checkMongoUri(connection.connectionString))
+            try:
+                checkMongoUri(connection.connectionString)
+            except BlockedAddressError as e:
+                raise CustomException(e, statusCode=400, uiMessage=BLOCKED_ADDRESS_MESSAGE)
             sanitizedCollection = self._sanitizeFileName(connection.collection)
             from api.services.managementService import managementService
 
             def writeCollection(path: str) -> None:
-                mongoClient = MongoClient(connection.connectionString, server_api=ServerApi('1'))
+                mongoClient = MongoClient(connection.connectionString, server_api=ServerApi('1'), server_selector=publicServers)
                 records = list(mongoClient[connection.db][connection.collection].find())
                 for record in records:
                     record.pop("_id", None)
