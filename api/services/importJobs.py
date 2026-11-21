@@ -22,7 +22,11 @@ _TABLE_FIELDS = {"status", "rows", "reason"}
 
 
 class ImportJobs:
-    """Tracks the one running import of each project and its per-table progress."""
+    """Tracks the one running import of each project and its per-table progress.
+
+    The lock value is the jobId, and every write names its jobId, so a stalled job
+    whose lock ran out cannot change the record or lock of a newer job.
+    """
 
     def __init__(self, redisClient=None):
         self._client = redisClient
@@ -50,38 +54,55 @@ class ImportJobs:
         return None if raw is None else json.loads(raw)
 
     def _write(self, projectId: str, record: dict) -> None:
-        self._redis.set(self._key(projectId), json.dumps(record))
-        self._redis.expire(self._key(projectId), _RECORD_SECONDS)
+        self._redis.set(self._key(projectId), json.dumps(record), ex=_RECORD_SECONDS)
+
+    def _owned(self, projectId: str, jobId: str) -> dict | None:
+        """The record, only if it belongs to jobId."""
+        record = self._read(projectId)
+        return record if record and record["jobId"] == jobId else None
+
+    def _holdsLock(self, projectId: str, jobId: str) -> bool:
+        value = self._redis.get(self._lockKey(projectId))
+        return value is not None and value.decode() == jobId
 
     def start(self, projectId: str, tables: list[tuple[str, str]]) -> str | None:
         """Take the project's lock and write a fresh record; None when an import is running."""
-        if not self._redis.set(self._lockKey(projectId), "1", nx=True, ex=_LOCK_SECONDS):
-            return None
         jobId = uuid.uuid4().hex
-        self._write(projectId, {
-            "jobId": jobId,
-            "state": "running",
-            "tables": [
-                {"name": name, "storedAs": storedAs, "status": "pending", "rows": None, "reason": None}
-                for name, storedAs in tables
-            ],
-            "kpis": "waiting",
-        })
+        if not self._redis.set(self._lockKey(projectId), jobId, nx=True, ex=_LOCK_SECONDS):
+            return None
+        try:
+            self._write(projectId, {
+                "jobId": jobId,
+                "state": "running",
+                "tables": [
+                    {"name": name, "storedAs": storedAs, "status": "pending", "rows": None, "reason": None}
+                    for name, storedAs in tables
+                ],
+                "kpis": "waiting",
+            })
+        except Exception:
+            self._redis.delete(self._lockKey(projectId))
+            raise
         return jobId
 
     def get(self, projectId: str) -> dict | None:
         """Return the record; a running one whose lock has expired is reported as failed."""
         record = self._read(projectId)
         if record and record["state"] == "running" and not self._redis.exists(self._lockKey(projectId)):
-            record["state"] = "failed"
+            record = self._read(projectId)  # a finish may have landed meanwhile
+            if record and record["state"] == "running":
+                record["state"] = "failed"
         return record
 
-    def setTable(self, projectId: str, storedAs: str, **fields) -> None:
+    def setTable(self, projectId: str, jobId: str, storedAs: str, **fields) -> bool:
+        """False, changing nothing, when jobId does not own the record."""
         if not fields.keys() <= _TABLE_FIELDS:
             raise ValueError(f"unknown table fields: {sorted(fields.keys() - _TABLE_FIELDS)}")
         if "status" in fields and fields["status"] not in _TABLE_STATUSES:
             raise ValueError(f"unknown table status: {fields['status']!r}")
-        record = self._read(projectId)
+        record = self._owned(projectId, jobId)
+        if record is None:
+            return False
         for table in record["tables"]:
             if table["storedAs"] == storedAs:
                 table.update(fields)
@@ -89,26 +110,36 @@ class ImportJobs:
         else:
             raise ValueError(f"unknown table: {storedAs!r}")
         self._write(projectId, record)
+        return True
 
-    def setKpis(self, projectId: str, status: str) -> None:
+    def setKpis(self, projectId: str, jobId: str, status: str) -> bool:
         if status not in _KPI_STATUSES:
             raise ValueError(f"unknown kpis status: {status!r}")
-        record = self._read(projectId)
+        record = self._owned(projectId, jobId)
+        if record is None:
+            return False
         record["kpis"] = status
         self._write(projectId, record)
+        return True
 
-    def refreshLock(self, projectId: str) -> None:
-        """Extend the lock while the job lives; never recreates one that is gone."""
-        if self._redis.exists(self._lockKey(projectId)):
-            self._redis.expire(self._lockKey(projectId), _LOCK_SECONDS)
+    def refreshLock(self, projectId: str, jobId: str) -> bool:
+        """Extend the lock only while jobId still holds it."""
+        if not self._holdsLock(projectId, jobId):
+            return False
+        self._redis.expire(self._lockKey(projectId), _LOCK_SECONDS)
+        return True
 
-    def finish(self, projectId: str, state: str) -> None:
+    def finish(self, projectId: str, jobId: str, state: str) -> bool:
         if state not in _FINAL_STATES:
             raise ValueError(f"unknown final state: {state!r}")
-        record = self._read(projectId)
+        record = self._owned(projectId, jobId)
+        if record is None:
+            return False
         record["state"] = state
         self._write(projectId, record)
-        self._redis.delete(self._lockKey(projectId))
+        if self._holdsLock(projectId, jobId):
+            self._redis.delete(self._lockKey(projectId))
+        return True
 
 
 importJobs = ImportJobs()
