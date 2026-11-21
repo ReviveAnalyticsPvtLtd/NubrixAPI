@@ -201,8 +201,24 @@ def _toType(column: "pa.ChunkedArray", target: "pa.DataType") -> "pa.ChunkedArra
     try:
         return column.cast(target)
     except (pa.ArrowInvalid, pa.ArrowNotImplementedError, pa.ArrowTypeError):
-        # Only a string target gets here in practice (nested or binary values Arrow will not cast).
-        return pa.chunked_array([pa.array([None if v is None else str(v) for v in column.to_pylist()], target)])
+        if pa.types.is_string(target):  # nested or binary values Arrow will not cast
+            return pa.chunked_array([pa.array([None if v is None else str(v) for v in column.to_pylist()], target)])
+        # A big int widened to double loses precision, which the safe cast refuses; the unified type is deliberate.
+        return column.cast(target, safe=False)
+
+
+def _chunkTable(chunk: "pd.DataFrame") -> "pa.Table":
+    """The chunk as Arrow. A column mixing types inside the chunk (ints and strings) becomes strings, nulls kept."""
+    try:
+        return pa.Table.from_pandas(chunk, preserve_index=False)
+    except (pa.ArrowInvalid, pa.ArrowTypeError):
+        chunk = chunk.copy()
+        for name in chunk.columns[chunk.dtypes == object]:
+            try:
+                pa.array(chunk[name])
+            except (pa.ArrowInvalid, pa.ArrowTypeError):
+                chunk[name] = chunk[name].map(lambda v: None if v is None or (not isinstance(v, (list, dict, tuple)) and pd.isna(v)) else str(v))
+        return pa.Table.from_pandas(chunk, preserve_index=False)
 
 
 def writeStoredChunksToPath(chunks: "Iterable[pd.DataFrame]", projectId: str, tableName: str, path: str) -> tuple[int, int]:
@@ -218,7 +234,7 @@ def writeStoredChunksToPath(chunks: "Iterable[pd.DataFrame]", projectId: str, ta
         try:
             parts = []
             for chunk in chunks:
-                table = pa.Table.from_pandas(chunk, preserve_index=False)
+                table = _chunkTable(chunk)
                 total += table.nbytes
                 if limit and total > limit:
                     raise TableTooLargeError(f"Table is over {total} bytes decoded, over the limit of {limit}.")
@@ -248,6 +264,9 @@ def writeStoredChunksToPath(chunks: "Iterable[pd.DataFrame]", projectId: str, ta
                     ]
                     rows += table.num_rows
                     writer.write_table(pa.Table.from_arrays(columns, schema=schema), row_group_size=ROW_GROUP_ROWS)
+            # Readers refuse on the footer's size, which string widening can push over after the input check passed.
+            if limit and encodedUncompressedBytes(pq.read_metadata(path)) > limit:
+                raise TableTooLargeError(f"Stored table is over the limit of {limit} bytes decoded.")
             return rows, len(schema)
         except BaseException:
             if os.path.exists(path):
