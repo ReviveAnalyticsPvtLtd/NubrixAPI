@@ -33,6 +33,8 @@ class Source:
 
 def toSource(kind: str, body: dict) -> Source:
     """Build a Source from a request body, checking its address. Errors never echo secrets."""
+    if kind not in ("mysql", "postgresql", "mongodb"):
+        raise ValueError("The database type must be mysql, postgresql or mongodb.")
     required = ["connectionString", "db"] if kind == "mongodb" else ["host", "port", "user", "password", "db"]
     for field in required:
         if not body.get(field):
@@ -40,9 +42,13 @@ def toSource(kind: str, body: dict) -> Source:
     if kind == "mongodb":
         checkMongoUri(body["connectionString"])
         return Source(kind=kind, db=body["db"], connectionString=body["connectionString"])
+    try:
+        port = int(body["port"])
+    except (TypeError, ValueError):
+        raise ValueError("The port must be a number.") from None
     return Source(
-        kind=kind, host=body["host"], port=int(body["port"]), user=body["user"],
-        password=body["password"], db=body["db"], address=publicAddress(body["host"], int(body["port"])),
+        kind=kind, host=body["host"], port=port, user=body["user"],
+        password=body["password"], db=body["db"], address=publicAddress(body["host"], port),
     )
 
 
@@ -50,16 +56,20 @@ def _engine(source: Source):
     if source.kind == "mysql":
         url = URL.create("mysql+pymysql", username=source.user, password=source.password,
                          host=source.address, port=source.port, database=source.db)
-        return create_engine(url, connect_args={"connect_timeout": 10})
+        return create_engine(url, connect_args={"connect_timeout": 10, "read_timeout": 300})
+    assert source.kind == "postgresql", source.kind
     url = URL.create("postgresql+psycopg2", username=source.user, password=source.password,
                      host=source.host, port=source.port, database=source.db)
     # libpq connects to hostaddr and still uses host for SNI and certificate checks
-    return create_engine(url, connect_args={"hostaddr": source.address, "connect_timeout": 10})
+    return create_engine(url, connect_args={
+        "hostaddr": source.address, "connect_timeout": 10,
+        "keepalives": 1, "keepalives_idle": 60, "keepalives_interval": 10, "keepalives_count": 5,
+    })
 
 
 def _mongoClient(source: Source) -> MongoClient:
     return MongoClient(source.connectionString, server_api=ServerApi("1"),
-                       server_selector=publicServers, serverSelectionTimeoutMS=10000)
+                       server_selector=publicServers, serverSelectionTimeoutMS=10000, socketTimeoutMS=300000)
 
 
 def listTables(source: Source) -> list[SourceTable]:
@@ -87,7 +97,7 @@ def listTables(source: Source) -> list[SourceTable]:
 
 def storedName(table: SourceTable) -> str:
     name, schema = table
-    return DataLoadService._sanitizeFileName(name if schema in (None, "public") else f"{schema}_{name}")
+    return DataLoadService._sanitizeName(name if schema in (None, "public") else f"{schema}_{name}")
 
 
 def readChunks(source: Source, table: SourceTable, chunkRows: int) -> Iterator[pd.DataFrame]:
@@ -103,7 +113,15 @@ def readChunks(source: Source, table: SourceTable, chunkRows: int) -> Iterator[p
     engine = _engine(source)
     try:
         query = select(text("*")).select_from(sqlalchemy.table(name, schema=schema))
-        with engine.connect() as conn:
+        # stream_results: without it pymysql and psycopg2 buffer the whole result before the first chunk
+        conn = engine.connect().execution_options(stream_results=True)
+        finished = False
+        try:
             yield from pd.read_sql(query, conn, chunksize=chunkRows)
+            finished = True
+        finally:
+            if not finished:
+                conn.invalidate()  # an abandoned pymysql SSCursor would drain the rest on close
+            conn.close()
     finally:
         engine.dispose()

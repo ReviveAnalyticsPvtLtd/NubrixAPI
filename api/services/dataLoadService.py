@@ -67,11 +67,14 @@ class DataLoadService:
         Returns:
             str: A sanitized, storage-safe file name without the extension.
         """
-        baseName = os.path.splitext(fileName)[0]
-        sanitized = re.sub(r"[^\w-]", "_", baseName)
+        return DataLoadService._sanitizeName(os.path.splitext(fileName)[0])
+
+    @staticmethod
+    def _sanitizeName(name: str) -> str:
+        """Replace characters outside word characters and hyphen with underscores, without cutting an extension."""
+        sanitized = re.sub(r"[^\w-]", "_", name)
         sanitized = re.sub(r"_+", "_", sanitized)
-        sanitized = sanitized.strip("_")
-        return sanitized
+        return sanitized.strip("_")
 
     def _releaseTableName(self, projectId: str, tableName: str) -> list[dict]:
         """Take the name from any transformation that still claims it, so none can remove or overwrite this table.
