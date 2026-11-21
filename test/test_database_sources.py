@@ -228,3 +228,39 @@ def test_sqlChunkRowsFollowTheTableWidth(sqliteEngine, columns, rows):
         list(readChunks(MYSQL, ("a", "sales"), 50000, 2000000))
     inspector.get_columns.assert_called_once_with("a", schema="sales")
     assert read.call_args.kwargs["chunksize"] == rows
+
+
+def _postgres(schemas: dict, partitions: dict):
+    """listTables of a fake PostgreSQL: schemas maps schema -> tables, partitions schema -> its partition tables."""
+    inspector = MagicMock()
+    inspector.get_schema_names.return_value = list(schemas)
+    inspector.get_table_names.side_effect = lambda schema=None: schemas[schema]
+    engine = MagicMock()
+    conn = engine.connect.return_value.__enter__.return_value
+    queries = []
+
+    def execute(query, params):
+        queries.append((str(query), params))
+        return MagicMock(scalars=lambda: iter(partitions.get(params["schema"], [])))
+
+    conn.execute.side_effect = execute
+    pg = Source(kind="postgresql", host="h", address="1.2.3.4", port=5432, user="u", password="p", db="d")
+    with patch.object(ds, "_engine", return_value=engine), patch("sqlalchemy.inspect", return_value=inspector):
+        return listTables(pg), queries
+
+
+def test_postgresListingDropsPartitionsAndKeepsTheParent():
+    found, queries = _postgres(
+        {"public": ["events", "events_2025", "events_2026", "orders"], "sales": ["a"]},
+        {"public": ["events_2025", "events_2026"]},
+    )
+    assert found == [("events", "public"), ("orders", "public"), ("a", "sales")]
+    assert [params for _, params in queries] == [{"schema": "public"}, {"schema": "sales"}]
+    assert all("relispartition" in query for query, _ in queries)
+
+
+def test_postgresListingSkipsManagedPlatformSchemas():
+    platform = ["auth", "storage", "realtime", "_realtime", "vault", "pgsodium", "pgsodium_masks", "extensions", "graphql",
+                "graphql_public", "supabase_functions", "supabase_migrations", "cron", "net", "pgbouncer", "_analytics"]
+    found, _ = _postgres({"public": ["orders"], "app": ["users"], **{s: ["secrets"] for s in platform}}, {})
+    assert found == [("users", "app"), ("orders", "public")]

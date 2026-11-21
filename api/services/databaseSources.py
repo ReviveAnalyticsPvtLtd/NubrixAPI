@@ -14,6 +14,13 @@ from utils.connectionTargets import checkMongoUri, publicAddress, publicServers
 
 SourceTable = tuple[str, str | None]
 _SKIPPED_SCHEMAS = ("information_schema", "pg_catalog", "pg_toast")
+# Supabase and hosted PostgreSQL internals: credentials, tokens and password hashes, never the user's own data.
+_PLATFORM_SCHEMAS = ("auth", "storage", "realtime", "_realtime", "vault", "pgsodium", "pgsodium_masks", "extensions",
+                     "graphql", "graphql_public", "supabase_functions", "supabase_migrations", "cron", "net", "pgbouncer",
+                     "_analytics")
+# get_table_names lists partitioned tables and their partitions; the parent holds every row.
+_PARTITIONS = text("SELECT c.relname FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace "
+                   "WHERE n.nspname = :schema AND c.relispartition")
 _MIN_CHUNK_ROWS = 1000
 
 
@@ -88,9 +95,13 @@ def listTables(source: Source) -> list[SourceTable]:
             if source.kind == "mysql":
                 found = [(n, None) for n in inspector.get_table_names()]
             else:
-                found = [(n, s) for s in inspector.get_schema_names()
-                         if s not in _SKIPPED_SCHEMAS and not s.startswith("pg_toast")
-                         for n in inspector.get_table_names(schema=s)]
+                found = []
+                with engine.connect() as conn:
+                    for s in inspector.get_schema_names():
+                        if s in _SKIPPED_SCHEMAS or s in _PLATFORM_SCHEMAS or s.startswith("pg_toast"):
+                            continue
+                        partitions = set(conn.execute(_PARTITIONS, {"schema": s}).scalars())
+                        found += [(n, s) for n in inspector.get_table_names(schema=s) if n not in partitions]
         finally:
             engine.dispose()
     return sorted(found, key=lambda t: (t[1] or "", t[0]))
