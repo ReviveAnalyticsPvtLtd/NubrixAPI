@@ -674,6 +674,66 @@ Also clears `latest_approved_artifact` on the transformation that produced the t
 
 ---
 
+### 3.8 `POST /api/latest/dataLoader/importDatabase`
+
+Starts a background import of every table of a database connection, then describes each table with AI metadata and generates KPIs when the project has none. Needs `metadata_generation` credits and the project's owner. PostgreSQL system and managed-platform schemas (for example Supabase's `auth` and `storage`) and partitions of partitioned tables are skipped. Table names are stored sanitized, schema-qualified outside `public`, with `_2`, `_3`, ... when two map to the same name.
+
+**Request Body (MySQL / PostgreSQL):**
+```json
+{
+  "projectId": "effeaef7-...",
+  "source": "postgresql",
+  "host": "db.example.com",
+  "port": 5432,
+  "user": "readonly",
+  "password": "password",
+  "db": "sales_db"
+}
+```
+
+**Request Body (MongoDB):**
+```json
+{
+  "projectId": "effeaef7-...",
+  "source": "mongodb",
+  "connectionString": "mongodb+srv://user:pass@cluster.mongodb.net",
+  "db": "analytics"
+}
+```
+
+**Response (202):**
+```json
+{
+  "jobId": "4f1c...",
+  "tables": ["orders", "sales_orders", "order_items"]
+}
+```
+
+**Errors:** `400` (missing field, blocked address or connection failure; never the driver's text), `402` (credits), `404` (not the project's owner), `409` (an import is already running for this project), `422` (no tables found), `503` (the import could not be enqueued).
+
+---
+
+### 3.9 `GET /api/latest/dataLoader/importStatus/{projectId}`
+
+Progress record of the project's latest import, kept 7 days. `state` is `running`, `done` or `failed` (a job whose worker stopped is reported `failed`); table `status` is `pending`, `loading`, `loaded`, `skipped` or `failed` with a fixed `reason`; `kpis` is `waiting`, `running`, `done`, `skipped` or `failed`. The record never holds connection details.
+
+**Response (200):**
+```json
+{
+  "jobId": "4f1c...",
+  "state": "running",
+  "tables": [
+    {"name": "orders", "storedAs": "orders", "status": "loaded", "rows": 1200, "reason": null},
+    {"name": "sales.orders", "storedAs": "sales_orders", "status": "pending", "rows": null, "reason": null}
+  ],
+  "kpis": "waiting"
+}
+```
+
+**Errors:** `404` (no import found, or not the project's owner)
+
+---
+
 ## 4. Table Viewer
 
 ### 4.1 `GET /api/latest/projects/viewTable/{projectId}/{tableName}`
@@ -2517,6 +2577,7 @@ The following endpoints consume credits and return `402 Payment Required` when t
 | `POST /utils/getSpeechTranscript` | `speech_to_text` |
 | `POST /utils/getInsightsFromImage` | `image_to_insights` |
 | `POST /dataLoader/loadPdfData` | `pdf_extraction_per_page` |
+| `POST /dataLoader/importDatabase` | `metadata_generation` |
 
 ---
 

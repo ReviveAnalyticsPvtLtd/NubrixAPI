@@ -39,7 +39,7 @@ NubrixAI Analytics Hub API — FastAPI + Celery + LangChain monolith.
 - `pyproject.toml` has no `[tool.pytest]` / lint config and there is no test directory — there are no automated tests. CI is a single GitHub Actions workflow `.github/workflows/subscriptionCron.yaml` that runs `python nubrix/components/subscriptionManager.py` daily. Do not invent a test command.
 - `prompts.yaml`, `codeTemplates.yaml`, `config.ini` are loaded by absolute path via `os.path.join(os.getcwd(), ...)` in `CodeGenerator` and friends — run from repo root.
 - `.env` is required and gitignored. Required keys: `SECRET_KEY`, `SUPABASE_URL`, `SUPABASE_KEY`, `DATABASE_URL`, `REDIS_HOST/PORT/PASSWORD`, plus provider keys (`GEMINI_API_KEY`/`GOOGLE_API_KEY`, `GROQ_API_KEY`, `CEREBRAS_API_KEY`, `OPENAI_API_KEY`, `LANGSMITH_*`, `LOGTAIL_*`, `RAZORPAY_*`, `BREVO_API_KEY`, `BREVO_SENDER_EMAIL`, `BREVO_SENDER_NAME`, `DASHBOARD_BASE_URL`, `LANGFUSE_*`). The forecast task also needs `FORECAST_DB_USER`, `FORECAST_DB_PASSWORD`, `FORECAST_DB_HOST`, `FORECAST_DB_PORT` and `FORECAST_DB_NAME`; it fails naming any that are missing when it starts, and the app and worker run without them.
-- `AGENTS.md` and `CLAUDE.md` are gitignored on purpose — this file is for the local agent, not for git.
+- `AGENTS.md` is tracked in git (the repo is public, so keep it free of secrets and customer data); `CLAUDE.md` is gitignored.
 - `OPENBLAS_NUM_THREADS=2` is set in `.env` to throttle BLAS (numpy/scipy) in the container.
 
 ## Sandbox Execution
