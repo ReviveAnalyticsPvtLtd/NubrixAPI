@@ -21,6 +21,7 @@ from sqlalchemy import URL, create_engine
 from utils.projectStorage import readJson, readTableBytes
 from utils.storedTables import decodeStoredTable, tableReadException, tableWriteException, writeStoredTableToPath
 from utils.logger import logger
+from utils.chartLabelUnits import hasCurrency, labelEvidence, removeUnsupportedCurrency
 from utils.mapPointLabels import ensureScatterMapPointLabels
 from api.commons import client
 from nubrix.components.chartBuilder import emptyChart
@@ -235,6 +236,24 @@ class DashboardService:
         widget.update(kept)
         ensureScatterMapPointLabels(widget)
         return widget, {key: widget[key] for key in produced}
+
+    @staticmethod
+    def _removeUnsupportedCurrency(projectId: str, widgets: list) -> None:
+        """Remove from the shown widgets a currency that neither their question nor the project's data names.
+
+        Display only: a refresh saves what the re-run produced. The metadata is read only when a label names a currency.
+        """
+        shown = [widget for widget in widgets if hasCurrency(widget)]
+        if not shown:
+            return
+        try:
+            metadata = readJson(projectId, "metadata.json")
+        except Exception as error:
+            # Only each widget's own question is evidence then: a currency the data names may be hidden on this view.
+            logger.warning(f"Project {projectId} metadata could not be read for the label check ({type(error).__name__})")
+            metadata = None
+        for widget in shown:
+            removeUnsupportedCurrency(widget, labelEvidence(widget.get("query"), metadata), ref=widget.get("id"))
 
     @staticmethod
     def _emptiedWidget(widget: dict) -> dict:
@@ -573,6 +592,7 @@ class DashboardService:
             if isinstance(widgets, list):
                 for widget in widgets:
                     ensureScatterMapPointLabels(widget)
+                self._removeUnsupportedCurrency(details.projectId, widgets)
             return pageInfo
         except Exception as e:
             if isBusy(e):

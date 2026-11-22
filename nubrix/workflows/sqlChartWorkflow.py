@@ -52,6 +52,7 @@ from nubrix.components.llmChainFactory import buildLlmChain
 from nubrix.components.periodProbe import PeriodProbe, chartHasNoData, combinedProbeSql, findPeriodProbes, isDataFree
 from nubrix.components.queryRephraser import ParallelQueryRephaser, QueryRephaser
 from nubrix.components.sqlGrounding import groundingText
+from utils.chartLabelUnits import labelEvidence, removeUnsupportedCurrency
 from utils.codeExecutor import REPLManager
 from utils.initMethods import serializer
 from utils.logger import logger
@@ -534,6 +535,8 @@ class SqlChartWorkflow:
         failure = state.get("failure")
         if chart is not None:
             request = ChartRequest.model_validate(state["chartRequest"])
+            removeUnsupportedCurrency(chart, labelEvidence(state.get("inputQuery"), state.get("metadata")),
+                                      ref=traceIdOf({"callbacks": _callbackHandlers(config)}))
             return {
                 "finalOutput": chart,
                 "codeOutput": json.dumps(chart, default=serializer),

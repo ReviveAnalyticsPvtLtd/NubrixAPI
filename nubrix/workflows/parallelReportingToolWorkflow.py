@@ -17,6 +17,7 @@ from utils.codeExecutor import REPLManager, _remove_code_fences
 from typing_extensions import TypedDict
 from utils.logger import logger
 from utils.sandboxSlots import BUSY_MESSAGE, SandboxBusyError
+from utils.chartLabelUnits import labelEvidence, removeUnsupportedCurrency
 from utils.mapPointLabels import ensureScatterMapPointLabels
 import json
 import os
@@ -196,6 +197,7 @@ class ParallelReportingToolWorkflow:
         except Exception as e:
             response = {"error": f"Endpoint says: {e}"}
         ensureScatterMapPointLabels(response)
+        removeUnsupportedCurrency(response, labelEvidence(state.get("inputQuery"), state.get("metadata")), ref=state.get("projectId"))
         return {
             "finalOutput": response
         }

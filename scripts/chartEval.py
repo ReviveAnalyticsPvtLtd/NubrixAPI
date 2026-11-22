@@ -95,6 +95,7 @@ from unittest import mock
 from nubrix.components.chartBuilder import _cell, _levelText, _number, _text
 from nubrix.components.chartContract import contractErrors
 from nubrix.components.chartGuards import MAX_NAMED_POINTS
+from utils.chartLabelUnits import labelTexts
 
 _REPO = Path(__file__).resolve().parent.parent
 _DEFAULT_REL_TOL = 0.0
@@ -829,6 +830,7 @@ def _judge(case: dict, response: dict, failedStage: str | None, failure: dict | 
         return result
     result["chartType"] = output.get("chartType")
     result["got"] = _gotFields(output)
+    result["shownText"] = labelTexts(output)
     if expect.get("doubt"):
         result["stage"] = "expectedDoubt"
         return result

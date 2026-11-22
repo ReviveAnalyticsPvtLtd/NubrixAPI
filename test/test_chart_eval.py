@@ -94,6 +94,8 @@ def test_harnessPassesOnSyntheticSetWithStubbedModel(tmp_path, capsys, monkeypat
             if case["id"] != "doubt-unclear":
                 assert case["generatedCode"].startswith('{"nubrixChart":1') and case["repairs"] == 0 and case["error"] is None
                 assert case["expected"] and case["got"]
+                # The labels the user is shown, for the benchmark's check that no currency was made up.
+                assert case["shownText"] and all(isinstance(text, str) for text in case["shownText"])
             else:
                 assert case["doubt"] == "Which numbers would you like to see, and for what period?" and case["generatedCode"] is None
     first = {case["id"]: case for case in report["runs"][0]["cases"]}
