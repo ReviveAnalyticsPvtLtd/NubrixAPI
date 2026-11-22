@@ -2239,6 +2239,8 @@ sqlQueryRephraserAgentPrompt: |
     - If the question could mean two things → **pick the more likely interpretation and execute**
     - If the calculation needs several steps (a running total, a moving average, a growth rate, a rank, a share of the total, a cumulative share, a per-customer rollup) → **plan the steps and execute**: the next step writes DuckDB SQL with CTEs and window functions, so all of these are possible
     - If the question names a standard business metric without defining it (repeat customer rate, average order value, conversion rate) → **use its usual definition, state it in the plan, and execute**
+    - A sensible default covers presentation only: sort order, top N, time bucket, label wording. Never assume a fact the data does not hold: a currency or unit, an exchange rate, a fiscal year that does not start in January, or a time zone. If the answer needs one the user did not give → **ask for it**.
+    - Name a currency in a title or label only when the question, a column name or a column's sample values name it; otherwise name none. The same goes for any other unit (kg, hours, days), except a percent you computed.
     - **ONLY issue a doubt when execution is genuinely IMPOSSIBLE, not merely imperfect**
     - **When in doubt about whether to doubt → EXECUTE**
 
@@ -2251,6 +2253,7 @@ sqlQueryRephraserAgentPrompt: |
     | A required column is completely absent from metadata, with no reasonable match | YES |
     | The chart type is invalid AND no alternative can be inferred | YES |
     | No column connects the tables that must be combined | YES |
+    | The answer needs a fact the data does not hold (an exchange rate, when the fiscal year starts, the currency to convert to) | YES → Ask for it |
     | Question is too vague to map to ANY measure or chart | YES |
     | The question names or implies no measure and no subject to list or map (a table, records, places) ("How are we doing?", "Show me something interesting", "Give me an overview") | YES → Ask which measure and which period |
     | The question asks to show a table, list records or map places, with no measure | NO → Execute (a table or a map needs no measure) |
@@ -2618,11 +2621,13 @@ parallelSqlQueryRephraserAgentPrompt: |
 
     - **You MUST ALWAYS produce a valid `rephrasedOutput`.** There is no rejection path. Every question you receive MUST result in a workable chart plan.
     - If a referenced column does not exist → **map it to the closest matching column in metadata**
-    - If tables must be combined but no common column exists → **use the most logical key (e.g., an id column) and proceed**
+    - If tables must be combined but no common column exists → **never join on a guessed key: plan the chart from the one table that holds the measure**
     - If the chart type is not stated → **infer the best one from data structure and intent**
     - If the question is vague → **pick the most informative default chart** (e.g., a bar chart of counts, a line chart of a trend)
     - If the question could mean two things → **pick the more likely interpretation and execute**
     - If a Card chart would return multiple values → **automatically switch to a bar chart**
+    - Never assume a fact the data does not hold: a currency or unit, an exchange rate, a fiscal year that does not start in January, or a time zone. Plan what the data does hold instead.
+    - Name a currency in a title or label only when the question, a column name or a column's sample values name it; otherwise name none. The same goes for any other unit (kg, hours, days), except a percent you computed.
     - **An empty or missing `rephrasedOutput` = a critical system failure. This must never happen.**
 
     ---
@@ -2688,7 +2693,7 @@ parallelSqlQueryRephraserAgentPrompt: |
     |---|---|
     | Column name doesn't exist | Map to the closest matching column name in metadata |
     | Table name doesn't exist | Use the most relevant table based on column overlap |
-    | No common join key | Use the first id/key-like column from each table |
+    | No common join key | Never guess a key: plan the chart from the one table that holds the measure |
     | Question is extremely vague (e.g., "show me something") | Default to a bar chart of counts or sums of the first numeric column grouped by the first text column |
     | Card requested but returns multiple values | Automatically switch to a bar chart |
     | Chart type not in approved list | Map to the closest approved chart type |
@@ -2846,6 +2851,7 @@ sqlChartGeneratorPrompt: |
     - "chartType": one of "bar", "line", "area", "histogram", "radar", "pie", "doughnut", "polarArea", "scatter", "bubble", "card", "table", "pivot", "geoMap".
     - "title": a short chart title (at most 200 characters) naming the measure, the breakdown and any filter or period, for example "Monthly Revenue by Channel, 2024".
     - "xLabel", "yLabel": readable axis titles for "bar", "line", "area", "histogram", "scatter" and "bubble". Leave them out for every other chart type.
+    - Name a currency in "title", "xLabel", "yLabel", "datasetLabels" or a card's "label" only when the question, a column name or a column's sample values name it; otherwise name none. The same goes for any other unit (kg, hours, days), except a percent you computed.
     - "sql": the query as one JSON string. Escape every double quote inside it as \" and keep it on one line.
     - "encoding": an object mapping chart roles to result column names (see the role rules). Leave out every role the chart type does not use.
     - "datasetLabels": optional object from a value column name to the legend name to show, for example {{"online_revenue": "Online"}}. Leave it out when the column name already reads well: the backend turns "units_sold" into "Units Sold".
@@ -3131,6 +3137,7 @@ sqlChartRepairPrompt: |
     - "chartType": one of "bar", "line", "area", "histogram", "radar", "pie", "doughnut", "polarArea", "scatter", "bubble", "card", "table", "pivot", "geoMap".
     - "title": a short chart title (at most 200 characters) naming the measure, the breakdown and any filter or period, for example "Monthly Revenue by Channel, 2024".
     - "xLabel", "yLabel": readable axis titles for "bar", "line", "area", "histogram", "scatter" and "bubble". Leave them out for every other chart type.
+    - Name a currency in "title", "xLabel", "yLabel", "datasetLabels" or a card's "label" only when the question, a column name or a column's sample values name it; otherwise name none. The same goes for any other unit (kg, hours, days), except a percent you computed.
     - "sql": the query as one JSON string. Escape every double quote inside it as \" and keep it on one line.
     - "encoding": an object mapping chart roles to result column names (see the role rules). Leave out every role the chart type does not use.
     - "datasetLabels": optional object from a value column name to the legend name to show, for example {{"online_revenue": "Online"}}. Leave it out when the column name already reads well: the backend turns "units_sold" into "Units Sold".

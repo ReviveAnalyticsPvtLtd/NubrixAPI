@@ -1270,3 +1270,44 @@ def test_notInFindsNothingWhereNotExistsAndALeftJoinFindTheUnmatchedRows():
     # Order 3 has no shop at all and order 4 a shop that is not listed: both are unmatched.
     assert _query(notExists, UNLISTED) == [(24,)]
     assert _query(leftJoin, UNLISTED) == [(24,)]
+
+
+# ---------------------------------------------------------------------------
+# No facts the data does not hold (currency, units, exchange rates, fiscal years, join keys)
+# ---------------------------------------------------------------------------
+
+CURRENCY_LABEL_RULE = (
+    "only when the question, a column name or a column's sample values name it; otherwise name none. The same goes for any "
+    "other unit (kg, hours, days), except a percent you computed."
+)
+FACTS = "Never assume a fact the data does not hold: a currency or unit, an exchange rate, a fiscal year that does not start in January, or a time zone."
+
+
+@pytest.mark.parametrize("key", [*CHART_PROMPT_KEYS, *REPHRASER_KEYS])
+def test_everySqlPromptNamesACurrencyOnlyFromEvidence(key):
+    assert CURRENCY_LABEL_RULE in _prompts()[key]
+
+
+@pytest.mark.parametrize("key", REPHRASER_KEYS)
+def test_bothPlannersNeverAssumeAFactTheDataDoesNotHold(key):
+    assert FACTS in _prompts()[key]
+
+
+def test_thePlannerAsksForAFactItCannotTakeFromTheData():
+    text = _prompts()["sqlQueryRephraserAgentPrompt"]
+    assert "If the answer needs one the user did not give → **ask for it**." in text
+    assert "| The answer needs a fact the data does not hold (an exchange rate, when the fiscal year starts, the currency to convert to) | YES → Ask for it |" in text
+
+
+def test_theParallelPlannerNeverJoinsOnAGuessedKey():
+    text = _prompts()["parallelSqlQueryRephraserAgentPrompt"]
+    assert "use the most logical key" not in text and "Use the first id/key-like column" not in text
+    assert "never join on a guessed key: plan the chart from the one table that holds the measure" in text
+    assert "| No common join key | Never guess a key: plan the chart from the one table that holds the measure |" in text
+
+
+@pytest.mark.parametrize("key", [*CHART_PROMPT_KEYS, *REPHRASER_KEYS])
+def test_noSqlPromptExampleTeachesACurrency(key):
+    text = _prompts()[key].replace("no ? or $1 parameters", "")  # a SQL parameter, not a currency
+    # The rules name currencies only as kinds of fact; no example may carry a symbol or code to copy.
+    assert not re.search(r"[$₹€£¥]|\b(USD|INR|EUR|GBP)\b", text)
