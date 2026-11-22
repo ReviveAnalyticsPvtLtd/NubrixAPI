@@ -44,6 +44,7 @@ from langgraph.graph import END, START, StateGraph
 from pydantic import ValidationError
 from typing_extensions import TypedDict
 
+from nubrix.components.chartBuilder import readableLabel
 from nubrix.components.chartEngine import ChartFailure, renderChartRequest
 from nubrix.components.chartFailureLog import logChartFailure, traceIdOf
 from nubrix.components.chartGuards import guardMessage
@@ -52,7 +53,7 @@ from nubrix.components.llmChainFactory import buildLlmChain
 from nubrix.components.periodProbe import PeriodProbe, chartHasNoData, combinedProbeSql, findPeriodProbes, isDataFree
 from nubrix.components.queryRephraser import ParallelQueryRephaser, QueryRephaser
 from nubrix.components.sqlGrounding import groundingText
-from utils.chartLabelUnits import labelEvidence, removeUnsupportedCurrency
+from utils.chartLabelUnits import cleanLabels, labelEvidence
 from utils.codeExecutor import REPLManager
 from utils.initMethods import serializer
 from utils.logger import logger
@@ -247,6 +248,46 @@ def _withPlanSliceType(update: dict, plan: str) -> dict:
     return update
 
 
+def _withCleanLabels(update: dict, state: "State", config: RunnableConfig | None) -> dict:
+    """The update with no unsupported currency in the text the model wrote: what is rendered is then what is saved.
+
+    A label the request leaves out is built from the model's own alias, so a cleaned one is written in. Series names
+    come from the data and are not checked.
+    """
+    request = update.get("chartRequest")
+    if not request:
+        return update
+    encoding, names = request["encoding"], request.get("datasetLabels") or {}
+    labels = {"title": request["title"]}
+    if encoding.get("x") and encoding.get("y"):
+        labels["xLabel"] = request.get("xLabel") or readableLabel(encoding["x"])
+        labels["yLabel"] = request.get("yLabel") or readableLabel(encoding["y"][0])
+    columns = []
+    if request["chartType"] == "card":
+        labels["cardLabel"] = encoding.get("label") or readableLabel(encoding["value"])
+    elif request["chartType"] in _SLICE_TYPES.values():
+        columns = [encoding["value"]]
+    elif not encoding.get("series"):
+        columns = encoding.get("y") or []
+    labels.update({("dataset", column): names.get(column) or readableLabel(column) for column in columns})
+    changed = cleanLabels(
+        labels,
+        labelEvidence(state.get("inputQuery"), state.get("metadata")),
+        ref=traceIdOf({"callbacks": _callbackHandlers(config)}),
+        series=tuple(("dataset", column) for column in columns),
+    )
+    if not changed:
+        return update
+    request = {**request, **{key: changed[key] for key in ("title", "xLabel", "yLabel") if key in changed}}
+    if "cardLabel" in changed:
+        request["encoding"] = {**encoding, "label": changed["cardLabel"]}
+    renamed = {column: changed["dataset", column] for column in columns if ("dataset", column) in changed}
+    if renamed:
+        request["datasetLabels"] = {**names, **renamed}
+    update.update(chartRequest=request, lastRequest=request)
+    return update
+
+
 class SqlChartWorkflow:
     """Builds the nodes; each workflow owns its chains and sandbox manager so parallel runs share no state."""
 
@@ -326,7 +367,8 @@ class SqlChartWorkflow:
         text = self.generatorChain.invoke(
             {"question": state["inputQuery"], "plan": self._plan(state), "grounding": state["grounding"]}, config
         )
-        return self._withMessage(_withPlanSliceType(self._parse(str(text)), self._plan(state)))
+        update = _withPlanSliceType(self._parse(str(text)), self._plan(state))
+        return self._withMessage(_withCleanLabels(update, state, config))
 
     def _repair(self, state: State, config: RunnableConfig):
         previous = json.dumps(state["lastRequest"], ensure_ascii=False) if state.get("lastRequest") else state.get("rawText", "")
@@ -352,7 +394,8 @@ class SqlChartWorkflow:
             failure = ChartFailure("model", _UNEXPECTED_MESSAGE)
             failure.__cause__ = error
             return {"chart": None, "failure": {"stage": "model", "message": _UNEXPECTED_MESSAGE, "error": failure, "repairable": False}}
-        update = self._withMessage(_withPlanSliceType(self._parse(str(text)), self._plan(state)))
+        update = _withPlanSliceType(self._parse(str(text)), self._plan(state))
+        update = self._withMessage(_withCleanLabels(update, state, config))
         update["debugAttempts"] = state.get("debugAttempts", 0) + 1
         if timedOut:
             update["timeoutRepaired"] = True
@@ -535,8 +578,6 @@ class SqlChartWorkflow:
         failure = state.get("failure")
         if chart is not None:
             request = ChartRequest.model_validate(state["chartRequest"])
-            removeUnsupportedCurrency(chart, labelEvidence(state.get("inputQuery"), state.get("metadata")),
-                                      ref=traceIdOf({"callbacks": _callbackHandlers(config)}))
             return {
                 "finalOutput": chart,
                 "codeOutput": json.dumps(chart, default=serializer),
