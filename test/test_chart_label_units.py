@@ -59,6 +59,27 @@ def test_a_currency_column_allows_every_currency_because_one_sample_row_cannot_l
     assert cleaned("Revenue EUR", metadata=metadata) == "Revenue EUR"
 
 
+@pytest.mark.parametrize(
+    "column, dataType",
+    [("CurrencyRateID", "double"), ("currency_id", "int64"), ("CurrencyKey", "Integer"),
+     ("amount_in_local_currency", "decimal128(18, 2)"), ("currency_rate", "float"), ("CurrencyID", "uint16")],
+)
+def test_a_numeric_column_named_after_a_currency_does_not_say_which_currency_the_data_holds(column, dataType):
+    # A key, a rate or an amount: one such column must not switch the check off for the whole project.
+    metadata = {"orders": {"columns": [{"name": column, "type": dataType}], "sample_row": {column: None}}}
+    assert cleaned("Scrapped cost ($)", metadata=metadata) == "Scrapped cost"
+
+
+@pytest.mark.parametrize(
+    "column, dataType",
+    [("currency", "string"), ("currency", "large_string"), ("currency_id", "string"), ("currency", None),
+     ("currency", "dictionary<values=string, indices=int32, ordered=0>"), ("currency_code", "int64"), ("ISO_CCY", "int32")],
+)
+def test_a_currency_column_that_can_hold_codes_still_allows_every_currency(column, dataType):
+    metadata = {"orders": {"columns": [{"name": column, "type": dataType}], "sample_row": {column: None}}}
+    assert cleaned("Revenue EUR", metadata=metadata) == "Revenue EUR"
+
+
 def test_a_word_names_the_same_currency_as_its_symbol():
     assert cleaned("Revenue ($)", question="revenue in dollars") == "Revenue ($)"
 

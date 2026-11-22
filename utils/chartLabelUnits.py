@@ -45,6 +45,9 @@ _AFTER_A_UNIT = re.compile(
 )
 _NUMBER = re.compile(r"\d+(?:[.,]\d+)*")
 _CURRENCY_COLUMN = re.compile(r"currenc|ccy", re.IGNORECASE)
+# A number under such a name is a key, rate or amount ("CurrencyRateID"), unless it is an ISO code (840 for USD).
+_NUMERIC_TYPE = re.compile(r"(?:u?int|bigint|smallint|long|float|double|halffloat|decimal|numeric|number)", re.IGNORECASE)
+_CODE_COLUMN = re.compile(r"code|iso", re.IGNORECASE)
 _UNWRAP = [
     (re.compile(r"\(\s*(?:in\s+)?[,/;]?\s*\)|\[\s*\]"), ""),  # empty brackets
     (re.compile(r"\(\s*[,/;]?\s*"), "("),
@@ -70,12 +73,19 @@ def labelEvidence(question: object, metadata: object) -> str:
         columns = entry.get("columns") if isinstance(entry.get("columns"), list) else []
         names = [str(column.get("name", "")) for column in columns if isinstance(column, dict)]
         parts += names
-        if any(_CURRENCY_COLUMN.search(name) for name in names):
+        if any(_holdsCurrencies(column) for column in columns if isinstance(column, dict)):
             parts += _FAMILY  # the data holds currencies, and one sample row can't list which
         sample = entry.get("sample_row")
         if isinstance(sample, dict):
             parts += [str(value) for value in sample.values()]
     return " ".join(parts).lower()
+
+
+def _holdsCurrencies(column: dict) -> bool:
+    name = str(column.get("name", ""))
+    if not _CURRENCY_COLUMN.search(name):
+        return False
+    return bool(_CODE_COLUMN.search(name)) or not _NUMERIC_TYPE.match(str(column.get("type", "")))
 
 
 def _evidenced(evidence: str) -> set[int]:
