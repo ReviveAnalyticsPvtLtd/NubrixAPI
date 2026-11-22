@@ -163,6 +163,17 @@ def test_worker_runs_steps_in_order_and_scrubs_identity_only_after_verification(
     assert [call[0] for call in cleanup.calls].count("delete_transient_state") == 2
 
 
+def test_verify_removes_storage_again_after_transient_state_is_gone():
+    repository = FakeRepository()
+    cleanup = FakeExternalCleanup()
+
+    _task(repository, cleanup).execute("request-1")
+
+    names = [call[0] for call in cleanup.calls]
+    assert names.count("delete_storage") == 2
+    assert names[-3:] == ["delete_transient_state", "delete_storage", "verify_external"]
+
+
 def test_inventory_failure_is_durable_before_any_destructive_cleanup():
     repository = FakeRepository()
     cleanup = FakeExternalCleanup()

@@ -422,6 +422,8 @@ class UserErasureTask:
         self, requestId: str, userId: str, projectIds: list[str], workerId: str
     ) -> dict:
         self.external.deleteTransientState(userId, projectIds)
+        # An import running when delete_storage ran can upload a file after it; its keys are gone now, so remove again.
+        self.external.deleteStorage(userId, projectIds)
         databaseResiduals = self.repository.verifyDatabaseErasure(userId)
         if any(databaseResiduals.values()):
             raise RuntimeError("database residuals remain")
