@@ -32,6 +32,7 @@ from api.models import (
 )
 import pandas as pd
 import tempfile
+import warnings
 import json
 import fitz
 import io
@@ -42,6 +43,8 @@ import csv
 
 # Seconds to wait before each retry of the release after a load's write.
 RELEASE_RETRY_PAUSES = (0.2, 0.5)
+# pymongo's URI warnings quote parts of the connection string, and stderr is logged.
+warnings.filterwarnings("ignore", category=UserWarning, module="pymongo")
 
 
 class DataLoadService:
@@ -134,6 +137,12 @@ class DataLoadService:
             logger.warning(f"Metadata generation for {kind} load of {tableNames} skipped: the sandbox is busy; regenerate it later.")
         else:
             logger.error(f"Metadata generation failed for {kind} load of {tableNames}: {error}")
+
+    @staticmethod
+    def _loadFailure(kind: str, error: Exception, uiMessage: str) -> CustomException:
+        """A database load's 400. A driver's message can quote connection details, so only its type is logged."""
+        logger.error(f"{kind} load failed ({type(error).__name__}).")
+        return CustomException(ConnectionError(), statusCode=400, uiMessage=uiMessage)
 
     def _writeTable(self, projectId: str, tableName: str, claims: list[dict], writeParquet) -> None:
         """Write a load's table under a name it accepted, then release the name again.
@@ -530,13 +539,7 @@ class DataLoadService:
         except CustomException:
             raise
         except Exception as e:
-            exception = CustomException(
-                e,
-                statusCode=400,
-                uiMessage="Unable to connect to MySQL : check host/port/credentials."
-            )
-            logger.error(exception)
-            raise exception
+            raise self._loadFailure("MySQL", e, "Unable to connect to MySQL : check host/port/credentials.") from None
 
             
     def loadPostgreSQL(self, connection: LoadMySQLorPostgreSQL, userId: str | None = None) -> dict:
@@ -580,13 +583,7 @@ class DataLoadService:
         except CustomException:
             raise
         except Exception as e:
-            exception = CustomException(
-                e,
-                statusCode=400,
-                uiMessage="Unable to connect to PostgreSQL: check host/port/credentials."
-            )
-            logger.error(exception)
-            raise exception
+            raise self._loadFailure("PostgreSQL", e, "Unable to connect to PostgreSQL: check host/port/credentials.") from None
         
     def loadMongoDB(self, connection: LoadMongoDB, userId: str | None = None) -> dict:
         """
@@ -623,13 +620,7 @@ class DataLoadService:
         except CustomException:
             raise
         except Exception as e:
-            exception = CustomException(
-                e,
-                statusCode=400,
-                uiMessage="Unable to connect to MongoDB: check connection string/credentials."
-            )
-            logger.error(exception)
-            raise exception
+            raise self._loadFailure("MongoDB", e, "Unable to connect to MongoDB: check connection string/credentials.") from None
         
     def deleteTable(self, tableDetails: DeleteTable) -> None:
         """
