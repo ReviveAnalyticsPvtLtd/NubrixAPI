@@ -18,6 +18,7 @@ API code decodes a stored table: they pick between the two.
 import hmac
 import io
 import json
+import math
 import os
 from hashlib import sha256
 
@@ -53,6 +54,8 @@ _MAX_PANDAS_METADATA_BYTES = 64 * 1024
 MAX_INFO_ANSWER_BYTES = 4 * 1024 * 1024
 _SMALL_ANSWER_OPS = {"info", "schema"}
 MAX_SAMPLE_CHARS = 64 * 1024
+# One value of the sample row saved in metadata, which every chart prompt carries.
+MAX_SAMPLE_VALUE_CHARS = 200
 # Carries a page's row count from the reader child; the parent removes it.
 PAGE_ROWS_KEY = b"nubrix.reader.total-rows"
 _NORMALISE_LAUNCHER = "normalise_launcher.py"
@@ -60,7 +63,7 @@ _READER_LAUNCHER = "table_reader_launcher.py"
 _NORMALISE_TIMEOUT_SECONDS = 120
 _READER_TIMEOUT_SECONDS = 60
 _STDERR_TAIL_CHARS = 2000
-_INFO_KEYS = {"columns", "rows", "cols", "sample", "sampleFailed"}
+_INFO_KEYS = {"columns", "rows", "cols", "sample", "sampleFailed", "sampleValues"}
 _SAVE_FAILED = "The transformation's result could not be read safely."
 _READ_FAILED = "This table could not be read safely."
 TOO_LARGE_CODE = "TABLE_TOO_LARGE"
@@ -330,6 +333,27 @@ def tableSchema(data: "bytes | str", maxDecoded: int) -> "pa.Schema":
     return plainSchema(schema)
 
 
+def _sampleValues(batch) -> dict | None:
+    """A batch's first row as JSON scalars, each cut to MAX_SAMPLE_VALUE_CHARS and all of them to MAX_SAMPLE_CHARS."""
+    if not batch.num_rows:
+        return None
+    values, left = {}, MAX_SAMPLE_CHARS
+    for field, column in zip(batch.schema, batch.columns):
+        try:
+            value = column[0].as_py()
+            if isinstance(value, float) and not math.isfinite(value):
+                value = None
+            elif value is not None and not isinstance(value, (bool, int, float)):
+                value = str(value)[:MAX_SAMPLE_VALUE_CHARS]
+        except Exception:  # A value Python can't hold, such as a date past year 9999.
+            continue
+        left -= len(field.name) + len(str(value))
+        if left < 0:
+            break
+        values[field.name] = value
+    return values
+
+
 def tableInfo(data: "bytes | str", maxDecoded: int) -> dict:
     """Columns, shape and a one-row sample, as metadata generation reads them.
 
@@ -344,6 +368,7 @@ def tableInfo(data: "bytes | str", maxDecoded: int) -> dict:
             "cols": int(metadata.num_columns),
             "sample": None,
             "sampleFailed": False,
+            "sampleValues": None,
         }
         if _overDecodedLimit(metadata, maxDecoded):
             info["sampleFailed"] = True
@@ -352,6 +377,7 @@ def tableInfo(data: "bytes | str", maxDecoded: int) -> dict:
             sample = next(parquet.iter_batches(batch_size=1), None)
             if sample is not None:
                 info["sample"] = sample.to_pandas().to_string()
+                info["sampleValues"] = _sampleValues(sample)
         except Exception:
             info["sampleFailed"] = True
         return info
@@ -528,6 +554,17 @@ def readUntrustedSchema(projectId: str, tableName: str, data: bytes, leaveHeadro
     return _ipcSchema(projectId, tableName, _readInChild(projectId, tableName, data, {"op": "schema"}, leaveHeadroom))
 
 
+def _isSampleValues(values) -> bool:
+    """Whether the child's sample values have the shape `_sampleValues` builds."""
+    return isinstance(values, dict) and all(
+        value is None
+        or type(value) in (bool, int)
+        or (type(value) is float and math.isfinite(value))
+        or (type(value) is str and len(value) <= MAX_SAMPLE_VALUE_CHARS)
+        for value in values.values()
+    )
+
+
 def _isInfo(info) -> bool:
     """Whether the child's answer has exactly the shape `tableInfo` builds."""
     return (
@@ -538,13 +575,15 @@ def _isInfo(info) -> bool:
         and all(type(info[key]) is int and info[key] >= 0 for key in ("rows", "cols"))
         and (info["sample"] is None or isinstance(info["sample"], str))
         and isinstance(info["sampleFailed"], bool)
+        and (info["sampleValues"] is None or _isSampleValues(info["sampleValues"]))
     )
 
 
 def readUntrustedInfo(projectId: str, tableName: str, data: bytes) -> dict:
     """Columns, shape and a one-row sample of a table that may not be the API's own, read as `readUntrustedTable` is.
 
-    Returns {"columns": [[name, type], ...], "rows", "cols", "sample": str | None, "sampleFailed": bool}: a sample of
+    Returns {"columns": [[name, type], ...], "rows", "cols", "sample": str | None, "sampleFailed": bool,
+    "sampleValues": dict | None (the same row as JSON scalars)}: a sample of
     None is a table with no rows, unless sampleFailed says it could not be read. A table over
     STORED_TABLE_MAX_DECODED_BYTES gets its shape and no sample. The child's sample is cut to MAX_SAMPLE_CHARS and its
     answer capped at MAX_INFO_ANSWER_BYTES; a larger answer is TableUnreadableError. Errors, including the sandbox's

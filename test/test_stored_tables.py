@@ -434,6 +434,7 @@ def _expectedInfo(data: bytes) -> dict:
         "cols": parquet.metadata.num_columns,
         "sample": None if sample is None else sample.to_pandas().to_string(),
         "sampleFailed": False,
+        "sampleValues": None if sample is None else storedTables._sampleValues(sample),
     }
 
 
@@ -686,12 +687,12 @@ def test_readerInfoForAnEmptyTableAndAFailedSample():
     empty = io.BytesIO()
     pq.write_table(pa.table({"a": pa.array([], pa.int64())}), empty)
     info = storedTables.readUntrustedInfo("p1", "t", empty.getvalue())
-    assert info == {"columns": [["a", "int64"]], "rows": 0, "cols": 1, "sample": None, "sampleFailed": False}
+    assert info == {"columns": [["a", "int64"]], "rows": 0, "cols": 1, "sample": None, "sampleFailed": False, "sampleValues": None}
     broken = _runOutput(_frame(), {b"pandas": json.dumps({"index_columns": ["nowhere"], "columns": []}).encode()})
     with pytest.raises(Exception):  # the sample really fails today
         next(pq.ParquetFile(io.BytesIO(broken)).iter_batches(batch_size=1)).to_pandas()
     info = storedTables.readUntrustedInfo("p1", "t", broken)
-    assert info == {"columns": [["a", "int64"], ["b", "string"]], "rows": 3, "cols": 2, "sample": None, "sampleFailed": True}
+    assert info == {"columns": [["a", "int64"], ["b", "string"]], "rows": 3, "cols": 2, "sample": None, "sampleFailed": True, "sampleValues": None}
 
 
 def test_readerDecodesDictionariesAndStripsMetadata():
@@ -999,7 +1000,7 @@ def test_pageAndInfoCheckTheWholeTable(monkeypatch, readerMemory):
 
     monkeypatch.setattr(pq.ParquetFile, "iter_batches", countingBatches)
     info = storedTables.readUntrustedInfo("p1", "t", data)
-    assert info == {"columns": [["a", "int64"]], "rows": 200_000, "cols": 1, "sample": None, "sampleFailed": True}
+    assert info == {"columns": [["a", "int64"]], "rows": 200_000, "cols": 1, "sample": None, "sampleFailed": True, "sampleValues": None}
     assert batchesRead == []  # in this process; the child path decodes nothing in this process either
 
 
@@ -1281,7 +1282,7 @@ def test_oversizedMarkedTableIsRefusedBeforeDecoding(monkeypatch, storage, noChi
     with pytest.raises(TableTooLargeError):
         storedTables.readStoredTablePage(PROJECT_ID, "orders", 0, 10)
     info = storedTables.storedTableInfo(PROJECT_ID, "orders", data)
-    assert info == {"columns": [["a", "int64"]], "rows": 10_000, "cols": 1, "sample": None, "sampleFailed": True}
+    assert info == {"columns": [["a", "int64"]], "rows": 10_000, "cols": 1, "sample": None, "sampleFailed": True, "sampleValues": None}
 
 
 def test_normaliseOffIgnoresMarkers(monkeypatch, storage):
@@ -1765,7 +1766,7 @@ def _infoReturns(monkeypatch, outcome):
 )
 def test_attributeInfoKeepsItsFallbackForATableItCannotRead(monkeypatch, make):
     service = _infoReturns(monkeypatch, _raiser(make))
-    assert service._attributeInfoFunc(PROJECT_ID, "orders") == ("DATAFRAME NAME: orders\n(Metadata read failed)\n", None)
+    assert service._attributeInfoFunc(PROJECT_ID, "orders") == ("DATAFRAME NAME: orders\n(Metadata read failed)\n", None, {})
 
 
 def test_attributeInfoReRaisesBusy(monkeypatch):
@@ -1785,7 +1786,7 @@ def test_attributeInfoReRaisesBusy(monkeypatch):
 )
 def test_attributeInfoKeepsItsFormat(monkeypatch, info, sampleLine):
     service = _infoReturns(monkeypatch, {"columns": [["a", "int64"], ["b", "string"]], "rows": 4, "cols": 2, **info})
-    text, shape = service._attributeInfoFunc(PROJECT_ID, "orders")
+    text, shape, _ = service._attributeInfoFunc(PROJECT_ID, "orders")
     assert text == "DATAFRAME NAME: orders\n- a (int64)\n- b (string)\nSHAPE: (4, 2)\n" + sampleLine
     assert shape == [4, 2]
 
@@ -2142,7 +2143,7 @@ def test_unmarkedHonestTableStillOpensEverywhere(monkeypatch, storage):
         today.setattr(dashboardModule, "decodeStoredTable", lambda p, t, data: types.SimpleNamespace(to_pandas=lambda: pd.read_parquet(io.BytesIO(data))), raising=False)
         assert columnTypes == dashboardModule.dashboardService._getDataTypes(PROJECT_ID, "sales")
 
-    info, shape = managementModule.managementService._attributeInfoFunc(PROJECT_ID, "sales")
+    info, shape, _ = managementModule.managementService._attributeInfoFunc(PROJECT_ID, "sales")
     assert (info, shape) == (_todaysAttributeInfo("sales", body), [5, 5])
 
     monkeypatch.setattr(initMethods, "_fetch_data_from_redis", lambda *_args: None)

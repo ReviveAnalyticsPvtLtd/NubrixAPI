@@ -459,7 +459,7 @@ class ManagementService:
             dataframeName (str): The dataframe/table name.
 
         Returns:
-            tuple: (attribute info string, deterministic [num_rows, num_cols] shape).
+            tuple: (attribute info string, deterministic [num_rows, num_cols] shape, the real first row or {}).
 
         Raises:
             SandboxBusyError: When the table's reader could not get a run slot; that is a retry, not a failed read.
@@ -477,12 +477,12 @@ class ManagementService:
                 attributeInfo += 'SAMPLE ROW: (no rows)\n'
             else:
                 attributeInfo += 'SAMPLE ROW:\n' + info["sample"] + '\n'
-            return attributeInfo, [int(num_rows), int(num_cols)]
+            return attributeInfo, [int(num_rows), int(num_cols)], info.get("sampleValues") or {}
         except Exception as e:
             if isBusy(e):
                 raise
             logger.error(f"Failed to generate attribute info for {dataframeName} under project {projectId}: {e}")
-            return f"DATAFRAME NAME: {dataframeName}\n(Metadata read failed)\n", None
+            return f"DATAFRAME NAME: {dataframeName}\n(Metadata read failed)\n", None, {}
 
     def _parseModelJsonOutput(self, rawOutput: object, stage: str) -> dict:
         """Delegate to shared parser in utils.llmOutputParser."""
@@ -545,9 +545,10 @@ class ManagementService:
                 dataFiles = [x.get("name") for x in listProjectFiles(self.client, projectId) if x.get("name").endswith(".parquet")]
             results = ""
             tableShapes: dict = {}
+            tableSamples: dict = {}
             for fileName in dataFiles:
                 dataframeName = fileName.replace(".parquet", "")
-                info, shape = self._attributeInfoFunc(projectId = projectId, dataframeName = dataframeName)
+                info, shape, tableSamples[dataframeName] = self._attributeInfoFunc(projectId = projectId, dataframeName = dataframeName)
                 results += info
                 if shape is not None:
                     tableShapes[dataframeName] = shape
@@ -576,6 +577,8 @@ class ManagementService:
                 # missing from the emitted entry.
                 if tableName in tableShapes:
                     metadata[tableName]["shape"] = tableShapes[tableName]
+                # Never the model's copy of the sample row: prompts and the currency check take it as fact.
+                metadata[tableName]["sample_row"] = tableSamples.get(tableName, {})
             return metadata
         except Exception as e:
             exception = tableReadException(e) or CustomException(e)
