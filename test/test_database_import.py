@@ -1,3 +1,4 @@
+import contextlib
 import dataclasses
 import json
 import types
@@ -18,7 +19,7 @@ from api.services.subscriptions.entitlementService import EntitlementUnavailable
 from nubrix.triggers.tasks import databaseImportTask as tasks
 from test.privateStorageFixtures import SERVICE_KEY, FakePrivateStorage
 from test.test_import_jobs import FakeRedis
-from utils.logger import logger
+from loguru import logger
 
 PROJECT = "11111111-2222-4333-8444-555555555555"
 USER = "user-1"
@@ -226,6 +227,18 @@ def test_tooLargeTableFailsAndOthersLoad(job, monkeypatch):
     assert describedNames(job) == [["small", "tiny"]]
 
 
+@contextlib.contextmanager
+def capturedLogs(monkeypatch, module):
+    # Other test files swap utils.logger for a stub at collection, so point the module at loguru itself.
+    monkeypatch.setattr(module, "logger", logger)
+    messages = []
+    sink = logger.add(messages.append, format="{message}")
+    try:
+        yield messages
+    finally:
+        logger.remove(sink)
+
+
 def test_driverErrorReasonIsGeneric(job, monkeypatch):
     makeTables(job.engine, {name: (1, 1) for name in "ab"})
     tables, jobId = startJob(job)
@@ -237,12 +250,8 @@ def test_driverErrorReasonIsGeneric(job, monkeypatch):
         return realRead(source, table, *sizes)
 
     monkeypatch.setattr(service, "readChunks", readChunks)
-    messages = []
-    sink = logger.add(messages.append, format="{message}")
-    try:
+    with capturedLogs(monkeypatch, service) as messages:
         service.runBatch(PROJECT, USER, jobId, MYSQL, tables, 0)
-    finally:
-        logger.remove(sink)
 
     found = statuses(job)
     assert (found["a"]["status"], found["a"]["reason"]) == ("failed", "Could not read this table")
@@ -541,13 +550,9 @@ def test_unexpectedErrorFailsJobWithoutLeakingIt(job, monkeypatch):
     makeTables(job.engine, {"a": (1, 1)})
     tables, jobId = startJob(job)
     monkeypatch.setattr(service, "runBatch", Mock(side_effect=RuntimeError("password=hunter2")))
-    messages = []
-    sink = logger.add(messages.append, format="{message}")
     task = _FakeTask()
-    try:
+    with capturedLogs(monkeypatch, tasks) as messages:
         tasks.importBatch(task, PROJECT, USER, jobId, dataclasses.asdict(MYSQL), [list(t) for t in tables], 0)
-    finally:
-        logger.remove(sink)
 
     record = job.jobs.get(PROJECT)
     assert (record["state"], record["kpis"]) == ("failed", "failed")
@@ -636,12 +641,8 @@ def test_deleteProjectSurvivesARedisFailure(monkeypatch):
     jobs = Mock()
     jobs.forget.side_effect = ConnectionError("redis://:hunter2@redis.test")
     management = _management(monkeypatch, jobs)
-    messages = []
-    sink = logger.add(messages.append, format="{message}")
-    try:
+    with capturedLogs(monkeypatch, managementModule) as messages:
         management.deleteProject(PROJECT)
-    finally:
-        logger.remove(sink)
 
     management.client.table.assert_called_with("Projects")
     assert any("ConnectionError" in str(m) for m in messages)

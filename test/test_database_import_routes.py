@@ -9,6 +9,7 @@ from fastapi import FastAPI, HTTPException
 from fastapi.responses import JSONResponse
 from fastapi.routing import APIRoute
 from fastapi.testclient import TestClient
+from loguru import logger
 
 import api.commons as commons
 from api.commons import UserContext
@@ -18,6 +19,7 @@ from api.services import databaseSources
 from api.services.importJobs import ImportJobs
 from nubrix.triggers.tasks import databaseImportTask
 from test.test_import_jobs import FakeRedis
+from utils import exceptionHandler
 from utils.connectionTargets import BLOCKED_ADDRESS_MESSAGE, BlockedAddressError
 
 OWNER = UserContext(userId="owner-user", email="owner@test.example", token="t")
@@ -52,6 +54,9 @@ class Owners:
 
 @pytest.fixture
 def env(monkeypatch):
+    # Other test files stub utils.logger at collection; both of these modules log on the routes' error paths.
+    for module in (dataLoader, exceptionHandler):
+        monkeypatch.setattr(module, "logger", logger)
     owners = Owners()
     monkeypatch.setattr(commons, "client", owners)
     jobs = ImportJobs(FakeRedis())
@@ -180,7 +185,6 @@ def test_statusChecksOwnerFirst(env):
 
 
 def test_listTablesValueErrorDoesNotLeak(env, monkeypatch, caplog):
-    from utils.logger import logger
     lines = []
     sink = logger.add(lines.append)
     monkeypatch.setattr(dataLoader, "listTables", Mock(side_effect=ValueError(f"'latin-1' codec can't encode {SECRET}")))
@@ -190,7 +194,9 @@ def test_listTablesValueErrorDoesNotLeak(env, monkeypatch, caplog):
         logger.remove(sink)
     assert (response.status_code, response.json()["message"]) == (400, CONNECT_FAILURE)
     assert SECRET not in response.text
-    assert SECRET not in "".join(str(line) for line in lines)
+    logged = "".join(str(line) for line in lines)
+    assert "could not connect" in logged
+    assert SECRET not in logged
 
 
 def test_validationErrorDoesNotEchoThePassword(env):
