@@ -2,7 +2,7 @@ import contextlib
 import dataclasses
 import json
 import types
-from unittest.mock import MagicMock, Mock, patch
+from unittest.mock import ANY, MagicMock, Mock, patch
 
 import pytest
 import sqlalchemy
@@ -424,10 +424,17 @@ class _FakeTask:
         return Retry()
 
 
+def sealed(jobId, source=MYSQL, projectId=PROJECT):
+    """The source argument as sendBatch queues it."""
+    task = _FakeTask()
+    tasks.sendBatch(task.app, projectId, USER, jobId, source, [], 0)
+    return task.sent[0][1][3]
+
+
 def test_batchTaskEnqueuesNextBatchThenKpis(job):
     makeTables(job.engine, {f"t{i:02}": (1, 1) for i in range(9)})
     tables, jobId = startJob(job)
-    fields = dataclasses.asdict(MYSQL)
+    fields = sealed(jobId)
     listed = [list(t) for t in tables]
     task = _FakeTask()
 
@@ -438,7 +445,7 @@ def test_batchTaskEnqueuesNextBatchThenKpis(job):
     tasks.importKpis(task, PROJECT, USER, jobId)
 
     assert task.sent == [
-        ("NubrixAI.importBatch", [PROJECT, USER, jobId, fields, listed, 8]),
+        ("NubrixAI.importBatch", [PROJECT, USER, jobId, ANY, listed, 8]),
         ("NubrixAI.importKpis", [PROJECT, USER, jobId]),
     ]
     assert all(options == {"ignore_result": True, **REDACTED} for options in task.options)
@@ -461,14 +468,14 @@ def test_crashedDeliveryIsRetriedNotDropped(job):
 
     task = _FakeTask(retries=0)
     with pytest.raises(Retry):
-        tasks.importBatch(task, PROJECT, USER, jobId, dataclasses.asdict(MYSQL), listed, 0)
+        tasks.importBatch(task, PROJECT, USER, jobId, sealed(jobId), listed, 0)
     assert task.retried == (300, 6, REDACTED) and task.sent == []
 
     job.redis.delete(f"import:{PROJECT}:batch")  # the dead delivery's marker runs out
     task = _FakeTask(retries=1)
-    tasks.importBatch(task, PROJECT, USER, jobId, dataclasses.asdict(MYSQL), listed, 0)
+    tasks.importBatch(task, PROJECT, USER, jobId, sealed(jobId), listed, 0)
 
-    assert task.sent == [("NubrixAI.importBatch", [PROJECT, USER, jobId, dataclasses.asdict(MYSQL), listed, 8])]
+    assert task.sent == [("NubrixAI.importBatch", [PROJECT, USER, jobId, ANY, listed, 8])]
     assert describedNames(job) == [[f"t{i:02}" for i in range(8)]]
     assert statuses(job)["t00"]["status"] == "loaded"
 
@@ -477,11 +484,11 @@ def test_lateDuplicateOfAFinishedBatchExitsQuietly(job):
     makeTables(job.engine, {f"t{i:02}": (1, 1) for i in range(9)})
     tables, jobId = startJob(job)
     listed = [list(t) for t in tables]
-    tasks.importBatch(_FakeTask(), PROJECT, USER, jobId, dataclasses.asdict(MYSQL), listed, 0)
+    tasks.importBatch(_FakeTask(), PROJECT, USER, jobId, sealed(jobId), listed, 0)
     before = job.jobs.get(PROJECT)
 
     late = _FakeTask()
-    tasks.importBatch(late, PROJECT, USER, jobId, dataclasses.asdict(MYSQL), listed, 0)
+    tasks.importBatch(late, PROJECT, USER, jobId, sealed(jobId), listed, 0)
 
     assert late.sent == [] and late.retried is None
     assert job.jobs.get(PROJECT) == before and job.metadata.call_count == 1
@@ -494,36 +501,87 @@ def test_busyRetriesSpentWhileHeldExitsQuietly(job):
     before = job.jobs.get(PROJECT)
 
     task = _FakeTask(retries=6)
-    tasks.importBatch(task, PROJECT, USER, jobId, dataclasses.asdict(MYSQL), [list(t) for t in tables], 0)
+    tasks.importBatch(task, PROJECT, USER, jobId, sealed(jobId), [list(t) for t in tables], 0)
 
     assert task.sent == [] and task.retried is None
     assert job.jobs.get(PROJECT) == before
     assert job.redis.get(f"import:{PROJECT}:batch") == f"{jobId}:0".encode()
 
 
-def test_sentMessagesCarryNoSourceFields(job, monkeypatch):
-    import contextlib
+SECRET_SOURCES = [
+    Source(kind="mysql", host="db-host.test", address="192.0.2.1", port=3306, user="alice-login", password="s3cret-pass", db="d"),
+    Source(kind="mongodb", db="d", connectionString="mongodb://alice-login:s3cret-pass@db-host.test/d"),
+]
 
+
+@pytest.mark.parametrize("source", SECRET_SOURCES, ids=lambda source: source.kind)
+def test_queuedMessagesHoldNoCredentials(job, monkeypatch, source):
     from nubrix.triggers.celery import celeryApp
 
-    makeTables(job.engine, {f"t{i:02}": (1, 1) for i in range(9)})
-    tables, jobId = startJob(job)
-    secret = Source(kind="mysql", host="db.test", address="192.0.2.1", port=3306, user="u", password="s3cret-pass", db="d")
+    jobId = job.jobs.start(PROJECT, [("a", "a"), ("b", "b")])
+    listed = [["a", None, "a"], ["b", None, "b"]]
+    given = []
+    monkeypatch.setattr(service, "runBatch", lambda *args, **_: given.append(args[3]) or (1 if args[5] == 0 else None))
     messages = []
     monkeypatch.setattr(celeryApp, "producer_or_acquire", lambda producer=None: contextlib.nullcontext(MagicMock()))
     monkeypatch.setattr(celeryApp.amqp, "send_task_message", lambda producer, name, message, **options: messages.append(message))
     task = _FakeTask()
     task.app = celeryApp
 
-    tasks.importBatch(task, PROJECT, USER, jobId, dataclasses.asdict(secret), [list(t) for t in tables], 0)
-    tasks.importBatch(task, PROJECT, USER, jobId, dataclasses.asdict(secret), [list(t) for t in tables], 8)
+    tasks.sendBatch(celeryApp, PROJECT, USER, jobId, source, listed, 0)  # what the route queues
+    assert "s3cret-pass" not in json.dumps(messages[0].body, default=dataclasses.asdict)
+    tasks.importBatch(task, *messages[0].body[0])  # queues the next batch
+    tasks.importBatch(task, *messages[1].body[0])  # queues the KPI step
 
-    assert [m.headers["task"] for m in messages] == ["NubrixAI.importBatch", "NubrixAI.importKpis"]
+    assert [m.headers["task"] for m in messages] == ["NubrixAI.importBatch", "NubrixAI.importBatch", "NubrixAI.importKpis"]
     for message in messages:
+        queued = json.dumps([message.headers, message.body, message.sent_event], default=lambda o: dataclasses.asdict(o) if dataclasses.is_dataclass(o) else str(o))
+        for private in ("s3cret-pass", "alice-login", "db-host.test"):
+            assert private not in queued
         assert (message.headers["argsrepr"], message.headers["kwargsrepr"]) == ("(redacted)", "{}")
-        assert "s3cret-pass" not in repr(message.headers) and "s3cret-pass" not in repr(message.sent_event)
         assert message.headers["ignore_result"] is True
-    assert "s3cret-pass" in repr(messages[0].body)  # the worker still gets the connection
+    assert given == [source, source]  # the worker still gets the connection
+
+
+@pytest.mark.parametrize("forgery", ["altered", "otherProject", "otherJob", "otherKey", "plainText"])
+def test_sourceNotSealedForThisJobIsRefused(job, monkeypatch, forgery):
+    jobId = job.jobs.start(PROJECT, [("a", "a")])
+    source = SECRET_SOURCES[0]
+    if forgery == "plainText":
+        sealedSource = dataclasses.asdict(source)
+    else:
+        with monkeypatch.context() as sealing:
+            if forgery == "otherKey":
+                sealing.setenv("SECRET_KEY", "another-secret")
+            sealedSource = sealed("another-job" if forgery == "otherJob" else jobId, source,
+                                  "another-project" if forgery == "otherProject" else PROJECT)
+        if forgery == "altered":
+            middle = len(sealedSource) // 2
+            sealedSource = sealedSource[:middle] + ("A" if sealedSource[middle] != "A" else "B") + sealedSource[middle + 1:]
+    run = Mock(return_value=None)
+    monkeypatch.setattr(service, "runBatch", run)
+    task = _FakeTask()
+
+    with capturedLogs(monkeypatch, tasks) as messages:
+        tasks.importBatch(task, PROJECT, USER, jobId, sealedSource, [["a", None, "a"]], 0)
+
+    assert not run.called and task.sent == []
+    assert job.jobs.get(PROJECT)["state"] == "failed"
+    assert not any("s3cret-pass" in str(m) for m in messages)
+
+
+@pytest.mark.parametrize("key", [None, ""])
+def test_nothingIsQueuedWithoutAKey(monkeypatch, key):
+    if key is None:
+        monkeypatch.delenv("SECRET_KEY")
+    else:
+        monkeypatch.setenv("SECRET_KEY", key)
+    task = _FakeTask()
+
+    with pytest.raises((KeyError, ValueError)):
+        tasks.sendBatch(task.app, PROJECT, USER, "job", MYSQL, [], 0)
+
+    assert task.sent == []
 
 
 def test_creditsUnavailableRetriesThenSkips(job):
@@ -534,11 +592,11 @@ def test_creditsUnavailableRetriesThenSkips(job):
 
     task = _FakeTask(retries=2)
     with pytest.raises(Retry):
-        tasks.importBatch(task, PROJECT, USER, jobId, dataclasses.asdict(MYSQL), listed, 0)
+        tasks.importBatch(task, PROJECT, USER, jobId, sealed(jobId), listed, 0)
     assert task.retried == (60, 3, REDACTED) and task.sent == []
 
     task = _FakeTask(retries=3)
-    tasks.importBatch(task, PROJECT, USER, jobId, dataclasses.asdict(MYSQL), listed, 0)
+    tasks.importBatch(task, PROJECT, USER, jobId, sealed(jobId), listed, 0)
     assert all((t["status"], t["reason"]) == ("skipped", "Could not check credits") for t in statuses(job).values())
     assert task.sent == [("NubrixAI.importKpis", [PROJECT, USER, jobId])]
 
@@ -552,7 +610,7 @@ def test_unexpectedErrorFailsJobWithoutLeakingIt(job, monkeypatch):
     monkeypatch.setattr(service, "runBatch", Mock(side_effect=RuntimeError("password=hunter2")))
     task = _FakeTask()
     with capturedLogs(monkeypatch, tasks) as messages:
-        tasks.importBatch(task, PROJECT, USER, jobId, dataclasses.asdict(MYSQL), [list(t) for t in tables], 0)
+        tasks.importBatch(task, PROJECT, USER, jobId, sealed(jobId), [list(t) for t in tables], 0)
 
     record = job.jobs.get(PROJECT)
     assert (record["state"], record["kpis"]) == ("failed", "failed")
@@ -611,7 +669,7 @@ def test_forgottenJobStopsWithoutWritingMoreTables(job, monkeypatch):
 
     monkeypatch.setattr(service, "readChunks", readChunks)
     task = _FakeTask()
-    tasks.importBatch(task, PROJECT, USER, jobId, dataclasses.asdict(MYSQL), [list(t) for t in tables], 0)
+    tasks.importBatch(task, PROJECT, USER, jobId, sealed(jobId), [list(t) for t in tables], 0)
 
     assert task.sent == [] and task.retried is None
     assert job.jobs.get(PROJECT) is None

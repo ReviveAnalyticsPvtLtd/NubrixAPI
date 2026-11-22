@@ -22,7 +22,6 @@ from api.services.dataLoadService import dataLoadService
 from fastapi.responses import ORJSONResponse
 from api.commons import requireProductAccess, requireCredits, requireProjectOwner, UserContext
 from typing import Annotated
-import dataclasses
 from api.services.databaseSources import listTables, storedName, toSource
 from api.services.importJobs import importJobs
 from utils.connectionTargets import BLOCKED_ADDRESS_MESSAGE, BlockedAddressError
@@ -238,7 +237,7 @@ async def importDatabase(body: ImportDatabase, user: UserContext = Depends(requi
     try:
         await asyncio.to_thread(
             databaseImportTask.sendBatch, celeryModule.celeryApp, body.projectId, user.userId, jobId,
-            dataclasses.asdict(source), [[name, schema, storedAs] for (name, schema), storedAs in zip(tables, stored)], start=0)
+            source, [[name, schema, storedAs] for (name, schema), storedAs in zip(tables, stored)], start=0)
     except Exception as e:
         logger.error(f"Import job {jobId} in project {body.projectId} could not be enqueued ({type(e).__name__}).")
         await asyncio.to_thread(importJobs.finish, body.projectId, jobId, "failed")  # frees the project's lock

@@ -4,8 +4,10 @@ databaseImportTask.py
 Celery task bodies of a database import, registered in nubrix/triggers/celery.py and routed to the `imports` queue.
 Each batch enqueues the next one at the back of the queue, so imports take turns batch by batch.
 
-sourceFields carry the connection's credentials, and a driver's error can quote them, so no exception leaves these
-tasks, logs name the exception's type only, and every message is sent with its args' repr redacted.
+The broker is not a place for secrets, so a message carries the connection only as sealedSource:
+encrypted with a key derived from SECRET_KEY and bound to its project and job. A driver's error can still quote the
+credentials, so no exception leaves these tasks, logs name the exception's type only, and every message is sent with
+its args' repr redacted.
 
 The default worker, beat and the API import this module through nubrix/triggers/celery.py, so it imports the service
 (and with it the AI stack) only inside the task bodies, which run on the imports worker alone.
@@ -13,10 +15,22 @@ The default worker, beat and the API import this module through nubrix/triggers/
 
 __all__ = ["IMPORT_BATCH_TASK", "IMPORT_KPIS_TASK", "IMPORT_TASK_OPTIONS", "importBatch", "importKpis", "sendBatch"]
 
+import base64
+import dataclasses
+import hashlib
+import hmac
+import json
+import os
+from typing import TYPE_CHECKING
+
 from celery.exceptions import Retry
+from cryptography.fernet import Fernet
 
 from api.commons import CreditsUnavailable
 from utils.logger import logger
+
+if TYPE_CHECKING:
+    from api.services.databaseSources import Source
 
 IMPORT_BATCH_TASK = "NubrixAI.importBatch"
 IMPORT_KPIS_TASK = "NubrixAI.importKpis"
@@ -27,11 +41,32 @@ _REDACTED = {"argsrepr": "(redacted)", "kwargsrepr": "{}"}
 _CREDIT_RETRIES, _CREDIT_RETRY_SECONDS = 3, 60
 # A dead delivery's marker runs out after 900 s, well within these 30 minutes.
 _BUSY_RETRIES, _BUSY_RETRY_SECONDS = 6, 300
+_KEY_DOMAIN = b"nubrix.import-source.v1"
 
 
-def sendBatch(app, projectId: str, userId: str, jobId: str, sourceFields: dict, tables: list[list], start: int) -> None:
-    """Enqueue the batch at `start`; the first one is sent the same way."""
-    app.send_task(IMPORT_BATCH_TASK, args=[projectId, userId, jobId, sourceFields, tables, start], ignore_result=True, **_REDACTED)
+def _cipher() -> Fernet:
+    secret = os.environ["SECRET_KEY"]
+    if not secret:
+        raise ValueError("SECRET_KEY is empty")
+    return Fernet(base64.urlsafe_b64encode(hmac.new(secret.encode(), _KEY_DOMAIN, hashlib.sha256).digest()))
+
+
+def _seal(projectId: str, jobId: str, source: "Source") -> str:
+    return _cipher().encrypt(json.dumps([projectId, jobId, dataclasses.asdict(source)]).encode()).decode()
+
+
+def _unseal(projectId: str, jobId: str, sealedSource: str) -> dict:
+    sealedProject, sealedJob, fields = json.loads(_cipher().decrypt(sealedSource.encode()))
+    # Without this, whoever can write to the broker could import another customer's database into their own project.
+    if (sealedProject, sealedJob) != (projectId, jobId):
+        raise ValueError("the source was sealed for another import")
+    return fields
+
+
+def sendBatch(app, projectId: str, userId: str, jobId: str, source: "Source", tables: list[list], start: int) -> None:
+    """Enqueue the batch at `start`; the first one is sent the same way. The only place a source enters a message."""
+    args = [projectId, userId, jobId, _seal(projectId, jobId, source), tables, start]
+    app.send_task(IMPORT_BATCH_TASK, args=args, ignore_result=True, **_REDACTED)
 
 
 def _retry(task, retries: int, seconds: int) -> None:
@@ -48,13 +83,13 @@ def _fail(service, projectId: str, jobId: str, error: Exception) -> None:
         logger.error(f"Import job {jobId} in project {projectId} could not be marked failed ({type(e).__name__}).")
 
 
-def importBatch(task, projectId: str, userId: str, jobId: str, sourceFields: dict, tables: list[list], start: int) -> None:
+def importBatch(task, projectId: str, userId: str, jobId: str, sealedSource: str, tables: list[list], start: int) -> None:
     """Run one batch, then enqueue the next one, or the KPI step after the last."""
     from api.services import databaseImportService as service
     from api.services.databaseSources import Source
 
     try:
-        source, sourceTables = Source(**sourceFields), [tuple(t) for t in tables]
+        source, sourceTables = Source(**_unseal(projectId, jobId, sealedSource)), [tuple(t) for t in tables]
         try:
             nextStart = service.runBatch(projectId, userId, jobId, source, sourceTables, start)
         except CreditsUnavailable:
@@ -63,7 +98,7 @@ def importBatch(task, projectId: str, userId: str, jobId: str, sourceFields: dic
         if nextStart is None:
             task.app.send_task(IMPORT_KPIS_TASK, args=[projectId, userId, jobId], ignore_result=True, **_REDACTED)
         else:
-            sendBatch(task.app, projectId, userId, jobId, sourceFields, tables, nextStart)
+            sendBatch(task.app, projectId, userId, jobId, source, tables, nextStart)
         logger.info(f"Import job {jobId} in project {projectId}: batch from {start} done, next {nextStart}.")
     except Retry:
         raise

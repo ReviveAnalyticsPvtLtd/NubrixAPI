@@ -1,4 +1,5 @@
 """POST /loaders/importDatabase and GET /loaders/importStatus/{projectId}."""
+import json
 import socket
 from unittest.mock import Mock
 
@@ -27,6 +28,7 @@ PROJECT = "owned-project"
 SECRET = "s3cret-pw"
 BODY = {"projectId": PROJECT, "source": "mysql", "host": "db.example.com", "port": 3306,
         "user": "u", "password": SECRET, "db": "shop"}
+SEND_BATCH = databaseImportTask.sendBatch  # the env fixture mocks it
 CONNECT_FAILURE = "Unable to connect: check host/port/credentials."
 
 
@@ -112,6 +114,17 @@ def test_answerNeverEchoesThePassword(env):
     response = post(env)
     assert SECRET not in response.text
     assert SECRET not in str(env.jobs.get(PROJECT))
+
+
+def test_routeQueuesNoPlainTextCredentials(env, monkeypatch):
+    from nubrix.triggers.celery import celeryApp
+    monkeypatch.setattr(databaseImportTask, "sendBatch", SEND_BATCH)
+    queued = []
+    monkeypatch.setattr(celeryApp, "send_task", lambda name, args, **options: queued.append(json.dumps(args)))
+    assert post(env).status_code == 202
+    assert len(queued) == 1
+    for private in (SECRET, BODY["host"]):
+        assert private not in queued[0]
 
 
 def test_missingFieldIs400(env):

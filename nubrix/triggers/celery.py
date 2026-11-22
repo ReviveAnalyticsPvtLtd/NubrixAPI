@@ -123,8 +123,8 @@ def runNotificationCleanup():
     return NotificationCleanupTask().execute()
 
 @celeryApp.task(name=IMPORT_BATCH_TASK, **IMPORT_TASK_OPTIONS)
-def runImportBatch(self, projectId: str, userId: str, jobId: str, sourceFields: dict, tables: list, start: int):
-    importBatch(self, projectId, userId, jobId, sourceFields, tables, start)
+def runImportBatch(self, projectId: str, userId: str, jobId: str, sealedSource: str, tables: list, start: int):
+    importBatch(self, projectId, userId, jobId, sealedSource, tables, start)
 
 @celeryApp.task(name=IMPORT_KPIS_TASK, **IMPORT_TASK_OPTIONS)
 def runImportKpis(self, projectId: str, userId: str, jobId: str):
