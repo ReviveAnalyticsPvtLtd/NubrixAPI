@@ -17,6 +17,12 @@ def _fileUrl():
         yield
 
 
+@pytest.fixture(autouse=True)
+def importState():
+    with mock.patch("api.services.managementService.importJobs") as jobs:
+        yield jobs
+
+
 def _management(bucket):
     service = object.__new__(ManagementService)
     service.client = fakeClient(bucket)
@@ -80,7 +86,7 @@ def test_metadata_refresh_sees_a_changed_table_past_the_first_names():
     service._generateMetadata.assert_called_once_with(projectId=PROJECT_ID, userId=None, tableNames=["a_table_0120"])
 
 
-def test_project_delete_removes_every_file_in_a_large_folder():
+def test_project_delete_removes_every_file_in_a_large_folder(importState):
     names = earlierTables(2500)
     bucket = FakeBucket(fileNames=names)
 
@@ -89,6 +95,7 @@ def test_project_delete_removes_every_file_in_a_large_folder():
     removed = [path for call in bucket.removeCalls for path in call]
     assert sorted(removed) == sorted(os.path.join(PROJECT_ID, name) for name in names)
     assert max(len(call) for call in bucket.removeCalls) <= MAX_REMOVE_PATHS
+    importState.forget.assert_called_once_with(PROJECT_ID)
 
 
 def test_project_delete_leaves_storage_alone_for_an_empty_folder():

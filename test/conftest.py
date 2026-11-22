@@ -1,4 +1,25 @@
+import logging
 import os
+
+import dotenv
+import logtail
+
+# Tests take no application settings from the shell or from .env:
+# scripts imported by tests must not reload .env, and the log shipper sends even with a blank token.
+dotenv.load_dotenv = lambda *args, **kwargs: False
+logtail.LogtailHandler = lambda *args, **kwargs: logging.NullHandler()
+_APP_SETTINGS = {
+    "BILLING_ADMIN_USER_IDS", "BREVO_API_BASE_URL", "BREVO_SENDER_EMAIL", "BREVO_SENDER_NAME",
+    "CREDIT_USAGE_SPOOL_DIR", "DASHBOARD_BASE_URL", "DOMAIN_FILE_URL", "FILE_URL",
+    "GOOGLE_APPLICATION_CREDENTIALS", "GOOGLE_GENAI_USE_VERTEXAI", "LOGTAIL_HOST",
+    "NOTIFICATION_DISPATCH_ENABLED", "NOTIFICATION_RECONCILIATION_ENABLED", "PRICING_PROXY_SECRET",
+    "SUBSCRIPTION_EDITABLE_CHECKOUT_ENABLED", "SUBSCRIPTION_MODEL_PHASE", "SUPABASE_ANON_KEY",
+    "SUPABASE_KEY_OLD", "TRIAL_EXPIRY_EMAIL_MODE", "USER_ERASURE_HMAC_SECRET", "WEB_WORKERS",
+}
+for _key in list(os.environ):
+    if (_key in _APP_SETTINGS or _key.endswith(("_API_KEY", "_EMAIL_URL"))
+            or _key.startswith(("LANGFUSE_", "LANGSMITH_", "LANGCHAIN_"))):
+        del os.environ[_key]
 
 # Unit tests must never inherit the application's configured database URL.
 # Real integration fixtures use MANUAL_BILLING_TEST_DATABASE_URL explicitly.
@@ -11,12 +32,13 @@ for _key in ('RAZORPAY_KEY_ID','RAZORPAY_KEY_SECRET','RAZORPAY_WEBHOOK_SECRET','
 # tests still mock Redis, Supabase, and payment providers themselves.
 os.environ["SUPABASE_URL"] = "http://localhost:1"
 os.environ["SUPABASE_KEY"] = "test-key"
-os.environ.setdefault("SECRET_KEY", "test-secret")
-os.environ.setdefault("REDIS_HOST", "localhost")
-os.environ.setdefault("REDIS_PORT", "6379")
-os.environ.setdefault("REDIS_PASSWORD", "")
-os.environ.setdefault("GEMINI_API_KEY", "test-key")
-os.environ.setdefault("GROQ_API_KEY", "test-key")
+os.environ["SECRET_KEY"] = "test-secret"
+# Nothing listens on port 1. Redis integration tests use MANUAL_BILLING_TEST_REDIS_URL.
+os.environ["REDIS_HOST"] = "127.0.0.1"
+os.environ["REDIS_PORT"] = "1"
+os.environ["REDIS_PASSWORD"] = ""
+os.environ["GEMINI_API_KEY"] = "test-key"
+os.environ["GROQ_API_KEY"] = "test-key"
 
 # Sandbox tests run as the developer's own uid outside the image, which sets SANDBOX_RUN_ROOT.
 os.environ.setdefault("SANDBOX_ALLOW_SAME_UID", "1")
