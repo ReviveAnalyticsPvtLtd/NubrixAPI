@@ -1311,3 +1311,26 @@ def test_noSqlPromptExampleTeachesACurrency(key):
     text = _prompts()[key].replace("no ? or $1 parameters", "")  # a SQL parameter, not a currency
     # The rules name currencies only as kinds of fact; no example may carry a symbol or code to copy.
     assert not re.search(r"[$₹€£¥]|\b(USD|INR|EUR|GBP)\b", text)
+
+
+FACT_REJECTION = (
+    "- The answer needs a fact the data does not hold: an amount converted to a currency (no exchange rate is given), "
+    "a fiscal year (the month it starts is not given), or a time zone the timestamps are not stored in\n"
+)
+CONVERT_DOUBT = (
+    '"doubt": "The data gives no exchange rate, so I can\'t convert the amounts to euros. Should I show the total as it is '
+    'stored?"'
+)
+FISCAL_DOUBT = '"doubt": "Which month does your fiscal year start in? I\'ll then total the right twelve months."'
+
+
+def test_thePlannerRejectsAQuestionThatNeedsAFactTheDataDoesNotHold():
+    text = _prompts()["sqlQueryRephraserAgentPrompt"]
+    criteria = text[text.index("## **IMMEDIATE REJECTION CRITERIA**") : text.index("## **EXECUTION BIAS")]
+    assert FACT_REJECTION in criteria
+
+
+def test_thePlannerShowsAConversionAndAFiscalYearAsQuestionsToAsk():
+    text = _prompts()["sqlQueryRephraserAgentPrompt"]
+    assert '**User Query:** "Total sales in euros"' in text and CONVERT_DOUBT in text
+    assert '**User Query:** "Revenue for fiscal year 2024"' in text and FISCAL_DOUBT in text

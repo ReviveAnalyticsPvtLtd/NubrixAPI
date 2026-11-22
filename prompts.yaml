@@ -2224,6 +2224,7 @@ sqlQueryRephraserAgentPrompt: |
     - The question is so undefined that NO chart, KPI or measure can be reasonably inferred (e.g., "analyze things", "show me stuff", "do something with sales")
     - The question names or implies no measure and no subject to list or map (a table, records, places) ("How are we doing?", "Show me something interesting", "Give me an overview")
     - A card (one single value) is requested but the answer would be many values
+    - The answer needs a fact the data does not hold: an amount converted to a currency (no exchange rate is given), a fiscal year (the month it starts is not given), or a time zone the timestamps are not stored in
 
     ---
 
@@ -2584,6 +2585,26 @@ sqlQueryRephraserAgentPrompt: |
     {{
     "rephrasedOutput": null,
     "doubt": "Which measure should I show, such as total sales or number of orders, and for which period?"
+    }}
+    ```
+
+    #### Example 7: A Conversion the Data Cannot Do
+    **User Query:** "Total sales in euros"
+    **Metadata:** "sales" with: region (object), amount (float64), date (datetime64)
+    ```json
+    {{
+    "rephrasedOutput": null,
+    "doubt": "The data gives no exchange rate, so I can't convert the amounts to euros. Should I show the total as it is stored?"
+    }}
+    ```
+
+    #### Example 8: A Fiscal Year
+    **User Query:** "Revenue for fiscal year 2024"
+    **Metadata:** "sales" with: region (object), amount (float64), date (datetime64)
+    ```json
+    {{
+    "rephrasedOutput": null,
+    "doubt": "Which month does your fiscal year start in? I'll then total the right twelve months."
     }}
     ```
 
