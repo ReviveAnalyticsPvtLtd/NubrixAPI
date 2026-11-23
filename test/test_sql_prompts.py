@@ -1330,7 +1330,13 @@ def test_thePlannerRejectsAQuestionThatNeedsAFactTheDataDoesNotHold():
     assert FACT_REJECTION in criteria
 
 
-def test_thePlannerShowsAConversionAndAFiscalYearAsQuestionsToAsk():
+def test_thePlannerShowsAFiscalYearAsAQuestionToAsk():
     text = _prompts()["sqlQueryRephraserAgentPrompt"]
-    assert '**User Query:** "Total sales in euros"' in text and CONVERT_DOUBT in text
+    assert '#### Example 7: A Fiscal Year' in text
     assert '**User Query:** "Revenue for fiscal year 2024"' in text and FISCAL_DOUBT in text
+
+
+def test_thePlannerHasNoConversionExample():
+    # A worked conversion example made the planner drop asked measures (benchmark G5); the rule line covers conversions.
+    text = _prompts()["sqlQueryRephraserAgentPrompt"]
+    assert '"Total sales in euros"' not in text and CONVERT_DOUBT not in text

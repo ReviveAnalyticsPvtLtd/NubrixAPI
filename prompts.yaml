@@ -2588,17 +2588,7 @@ sqlQueryRephraserAgentPrompt: |
     }}
     ```
 
-    #### Example 7: A Conversion the Data Cannot Do
-    **User Query:** "Total sales in euros"
-    **Metadata:** "sales" with: region (object), amount (float64), date (datetime64)
-    ```json
-    {{
-    "rephrasedOutput": null,
-    "doubt": "The data gives no exchange rate, so I can't convert the amounts to euros. Should I show the total as it is stored?"
-    }}
-    ```
-
-    #### Example 8: A Fiscal Year
+    #### Example 7: A Fiscal Year
     **User Query:** "Revenue for fiscal year 2024"
     **Metadata:** "sales" with: region (object), amount (float64), date (datetime64)
     ```json
