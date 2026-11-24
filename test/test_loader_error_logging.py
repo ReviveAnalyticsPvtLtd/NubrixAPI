@@ -56,6 +56,7 @@ def driverFailure(*args, **kwargs):
 
 
 module.dataLoadService._acceptTableName = lambda *args: []
+module.publicAddress = lambda host, port: "192.0.2.1"  # past the address check, so the driver's error is what fails
 module.pd.read_sql = driverFailure
 module.MongoClient.__getitem__ = driverFailure
 dataLoader.requireProjectOwner = lambda *args: None
