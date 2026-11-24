@@ -10,7 +10,7 @@ RUN_INTEGRATION = os.environ.get("RUN_REDIS_INTEGRATION") == "1"
 _FALLBACK = 2678400
 
 
-@unittest.skipUnless(RUN_INTEGRATION, "Set RUN_REDIS_INTEGRATION=1 with Redis env to run")
+@unittest.skipUnless(RUN_INTEGRATION, "Set RUN_REDIS_INTEGRATION=1 and MANUAL_BILLING_TEST_REDIS_URL (a disposable loopback Redis) to run")
 class TestCreditLuaIntegration(unittest.TestCase):
     def setUp(self):
         import redis

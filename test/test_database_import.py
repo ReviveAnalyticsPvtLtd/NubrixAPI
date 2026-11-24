@@ -241,6 +241,7 @@ def capturedLogs(monkeypatch, module):
         yield messages
     finally:
         logger.remove(sink)
+    assert messages, "nothing was logged, so the leak check saw nothing"
 
 
 def test_driverErrorReasonIsGeneric(job, monkeypatch):

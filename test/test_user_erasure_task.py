@@ -174,6 +174,54 @@ def test_verify_removes_storage_again_after_transient_state_is_gone():
     assert names[-3:] == ["delete_transient_state", "delete_storage", "verify_external"]
 
 
+class LateFileCleanup(FakeExternalCleanup):
+    """Storage a running import writes into after the first removal; the verify step's removal can fail once."""
+
+    def __init__(self, failSecondRemoval=False):
+        super().__init__()
+        self.files = {"project-1/orders.parquet"}
+        self.removals = 0
+        self.failSecondRemoval = failSecondRemoval
+
+    def deleteStorage(self, userId, projectIds):
+        self.removals += 1
+        self._call("delete_storage", userId, tuple(projectIds))
+        if self.failSecondRemoval and self.removals == 2:
+            raise RuntimeError("storage unavailable")
+        self.files.clear()
+        return {"objectsDeleted": 1}
+
+    def deleteTransientState(self, userId, projectIds):
+        if not any(call[0] == "delete_transient_state" for call in self.calls):
+            self.files.add("project-1/metadata.json")  # an import step writes before its keys are forgotten
+        return super().deleteTransientState(userId, projectIds)
+
+    def verifyExternalErasure(self, userId, projectIds):
+        super().verifyExternalErasure(userId, projectIds)
+        return {"storageObjects": len(self.files)} if self.files else {}
+
+
+def test_file_written_after_the_first_storage_removal_is_removed_before_completion():
+    cleanup = LateFileCleanup()
+
+    result = _task(FakeRepository(), cleanup).execute("request-1")
+
+    assert result["status"] == "COMPLETED"
+    assert cleanup.files == set()
+
+
+def test_failed_second_storage_removal_retries_and_then_completes():
+    repository = FakeRepository(retryScheduled=True)
+    cleanup = LateFileCleanup(failSecondRemoval=True)
+
+    first = _task(repository, cleanup).execute("request-1")
+
+    assert first["status"] != "COMPLETED" and repository.scrubbed is False
+    assert cleanup.files == {"project-1/metadata.json"}
+    second = _task(repository, cleanup).execute("request-1")
+    assert second["status"] == "COMPLETED" and cleanup.files == set()
+
+
 def test_inventory_failure_is_durable_before_any_destructive_cleanup():
     repository = FakeRepository()
     cleanup = FakeExternalCleanup()
