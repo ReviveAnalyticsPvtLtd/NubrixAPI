@@ -106,7 +106,13 @@ def _projectExists(projectId: str) -> bool:
 
 def _requireProject(projectId: str) -> None:
     """Stop a job whose project is gone: it may have been started while the delete's own cleanup ran."""
-    if not _projectExists(projectId):
+    try:
+        exists = _projectExists(projectId)
+    except Exception as e:
+        # a brief Supabase error must not end the import; the next check, and every record write, still stop it
+        logger.warning(f"Project check of the import in project {projectId} failed ({type(e).__name__}).")
+        return
+    if not exists:
         importJobs.forget(projectId)
         raise JobStopped()
 
@@ -277,6 +283,7 @@ def runKpis(projectId: str, userId: str, jobId: str, skip: bool = False) -> None
         kpis = _record(projectId, jobId)["kpis"]
         if kpis in ("waiting", "running"):  # otherwise an earlier delivery stopped between the two writes below
             kpis = "skipped" if skip else _generateKpis(projectId, userId, jobId)
+            _requireProject(projectId)  # the model call is long; the project may have gone meanwhile
         _check(importJobs.setKpis(projectId, jobId, kpis))
         _check(importJobs.finish(projectId, jobId, "done"))
 

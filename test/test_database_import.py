@@ -764,6 +764,53 @@ def test_importStartedAfterTheProjectIsDeletedWritesNothing(job, step):
     assert job.redis.values == {}
 
 
+def test_projectCheckErrorLetsTheImportGoOn(job, monkeypatch):
+    makeTables(job.engine, {"a": (1, 1)})
+    tables, jobId = startJob(job)
+    monkeypatch.setattr(service, "_projectExists", Mock(side_effect=ConnectionError("Server disconnected")))
+    task = _FakeTask()
+
+    batch(task, jobId, [list(t) for t in tables])
+
+    assert job.jobs.get(PROJECT)["state"] == "running" and "a.parquet" in projectFiles(job)
+    assert task.sent[0][0] == "NubrixAI.importKpis"
+
+
+def test_kpisWrittenAfterADeleteThatKeptTheRecordAreRemoved(job):
+    jobId = job.jobs.start(PROJECT, [("a", "a")])
+    job.redis.set(f"import:{PROJECT}:next", f"{jobId}:kpis")
+    job.storage.putJson(PROJECT, "metadata.json", {"a": {}})
+
+    def insightsAfterDelete(projectId, userId=None):
+        # the route re-started the job between a delete's forget and its row delete
+        for key in [key for key in job.storage.objects if key.startswith(f"AnalyticsHub/{PROJECT}/")]:
+            del job.storage.objects[key]
+        job.project.exists = False
+        job.storage.putJson(PROJECT, "insights.json", [])
+
+    job.insights.side_effect = insightsAfterDelete
+    kpis(_FakeTask(), jobId)
+
+    assert projectFiles(job) == [] and job.redis.values == {}
+
+
+@pytest.mark.parametrize("rows, exists", [([], False), ([{"projectId": PROJECT}], True)])
+def test_projectExistsReadsTheProjectsRow(monkeypatch, rows, exists):
+    calls = []
+
+    class Query:
+        def __getattr__(self, name):
+            return lambda *args: calls.append((name, *args)) or self
+
+        def execute(self):
+            return types.SimpleNamespace(data=rows)
+
+    monkeypatch.setattr(dataLoadModule.dataLoadService, "client", Query())
+
+    assert service._projectExists(PROJECT) is exists
+    assert ("table", "Projects") in calls and ("eq", "projectId", PROJECT) in calls
+
+
 def test_deleteDuringTheLastProgressWriteLeavesNoKeys(job, monkeypatch):
     makeTables(job.engine, {"a": (1, 1)})
     tables, jobId = startJob(job)
