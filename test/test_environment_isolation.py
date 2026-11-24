@@ -7,18 +7,21 @@ import sys
 
 import pytest
 
+ROOT = Path(__file__).resolve().parents[1]
 CONFTEST = Path(__file__).with_name("conftest.py")
 LEAK = "inherited-app-value"
 REPLACED = {
     "REDIS_HOST": "127.0.0.1", "REDIS_PORT": "1", "REDIS_PASSWORD": "",
     "SECRET_KEY": "test-secret", "GEMINI_API_KEY": "test-key", "GROQ_API_KEY": "test-key",
+    "PAYMENT_RULES_EFFECTIVE_AT": "2026-01-01T00:00:00+00:00",
 }
 REMOVED = (
     "GOOGLE_API_KEY", "OPENAI_API_KEY", "CEREBRAS_API_KEY", "ANOTHER_PROVIDER_API_KEY",
     "LANGFUSE_SECRET_KEY", "LANGFUSE_PUBLIC_KEY", "LANGSMITH_TRACING", "LANGCHAIN_TRACING_V2",
     "SUPABASE_KEY_OLD", "USER_ERASURE_HMAC_SECRET", "PRICING_PROXY_SECRET",
     "SUBSCRIPTION_MODEL_PHASE", "NOTIFICATION_DISPATCH_ENABLED", "CREDIT_USAGE_SPOOL_DIR",
-    "FILE_URL", "DOMAIN_FILE_URL", "PAYMENT_FAILED_EMAIL_URL",
+    "FILE_URL", "DOMAIN_FILE_URL", "PAYMENT_FAILED_EMAIL_URL", "MANUAL_CHECKOUT_TTL_SECONDS",
+    "CELERY_BROKER_URL", "CELERY_RESULT_BACKEND", "PGHOSTADDR", "PGHOST", "PGPASSWORD", "PGSERVICEFILE",
 )
 
 
@@ -49,7 +52,11 @@ def test_dotenvFileCannotPutThemBack(tmp_path):
     assert not loaded  # asserting on the dict would print the environment when it fails
 
 
-def test_logsAreNotShipped():
-    code = "from logtail import LogtailHandler; os.environ['LOG_SINK'] = type(LogtailHandler(source_token='')).__name__; "
-
-    assert _environmentAfterSetup({}, code)["LOG_SINK"] == "NullHandler"
+@pytest.mark.parametrize("token, shipped", [("", False), ("test-token", True)])
+def test_logsShipOnlyWithAToken(tmp_path, token, shipped):
+    # a test's child process does not run conftest.py, so the logger itself must not ship without a token
+    child = "import sys, logtail; logtail.LogtailHandler = lambda *a, **k: sys.exit(3); import utils.logger"
+    env = {**os.environ, "LOGTAIL_TOKEN": token,
+           "PYTHONPATH": os.pathsep.join(filter(None, [str(ROOT), os.environ.get("PYTHONPATH")]))}
+    done = subprocess.run([sys.executable, "-c", child], cwd=tmp_path, env=env, capture_output=True, text=True, timeout=120)
+    assert done.returncode == (3 if shipped else 0), done.stderr[-2000:]

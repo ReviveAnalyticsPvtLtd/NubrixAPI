@@ -1,13 +1,10 @@
-import logging
 import os
 
 import dotenv
-import logtail
 
-# Tests take no application settings from the shell or from .env:
-# scripts imported by tests must not reload .env, and the log shipper sends even with a blank token.
+# Tests take no application settings from the shell or from .env: scripts imported by tests must not reload .env.
+# Child processes do not run this file, so they get this cleaned environment and must not read .env either.
 dotenv.load_dotenv = lambda *args, **kwargs: False
-logtail.LogtailHandler = lambda *args, **kwargs: logging.NullHandler()
 _APP_SETTINGS = {
     "BILLING_ADMIN_USER_IDS", "BREVO_API_BASE_URL", "BREVO_SENDER_EMAIL", "BREVO_SENDER_NAME",
     "CREDIT_USAGE_SPOOL_DIR", "DASHBOARD_BASE_URL", "DOMAIN_FILE_URL", "FILE_URL",
@@ -18,7 +15,9 @@ _APP_SETTINGS = {
 }
 for _key in list(os.environ):
     if (_key in _APP_SETTINGS or _key.endswith(("_API_KEY", "_EMAIL_URL"))
-            or _key.startswith(("LANGFUSE_", "LANGSMITH_", "LANGCHAIN_"))):
+            or _key.startswith(("LANGFUSE_", "LANGSMITH_", "LANGCHAIN_"))
+            # Celery reads its broker URL, and libpq its PG* settings, over the dummies below
+            or _key.startswith(("CELERY_", "PG")) or _key == "MANUAL_CHECKOUT_TTL_SECONDS"):
         del os.environ[_key]
 
 # Unit tests must never inherit the application's configured database URL.
@@ -44,7 +43,7 @@ os.environ["GROQ_API_KEY"] = "test-key"
 os.environ.setdefault("SANDBOX_ALLOW_SAME_UID", "1")
 
 # Automatic-capture rules cutover; unset blocks new Orders by design.
-os.environ.setdefault("PAYMENT_RULES_EFFECTIVE_AT", "2026-01-01T00:00:00+00:00")
+os.environ["PAYMENT_RULES_EFFECTIVE_AT"] = "2026-01-01T00:00:00+00:00"
 
 
 import pytest  # noqa: E402
