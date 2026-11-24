@@ -10,7 +10,7 @@ from sqlalchemy import create_engine, select, text
 from sqlalchemy.engine import URL
 
 from api.services.dataLoadService import DataLoadService
-from utils.connectionTargets import checkMongoUri, publicAddress, publicServers
+from utils.connectionTargets import BlockedAddressError, checkMongoUri, publicAddress, publicServers
 
 SourceTable = tuple[str, str | None]
 _SKIPPED_SCHEMAS = ("information_schema", "pg_catalog", "pg_toast")
@@ -48,7 +48,13 @@ def toSource(kind: str, body: dict) -> Source:
         if not body.get(field):
             raise ValueError(f"The {field} field is required.")
     if kind == "mongodb":
-        checkMongoUri(body["connectionString"])
+        try:
+            checkMongoUri(body["connectionString"])
+        except BlockedAddressError:
+            raise
+        except ValueError:
+            # the parser's message quotes the option value or URI part it rejected
+            raise ValueError("The connection string is not valid.") from None
         return Source(kind=kind, db=body["db"], connectionString=body["connectionString"])
     try:
         port = int(body["port"])

@@ -246,5 +246,35 @@ def test_mongoBodyNeverEchoesTheConnectionString(env, monkeypatch):
     assert SECRET not in str(env.jobs.get(PROJECT))
 
 
+CANARY = "hostcanary"
+
+
+def _private(*_args, **_kwargs):
+    return [(socket.AF_INET, socket.SOCK_STREAM, 6, "", ("10.0.0.1", 0))]
+
+
+@pytest.mark.parametrize("body", [
+    {"host": f"{CANARY}.internal"},
+    {"host": f"{CANARY}.example.com"},
+    {"source": "mongodb", "connectionString": f"mongodb://u:pw@{CANARY}.internal/shop"},
+    {"source": "mongodb", "connectionString": f"mongodb://u:pw@{CANARY}.example.com/shop"},
+    {"source": "mongodb", "connectionString": f"mongodb://u:pw@db.example.com/shop?maxPoolSize={CANARY}"},
+    {"source": "mongodb", "connectionString": f"mongodb://u:pw@db.example.com/shop?readPreference={CANARY}"},
+], ids=["sqlName", "sqlPrivate", "mongoName", "mongoPrivate", "mongoNumber", "mongoChoice"])
+def test_refusedConnectionNeverShowsItsHostOrOptions(env, monkeypatch, body):
+    from utils import connectionTargets
+    monkeypatch.setattr(databaseSources, "publicAddress", connectionTargets.publicAddress)  # the real checks
+    monkeypatch.setattr(connectionTargets.socket, "getaddrinfo", _private)
+    lines = []
+    sink = logger.add(lines.append)
+    try:
+        response = post(env, **body)
+    finally:
+        logger.remove(sink)
+    logged = "".join(str(line) for line in lines)
+    assert response.status_code == 400 and logged  # something was logged, and it was checked
+    assert CANARY not in response.text and CANARY not in logged
+
+
 def test_namesWithNoWordCharactersAreStoredAsTableAndKeptApart():
     assert dataLoader._uniqueNames([("$$$", None), ("###", None), ("table", None)]) == ["table", "table_2", "table_3"]
