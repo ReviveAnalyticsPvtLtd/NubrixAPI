@@ -4,7 +4,7 @@ storageListing.py
 Complete listings of project folders in the AnalyticsHub bucket.
 """
 
-__all__ = ["listProjectFiles"]
+__all__ = ["listProjectFiles", "removeProjectFiles"]
 
 
 _BUCKET = "AnalyticsHub"
@@ -28,3 +28,11 @@ def listProjectFiles(client, projectId: str) -> list[dict]:
         files.extend(page)
         if len(page) < _PAGE_SIZE:
             return files
+
+
+def removeProjectFiles(client, projectId: str) -> None:
+    """Remove every file in a project folder."""
+    paths = [f"{projectId}/{entry.get('name')}" for entry in listProjectFiles(client, projectId)]
+    # Storage refuses more than 1000 paths in one remove.
+    for start in range(0, len(paths), 1000):
+        client.storage.from_(_BUCKET).remove(paths[start : start + 1000])

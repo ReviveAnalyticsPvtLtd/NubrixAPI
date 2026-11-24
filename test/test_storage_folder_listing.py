@@ -93,7 +93,7 @@ def test_project_delete_removes_every_file_in_a_large_folder(importState):
     _management(bucket).deleteProject(PROJECT_ID)
 
     removed = [path for call in bucket.removeCalls for path in call]
-    assert sorted(removed) == sorted(os.path.join(PROJECT_ID, name) for name in names)
+    assert sorted(removed) == sorted(f"{PROJECT_ID}/{name}" for name in names)
     assert max(len(call) for call in bucket.removeCalls) <= MAX_REMOVE_PATHS
     importState.forget.assert_called_once_with(PROJECT_ID)
 

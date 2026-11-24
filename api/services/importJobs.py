@@ -63,8 +63,10 @@ class ImportJobs:
         raw = self._redis.get(self._key(projectId))
         return None if raw is None else json.loads(raw)
 
-    def _write(self, projectId: str, record: dict) -> None:
-        self._redis.set(self._key(projectId), json.dumps(record), ex=_RECORD_SECONDS)
+    def _write(self, projectId: str, record: dict, existing: bool = True) -> bool:
+        """False when `existing` and the record is gone: a forgotten project's record is never written back."""
+        options = {"xx": True} if existing else {}
+        return bool(self._redis.set(self._key(projectId), json.dumps(record), ex=_RECORD_SECONDS, **options))
 
     def _owned(self, projectId: str, jobId: str) -> dict | None:
         """The record, only if it belongs to jobId."""
@@ -89,7 +91,7 @@ class ImportJobs:
                     for name, storedAs in tables
                 ],
                 "kpis": "waiting",
-            })
+            }, existing=False)
         except Exception:
             self._redis.delete(self._lockKey(projectId))
             raise
@@ -121,8 +123,7 @@ class ImportJobs:
                 break
         else:
             raise ValueError(f"unknown table: {storedAs!r}")
-        self._write(projectId, record)
-        return True
+        return self._write(projectId, record)
 
     def setKpis(self, projectId: str, jobId: str, status: str) -> bool:
         if status not in _KPI_STATUSES:
@@ -131,8 +132,7 @@ class ImportJobs:
         if record is None:
             return False
         record["kpis"] = status
-        self._write(projectId, record)
-        return True
+        return self._write(projectId, record)
 
     def refreshLock(self, projectId: str, jobId: str) -> bool:
         """Extend the lock only while jobId still holds it."""
@@ -148,7 +148,8 @@ class ImportJobs:
         if record is None:
             return False
         record["state"] = state
-        self._write(projectId, record)
+        if not self._write(projectId, record):
+            return False
         if self._holdsLock(projectId, jobId):
             self._redis.delete(self._lockKey(projectId))
         return True

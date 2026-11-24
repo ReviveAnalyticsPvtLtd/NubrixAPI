@@ -12,10 +12,10 @@ class FakeRedis:
         self.ttls = {}
         self.failSetOn = None
 
-    def set(self, key, value, nx=False, ex=None):
+    def set(self, key, value, nx=False, xx=False, ex=None):
         if key == self.failSetOn:
             raise RuntimeError("redis unavailable")
-        if nx and key in self.values:
+        if (nx and key in self.values) or (xx and key not in self.values):
             return None
         self.values[key] = value.encode() if isinstance(value, str) else value
         self.ttls.pop(key, None)  # a plain SET clears the TTL, like real Redis
@@ -171,6 +171,21 @@ def test_finishedJobKeepsItsKpis():
     jobId = jobs.start("p1", TABLES)
     jobs.finish("p1", jobId, "done")
     assert jobs.get("p1")["kpis"] == "waiting"
+
+
+@pytest.mark.parametrize("write", ["setTable", "setKpis", "finish"])
+def test_forgottenRecordIsNotWrittenBack(monkeypatch, write):
+    jobs, redis = make()
+    jobId = jobs.start("p1", TABLES)
+    stale = jobs._read("p1")
+    jobs.forget("p1")  # the project is deleted between a write's read and its write
+    monkeypatch.setattr(jobs, "_owned", lambda projectId, jobId: stale)
+
+    written = {"setTable": lambda: jobs.setTable("p1", jobId, "orders", status="loading"),
+               "setKpis": lambda: jobs.setKpis("p1", jobId, "running"),
+               "finish": lambda: jobs.finish("p1", jobId, "done")}[write]()
+
+    assert written is False and redis.values == {}
 
 
 def test_forgetRemovesEveryKeyOfTheProject():

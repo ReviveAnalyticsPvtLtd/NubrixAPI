@@ -42,7 +42,7 @@ class _Client:
 
     def __init__(self, storage: FakePrivateStorage):
         self._storage = storage
-        self.storage = types.SimpleNamespace(from_=lambda _bucket: types.SimpleNamespace(list=self._list, upload=self._upload))
+        self.storage = types.SimpleNamespace(from_=lambda _bucket: types.SimpleNamespace(list=self._list, upload=self._upload, remove=self._remove))
 
     def table(self, _name):
         return _Query()
@@ -50,6 +50,10 @@ class _Client:
     def _list(self, path=None, options=None):
         prefix = f"AnalyticsHub/{path}/"
         return [{"name": key[len(prefix):], "metadata": {}} for key in self._storage.objects if key.startswith(prefix)]
+
+    def _remove(self, paths):
+        for path in paths:
+            self._storage.objects.pop(f"AnalyticsHub/{path}", None)
 
     def _upload(self, path, file, file_options=None):
         if isinstance(file, str):
@@ -708,6 +712,51 @@ def test_chunkSizeSettingsReachTheReader(job, monkeypatch):
     assert calls == [("mysql", ("a", None), (50000, 2000000)), ("mongodb", ("m", None), (5000, 2000000))]
 
 
+def eraseProject(job):
+    """What an erasure or a project delete leaves: no import keys, no project row, an empty folder."""
+    job.jobs.forget(PROJECT)
+    for key in [key for key in job.storage.objects if key.startswith(f"AnalyticsHub/{PROJECT}/")]:
+        del job.storage.objects[key]
+
+
+def projectFiles(job):
+    return sorted(key.rsplit("/", 1)[1] for key in job.storage.objects if key.startswith(f"AnalyticsHub/{PROJECT}/"))
+
+
+@pytest.mark.parametrize("projectRow", [[], [{"projectId": PROJECT}]], ids=["deleted", "kept"])
+def test_metadataWrittenAfterTheProjectIsErasedIsRemoved(job, monkeypatch, projectRow):
+    makeTables(job.engine, {"a": (1, 1)})
+    tables, jobId = startJob(job)
+    monkeypatch.setattr(_Query, "execute", lambda self: types.SimpleNamespace(data=projectRow))
+
+    def describeAfterErasure(projectId, tableNames, userId=None):
+        eraseProject(job)  # the erasure completes while the model call runs
+        job.storage.putJson(PROJECT, "metadata.json", {"a": {}})
+        return {"a": {}}
+
+    job.metadata.side_effect = describeAfterErasure
+    batch(_FakeTask(), jobId, [list(t) for t in tables])
+
+    assert projectFiles(job) == ([] if not projectRow else ["metadata.json"])
+    assert job.jobs.get(PROJECT) is None
+
+
+def test_kpisWrittenAfterTheProjectIsErasedAreRemoved(job, monkeypatch):
+    jobId = job.jobs.start(PROJECT, [("a", "a")])
+    job.redis.set(f"import:{PROJECT}:next", f"{jobId}:kpis")
+    job.storage.putJson(PROJECT, "metadata.json", {"a": {}})
+    monkeypatch.setattr(service, "creditsAllow", lambda *_: True)
+
+    def insightsAfterErasure(projectId, userId=None):
+        eraseProject(job)
+        job.storage.putJson(PROJECT, "insights.json", [])
+
+    job.insights.side_effect = insightsAfterErasure
+    kpis(_FakeTask(), jobId)
+
+    assert projectFiles(job) == [] and job.jobs.get(PROJECT) is None
+
+
 def test_forgottenJobStopsWithoutWritingMoreTables(job, monkeypatch):
     makeTables(job.engine, {name: (1, 1) for name in "ab"})
     tables, jobId = startJob(job)
@@ -729,7 +778,7 @@ def test_forgottenJobStopsWithoutWritingMoreTables(job, monkeypatch):
 
 def _management(monkeypatch, jobs):
     monkeypatch.setattr(managementModule, "importJobs", jobs)
-    monkeypatch.setattr(managementModule, "listProjectFiles", lambda client, projectId: [])
+    monkeypatch.setattr(managementModule, "removeProjectFiles", lambda client, projectId: None)
     management = object.__new__(managementModule.ManagementService)
     management.client = MagicMock()
     return management

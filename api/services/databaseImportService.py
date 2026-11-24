@@ -26,6 +26,7 @@ from api.services.managementService import managementService
 from utils.logger import logger
 from utils.projectStorage import StorageObjectNotFound, readJson
 from utils.sandboxLimits import _readInt
+from utils.storageListing import removeProjectFiles
 from utils.storedTables import TOO_LARGE_CODE, TableTooLargeError, writeStoredChunksToPath
 
 NAME_TAKEN = "A table with this name already exists"
@@ -89,10 +90,27 @@ def _holding(projectId: str, jobId: str, step):
         raise BatchBusy()
     try:
         yield lambda: redis.expire(key, _MARKER_SECONDS)
+    except JobStopped:
+        _removeIfDeleted(projectId)
+        raise
     finally:
         held = redis.get(key)
         if held is not None and held.decode() == value:
             redis.delete(key)
+
+
+def _removeIfDeleted(projectId: str) -> None:
+    """A step stopped by an erasure or project delete removes what it wrote after that delete's own removal.
+
+    Only when both the job record and the project row are gone, so a lost Redis record never empties a live project.
+    """
+    try:
+        if importJobs.get(projectId) is None and not (
+            dataLoadService.client.table("Projects").select("projectId").eq("projectId", projectId).limit(1).execute().data
+        ):
+            removeProjectFiles(dataLoadService.client, projectId)
+    except Exception as e:
+        logger.error(f"Files of stopped import in project {projectId} could not be cleaned up ({type(e).__name__}).")
 
 
 def _nextStep(projectId: str, jobId: str):
