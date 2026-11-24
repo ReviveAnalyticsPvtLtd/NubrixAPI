@@ -276,5 +276,24 @@ def test_refusedConnectionNeverShowsItsHostOrOptions(env, monkeypatch, body):
     assert CANARY not in response.text and CANARY not in logged
 
 
+def test_unencodableHostNeverShowsItsText(env, monkeypatch):
+    from utils import connectionTargets
+
+    def idna(host, *_args, **_kwargs):
+        raise UnicodeError(f"Invalid character {host!r}")  # Python's IDNA codec quotes the character it rejects
+
+    monkeypatch.setattr(databaseSources, "publicAddress", connectionTargets.publicAddress)
+    monkeypatch.setattr(connectionTargets.socket, "getaddrinfo", idna)
+    lines = []
+    sink = logger.add(lines.append)
+    try:
+        response = post(env, host=f"{CANARY}.example.com")
+    finally:
+        logger.remove(sink)
+    logged = "".join(str(line) for line in lines)
+    assert response.status_code == 400 and logged
+    assert CANARY not in response.text and CANARY not in logged
+
+
 def test_namesWithNoWordCharactersAreStoredAsTableAndKeptApart():
     assert dataLoader._uniqueNames([("$$$", None), ("###", None), ("table", None)]) == ["table", "table_2", "table_3"]

@@ -60,9 +60,16 @@ def toSource(kind: str, body: dict) -> Source:
         port = int(body["port"])
     except (TypeError, ValueError):
         raise ValueError("The port must be a number.") from None
+    try:
+        address = publicAddress(body["host"], port)
+    except BlockedAddressError:
+        raise
+    except ValueError:
+        # an unencodable host name raises UnicodeError, which quotes the character it rejected
+        raise ValueError("The host is not valid.") from None
     return Source(
         kind=kind, host=body["host"], port=port, user=body["user"],
-        password=body["password"], db=body["db"], address=publicAddress(body["host"], port),
+        password=body["password"], db=body["db"], address=address,
     )
 
 
