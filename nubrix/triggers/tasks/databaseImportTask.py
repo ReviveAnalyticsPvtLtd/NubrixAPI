@@ -6,9 +6,9 @@ Each batch enqueues the next one at the back of the queue, so imports take turns
 
 The broker is not a place for secrets, so a batch message carries the connection only inside `sealed`: every
 argument of the message, encrypted with a key derived from SECRET_KEY. A step runs only when its plain arguments
-match the sealed ones, so a message altered in the broker cannot change what is read, for whom, or where it is stored. A driver's error can still quote the
-credentials, so no exception leaves these tasks, logs name the exception's type only, and every message is sent with
-its args' repr redacted.
+match the sealed ones, so a message altered in the broker cannot change what is read, for whom, or where it is
+stored. A driver's error can still quote the credentials, so no exception leaves these tasks, logs name the
+exception's type only, and every message is sent with its args' repr redacted.
 
 The default worker, beat and the API import this module through nubrix/triggers/celery.py, so it imports the service
 (and with it the AI stack) only inside the task bodies, which run on the imports worker alone.

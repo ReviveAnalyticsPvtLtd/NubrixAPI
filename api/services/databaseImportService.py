@@ -43,7 +43,8 @@ _KPIS = "kpis"
 
 
 class JobStopped(Exception):
-    """The job was superseded, or this step was already done by another delivery: stop and enqueue nothing."""
+    """The job was superseded, its project was erased or deleted, or this step was already done by another delivery:
+    stop and enqueue nothing."""
 
 
 class BatchBusy(Exception):
@@ -99,15 +100,25 @@ def _holding(projectId: str, jobId: str, step):
             redis.delete(key)
 
 
+def _projectExists(projectId: str) -> bool:
+    return bool(dataLoadService.client.table("Projects").select("projectId").eq("projectId", projectId).limit(1).execute().data)
+
+
+def _requireProject(projectId: str) -> None:
+    """Stop a job whose project is gone: it may have been started while the delete's own cleanup ran."""
+    if not _projectExists(projectId):
+        importJobs.forget(projectId)
+        raise JobStopped()
+
+
 def _removeIfDeleted(projectId: str) -> None:
     """A step stopped by an erasure or project delete removes what it wrote after that delete's own removal.
 
     Only when both the job record and the project row are gone, so a lost Redis record never empties a live project.
     """
     try:
-        if importJobs.get(projectId) is None and not (
-            dataLoadService.client.table("Projects").select("projectId").eq("projectId", projectId).limit(1).execute().data
-        ):
+        if importJobs.get(projectId) is None and not _projectExists(projectId):
+            importJobs.forget(projectId)  # a step may have set its pointer again after the delete
             removeProjectFiles(dataLoadService.client, projectId)
     except Exception as e:
         logger.error(f"Files of stopped import in project {projectId} could not be cleaned up ({type(e).__name__}).")
@@ -125,6 +136,7 @@ def _nextStep(projectId: str, jobId: str):
 def _advance(projectId: str, jobId: str, step) -> None:
     _record(projectId, jobId)
     importJobs._redis.set(f"import:{projectId}:next", f"{jobId}:{step}", ex=_POINTER_SECONDS)
+    _record(projectId, jobId)  # a delete between the two must not leave the pointer, or send the next step
 
 
 def runBatch(projectId: str, userId: str, jobId: str, source: Source, tables: list[SourceTable], start: int,
@@ -136,6 +148,7 @@ def runBatch(projectId: str, userId: str, jobId: str, source: Source, tables: li
     CreditsUnavailable when credits could not be checked.
     """
     with _holding(projectId, jobId, start) as refreshMarker:
+        _requireProject(projectId)
         step = _nextStep(projectId, jobId)
         if step == _KPIS or step > start:
             raise JobStopped()
@@ -260,6 +273,7 @@ def runKpis(projectId: str, userId: str, jobId: str, skip: bool = False) -> None
     CreditsUnavailable when credits could not be checked.
     """
     with _holding(projectId, jobId, _KPIS):
+        _requireProject(projectId)
         kpis = _record(projectId, jobId)["kpis"]
         if kpis in ("waiting", "running"):  # otherwise an earlier delivery stopped between the two writes below
             kpis = "skipped" if skip else _generateKpis(projectId, userId, jobId)

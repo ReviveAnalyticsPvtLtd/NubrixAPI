@@ -90,9 +90,12 @@ def job(monkeypatch, tmp_path):
     monkeypatch.setattr(managementModule.managementService, "generateInsightsForProject", insights)
     credits = Mock(return_value=True)
     monkeypatch.setattr(service, "creditsAllow", credits)
+    project = types.SimpleNamespace(exists=True)  # whether the Projects row is there
+    monkeypatch.setattr(service, "_projectExists", lambda projectId: project.exists)
     engine = sqlalchemy.create_engine(f"sqlite:///{tmp_path / 'source.db'}")
     with patch.object(ds, "_engine", return_value=engine):
-        yield types.SimpleNamespace(storage=storage, jobs=jobs, redis=redis, metadata=metadata, insights=insights, credits=credits, engine=engine)
+        yield types.SimpleNamespace(storage=storage, jobs=jobs, redis=redis, metadata=metadata, insights=insights, credits=credits,
+                                    engine=engine, project=project)
     storage.close()
 
 
@@ -716,6 +719,7 @@ def test_chunkSizeSettingsReachTheReader(job, monkeypatch):
 def eraseProject(job):
     """What an erasure or a project delete leaves: no import keys, no project row, an empty folder."""
     job.jobs.forget(PROJECT)
+    job.project.exists = False
     for key in [key for key in job.storage.objects if key.startswith(f"AnalyticsHub/{PROJECT}/")]:
         del job.storage.objects[key]
 
@@ -724,22 +728,57 @@ def projectFiles(job):
     return sorted(key.rsplit("/", 1)[1] for key in job.storage.objects if key.startswith(f"AnalyticsHub/{PROJECT}/"))
 
 
-@pytest.mark.parametrize("projectRow", [[], [{"projectId": PROJECT}]], ids=["deleted", "kept"])
-def test_metadataWrittenAfterTheProjectIsErasedIsRemoved(job, monkeypatch, projectRow):
+@pytest.mark.parametrize("rowDeleted", [True, False], ids=["deleted", "kept"])
+def test_metadataWrittenAfterTheProjectIsErasedIsRemoved(job, rowDeleted):
     makeTables(job.engine, {"a": (1, 1)})
     tables, jobId = startJob(job)
-    monkeypatch.setattr(_Query, "execute", lambda self: types.SimpleNamespace(data=projectRow))
 
     def describeAfterErasure(projectId, tableNames, userId=None):
         eraseProject(job)  # the erasure completes while the model call runs
+        job.project.exists = not rowDeleted  # kept: only the Redis keys were lost
         job.storage.putJson(PROJECT, "metadata.json", {"a": {}})
         return {"a": {}}
 
     job.metadata.side_effect = describeAfterErasure
     batch(_FakeTask(), jobId, [list(t) for t in tables])
 
-    assert projectFiles(job) == ([] if not projectRow else ["metadata.json"])
+    assert projectFiles(job) == ([] if rowDeleted else ["metadata.json"])
     assert job.jobs.get(PROJECT) is None
+
+
+@pytest.mark.parametrize("step", ["batch", "kpis"])
+def test_importStartedAfterTheProjectIsDeletedWritesNothing(job, step):
+    makeTables(job.engine, {"a": (1, 1)})
+    tables, jobId = startJob(job)  # the route listed tables while the delete's own cleanup ran
+    job.project.exists = False
+    task = _FakeTask()
+
+    if step == "batch":
+        batch(task, jobId, [list(t) for t in tables])
+    else:
+        job.redis.set(f"import:{PROJECT}:next", f"{jobId}:kpis")
+        kpis(task, jobId)
+
+    assert projectFiles(job) == [] and task.sent == []
+    assert not job.metadata.called and not job.insights.called
+    assert job.redis.values == {}
+
+
+def test_deleteDuringTheLastProgressWriteLeavesNoKeys(job, monkeypatch):
+    makeTables(job.engine, {"a": (1, 1)})
+    tables, jobId = startJob(job)
+    realSet = job.redis.set
+
+    def deleteThenSet(key, value, **options):
+        if key.endswith(":next"):
+            eraseProject(job)
+        return realSet(key, value, **options)
+
+    monkeypatch.setattr(job.redis, "set", deleteThenSet)
+    task = _FakeTask()
+    batch(task, jobId, [list(t) for t in tables])
+
+    assert job.redis.values == {} and projectFiles(job) == [] and task.sent == []
 
 
 def test_kpisWrittenAfterTheProjectIsErasedAreRemoved(job, monkeypatch):
