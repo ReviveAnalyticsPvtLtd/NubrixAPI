@@ -55,7 +55,11 @@ def _setting(name: str, default: int) -> int:
 
 def _storedAs(table: tuple) -> str:
     """The name a table is stored under: a third element when the route made names unique, else derived."""
-    return table[2] if len(table) == 3 else storedName(table)
+    name = table[2] if len(table) == 3 else storedName(table)
+    # the route only makes sanitised names; anything else could reach another project's storage path
+    if not name or name != dataLoadService._sanitizeName(name):
+        raise ValueError("unsafe stored name")
+    return name
 
 
 def _check(written: bool) -> None:

@@ -123,12 +123,12 @@ def runNotificationCleanup():
     return NotificationCleanupTask().execute()
 
 @celeryApp.task(name=IMPORT_BATCH_TASK, **IMPORT_TASK_OPTIONS)
-def runImportBatch(self, projectId: str, userId: str, jobId: str, sealedSource: str, tables: list, start: int):
-    importBatch(self, projectId, userId, jobId, sealedSource, tables, start)
+def runImportBatch(self, projectId: str, userId: str, jobId: str, sealed: str, tables: list, start: int):
+    importBatch(self, projectId, userId, jobId, sealed, tables, start)
 
 @celeryApp.task(name=IMPORT_KPIS_TASK, **IMPORT_TASK_OPTIONS)
-def runImportKpis(self, projectId: str, userId: str, jobId: str):
-    importKpis(self, projectId, userId, jobId)
+def runImportKpis(self, projectId: str, userId: str, jobId: str, sealed: str):
+    importKpis(self, projectId, userId, jobId, sealed)
 
 # Imports have their own worker program (supervisord `celery-imports`), so they never hold the default queue's workers.
 celeryApp.conf.task_routes = {
