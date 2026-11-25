@@ -21,7 +21,7 @@ from api.services import databaseSources
 from api.services.importJobs import ImportJobs
 from nubrix.triggers.tasks import databaseImportTask
 from test.test_import_jobs import FakeRedis
-from utils import exceptionHandler
+from utils import connectionTargets, exceptionHandler
 from utils.connectionTargets import BLOCKED_ADDRESS_MESSAGE, BlockedAddressError
 
 OWNER = UserContext(userId="owner-user", email="owner@test.example", token="t")
@@ -130,8 +130,11 @@ def test_eachLoaderBuildsItsOwnSource(env, monkeypatch, source):
     assert env.toSource.call_args.args[0] == source
 
 
-def test_oldSingleTableBodyOnlyLists(env):
-    response = listing(env, table="orders")
+@pytest.mark.parametrize("source,field", [("mysql", "table"), ("mongodb", "collection")])
+def test_oldSingleTableBodyOnlyLists(env, monkeypatch, source, field):
+    monkeypatch.setattr(databaseSources, "checkMongoUri", lambda value: None)
+    # older clients still send the one table or collection they meant to load
+    response = listing(env, source=source, connectionString="mongodb://u:p@db.example.com/shop", **{field: "orders"})
     assert response.status_code == 200 and response.json() == {"tables": CHOSEN}
     assert env.jobs.get(PROJECT) is None
     env.send.assert_not_called()
@@ -283,6 +286,15 @@ def test_unresolvableHostIs400(env, route, monkeypatch):
     monkeypatch.setattr(databaseSources, "publicAddress", gone)
     response = call(env, route)
     assert (response.status_code, response.json()["message"]) == (400, CONNECT_FAILURE)
+
+
+def test_unresolvableMongoHostIs400(env, route, monkeypatch):
+    def gone(*_args, **_kwargs):
+        raise socket.gaierror("nope")
+    monkeypatch.setattr(connectionTargets.socket, "getaddrinfo", gone)
+    response = call(env, route, source="mongodb", connectionString="mongodb://u:p@nowhere.example/shop")
+    assert (response.status_code, response.json()["message"]) == (400, CONNECT_FAILURE)
+    assert "nowhere.example" not in response.text
 
 
 def test_noTablesIs422(env, route, monkeypatch):

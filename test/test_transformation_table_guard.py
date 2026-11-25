@@ -996,7 +996,7 @@ def _upload_file(name):
 def _runSync(coroutine):
     """Run a coroutine to the end, also from a hook that fires inside a running event loop (a load inside an apply, or the reverse)."""
     with ThreadPoolExecutor(max_workers=1) as pool:
-        return pool.submit(asyncio.run, coroutine).result()
+        return pool.submit(asyncio.run, coroutine).result(timeout=120)  # a deadlocked hook fails instead of hanging
 
 
 def _loadVia(kind, service, tableName, pdfTables=1):

@@ -98,6 +98,8 @@ def test_failedLoadsStillAnswerAndLog(output):
     answers = [line for line in output["stdout"].splitlines() if line.startswith("ANSWER")]
     assert len(answers) == len(URIS) + 2
     assert all(line.startswith("ANSWER 400") for line in answers), answers
+    # the MySQL and PostgreSQL answers come first; the Mongo URIs fail at the URI check or the driver
+    assert all("Unable to connect: check host/port/credentials." in line for line in answers[:2]), answers
     assert sum("Unable to connect: check host/port/credentials." in line for line in answers) >= 3, answers
     assert "could not connect (OperationalError)" in output["log file"]
 
