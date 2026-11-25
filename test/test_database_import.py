@@ -262,6 +262,20 @@ def test_resumedLastTableStillMarksTheProjectModified(job, monkeypatch):
     assert touched == [PROJECT]
 
 
+def test_redeliveryAfterEveryTableWasMarkedStillMarksTheProjectModified(job, monkeypatch):
+    makeTables(job.engine, {name: (1, 1) for name in "ab"})
+    tables, jobId = startJob(job)
+    # the dead delivery marked both tables, then died before touching the project
+    for name in "ab":
+        job.jobs.setTable(PROJECT, jobId, name, status="loaded", rows=1)
+    touched = []
+    monkeypatch.setattr(service, "updateProjectModifiedAt", touched.append)
+
+    assert service.runBatch(PROJECT, USER, jobId, MYSQL, tables, 0) is None
+
+    assert touched == [PROJECT]
+
+
 def test_resumedTablesDoNotCountTowardTheBatch(job, monkeypatch):
     makeTables(job.engine, {name: (1, 1) for name in "abcdefg"})
     monkeypatch.setenv("IMPORT_BATCH_TABLES", "2")

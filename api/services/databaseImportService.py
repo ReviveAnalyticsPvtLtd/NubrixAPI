@@ -11,7 +11,7 @@ connection's user, host or password, and table names are the customer's.
 Two Redis keys beside the job's record keep deliveries apart. `import:{projectId}:batch` is held by the delivery
 running a batch, so a second delivery of it waits instead of running it twice.
 `import:{projectId}:next` names the step that should run next, so a late delivery of a step another delivery
-already finished does nothing.
+already finished does nothing, except end a job the last batch's delivery left running when it died.
 """
 
 __all__ = ["BatchBusy", "JobStopped", "runBatch", "failJob"]
@@ -181,6 +181,8 @@ def _runBatch(projectId, jobId, source, tables, start, refreshMarker) -> int | N
         storedAs = _storedAs(table)
         state = status[storedAs]
         if state in ("skipped", "failed", "loaded"):
+            # loaded on entry means an earlier delivery of this batch stored it and died, maybe before touching the project
+            resumed += state == "loaded"
             continue
         if state == "loading" and tableFileState(dataLoadService.client, projectId, storedAs) is not None:
             # stored by an earlier delivery of this batch, which died before marking it
@@ -194,7 +196,7 @@ def _runBatch(projectId, jobId, source, tables, start, refreshMarker) -> int | N
         if fields["status"] == "loaded":
             columns += width
             loaded += 1
-    if loaded or resumed:  # a dead delivery stored the resumed ones but never got to touch the project
+    if loaded or resumed:
         updateProjectModifiedAt(projectId)
     logger.info(f"Import job {jobId} in project {projectId}: batch from {start} loaded {loaded} of {attempted} tables.")
     return index if index < len(tables) else None
