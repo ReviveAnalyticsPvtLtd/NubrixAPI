@@ -134,7 +134,8 @@ def test_eachLoaderBuildsItsOwnSource(env, monkeypatch, source):
 def test_oldSingleTableBodyOnlyLists(env, monkeypatch, source, field):
     monkeypatch.setattr(databaseSources, "checkMongoUri", lambda value: None)
     # older clients still send the one table or collection they meant to load
-    response = listing(env, source=source, connectionString="mongodb://u:p@db.example.com/shop", **{field: "orders"})
+    mongo = {"connectionString": "mongodb://u:p@db.example.com/shop"} if source == "mongodb" else {}
+    response = listing(env, source=source, **mongo, **{field: "orders"})
     assert response.status_code == 200 and response.json() == {"tables": CHOSEN}
     assert env.jobs.get(PROJECT) is None
     env.send.assert_not_called()

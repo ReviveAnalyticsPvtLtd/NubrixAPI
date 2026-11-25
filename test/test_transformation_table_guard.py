@@ -1,7 +1,7 @@
 """Tests for the base-table guard on transformation output names."""
 
 import asyncio
-from concurrent.futures import ThreadPoolExecutor
+import threading
 import copy
 import hashlib
 import io
@@ -995,8 +995,22 @@ def _upload_file(name):
 
 def _runSync(coroutine):
     """Run a coroutine to the end, also from a hook that fires inside a running event loop (a load inside an apply, or the reverse)."""
-    with ThreadPoolExecutor(max_workers=1) as pool:
-        return pool.submit(asyncio.run, coroutine).result(timeout=120)  # a deadlocked hook fails instead of hanging
+    outcome = {}
+
+    def run():
+        try:
+            outcome["value"] = asyncio.run(coroutine)
+        except BaseException as error:
+            outcome["error"] = error
+
+    # a daemon thread, so a deadlocked hook fails the test instead of hanging the run (a pool would be joined)
+    worker = threading.Thread(target=run, daemon=True)
+    worker.start()
+    worker.join(120)
+    assert not worker.is_alive(), "the coroutine did not finish within 120 s"
+    if "error" in outcome:
+        raise outcome["error"]
+    return outcome.get("value")
 
 
 def _loadVia(kind, service, tableName, pdfTables=1):
