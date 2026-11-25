@@ -145,7 +145,7 @@ class LoadMongoDB(BaseModel):
     db: str
     collection: str
 
-class ImportDatabase(BaseModel):
+class DatabaseConnection(BaseModel):
     projectId: str
     source: Literal["mysql", "postgresql", "mongodb"]
     host: str | None = None

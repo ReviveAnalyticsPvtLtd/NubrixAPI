@@ -674,7 +674,25 @@ Also clears `latest_approved_artifact` on the transformation that produced the t
 
 ---
 
-### 3.8 `POST /api/latest/dataLoader/importDatabase`
+### 3.8 `POST /api/latest/dataLoader/listDatabaseTables`
+
+Step 1 of a database import: connects and lists the tables, so the user can choose which to import. Imports nothing, writes nothing and takes no credits; needs product access and the project's owner. The body is the same connection as `importDatabase` (3.9) without `tables`. Tables are listed in the order `importDatabase` uses, with the same skipped schemas and partitions. `name` is what the user sees (schema-qualified outside `public`), `storedAs` the name the table would be stored under.
+
+**Response (200):**
+```json
+{
+  "tables": [
+    {"name": "orders", "storedAs": "orders"},
+    {"name": "sales.orders", "storedAs": "sales_orders"}
+  ]
+}
+```
+
+**Errors:** `400` (missing field, blocked address or connection failure; never the driver's text), `404` (not the project's owner), `422` (no tables found).
+
+---
+
+### 3.9 `POST /api/latest/dataLoader/importDatabase`
 
 Starts a background import of every table of a database connection. It only loads the tables; metadata and KPIs are a separate step. Needs `metadata_generation` credits and the project's owner. PostgreSQL system and managed-platform schemas (for example Supabase's `auth` and `storage`) and partitions of partitioned tables are skipped. Table names are stored sanitized, schema-qualified outside `public`, with `_2`, `_3`, ... when two map to the same name.
 
@@ -713,7 +731,7 @@ Starts a background import of every table of a database connection. It only load
 
 ---
 
-### 3.9 `GET /api/latest/dataLoader/importStatus/{projectId}`
+### 3.10 `GET /api/latest/dataLoader/importStatus/{projectId}`
 
 Progress record of the project's latest import, kept 7 days. `state` is `running`, `done` or `failed` (a job whose worker stopped is reported `failed`); table `status` is `pending`, `loading`, `loaded`, `skipped` or `failed` with a fixed `reason`. The record never holds connection details. The import only loads tables: once `state` is `done`, the client runs metadata and KPIs through `generateMetadata` and `generateKpis`, as for the other connectors.
 

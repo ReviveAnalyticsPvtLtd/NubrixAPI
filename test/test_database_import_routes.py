@@ -1,4 +1,4 @@
-"""POST /loaders/importDatabase and GET /loaders/importStatus/{projectId}."""
+"""POST /loaders/listDatabaseTables, POST /loaders/importDatabase and GET /loaders/importStatus/{projectId}."""
 import json
 import socket
 from unittest.mock import Mock
@@ -90,6 +90,35 @@ def post(env, **changes):
     return env.client.post("/loaders/importDatabase", json={**BODY, **changes})
 
 
+IMPORT, LIST = "/loaders/importDatabase", "/loaders/listDatabaseTables"
+SUCCESS = {IMPORT: 202, LIST: 200}
+
+
+@pytest.fixture(params=[IMPORT, LIST], ids=["import", "list"])
+def route(request):
+    """Both routes connect and list the same way, so every connection check runs against each."""
+    return request.param
+
+
+def call(env, route, **changes):
+    return post(env, **changes) if route == IMPORT else env.client.post(LIST, json={**BODY, **changes})
+
+
+def listing(env, **changes):
+    return env.client.post(LIST, json={**BODY, **changes})
+
+
+def test_listAnswersNamesAndStoredNames(env):
+    response = listing(env)
+    assert response.status_code == 200
+    assert response.json() == {"tables": [
+        {"name": "orders", "storedAs": "orders"}, {"name": "a b", "storedAs": "a_b"},
+        {"name": "a_b", "storedAs": "a_b_2"}, {"name": "sales.users", "storedAs": "sales_users"},
+        {"name": "t", "storedAs": "t"}]}
+    assert env.jobs.get(PROJECT) is None
+    env.send.assert_not_called()
+
+
 def test_startsJobAndAnswers202(env):
     response = post(env)
     assert response.status_code == 202
@@ -110,8 +139,8 @@ def test_enqueuesFirstBatchOnce(env):
     assert env.send.call_args.kwargs["start"] == 0
 
 
-def test_answerNeverEchoesThePassword(env):
-    response = post(env)
+def test_answerNeverEchoesThePassword(env, route):
+    response = call(env, route)
     assert SECRET not in response.text
     assert SECRET not in str(env.jobs.get(PROJECT))
 
@@ -134,33 +163,33 @@ def test_missingFieldIs400(env):
     env.send.assert_not_called()
 
 
-def test_blockedAddressIs400(env, monkeypatch):
+def test_blockedAddressIs400(env, route, monkeypatch):
     def blocked(host, port):
         raise BlockedAddressError("10.0.0.1")
     monkeypatch.setattr(databaseSources, "publicAddress", blocked)
-    response = post(env)
+    response = call(env, route)
     assert (response.status_code, response.json()["message"]) == (400, BLOCKED_ADDRESS_MESSAGE)
 
 
 @pytest.mark.parametrize("failure", [RuntimeError(f"login failed for {SECRET}"), ConnectionError("x")])
-def test_listFailureIs400WithoutDriverText(env, monkeypatch, failure):
+def test_listFailureIs400WithoutDriverText(env, route, monkeypatch, failure):
     monkeypatch.setattr(dataLoader, "listTables", Mock(side_effect=failure))
-    response = post(env)
+    response = call(env, route)
     assert (response.status_code, response.json()["message"]) == (400, CONNECT_FAILURE)
     assert SECRET not in response.text
 
 
-def test_unresolvableHostIs400(env, monkeypatch):
+def test_unresolvableHostIs400(env, route, monkeypatch):
     def gone(host, port):
         raise socket.gaierror("nope")
     monkeypatch.setattr(databaseSources, "publicAddress", gone)
-    response = post(env)
+    response = call(env, route)
     assert (response.status_code, response.json()["message"]) == (400, CONNECT_FAILURE)
 
 
-def test_noTablesIs422(env, monkeypatch):
+def test_noTablesIs422(env, route, monkeypatch):
     monkeypatch.setattr(dataLoader, "listTables", Mock(return_value=[]))
-    response = post(env)
+    response = call(env, route)
     assert (response.status_code, response.json()["message"]) == (422, "No tables found.")
 
 
@@ -171,9 +200,9 @@ def test_runningImportIs409(env):
     assert env.send.call_count == 1
 
 
-def test_nonOwnerNeverTouchesTheHost(env):
+def test_nonOwnerNeverTouchesTheHost(env, route):
     env.owners.owner = "someone-else"
-    response = post(env)
+    response = call(env, route)
     assert response.status_code == 404
     dataLoader.listTables.assert_not_called()
     env.toSource.assert_not_called()
@@ -197,12 +226,12 @@ def test_statusChecksOwnerFirst(env):
     assert env.owners.calls == 1
 
 
-def test_listTablesValueErrorDoesNotLeak(env, monkeypatch, caplog):
+def test_listTablesValueErrorDoesNotLeak(env, route, monkeypatch, caplog):
     lines = []
     sink = logger.add(lines.append)
     monkeypatch.setattr(dataLoader, "listTables", Mock(side_effect=ValueError(f"'latin-1' codec can't encode {SECRET}")))
     try:
-        response = post(env)
+        response = call(env, route)
     finally:
         logger.remove(sink)
     assert (response.status_code, response.json()["message"]) == (400, CONNECT_FAILURE)
@@ -212,9 +241,9 @@ def test_listTablesValueErrorDoesNotLeak(env, monkeypatch, caplog):
     assert SECRET not in logged
 
 
-def test_validationErrorDoesNotEchoThePassword(env):
+def test_validationErrorDoesNotEchoThePassword(env, route):
     body = {k: v for k, v in BODY.items() if k != "db"}
-    response = env.client.post("/loaders/importDatabase", json=body)
+    response = env.client.post(route, json=body)
     assert response.status_code == 422
     assert SECRET not in response.text
     assert response.json()["detail"][0]["loc"][-1] == "db"
@@ -236,12 +265,12 @@ def test_failedEnqueueFreesTheProject(env):
     assert post(env).status_code == 202
 
 
-def test_mongoBodyNeverEchoesTheConnectionString(env, monkeypatch):
+def test_mongoBodyNeverEchoesTheConnectionString(env, route, monkeypatch):
     uri = "mongodb://user:" + SECRET + "@db.example.com/shop"
     monkeypatch.setattr(databaseSources, "checkMongoUri", lambda value: None)
-    response = env.client.post("/loaders/importDatabase", json={
+    response = env.client.post(route, json={
         "projectId": PROJECT, "source": "mongodb", "db": "shop", "connectionString": uri})
-    assert response.status_code == 202
+    assert response.status_code == SUCCESS[route]
     assert SECRET not in response.text
     assert SECRET not in str(env.jobs.get(PROJECT))
 
@@ -261,14 +290,14 @@ def _private(*_args, **_kwargs):
     {"source": "mongodb", "connectionString": f"mongodb://u:pw@db.example.com/shop?maxPoolSize={CANARY}"},
     {"source": "mongodb", "connectionString": f"mongodb://u:pw@db.example.com/shop?readPreference={CANARY}"},
 ], ids=["sqlName", "sqlPrivate", "mongoName", "mongoPrivate", "mongoNumber", "mongoChoice"])
-def test_refusedConnectionNeverShowsItsHostOrOptions(env, monkeypatch, body):
+def test_refusedConnectionNeverShowsItsHostOrOptions(env, route, monkeypatch, body):
     from utils import connectionTargets
     monkeypatch.setattr(databaseSources, "publicAddress", connectionTargets.publicAddress)  # the real checks
     monkeypatch.setattr(connectionTargets.socket, "getaddrinfo", _private)
     lines = []
     sink = logger.add(lines.append)
     try:
-        response = post(env, **body)
+        response = call(env, route, **body)
     finally:
         logger.remove(sink)
     logged = "".join(str(line) for line in lines)
@@ -276,7 +305,7 @@ def test_refusedConnectionNeverShowsItsHostOrOptions(env, monkeypatch, body):
     assert CANARY not in response.text and CANARY not in logged
 
 
-def test_unencodableHostNeverShowsItsText(env, monkeypatch):
+def test_unencodableHostNeverShowsItsText(env, route, monkeypatch):
     from utils import connectionTargets
 
     def idna(host, *_args, **_kwargs):
@@ -287,7 +316,7 @@ def test_unencodableHostNeverShowsItsText(env, monkeypatch):
     lines = []
     sink = logger.add(lines.append)
     try:
-        response = post(env, host=f"{CANARY}.example.com")
+        response = call(env, route, host=f"{CANARY}.example.com")
     finally:
         logger.remove(sink)
     logged = "".join(str(line) for line in lines)

@@ -10,7 +10,7 @@ __all__ = ["router"]
 
 
 from api.models import (
-    ImportDatabase,
+    DatabaseConnection,
     LoadMySQLorPostgreSQL,
     LoadMongoDB,
     DeleteTable
@@ -202,15 +202,14 @@ def _uniqueNames(tables: list) -> list[str]:
     return names
 
 
-@router.post("/importDatabase", status_code=202)
-async def importDatabase(body: ImportDatabase, user: UserContext = Depends(requireCredits("metadata_generation"))):
-    """
-    Start a background import of every table of a database connection.
+def _displayName(table: tuple) -> str:
+    """The name the user sees: schema-qualified outside `public`."""
+    name, schema = table
+    return f"{schema}.{name}" if schema not in (None, "public") else name
 
-    Returns:
-        ORJSONResponse: 202 with the jobId and the names the tables will be stored under.
-    """
-    await asyncio.to_thread(requireProjectOwner, body.projectId, user)
+
+async def _connect(body: DatabaseConnection) -> tuple:
+    """Connect and list the tables, after the route's owner check: the source, its tables and their stored names."""
     try:
         source = await asyncio.to_thread(toSource, body.source, body.model_dump())
     except BlockedAddressError as e:
@@ -226,9 +225,35 @@ async def importDatabase(body: ImportDatabase, user: UserContext = Depends(requi
         _connectFailure(body.projectId, e)
     if not tables:
         _refuse(LookupError("No tables found."), 422, "No tables found.")
-    stored = _uniqueNames(tables)
-    named = [(f"{schema}.{name}" if schema not in (None, "public") else name, storedAs)
-             for (name, schema), storedAs in zip(tables, stored)]
+    return source, tables, _uniqueNames(tables)
+
+
+@router.post("/listDatabaseTables")
+async def listDatabaseTables(body: DatabaseConnection, user: UserContext = Depends(requireProductAccess)):
+    """
+    List the tables of a database connection, so the user can choose which to import. Imports nothing and takes no
+    credits.
+
+    Returns:
+        ORJSONResponse: 200 with each table's name and the name it would be stored under.
+    """
+    await asyncio.to_thread(requireProjectOwner, body.projectId, user)
+    _, tables, stored = await _connect(body)
+    return ORJSONResponse(status_code=200, content={
+        "tables": [{"name": _displayName(table), "storedAs": storedAs} for table, storedAs in zip(tables, stored)]})
+
+
+@router.post("/importDatabase", status_code=202)
+async def importDatabase(body: DatabaseConnection, user: UserContext = Depends(requireCredits("metadata_generation"))):
+    """
+    Start a background import of every table of a database connection.
+
+    Returns:
+        ORJSONResponse: 202 with the jobId and the names the tables will be stored under.
+    """
+    await asyncio.to_thread(requireProjectOwner, body.projectId, user)
+    source, tables, stored = await _connect(body)
+    named = [(_displayName(table), storedAs) for table, storedAs in zip(tables, stored)]
     jobId = await asyncio.to_thread(importJobs.start, body.projectId, named)
     if jobId is None:
         _refuse(RuntimeError("import running"), 409, "An import is already running for this project.")
