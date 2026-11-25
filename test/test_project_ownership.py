@@ -162,7 +162,7 @@ def test_every_project_route_checks_ownership_before_doing_anything(endpoint):
 
 def test_route_inventory_covers_the_known_project_routes():
     # A broken inventory would let the check above pass by finding nothing.
-    assert len(projectRoutes()) == 55
+    assert len(projectRoutes()) == 54
 
 
 @pytest.mark.parametrize("user,status,called", [(OWNER, 200, True), (OTHER, 404, False)])

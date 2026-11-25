@@ -3,17 +3,13 @@ import types
 
 import pytest
 
-from api.services.dataLoadService import dataLoadService
-from api.models import LoadMongoDB, LoadMySQLorPostgreSQL
 from utils import connectionTargets
 from utils.connectionTargets import (
-    BLOCKED_ADDRESS_MESSAGE,
     BlockedAddressError,
     checkMongoUri,
     publicAddress,
     publicServers,
 )
-from utils.exceptionHandler import CustomException
 
 
 def _resolveTo(monkeypatch, *ips):
@@ -66,20 +62,6 @@ def test_mongoUriWithPublicHostsPasses(monkeypatch):
     checkMongoUri("mongodb://ignored")
 
 
-def test_oldLoaderRefusesPrivateHost(monkeypatch):
-    import api.services.dataLoadService as module
-
-    def boom(*a, **k):
-        raise AssertionError("create_engine must not run")
-    monkeypatch.setattr(module, "create_engine", boom)
-    _resolveTo(monkeypatch, "10.0.0.1")
-    connection = LoadMySQLorPostgreSQL(host="10.0.0.1", port=3306, user="u", password="p", db="d", table="t", projectId="p1")
-    with pytest.raises(CustomException) as caught:
-        dataLoadService.loadMySql(connection)
-    assert caught.value.statusCode == 400
-    assert caught.value.uiMessage == BLOCKED_ADDRESS_MESSAGE
-
-
 def _failToResolve(*a, **k):
     raise socket.gaierror(11001, "getaddrinfo failed")
 
@@ -88,28 +70,6 @@ def test_unresolvableHostIsNotReportedAsBlocked(monkeypatch):
     monkeypatch.setattr(socket, "getaddrinfo", _failToResolve)
     with pytest.raises(socket.gaierror):
         publicAddress("typo.example.com", 3306)
-
-
-@pytest.mark.parametrize("loader,message", [
-    ("loadMySql", "Unable to connect to MySQL : check host/port/credentials."),
-    ("loadPostgreSQL", "Unable to connect to PostgreSQL: check host/port/credentials."),
-])
-def test_loaderKeepsConnectMessageForUnresolvableHost(monkeypatch, loader, message):
-    monkeypatch.setattr(socket, "getaddrinfo", _failToResolve)
-    connection = LoadMySQLorPostgreSQL(host="typo.example.com", port=3306, user="u", password="p", db="d", table="t", projectId="p1")
-    with pytest.raises(CustomException) as caught:
-        getattr(dataLoadService, loader)(connection)
-    assert caught.value.statusCode == 400
-    assert caught.value.uiMessage == message
-
-
-def test_mongoLoaderKeepsConnectMessageForUnresolvableHost(monkeypatch):
-    monkeypatch.setattr(connectionTargets, "parse_uri", lambda uri: {"nodelist": [("typo.example.com", 27017)]})
-    monkeypatch.setattr(socket, "getaddrinfo", _failToResolve)
-    with pytest.raises(CustomException) as caught:
-        dataLoadService.loadMongoDB(LoadMongoDB(projectId="p1", connectionString="mongodb://ignored", db="d", collection="c"))
-    assert caught.value.statusCode == 400
-    assert caught.value.uiMessage == "Unable to connect to MongoDB: check connection string/credentials."
 
 
 def _server(host, port=27017):
@@ -127,71 +87,3 @@ def test_serverSelectorKeepsOnlyPublicServers(monkeypatch):
 def test_serverSelectorDropsServersThatDoNotResolve(monkeypatch):
     monkeypatch.setattr(socket, "getaddrinfo", _failToResolve)
     assert publicServers([_server("typo.example.com")]) == []
-
-
-def _connection(**kw):
-    return LoadMySQLorPostgreSQL(**{"host": "db.example.com", "port": 3306, "user": "u", "password": "p", "db": "d", "table": "t", "projectId": "p1", **kw})
-
-
-class _Stop(Exception):
-    pass
-
-
-def _captureEngine(monkeypatch):
-    import api.services.dataLoadService as module
-    seen = {}
-
-    def fake(url, **kw):
-        seen["url"], seen["kw"] = url, kw
-        raise _Stop()
-    monkeypatch.setattr(module, "create_engine", fake)
-    _resolveTo(monkeypatch, "8.8.8.8")
-    return seen
-
-
-def test_mysqlConnectsToTheResolvedAddress(monkeypatch):
-    seen = _captureEngine(monkeypatch)
-    with pytest.raises(CustomException):
-        dataLoadService.loadMySql(_connection())
-    assert seen["url"].host == "8.8.8.8"
-
-
-def test_postgresKeepsItsNameAndPinsTheAddress(monkeypatch):
-    seen = _captureEngine(monkeypatch)
-    with pytest.raises(CustomException):
-        dataLoadService.loadPostgreSQL(_connection(port=5432))
-    assert seen["url"].host == "db.example.com"
-    assert seen["kw"]["connect_args"] == {"hostaddr": "8.8.8.8"}
-
-
-def test_postgresLoaderRefusesPrivateHost(monkeypatch):
-    seen = _captureEngine(monkeypatch)
-    _resolveTo(monkeypatch, "10.0.0.1")
-    with pytest.raises(CustomException) as caught:
-        dataLoadService.loadPostgreSQL(_connection(port=5432))
-    assert (caught.value.statusCode, caught.value.uiMessage) == (400, BLOCKED_ADDRESS_MESSAGE)
-    assert seen == {}
-
-
-def test_mongoLoaderRefusesPrivateHost(monkeypatch):
-    monkeypatch.setattr(connectionTargets, "parse_uri", lambda uri: {"nodelist": [("db.example.com", 27017)]})
-    _resolveTo(monkeypatch, "10.0.0.1")
-    with pytest.raises(CustomException) as caught:
-        dataLoadService.loadMongoDB(LoadMongoDB(projectId="p1", connectionString="mongodb://ignored", db="d", collection="c"))
-    assert (caught.value.statusCode, caught.value.uiMessage) == (400, BLOCKED_ADDRESS_MESSAGE)
-
-
-def test_mongoLoaderPassesTheServerSelector(monkeypatch):
-    import api.services.dataLoadService as module
-    monkeypatch.setattr(module, "checkMongoUri", lambda uri: None)
-    seen = {}
-
-    def fake(*a, **kw):
-        seen.update(kw)
-        raise _Stop()
-    monkeypatch.setattr(module, "MongoClient", fake)
-    monkeypatch.setattr(dataLoadService, "_acceptTableName", lambda *a: {})
-    monkeypatch.setattr(dataLoadService, "_writeTable", lambda projectId, name, claims, write: write("unused"))
-    with pytest.raises(CustomException):
-        dataLoadService.loadMongoDB(LoadMongoDB(projectId="p1", connectionString="mongodb://ignored", db="d", collection="c"))
-    assert seen["server_selector"] is publicServers

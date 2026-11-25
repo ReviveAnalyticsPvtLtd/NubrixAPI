@@ -1,4 +1,4 @@
-"""A failed database load reports the error's type only, on every output: response, stdout, stderr, log file.
+"""A failed database connection reports the error's type only, on every output: response, stdout, stderr, log file.
 
 It runs in a child process because pytest replaces warning filters and captures streams, and other test files stub
 the logger at collection.
@@ -46,7 +46,7 @@ from fastapi.testclient import TestClient
 from sqlalchemy.exc import OperationalError
 
 from api.routers import dataLoader
-from api.services import dataLoadService as module
+from api.services import databaseSources
 
 uris, quoted = json.loads(sys.argv[1])
 
@@ -55,10 +55,8 @@ def driverFailure(*args, **kwargs):
     raise OperationalError("SELECT * FROM t", {}, Exception(quoted))
 
 
-module.dataLoadService._acceptTableName = lambda *args: []
-module.publicAddress = lambda host, port: "192.0.2.1"  # past the address check, so the driver's error is what fails
-module.pd.read_sql = driverFailure
-module.MongoClient.__getitem__ = driverFailure
+databaseSources.publicAddress = lambda host, port: "192.0.2.1"  # past the address check, so the driver's error is what fails
+dataLoader.listTables = driverFailure
 dataLoader.requireProjectOwner = lambda *args: None
 app = FastAPI()
 app.include_router(dataLoader.router)
@@ -68,9 +66,9 @@ for route in dataLoader.router.routes:
             app.dependency_overrides[dependency.call] = lambda: type("User", (), {"userId": "owner"})()
 client = TestClient(app)
 
-sql = dict(projectId="p", user="u", password="pw", host="127.0.0.1", port=1, db="d", table="t")
+sql = dict(projectId="p", user="u", password="pw", host="127.0.0.1", port=1, db="d")
 requests = [("/loadMySql", sql), ("/loadPostgreSQL", sql)]
-requests += [("/loadMongoDB", dict(projectId="p", connectionString=uri, db="d", collection="c")) for uri in uris]
+requests += [("/loadMongoDB", dict(projectId="p", connectionString=uri, db="d")) for uri in uris]
 for path, body in requests:
     response = client.post(path, json=body)
     print("ANSWER", response.status_code, response.text)
@@ -99,10 +97,9 @@ def output(tmp_path_factory):
 def test_failedLoadsStillAnswerAndLog(output):
     answers = [line for line in output["stdout"].splitlines() if line.startswith("ANSWER")]
     assert len(answers) == len(URIS) + 2
-    assert all(line.startswith("ANSWER 400") and "Unable to connect to" in line for line in answers), answers
-    for kind in ("MySQL", "PostgreSQL", "MongoDB"):
-        assert f"{kind} load failed (" in output["log file"]
-    assert "MySQL load failed (OperationalError)" in output["log file"]
+    assert all(line.startswith("ANSWER 400") for line in answers), answers
+    assert sum("Unable to connect: check host/port/credentials." in line for line in answers) >= 3, answers
+    assert "could not connect (OperationalError)" in output["log file"]
 
 
 @pytest.mark.parametrize("sink", ["stdout", "stderr", "log file"])

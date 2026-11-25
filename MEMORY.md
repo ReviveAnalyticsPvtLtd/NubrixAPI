@@ -133,9 +133,7 @@ Called at every entry point where a new table is created:
 - CSV upload (`dataLoadService.loadCsvData`)
 - Excel upload (`dataLoadService.loadExcelData`)
 - PDF upload (`dataLoadService.loadPdfData`)
-- MySQL load (`dataLoadService.loadMySql`)
-- PostgreSQL load (`dataLoadService.loadPostgreSQL`)
-- MongoDB load (`dataLoadService.loadMongoDB`)
+- Database import (`databaseImportService`, through `dataLoadService._acceptTableName`)
 
 ---
 

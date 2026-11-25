@@ -11,7 +11,6 @@ __all__ = ["router"]
 
 from api.models import (
     ChosenTable,
-    DatabaseConnection,
     ImportDatabase,
     LoadMySQLorPostgreSQL,
     LoadMongoDB,
@@ -98,64 +97,40 @@ async def loadPdfData(projectId: Annotated[str, Form()], files: list[UploadFile]
         raiseHttpException(e)
 
 @router.post("/loadMySql")
-async def loadMySql(connection: LoadMySQLorPostgreSQL, user: UserContext = Depends(requireCredits("metadata_generation"))):
+async def loadMySql(connection: LoadMySQLorPostgreSQL, user: UserContext = Depends(requireProductAccess)):
     """
-    Load data from a MySQL database connection and generate metadata for the
-    loaded table.
-
-    Args:
-        connection (LoadMySQLorPostgreSQL): Connection details for MySQL.
-        user: UserContext injected after credit validation.
+    Step 1 of a database import: connect to a MySQL database and list its tables, so the user can choose which to
+    import with importDatabase. Imports nothing, writes nothing and takes no credits.
 
     Returns:
-        ORJSONResponse: Success with generated metadata for the new table.
+        ORJSONResponse: 200 with each table's name and the name it would be stored under.
     """
     await asyncio.to_thread(requireProjectOwner, connection.projectId, user)
-    try:
-        metadata = dataLoadService.loadMySql(connection=connection, userId=user.userId)
-        return ORJSONResponse(status_code=200, content={"status": "SUCCESS", "metadata": metadata})
-    except CustomException as e:
-        raiseHttpException(e)
-    
+    return await _listTables("mysql", connection)
+
 @router.post("/loadPostgreSQL")
-async def loadPostgreSQL(connection: LoadMySQLorPostgreSQL, user: UserContext = Depends(requireCredits("metadata_generation"))):
+async def loadPostgreSQL(connection: LoadMySQLorPostgreSQL, user: UserContext = Depends(requireProductAccess)):
     """
-    Load data from a PostgreSQL database connection and generate metadata for the
-    loaded table.
-
-    Args:
-        connection (LoadMySQLorPostgreSQL): Connection details for PostgreSQL.
-        user: UserContext injected after credit validation.
+    Step 1 of a database import: connect to a PostgreSQL database and list its tables, so the user can choose which to
+    import with importDatabase. Imports nothing, writes nothing and takes no credits.
 
     Returns:
-        ORJSONResponse: Success with generated metadata for the new table.
+        ORJSONResponse: 200 with each table's name and the name it would be stored under.
     """
     await asyncio.to_thread(requireProjectOwner, connection.projectId, user)
-    try:
-        metadata = dataLoadService.loadPostgreSQL(connection=connection, userId=user.userId)
-        return ORJSONResponse(status_code=200, content={"status": "SUCCESS", "metadata": metadata})
-    except CustomException as e:
-        raiseHttpException(e)
-    
+    return await _listTables("postgresql", connection)
+
 @router.post("/loadMongoDB")
-async def loadMongoDB(connection: LoadMongoDB, user: UserContext = Depends(requireCredits("metadata_generation"))):
+async def loadMongoDB(connection: LoadMongoDB, user: UserContext = Depends(requireProductAccess)):
     """
-    Load data from a MongoDB database connection and generate metadata for the
-    loaded collection.
-
-    Args:
-        connection (LoadMongoDB): Connection details for MongoDB.
-        user: UserContext injected after credit validation.
+    Step 1 of a database import: connect to a MongoDB database and list its tables, so the user can choose which to
+    import with importDatabase. Imports nothing, writes nothing and takes no credits.
 
     Returns:
-        ORJSONResponse: Success with generated metadata for the new table.
+        ORJSONResponse: 200 with each table's name and the name it would be stored under.
     """
     await asyncio.to_thread(requireProjectOwner, connection.projectId, user)
-    try:
-        metadata = dataLoadService.loadMongoDB(connection=connection, userId=user.userId)
-        return ORJSONResponse(status_code=200, content={"status": "SUCCESS", "metadata": metadata})
-    except CustomException as e:
-        raiseHttpException(e)
+    return await _listTables("mongodb", connection)
 
 @router.delete("/deleteTable")
 async def deleteTable(tableDetails: DeleteTable, user: UserContext = Depends(requireProductAccess)):
@@ -211,10 +186,10 @@ def _displayName(table: tuple) -> str:
     return f"{schema}.{name}" if schema not in (None, "public") else name
 
 
-async def _connect(body: DatabaseConnection) -> tuple:
+async def _connect(kind: str, body) -> tuple:
     """Connect and list the tables, after the route's owner check: the source, its tables and their stored names."""
     try:
-        source = await asyncio.to_thread(toSource, body.source, body.model_dump())
+        source = await asyncio.to_thread(toSource, kind, body.model_dump())
     except BlockedAddressError as e:
         _refuse(e, 400, BLOCKED_ADDRESS_MESSAGE)
     except ValueError as e:
@@ -231,17 +206,9 @@ async def _connect(body: DatabaseConnection) -> tuple:
     return source, tables, _uniqueNames(tables)
 
 
-@router.post("/listDatabaseTables")
-async def listDatabaseTables(body: DatabaseConnection, user: UserContext = Depends(requireProductAccess)):
-    """
-    List the tables of a database connection, so the user can choose which to import. Imports nothing and takes no
-    credits.
-
-    Returns:
-        ORJSONResponse: 200 with each table's name and the name it would be stored under.
-    """
-    await asyncio.to_thread(requireProjectOwner, body.projectId, user)
-    _, tables, stored = await _connect(body)
+async def _listTables(source: str, connection) -> ORJSONResponse:
+    """The loaders' answer, after their owner check: each table's name and the name it would be stored under."""
+    _, tables, stored = await _connect(source, connection)
     return ORJSONResponse(status_code=200, content={
         "tables": [{"name": _displayName(table), "storedAs": storedAs} for table, storedAs in zip(tables, stored)]})
 
@@ -250,7 +217,7 @@ def _chosen(tables: list, stored: list[str], chosen: list[ChosenTable]) -> tuple
     """The listed tables the user chose, in list order, with their stored names.
 
     A choice must match a listed table's name and stored name together, so a table added to the database since
-    listDatabaseTables can never be imported under a name the user chose for another one.
+    the loader listed it can never be imported under a name the user chose for another one.
     """
     wanted = {(c.name, c.storedAs) for c in chosen}
     picked = [(table, storedAs) for table, storedAs in zip(tables, stored) if (_displayName(table), storedAs) in wanted]
@@ -264,7 +231,7 @@ def _chosen(tables: list, stored: list[str], chosen: list[ChosenTable]) -> tuple
 async def importDatabase(body: ImportDatabase, user: UserContext = Depends(requireCredits("metadata_generation"))):
     """
     Start a background import of the chosen tables of a database connection. The client sends back entries from
-    listDatabaseTables; the tables are listed again and every entry
+    loadMySql / loadPostgreSQL / loadMongoDB; the tables are listed again and every entry
     must still match one by name and stored name, or the whole import is refused.
 
     Returns:
@@ -273,7 +240,7 @@ async def importDatabase(body: ImportDatabase, user: UserContext = Depends(requi
     await asyncio.to_thread(requireProjectOwner, body.projectId, user)
     if not body.tables:
         _refuse(ValueError("no tables chosen"), 400, "Choose at least one table.")
-    source, tables, stored = await _connect(body)
+    source, tables, stored = await _connect(body.source, body)
     tables, stored = _chosen(tables, stored, body.tables)
     named = [(_displayName(table), storedAs) for table, storedAs in zip(tables, stored)]
     jobId = await asyncio.to_thread(importJobs.start, body.projectId, named)

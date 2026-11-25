@@ -1,4 +1,5 @@
-"""POST /loaders/listDatabaseTables, POST /loaders/importDatabase and GET /loaders/importStatus/{projectId}."""
+"""POST /loaders/loadMySql, /loadPostgreSQL, /loadMongoDB (step 1: list), POST /loaders/importDatabase and GET /loaders/importStatus."""
+import inspect
 import json
 import socket
 from unittest.mock import Mock
@@ -28,7 +29,7 @@ PROJECT = "owned-project"
 SECRET = "s3cret-pw"
 BODY = {"projectId": PROJECT, "source": "mysql", "host": "db.example.com", "port": 3306,
         "user": "u", "password": SECRET, "db": "shop"}
-# every table the env fixture lists, as listDatabaseTables answers them
+# every table the env fixture lists, as the loaders answer them
 CHOSEN = [{"name": "orders", "storedAs": "orders"}, {"name": "a b", "storedAs": "a_b"},
           {"name": "a_b", "storedAs": "a_b_2"}, {"name": "sales.users", "storedAs": "sales_users"},
           {"name": "t", "storedAs": "t"}]
@@ -94,22 +95,71 @@ def post(env, **changes):
     return env.client.post("/loaders/importDatabase", json={**BODY, "tables": CHOSEN, **changes})
 
 
-IMPORT, LIST = "/loaders/importDatabase", "/loaders/listDatabaseTables"
+IMPORT, LIST = "/loaders/importDatabase", "list"
+LOADERS = {"mysql": "/loaders/loadMySql", "postgresql": "/loaders/loadPostgreSQL", "mongodb": "/loaders/loadMongoDB"}
 SUCCESS = {IMPORT: 202, LIST: 200}
 
 
 @pytest.fixture(params=[IMPORT, LIST], ids=["import", "list"])
 def route(request):
-    """Both routes connect and list the same way, so every connection check runs against each."""
+    """Both steps connect and list the same way, so every connection check runs against each."""
     return request.param
 
 
+def send(env, route, body):
+    """POST a body as is: to importDatabase, or to the loader its `source` names (the loaders take no `source`)."""
+    if route == IMPORT:
+        return env.client.post(IMPORT, json=body)
+    body = dict(body)
+    return env.client.post(LOADERS[body.pop("source")], json=body)
+
+
 def call(env, route, **changes):
-    return post(env, **changes) if route == IMPORT else env.client.post(LIST, json={**BODY, **changes})
+    return post(env, **changes) if route == IMPORT else send(env, LIST, {**BODY, **changes})
 
 
 def listing(env, **changes):
-    return env.client.post(LIST, json={**BODY, **changes})
+    return call(env, LIST, **changes)
+
+
+@pytest.mark.parametrize("source", ["mysql", "postgresql", "mongodb"])
+def test_eachLoaderBuildsItsOwnSource(env, monkeypatch, source):
+    monkeypatch.setattr(databaseSources, "checkMongoUri", lambda value: None)
+    response = listing(env, source=source, connectionString="mongodb://u:p@db.example.com/shop")
+    assert response.status_code == 200
+    assert env.toSource.call_args.args[0] == source
+
+
+def test_oldSingleTableBodyOnlyLists(env):
+    response = listing(env, table="orders")
+    assert response.status_code == 200 and response.json() == {"tables": CHOSEN}
+    assert env.jobs.get(PROJECT) is None
+    env.send.assert_not_called()
+
+
+def test_listedPairsImportOnTheSameSource(env):
+    listed = listing(env, source="postgresql").json()["tables"]
+    response = post(env, source="postgresql", tables=listed)
+    assert response.status_code == 202 and response.json()["tables"] == [t["storedAs"] for t in listed]
+
+
+def _gates(path):
+    route = next(r for r in dataLoader.router.routes if isinstance(r, APIRoute) and r.path == path)
+    calls = [dependency.call for dependency in route.dependant.dependencies]
+    credits = [inspect.getclosurevars(c).nonlocals.get("operationType") for c in calls
+               if c.__name__ == "_dependency"]
+    return calls, credits
+
+
+@pytest.mark.parametrize("path", ["/loadMySql", "/loadPostgreSQL", "/loadMongoDB"])
+def test_loadersNeedProductAccessAndNoCredits(path):
+    calls, credits = _gates(path)
+    assert commons.requireProductAccess in calls and credits == []
+
+
+def test_importNeedsMetadataCredits():
+    calls, credits = _gates("/importDatabase")
+    assert credits == ["metadata_generation"]
 
 
 def test_listAnswersNamesAndStoredNames(env):
@@ -290,16 +340,16 @@ def test_listTablesValueErrorDoesNotLeak(env, route, monkeypatch, caplog):
 
 
 def test_validationErrorDoesNotEchoThePassword(env, route):
-    body = {k: v for k, v in BODY.items() if k != "db"}
-    response = env.client.post(route, json=body)
+    body = {k: v for k, v in {**BODY, "tables": CHOSEN}.items() if k != "db"}
+    response = send(env, route, body)
     assert response.status_code == 422
     assert SECRET not in response.text
     assert response.json()["detail"][0]["loc"][-1] == "db"
 
 
-def test_oldLoaderValidationErrorDoesNotEchoThePassword(env):
+def test_loaderValidationErrorDoesNotEchoThePassword(env):
     response = env.client.post("/loaders/loadMySql", json={
-        "projectId": PROJECT, "host": "db.example.com", "port": 3306, "user": "u", "password": SECRET, "db": "shop"})
+        "projectId": PROJECT, "host": "db.example.com", "port": "not-a-port", "user": "u", "password": SECRET, "db": "shop"})
     assert response.status_code == 422
     assert SECRET not in response.text
 
@@ -316,7 +366,7 @@ def test_failedEnqueueFreesTheProject(env):
 def test_mongoBodyNeverEchoesTheConnectionString(env, route, monkeypatch):
     uri = "mongodb://user:" + SECRET + "@db.example.com/shop"
     monkeypatch.setattr(databaseSources, "checkMongoUri", lambda value: None)
-    response = env.client.post(route, json={
+    response = send(env, route, {
         "projectId": PROJECT, "source": "mongodb", "db": "shop", "connectionString": uri, "tables": CHOSEN})
     assert response.status_code == SUCCESS[route]
     assert SECRET not in response.text

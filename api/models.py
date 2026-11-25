@@ -130,20 +130,20 @@ class GetFieldsFromSources(BaseModel):
     projectId: str
     tableName: str
 
+# Step 1 of a database import: the connection whose tables loadMySql / loadPostgreSQL / loadMongoDB list.
+# Connection fields are optional so an empty one gets the 400 "The ... field is required." rather than a 422.
 class LoadMySQLorPostgreSQL(BaseModel):
     projectId: str
-    user: str
-    password: str
-    host: str
-    port: int
+    host: str | None = None
+    port: int | None = None
+    user: str | None = None
+    password: str | None = None
     db: str
-    table: str
 
 class LoadMongoDB(BaseModel):
     projectId: str
-    connectionString: str
+    connectionString: str | None = None
     db: str
-    collection: str
 
 class DatabaseConnection(BaseModel):
     projectId: str

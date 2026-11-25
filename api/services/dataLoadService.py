@@ -1,7 +1,7 @@
 """
 dataLoadService.py
 
-dataLoadService module provides services for loading and managing data from various sources (CSV, Excel, PDF, MySQL, PostgreSQL, MongoDB) and deleting tables for NubrixAI projects.
+dataLoadService module provides services for loading and managing data from file uploads (CSV, Excel, PDF) and deleting tables for NubrixAI projects.
 """
 
 __version__ = "1.0.0"
@@ -12,13 +12,9 @@ __all__ = ["dataLoadService"]
 from nubrix.components.pdfTableExtractor import PdfTableExtractor
 from api.services.credits.creditTrackingCallback import CreditTrackingCallback
 from api.commons import giveTableNameBack, tableFileState, updateProjectModifiedAt
-from utils.connectionTargets import BLOCKED_ADDRESS_MESSAGE, BlockedAddressError, checkMongoUri, publicAddress, publicServers
 from utils.exceptionHandler import CustomException
 from utils.initMethods import forget_table
-from pymongo.mongo_client import MongoClient
-from pymongo.server_api import ServerApi
 from fastapi import Form, UploadFile
-from sqlalchemy import URL, create_engine
 from utils.projectStorage import readJson
 from utils.logger import logger
 from utils.sandboxSlots import isBusy
@@ -26,11 +22,7 @@ from utils.storedTables import tableWriteException, writeStoredTableToPath
 from api.commons import client
 from typing import Annotated
 from time import sleep
-from api.models import (
-    LoadMySQLorPostgreSQL,
-    LoadMongoDB,
-    DeleteTable
-)
+from api.models import DeleteTable
 import pandas as pd
 import tempfile
 import warnings
@@ -142,12 +134,6 @@ class DataLoadService:
             logger.warning(f"Metadata generation for {kind} load of {tableNames} skipped: the sandbox is busy; regenerate it later.")
         else:
             logger.error(f"Metadata generation failed for {kind} load of {tableNames}: {error}")
-
-    @staticmethod
-    def _loadFailure(kind: str, error: Exception, uiMessage: str) -> CustomException:
-        """A database load's 400. A driver's message can quote connection details, so only its type is logged."""
-        logger.error(f"{kind} load failed ({type(error).__name__}).")
-        return CustomException(ConnectionError(), statusCode=400, uiMessage=uiMessage)
 
     def _writeTable(self, projectId: str, tableName: str, claims: list[dict], writeParquet) -> None:
         """Write a load's table under a name it accepted, then release the name again.
@@ -503,144 +489,6 @@ class DataLoadService:
             logger.error(exception)
             raise exception
 
-    @staticmethod
-    def _publicHost(host: str, port: int) -> str:
-        try:
-            return publicAddress(host, port)
-        except BlockedAddressError as e:
-            raise CustomException(e, statusCode=400, uiMessage=BLOCKED_ADDRESS_MESSAGE)
-
-    def loadMySql(self, connection: LoadMySQLorPostgreSQL, userId: str | None = None) -> dict:
-        """
-        Load data from MySQL database and generate metadata for the loaded table.
-        """
-        try:
-            required = [connection.host, connection.port, connection.user,
-                        connection.password, connection.db, connection.table, connection.projectId]
-            if not all(required):
-                raise CustomException(
-                    ValueError("Missing required DB fields"),
-                    statusCode=400,
-                    uiMessage="Missing required DB connection fields."
-                )
-            address = self._publicHost(connection.host, connection.port)
-            connStr = URL.create(
-                "mysql+pymysql",
-                username=connection.user,
-                password=connection.password,
-                host=address,
-                port=connection.port,
-                database=connection.db,
-            )
-            engine = create_engine(connStr)
-            sanitizedTable = self._sanitizeFileName(connection.table)
-            from api.services.managementService import managementService
-            claims = self._acceptTableName(connection.projectId, sanitizedTable)
-            self._writeTable(
-                connection.projectId, sanitizedTable, claims,
-                lambda path: writeStoredTableToPath(pd.read_sql(f"SELECT * FROM {connection.table}", engine), connection.projectId, sanitizedTable, path),
-            )
-            updateProjectModifiedAt(connection.projectId)
-            newMetadata = {}
-            try:
-                newMetadata = managementService.generateMetadataForTables(
-                    projectId=connection.projectId, tableNames=[sanitizedTable], userId=userId
-                )
-            except Exception as metaErr:
-                self._logMetadataFailure("MySQL", [sanitizedTable], metaErr)
-            return newMetadata
-        except CustomException:
-            raise
-        except Exception as e:
-            raise self._loadFailure("MySQL", e, "Unable to connect to MySQL : check host/port/credentials.") from None
-
-            
-    def loadPostgreSQL(self, connection: LoadMySQLorPostgreSQL, userId: str | None = None) -> dict:
-        """
-        Load data from PostgreSQL database and generate metadata for the loaded table.
-        """
-        try:
-            required = [connection.host, connection.port, connection.user,
-                        connection.password, connection.db, connection.table, connection.projectId]
-            if not all(required):
-                raise CustomException(
-                    ValueError("Missing required DB fields"),
-                    statusCode=400,
-                    uiMessage="Missing required DB connection fields."
-                )
-            address = self._publicHost(connection.host, connection.port)
-            connStr = URL.create(
-                "postgresql+psycopg2",
-                username=connection.user,
-                password=connection.password,
-                host=connection.host,
-                port=connection.port,
-                database=connection.db,
-            )
-            # libpq connects to hostaddr and still uses host for SNI and certificate checks
-            engine = create_engine(connStr, connect_args={"hostaddr": address})
-            sanitizedTable = self._sanitizeFileName(connection.table)
-            from api.services.managementService import managementService
-            claims = self._acceptTableName(connection.projectId, sanitizedTable)
-            self._writeTable(
-                connection.projectId, sanitizedTable, claims,
-                lambda path: writeStoredTableToPath(pd.read_sql(f"SELECT * FROM {connection.table}", engine), connection.projectId, sanitizedTable, path),
-            )
-            updateProjectModifiedAt(connection.projectId)
-            newMetadata = {}
-            try:
-                newMetadata = managementService.generateMetadataForTables(
-                    projectId=connection.projectId, tableNames=[sanitizedTable], userId=userId
-                )
-            except Exception as metaErr:
-                self._logMetadataFailure("PostgreSQL", [sanitizedTable], metaErr)
-            return newMetadata
-        except CustomException:
-            raise
-        except Exception as e:
-            raise self._loadFailure("PostgreSQL", e, "Unable to connect to PostgreSQL: check host/port/credentials.") from None
-        
-    def loadMongoDB(self, connection: LoadMongoDB, userId: str | None = None) -> dict:
-        """
-        Load data from MongoDB and generate metadata for the loaded collection.
-        """
-        try:
-            if not connection.connectionString or not connection.db or not connection.collection:
-                raise CustomException(
-                    ValueError("Missing MongoDB connection fields"),
-                    statusCode=400,
-                    uiMessage="Missing required DB connection fields."
-                )
-            try:
-                checkMongoUri(connection.connectionString)
-            except BlockedAddressError as e:
-                raise CustomException(e, statusCode=400, uiMessage=BLOCKED_ADDRESS_MESSAGE)
-            sanitizedCollection = self._sanitizeFileName(connection.collection)
-            from api.services.managementService import managementService
-
-            def writeCollection(path: str) -> None:
-                mongoClient = MongoClient(connection.connectionString, server_api=ServerApi('1'), server_selector=publicServers)
-                records = list(mongoClient[connection.db][connection.collection].find())
-                for record in records:
-                    record.pop("_id", None)
-                writeStoredTableToPath(pd.DataFrame(records), connection.projectId, sanitizedCollection, path)
-
-            claims = self._acceptTableName(connection.projectId, sanitizedCollection)
-            self._writeTable(connection.projectId, sanitizedCollection, claims, writeCollection)
-            updateProjectModifiedAt(connection.projectId)
-            newMetadata = {}
-            try:
-                newMetadata = managementService.generateMetadataForTables(
-                    projectId=connection.projectId, tableNames=[sanitizedCollection], userId=userId
-                )
-            except Exception as metaErr:
-                self._logMetadataFailure("MongoDB", [sanitizedCollection], metaErr)
-            return newMetadata
-        except CustomException:
-            raise
-        except Exception as e:
-            raise self._loadFailure("MongoDB", e, "Unable to connect to MongoDB: check connection string/credentials.") from None
-        
     def deleteTable(self, tableDetails: DeleteTable) -> None:
         """
         Deletes a table from the project storage and updates project metadata accordingly.
