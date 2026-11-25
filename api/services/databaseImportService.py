@@ -150,7 +150,12 @@ def runBatch(projectId: str, userId: str, jobId: str, source: Source, tables: li
     with _holding(projectId, jobId, start) as refreshMarker:
         _requireProject(projectId)
         step = _nextStep(projectId, jobId)
-        if step == _DONE or step > start:
+        if step == _DONE:
+            # every batch is done; the delivery that ran the last one may have died before ending the job
+            _record(projectId, jobId)  # only a job still running: a late duplicate leaves an ended one as it is
+            _check(importJobs.finish(projectId, jobId, "done"))
+            return None
+        if step > start:
             raise JobStopped()
         nextStart = _runBatch(projectId, jobId, source, tables, start, refreshMarker)
         # moved on before the marker is released, so a delivery waiting for it finds the batch done
@@ -169,7 +174,7 @@ def _runBatch(projectId, jobId, source, tables, start, refreshMarker) -> int | N
 
     _check(importJobs.refreshLock(projectId, jobId))
     maxTables, maxColumns = _setting("IMPORT_BATCH_TABLES", 8), _setting("IMPORT_BATCH_COLUMNS", 400)
-    attempted = columns = loaded = 0
+    attempted = columns = loaded = resumed = 0
     index = start
     while index < len(tables) and attempted < maxTables and columns < maxColumns:
         table, index = tables[index], index + 1
@@ -180,6 +185,7 @@ def _runBatch(projectId, jobId, source, tables, start, refreshMarker) -> int | N
         if state == "loading" and tableFileState(dataLoadService.client, projectId, storedAs) is not None:
             # stored by an earlier delivery of this batch, which died before marking it
             _set(projectId, jobId, storedAs, status="loaded", reason=None)
+            resumed += 1
             continue
         attempted += 1
         _set(projectId, jobId, storedAs, status="loading")
@@ -188,7 +194,7 @@ def _runBatch(projectId, jobId, source, tables, start, refreshMarker) -> int | N
         if fields["status"] == "loaded":
             columns += width
             loaded += 1
-    if loaded:
+    if loaded or resumed:  # a dead delivery stored the resumed ones but never got to touch the project
         updateProjectModifiedAt(projectId)
     logger.info(f"Import job {jobId} in project {projectId}: batch from {start} loaded {loaded} of {attempted} tables.")
     return index if index < len(tables) else None

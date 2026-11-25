@@ -247,6 +247,21 @@ def test_redeliveredBatchResumes(job):
     assert job.storage.objects[f"AnalyticsHub/{PROJECT}/d.parquet"] == b"written before the crash"
 
 
+def test_resumedLastTableStillMarksTheProjectModified(job, monkeypatch):
+    makeTables(job.engine, {name: (1, 1) for name in "ab"})
+    tables, jobId = startJob(job)
+    # the dead delivery stored b but died before marking it, and before touching the project
+    job.jobs.setTable(PROJECT, jobId, "a", status="loaded", rows=1)
+    job.jobs.setTable(PROJECT, jobId, "b", status="loading")
+    job.storage.put(PROJECT, "b.parquet", b"written before the crash")
+    touched = []
+    monkeypatch.setattr(service, "updateProjectModifiedAt", touched.append)
+
+    assert service.runBatch(PROJECT, USER, jobId, MYSQL, tables, 0) is None
+
+    assert touched == [PROJECT]
+
+
 def test_resumedTablesDoNotCountTowardTheBatch(job, monkeypatch):
     makeTables(job.engine, {name: (1, 1) for name in "abcdefg"})
     monkeypatch.setenv("IMPORT_BATCH_TABLES", "2")
@@ -375,6 +390,35 @@ def test_lateDuplicateOfTheLastBatchAfterDoneExitsQuietly(job):
 
     assert late.sent == [] and late.retried is None
     assert job.jobs.get(PROJECT) == before
+
+
+def test_deliveryAfterADeathBeforeTheEndEndsTheJob(job):
+    makeTables(job.engine, {name: (1, 1) for name in "ab"})
+    tables, jobId = startJob(job)
+    listed = [list(t) for t in tables]
+    # the last batch loaded everything and moved the pointer on, then its worker died before ending the job
+    for name in "ab":
+        job.jobs.setTable(PROJECT, jobId, name, status="loaded", rows=1)
+    job.redis.set(f"import:{PROJECT}:next", f"{jobId}:done")
+
+    again = _FakeTask(retries=1)
+    batch(again, jobId, listed, 0)
+
+    assert job.jobs.get(PROJECT)["state"] == "done"
+    assert again.sent == [] and again.retried is None
+
+
+def test_lateDuplicateLeavesAnEndedJobAsItIs(job):
+    makeTables(job.engine, {name: (1, 1) for name in "ab"})
+    tables, jobId = startJob(job)
+    job.redis.set(f"import:{PROJECT}:next", f"{jobId}:done")
+    service.failJob(PROJECT, jobId)
+
+    late = _FakeTask(retries=1)
+    batch(late, jobId, [list(t) for t in tables], 0)
+
+    assert job.jobs.get(PROJECT)["state"] == "failed"
+    assert late.sent == [] and late.retried is None
 
 
 def test_lastBatchEndsTheJobDone(job):
