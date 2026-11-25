@@ -10,7 +10,9 @@ __all__ = ["router"]
 
 
 from api.models import (
+    ChosenTable,
     DatabaseConnection,
+    ImportDatabase,
     LoadMySQLorPostgreSQL,
     LoadMongoDB,
     DeleteTable
@@ -176,6 +178,7 @@ async def deleteTable(tableDetails: DeleteTable, user: UserContext = Depends(req
 
 
 _CONNECT_FAILURE = "Unable to connect: check host/port/credentials."
+_NOT_FOUND = "Some selected tables were not found. Connect again to refresh the list."
 
 
 def _refuse(error: Exception, status: int, message: str):
@@ -243,16 +246,34 @@ async def listDatabaseTables(body: DatabaseConnection, user: UserContext = Depen
         "tables": [{"name": _displayName(table), "storedAs": storedAs} for table, storedAs in zip(tables, stored)]})
 
 
-@router.post("/importDatabase", status_code=202)
-async def importDatabase(body: DatabaseConnection, user: UserContext = Depends(requireCredits("metadata_generation"))):
+def _chosen(tables: list, stored: list[str], chosen: list[ChosenTable]) -> tuple[list, list[str]]:
+    """The listed tables the user chose, in list order, with their stored names.
+
+    A choice must match a listed table's name and stored name together, so a table added to the database since
+    listDatabaseTables can never be imported under a name the user chose for another one.
     """
-    Start a background import of every table of a database connection.
+    wanted = {(c.name, c.storedAs) for c in chosen}
+    picked = [(table, storedAs) for table, storedAs in zip(tables, stored) if (_displayName(table), storedAs) in wanted]
+    if len(picked) != len(wanted):
+        # the names are the customer's, so neither the answer nor the log names them
+        _refuse(LookupError("chosen tables not listed"), 400, _NOT_FOUND)
+    return [table for table, _ in picked], [storedAs for _, storedAs in picked]
+
+
+@router.post("/importDatabase", status_code=202)
+async def importDatabase(body: ImportDatabase, user: UserContext = Depends(requireCredits("metadata_generation"))):
+    """
+    Start a background import of the chosen tables of a database connection. The client sends back entries from
+    listDatabaseTables; the tables are listed again and only matching entries are imported.
 
     Returns:
         ORJSONResponse: 202 with the jobId and the names the tables will be stored under.
     """
     await asyncio.to_thread(requireProjectOwner, body.projectId, user)
+    if not body.tables:
+        _refuse(ValueError("no tables chosen"), 400, "Choose at least one table.")
     source, tables, stored = await _connect(body)
+    tables, stored = _chosen(tables, stored, body.tables)
     named = [(_displayName(table), storedAs) for table, storedAs in zip(tables, stored)]
     jobId = await asyncio.to_thread(importJobs.start, body.projectId, named)
     if jobId is None:

@@ -28,6 +28,10 @@ PROJECT = "owned-project"
 SECRET = "s3cret-pw"
 BODY = {"projectId": PROJECT, "source": "mysql", "host": "db.example.com", "port": 3306,
         "user": "u", "password": SECRET, "db": "shop"}
+# every table the env fixture lists, as listDatabaseTables answers them
+CHOSEN = [{"name": "orders", "storedAs": "orders"}, {"name": "a b", "storedAs": "a_b"},
+          {"name": "a_b", "storedAs": "a_b_2"}, {"name": "sales.users", "storedAs": "sales_users"},
+          {"name": "t", "storedAs": "t"}]
 SEND_BATCH = databaseImportTask.sendBatch  # the env fixture mocks it
 CONNECT_FAILURE = "Unable to connect: check host/port/credentials."
 
@@ -87,7 +91,7 @@ def env(monkeypatch):
 
 
 def post(env, **changes):
-    return env.client.post("/loaders/importDatabase", json={**BODY, **changes})
+    return env.client.post("/loaders/importDatabase", json={**BODY, "tables": CHOSEN, **changes})
 
 
 IMPORT, LIST = "/loaders/importDatabase", "/loaders/listDatabaseTables"
@@ -111,10 +115,7 @@ def listing(env, **changes):
 def test_listAnswersNamesAndStoredNames(env):
     response = listing(env)
     assert response.status_code == 200
-    assert response.json() == {"tables": [
-        {"name": "orders", "storedAs": "orders"}, {"name": "a b", "storedAs": "a_b"},
-        {"name": "a_b", "storedAs": "a_b_2"}, {"name": "sales.users", "storedAs": "sales_users"},
-        {"name": "t", "storedAs": "t"}]}
+    assert response.json() == {"tables": CHOSEN}
     assert env.jobs.get(PROJECT) is None
     env.send.assert_not_called()
 
@@ -161,6 +162,53 @@ def test_missingFieldIs400(env):
     assert response.status_code == 400
     assert response.json()["message"] == "The host field is required."
     env.send.assert_not_called()
+
+
+def test_importWithoutTablesIsRefused(env):
+    response = env.client.post("/loaders/importDatabase", json=BODY)
+    assert response.status_code == 422
+    assert response.json()["detail"][0]["loc"][-1] == "tables"
+    assert env.jobs.get(PROJECT) is None
+    env.send.assert_not_called()
+
+
+def test_importsOnlyChosenTablesInListOrder(env):
+    response = post(env, tables=[{"name": "t", "storedAs": "t"}, {"name": "orders", "storedAs": "orders"}])
+    assert response.status_code == 202 and response.json()["tables"] == ["orders", "t"]
+    assert [(t["name"], t["storedAs"]) for t in env.jobs.get(PROJECT)["tables"]] == [("orders", "orders"), ("t", "t")]
+    assert env.send.call_args.args[5] == [["orders", None, "orders"], ["t", "public", "t"]]
+
+
+def test_emptyChoiceIs400(env):
+    response = post(env, tables=[])
+    assert response.status_code == 400 and response.json()["message"] == "Choose at least one table."
+    assert env.jobs.get(PROJECT) is None and not env.send.called
+
+
+def test_unknownChoiceIs400WithoutTheName(env):
+    lines = []
+    sink = logger.add(lines.append)
+    try:
+        response = post(env, tables=[{"name": "orders", "storedAs": "orders"}, {"name": "secret_tbl", "storedAs": "secret_tbl"}])
+    finally:
+        logger.remove(sink)
+    assert response.status_code == 400
+    assert response.json()["message"] == "Some selected tables were not found. Connect again to refresh the list."
+    assert "secret_tbl" not in response.text and "secret_tbl" not in "".join(str(line) for line in lines)
+    assert env.jobs.get(PROJECT) is None and not env.send.called
+
+
+def test_mismatchedPairIs400(env):
+    # "a_b" is listed, but stored as "a_b_2": a table added between the two calls must not take a chosen name
+    response = post(env, tables=[{"name": "a_b", "storedAs": "a_b"}])
+    assert response.status_code == 400
+    assert env.jobs.get(PROJECT) is None and not env.send.called
+
+
+def test_duplicateChoiceImportsOnce(env):
+    response = post(env, tables=[{"name": "orders", "storedAs": "orders"}] * 2)
+    assert response.status_code == 202 and response.json()["tables"] == ["orders"]
+    assert [t["storedAs"] for t in env.jobs.get(PROJECT)["tables"]] == ["orders"]
 
 
 def test_blockedAddressIs400(env, route, monkeypatch):
@@ -269,7 +317,7 @@ def test_mongoBodyNeverEchoesTheConnectionString(env, route, monkeypatch):
     uri = "mongodb://user:" + SECRET + "@db.example.com/shop"
     monkeypatch.setattr(databaseSources, "checkMongoUri", lambda value: None)
     response = env.client.post(route, json={
-        "projectId": PROJECT, "source": "mongodb", "db": "shop", "connectionString": uri})
+        "projectId": PROJECT, "source": "mongodb", "db": "shop", "connectionString": uri, "tables": CHOSEN})
     assert response.status_code == SUCCESS[route]
     assert SECRET not in response.text
     assert SECRET not in str(env.jobs.get(PROJECT))

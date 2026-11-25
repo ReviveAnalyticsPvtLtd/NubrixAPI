@@ -155,6 +155,13 @@ class DatabaseConnection(BaseModel):
     db: str
     connectionString: str | None = None
 
+class ChosenTable(BaseModel):
+    name: str
+    storedAs: str
+
+class ImportDatabase(DatabaseConnection):
+    tables: list[ChosenTable]
+
 class CreatePage(BaseModel):
     projectId: str
     pageName: str
