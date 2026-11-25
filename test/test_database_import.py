@@ -8,14 +8,12 @@ import pytest
 import sqlalchemy
 from celery.exceptions import Retry
 
-from api import commons
 from api.services import databaseImportService as service
 from api.services import databaseSources as ds
 from api.services import dataLoadService as dataLoadModule
 from api.services import managementService as managementModule
 from api.services.databaseSources import Source, listTables, storedName
 from api.services.importJobs import ImportJobs
-from api.services.subscriptions.entitlementService import EntitlementUnavailableError
 from nubrix.triggers.tasks import databaseImportTask as tasks
 from test.privateStorageFixtures import SERVICE_KEY, FakePrivateStorage
 from test.test_import_jobs import FakeRedis
@@ -24,7 +22,6 @@ from loguru import logger
 PROJECT = "11111111-2222-4333-8444-555555555555"
 USER = "user-1"
 MYSQL = Source(kind="mysql", host="db.test", address="192.0.2.1", port=3306, user="u", password="p", db="d")
-DESCRIPTION_MISSING = "Description could not be generated"
 
 
 class _Query:
@@ -78,23 +75,15 @@ def job(monkeypatch, tmp_path):
     redis = FakeRedis()
     jobs = ImportJobs(redis)
     monkeypatch.setattr(service, "importJobs", jobs)
-    def describe(projectId, tableNames, userId=None):
-        """Writes metadata.json as the real call does, since resumed batches and the KPI step read it."""
-        current = json.loads(storage.objects.get(f"AnalyticsHub/{projectId}/metadata.json", b"{}"))
-        storage.putJson(projectId, "metadata.json", current | {name: {} for name in tableNames})
-        return {name: {} for name in tableNames}
-
-    metadata = Mock(side_effect=describe)
+    metadata = Mock(return_value={})  # the job must never call the model: step 3 runs from the browser
     monkeypatch.setattr(managementModule.managementService, "generateMetadataForTables", metadata)
     insights = Mock(return_value={})
     monkeypatch.setattr(managementModule.managementService, "generateInsightsForProject", insights)
-    credits = Mock(return_value=True)
-    monkeypatch.setattr(service, "creditsAllow", credits)
     project = types.SimpleNamespace(exists=True)  # whether the Projects row is there
     monkeypatch.setattr(service, "_projectExists", lambda projectId: project.exists)
     engine = sqlalchemy.create_engine(f"sqlite:///{tmp_path / 'source.db'}")
     with patch.object(ds, "_engine", return_value=engine):
-        yield types.SimpleNamespace(storage=storage, jobs=jobs, redis=redis, metadata=metadata, insights=insights, credits=credits,
+        yield types.SimpleNamespace(storage=storage, jobs=jobs, redis=redis, metadata=metadata, insights=insights,
                                     engine=engine, project=project)
     storage.close()
 
@@ -130,8 +119,8 @@ def statuses(job) -> dict:
     return {t["storedAs"]: t for t in job.jobs.get(PROJECT)["tables"]}
 
 
-def describedNames(job) -> list[list[str]]:
-    return [call.kwargs["tableNames"] for call in job.metadata.call_args_list]
+def loadedNames(job) -> list[str]:
+    return [name for name, table in statuses(job).items() if table["status"] == "loaded"]
 
 
 def test_batchClosesAtEightTables(job):
@@ -140,7 +129,6 @@ def test_batchClosesAtEightTables(job):
 
     assert service.runBatch(PROJECT, USER, jobId, MYSQL, tables, 0) == 8
 
-    assert describedNames(job) == [[f"t{i:02}" for i in range(8)]]
     found = statuses(job)
     assert [found[f"t{i:02}"]["status"] for i in range(10)] == ["loaded"] * 8 + ["pending"] * 2
     assert found["t00"]["rows"] == 1 and found["t00"]["reason"] is None
@@ -153,9 +141,9 @@ def test_batchClosesAt400Columns(job):
     tables, jobId = startJob(job)
 
     assert service.runBatch(PROJECT, USER, jobId, MYSQL, tables, 0) == 3
+    assert loadedNames(job) == ["a", "b", "c"]
     assert service.runBatch(PROJECT, USER, jobId, MYSQL, tables, 3) is None
-
-    assert describedNames(job) == [["a", "b", "c"], ["d"]]
+    assert loadedNames(job) == ["a", "b", "c", "d"]
 
 
 def test_wideTableIsItsOwnBatch(job):
@@ -163,48 +151,7 @@ def test_wideTableIsItsOwnBatch(job):
     tables, jobId = startJob(job)
 
     assert service.runBatch(PROJECT, USER, jobId, MYSQL, tables, 0) == 1
-    assert describedNames(job) == [["a"]]
-
-
-def test_missingDescriptionsAreRetriedOneByOne(job):
-    makeTables(job.engine, {name: (1, 1) for name in "abc"})
-    tables, jobId = startJob(job)
-    job.metadata.side_effect = lambda projectId, tableNames, userId=None: {n: {} for n in tableNames if n != "c"}
-
-    assert service.runBatch(PROJECT, USER, jobId, MYSQL, tables, 0) is None
-
-    assert describedNames(job) == [["a", "b", "c"], ["c"]]
-    found = statuses(job)
-    assert found["c"]["status"] == "loaded" and found["c"]["reason"] == DESCRIPTION_MISSING
-    assert found["a"]["reason"] is None
-
-
-def test_failedDescribeCallRetriesEveryTable(job):
-    makeTables(job.engine, {name: (1, 1) for name in "ab"})
-    tables, jobId = startJob(job)
-    job.metadata.side_effect = lambda projectId, tableNames, userId=None: (
-        (_ for _ in ()).throw(RuntimeError("model answer cut off")) if len(tableNames) > 1 else {n: {} for n in tableNames}
-    )
-
-    service.runBatch(PROJECT, USER, jobId, MYSQL, tables, 0)
-
-    assert describedNames(job) == [["a", "b"], ["a"], ["b"]]
-    assert all(t["reason"] is None and t["status"] == "loaded" for t in statuses(job).values())
-
-
-def test_outOfCreditsSkipsTheRest(job):
-    makeTables(job.engine, {f"t{i:02}": (1, 1) for i in range(10)})
-    tables, jobId = startJob(job)
-    assert service.runBatch(PROJECT, USER, jobId, MYSQL, tables, 0) == 8
-    job.credits.return_value = False
-
-    assert service.runBatch(PROJECT, USER, jobId, MYSQL, tables, 8) is None
-
-    job.credits.assert_called_with(USER, "metadata_generation")
-    found = statuses(job)
-    assert [(found[n]["status"], found[n]["reason"]) for n in ("t08", "t09")] == [("skipped", "Out of credits")] * 2
-    assert found["t07"]["status"] == "loaded"
-    assert len(job.metadata.call_args_list) == 1
+    assert loadedNames(job) == ["a"]
 
 
 def test_takenNameIsSkipped(job):
@@ -217,7 +164,6 @@ def test_takenNameIsSkipped(job):
     found = statuses(job)
     assert (found["a"]["status"], found["a"]["reason"]) == ("skipped", "A table with this name already exists")
     assert found["b"]["status"] == "loaded"
-    assert describedNames(job) == [["b"]]
 
 
 def test_tooLargeTableFailsAndOthersLoad(job, monkeypatch):
@@ -231,7 +177,6 @@ def test_tooLargeTableFailsAndOthersLoad(job, monkeypatch):
     assert (found["big"]["status"], found["big"]["reason"]) == ("failed", "Too large to import")
     assert found["small"]["status"] == found["tiny"]["status"] == "loaded"
     assert f"AnalyticsHub/{PROJECT}/big.parquet" not in job.storage.objects
-    assert describedNames(job) == [["small", "tiny"]]
 
 
 @contextlib.contextmanager
@@ -281,10 +226,9 @@ def test_emptyTablesLoadWithNoRows(job, monkeypatch):
 
 
 def crashMidBatch(job, jobId):
-    """What a delivery that died mid-batch leaves: a, b, c stored with only a, b described, d stored but not marked."""
+    """What a delivery that died mid-batch leaves: a, b, c stored and marked, d stored but not marked."""
     for name in "abc":
         job.jobs.setTable(PROJECT, jobId, name, status="loaded", rows=99)
-    job.storage.putJson(PROJECT, "metadata.json", {"a": {}, "b": {}})
     job.jobs.setTable(PROJECT, jobId, "d", status="loading")
     job.storage.put(PROJECT, "d.parquet", b"written before the crash")
 
@@ -300,32 +244,18 @@ def test_redeliveredBatchResumes(job):
     assert all((found[n]["status"], found[n]["rows"], found[n]["reason"]) == ("loaded", 99, None) for n in "abc")
     assert (found["d"]["status"], found["d"]["reason"]) == ("loaded", None)
     assert found["e"]["status"] == "loaded"
-    assert describedNames(job) == [["c", "d", "e"]]
+    assert job.storage.objects[f"AnalyticsHub/{PROJECT}/d.parquet"] == b"written before the crash"
 
 
-def test_resumedTablesCountTowardTheBatch(job, monkeypatch):
-    makeTables(job.engine, {name: (1, 1) for name in "abcdef"})
-    monkeypatch.setenv("IMPORT_BATCH_TABLES", "3")
+def test_resumedTablesDoNotCountTowardTheBatch(job, monkeypatch):
+    makeTables(job.engine, {name: (1, 1) for name in "abcdefg"})
+    monkeypatch.setenv("IMPORT_BATCH_TABLES", "2")
     tables, jobId = startJob(job)
     crashMidBatch(job, jobId)
 
-    # a and b are done and not counted; c and d are, so the batch closes after e
-    assert service.runBatch(PROJECT, USER, jobId, MYSQL, tables, 0) == 5
-    assert describedNames(job) == [["c", "d", "e"]]
-    assert statuses(job)["f"]["status"] == "pending"
-
-
-def test_resumedTableStillUndescribedGetsTheReason(job):
-    makeTables(job.engine, {name: (1, 1) for name in "abcd"})
-    tables, jobId = startJob(job)
-    crashMidBatch(job, jobId)
-    job.metadata.side_effect = lambda projectId, tableNames, userId=None: {}
-
-    service.runBatch(PROJECT, USER, jobId, MYSQL, tables, 0)
-
-    found = statuses(job)
-    assert (found["c"]["reason"], found["d"]["reason"]) == (DESCRIPTION_MISSING, DESCRIPTION_MISSING)
-    assert describedNames(job) == [["c", "d"], ["c"], ["d"]]
+    # a to d were stored by the dead delivery and cost nothing now, so the batch closes after e and f
+    assert service.runBatch(PROJECT, USER, jobId, MYSQL, tables, 0) == 6
+    assert statuses(job)["g"]["status"] == "pending"
 
 
 def test_batchMarkerIsReleasedAndRefreshedWhileWriting(job, monkeypatch):
@@ -354,43 +284,13 @@ def test_supersededJobStops(job):
     assert statuses(job)["a"]["status"] == "pending"
 
 
-@pytest.mark.parametrize("insights, kpis", [("present", "skipped"), ("missing", "done"), ("raises", "failed"), ("no metadata", "skipped")])
-def test_kpisOnlyWhenProjectHasNone(job, insights, kpis):
-    _, jobId = startJob(job)
-    if insights != "no metadata":
-        job.storage.putJson(PROJECT, "metadata.json", {"a": {}})
-    if insights == "present":
-        job.storage.putJson(PROJECT, "insights.json", {"insights": []})
-    if insights == "raises":
-        job.insights.side_effect = RuntimeError("prompt too large")
-
-    service.runKpis(PROJECT, USER, jobId)
-
-    record = job.jobs.get(PROJECT)
-    assert (record["kpis"], record["state"]) == (kpis, "done")
-    assert job.insights.called == (insights in ("missing", "raises"))
-    if insights in ("missing", "raises"):
-        job.credits.assert_called_with(USER, "insight_generation")
-
-
-def test_kpisSkippedWithoutCredits(job):
-    _, jobId = startJob(job)
-    job.storage.putJson(PROJECT, "metadata.json", {"a": {}})
-    job.credits.return_value = False
-
-    service.runKpis(PROJECT, USER, jobId)
-
-    assert not job.insights.called
-    assert (job.jobs.get(PROJECT)["kpis"], job.jobs.get(PROJECT)["state"]) == ("skipped", "done")
-
-
 def test_tasksRouteToImportsQueue():
     from nubrix.triggers.celery import celeryApp
 
-    for name in ("NubrixAI.importBatch", "NubrixAI.importKpis"):
-        assert celeryApp.conf.task_routes[name] == {"queue": "imports"}
-        task = celeryApp.tasks[name]
-        assert (task.acks_late, task.reject_on_worker_lost, task.ignore_result) == (True, True, True)
+    assert celeryApp.conf.task_routes == {"NubrixAI.importBatch": {"queue": "imports"}}
+    task = celeryApp.tasks["NubrixAI.importBatch"]
+    assert (task.acks_late, task.reject_on_worker_lost, task.ignore_result) == (True, True, True)
+    assert "NubrixAI.importKpis" not in celeryApp.tasks
 
 
 def test_celeryAppLoadsNoImportService():
@@ -408,7 +308,7 @@ def test_celeryAppLoadsNoImportService():
     assert done.returncode == 0, done.stderr[-2000:]
     loaded, routes = json.loads(done.stdout.strip().splitlines()[-1])
     assert loaded == []
-    assert routes == {"NubrixAI.importBatch": {"queue": "imports"}, "NubrixAI.importKpis": {"queue": "imports"}}
+    assert routes == {"NubrixAI.importBatch": {"queue": "imports"}}
 
 
 REDACTED = {"argsrepr": "(redacted)", "kwargsrepr": "{}"}
@@ -444,12 +344,7 @@ def batch(task, jobId, tables, start=0, source=MYSQL):
     tasks.importBatch(task, PROJECT, USER, jobId, sealed(jobId, source, tables=tables, start=start), tables, start)
 
 
-def kpis(task, jobId):
-    """Deliver the KPI message as the last batch queues it."""
-    tasks.importKpis(task, PROJECT, USER, jobId, tasks._seal(tasks.IMPORT_KPIS_TASK, PROJECT, USER, jobId))
-
-
-def test_batchTaskEnqueuesNextBatchThenKpis(job):
+def test_batchTaskEnqueuesNextBatchThenEndsTheJob(job):
     makeTables(job.engine, {f"t{i:02}": (1, 1) for i in range(9)})
     tables, jobId = startJob(job)
     listed = [list(t) for t in tables]
@@ -458,20 +353,64 @@ def test_batchTaskEnqueuesNextBatchThenKpis(job):
     batch(task, jobId, listed, 0)
     assert job.redis.get(f"import:{PROJECT}:next") == f"{jobId}:8".encode()
     batch(task, jobId, listed, 8)
-    assert job.redis.get(f"import:{PROJECT}:next") == f"{jobId}:kpis".encode()
-    kpis(task, jobId)
+    assert job.redis.get(f"import:{PROJECT}:next") == f"{jobId}:done".encode()
 
-    assert task.sent == [
-        ("NubrixAI.importBatch", [PROJECT, USER, jobId, ANY, listed, 8]),
-        ("NubrixAI.importKpis", [PROJECT, USER, jobId, ANY]),
-    ]
+    assert task.sent == [("NubrixAI.importBatch", [PROJECT, USER, jobId, ANY, listed, 8])]
     assert all(options == {"ignore_result": True, **REDACTED} for options in task.options)
-    assert (job.jobs.get(PROJECT)["state"], job.jobs.get(PROJECT)["kpis"]) == ("done", "done")
+    record = job.jobs.get(PROJECT)
+    assert record["state"] == "done" and "kpis" not in record
+    assert all(t["status"] == "loaded" for t in record["tables"])
 
-    # late duplicates of the last batch and of the KPI step do nothing: no second chain, no second KPI charge
+
+def test_lateDuplicateOfTheLastBatchAfterDoneExitsQuietly(job):
+    makeTables(job.engine, {name: (1, 1) for name in "ab"})
+    tables, jobId = startJob(job)
+    listed = [list(t) for t in tables]
+    batch(_FakeTask(), jobId, listed, 0)
+    before = job.jobs.get(PROJECT)
+    assert before["state"] == "done"
+
+    late = _FakeTask()
+    batch(late, jobId, listed, 0)
+
+    assert late.sent == [] and late.retried is None
+    assert job.jobs.get(PROJECT) == before
+
+
+def test_lastBatchEndsTheJobDone(job):
+    makeTables(job.engine, {name: (1, 1) for name in "abc"})
+    tables, jobId = startJob(job)
+
+    assert service.runBatch(PROJECT, USER, jobId, MYSQL, tables, 0) is None
+
+    record = job.jobs.get(PROJECT)
+    assert record["state"] == "done" and "kpis" not in record
+    assert all(t["status"] == "loaded" for t in record["tables"])
+
+
+def test_jobEndsDoneWhenEveryTableFailed(job, monkeypatch):
+    makeTables(job.engine, {name: (1, 1) for name in "ab"})
+    tables, jobId = startJob(job)
+    monkeypatch.setattr(service, "readChunks", Mock(side_effect=RuntimeError("unreadable")))
+
+    assert service.runBatch(PROJECT, USER, jobId, MYSQL, tables, 0) is None
+
+    record = job.jobs.get(PROJECT)
+    assert record["state"] == "done"
+    assert [(t["status"], t["reason"]) for t in record["tables"]] == [("failed", "Could not read this table")] * 2
+
+
+def test_noModelCallDuringTheImport(job):
+    makeTables(job.engine, {f"t{i:02}": (1, 1) for i in range(9)})
+    tables, jobId = startJob(job)
+    listed = [list(t) for t in tables]
+    task = _FakeTask()
+
+    batch(task, jobId, listed, 0)
     batch(task, jobId, listed, 8)
-    kpis(task, jobId)
-    assert len(task.sent) == 2 and job.insights.call_count == 1
+
+    assert job.jobs.get(PROJECT)["state"] == "done"
+    assert not job.metadata.called and not job.insights.called
 
 
 def test_crashedDeliveryIsRetriedNotDropped(job):
@@ -492,9 +431,10 @@ def test_crashedDeliveryIsRetriedNotDropped(job):
     task = _FakeTask(retries=1)
     batch(task, jobId, listed, 0)
 
-    assert task.sent == [("NubrixAI.importBatch", [PROJECT, USER, jobId, ANY, listed, 8])]
-    assert describedNames(job) == [[f"t{i:02}" for i in range(8)]]
-    assert statuses(job)["t00"]["status"] == "loaded"
+    # t00 was stored by the dead delivery and does not count, so the other eight fit and the job ends
+    assert task.sent == []
+    assert loadedNames(job) == [f"t{i:02}" for i in range(9)]
+    assert job.jobs.get(PROJECT)["state"] == "done"
 
 
 def test_lateDuplicateOfAFinishedBatchExitsQuietly(job):
@@ -508,7 +448,7 @@ def test_lateDuplicateOfAFinishedBatchExitsQuietly(job):
     batch(late, jobId, listed, 0)
 
     assert late.sent == [] and late.retried is None
-    assert job.jobs.get(PROJECT) == before and job.metadata.call_count == 1
+    assert job.jobs.get(PROJECT) == before
 
 
 def test_busyRetriesSpentWhileHeldExitsQuietly(job):
@@ -548,13 +488,9 @@ def test_queuedMessagesHoldNoCredentials(job, monkeypatch, source):
     tasks.sendBatch(celeryApp, PROJECT, USER, jobId, source, listed, 0)  # what the route queues
     assert "s3cret-pass" not in json.dumps(messages[0].body, default=dataclasses.asdict)
     tasks.importBatch(task, *messages[0].body[0])  # queues the next batch
-    tasks.importBatch(task, *messages[1].body[0])  # queues the KPI step
-    kpi = Mock()
-    monkeypatch.setattr(service, "runKpis", kpi)
-    tasks.importKpis(task, *messages[2].body[0])
-    assert kpi.call_args.args == (PROJECT, USER, jobId)
+    tasks.importBatch(task, *messages[1].body[0])  # the last batch queues nothing
 
-    assert [m.headers["task"] for m in messages] == ["NubrixAI.importBatch", "NubrixAI.importBatch", "NubrixAI.importKpis"]
+    assert [m.headers["task"] for m in messages] == ["NubrixAI.importBatch", "NubrixAI.importBatch"]
     for message in messages:
         queued = json.dumps([message.headers, message.body, message.sent_event], default=lambda o: dataclasses.asdict(o) if dataclasses.is_dataclass(o) else str(o))
         for private in ("s3cret-pass", "alice-login", "db-host.test"):
@@ -591,28 +527,23 @@ def test_sourceNotSealedForThisJobIsRefused(job, monkeypatch, forgery):
     assert not any("s3cret-pass" in str(m) for m in messages)
 
 
-@pytest.mark.parametrize("change", ["userId", "tables", "start", "kpiToken", "batchTokenAsKpi"])
+@pytest.mark.parametrize("change", ["userId", "tables", "start"])
 def test_everyMessageArgumentIsBound(job, monkeypatch, change):
     jobId = job.jobs.start(PROJECT, [("a", "a"), ("b", "b")])
     tables = [["a", None, "a"], ["b", None, "b"]]
     token = sealed(jobId, tables=tables)
-    run, kpi = Mock(return_value=None), Mock()
+    run = Mock(return_value=None)
     monkeypatch.setattr(service, "runBatch", run)
-    monkeypatch.setattr(service, "runKpis", kpi)
     task = _FakeTask()
 
     if change == "userId":
         tasks.importBatch(task, PROJECT, "another-user", jobId, token, tables, 0)
     elif change == "tables":
         tasks.importBatch(task, PROJECT, USER, jobId, token, [["users", "auth", "a"], ["b", None, "b"]], 0)
-    elif change == "start":
-        tasks.importBatch(task, PROJECT, USER, jobId, token, tables, 99)
-    elif change == "kpiToken":
-        tasks.importKpis(task, PROJECT, "another-user", jobId, tasks._seal(tasks.IMPORT_KPIS_TASK, PROJECT, USER, jobId))
     else:
-        tasks.importKpis(task, PROJECT, USER, jobId, token)
+        tasks.importBatch(task, PROJECT, USER, jobId, token, tables, 99)
 
-    assert not run.called and not kpi.called and task.sent == []
+    assert not run.called and task.sent == []
     assert job.jobs.get(PROJECT)["state"] == "failed"
 
 
@@ -642,26 +573,6 @@ def test_nothingIsQueuedWithoutAKey(monkeypatch, key):
     assert task.sent == []
 
 
-def test_creditsUnavailableRetriesThenSkips(job):
-    makeTables(job.engine, {name: (1, 1) for name in "ab"})
-    tables, jobId = startJob(job)
-    job.credits.side_effect = commons.CreditsUnavailable()
-    listed = [list(t) for t in tables]
-
-    task = _FakeTask(retries=2)
-    with pytest.raises(Retry):
-        batch(task, jobId, listed, 0)
-    assert task.retried == (60, 3, REDACTED) and task.sent == []
-
-    task = _FakeTask(retries=3)
-    batch(task, jobId, listed, 0)
-    assert all((t["status"], t["reason"]) == ("skipped", "Could not check credits") for t in statuses(job).values())
-    assert task.sent == [("NubrixAI.importKpis", [PROJECT, USER, jobId, ANY])]
-
-    kpis(task, jobId)
-    assert (job.jobs.get(PROJECT)["kpis"], job.jobs.get(PROJECT)["state"]) == ("skipped", "done")
-
-
 def test_unexpectedErrorFailsJobWithoutLeakingIt(job, monkeypatch):
     makeTables(job.engine, {"a": (1, 1)})
     tables, jobId = startJob(job)
@@ -671,34 +582,9 @@ def test_unexpectedErrorFailsJobWithoutLeakingIt(job, monkeypatch):
         batch(task, jobId, [list(t) for t in tables], 0)
 
     record = job.jobs.get(PROJECT)
-    assert (record["state"], record["kpis"]) == ("failed", "failed")
+    assert record["state"] == "failed" and "kpis" not in record
     assert task.sent == []
     assert not any("hunter2" in str(m) for m in messages)
-
-
-def test_creditsAllowMatchesTheDependency(monkeypatch):
-    from api.services.credits import creditService as creditModule
-
-    plan = types.SimpleNamespace(trialOrAbove=True)
-    monkeypatch.setattr(commons.subscriptionEntitlementService, "get", lambda userId: plan)
-    balance = {"value": 5000}
-    monkeypatch.setattr(creditModule.creditService, "getRemainingTokens", lambda userId: balance["value"])
-
-    assert commons.creditsAllow(USER, "metadata_generation") is True
-    balance["value"] = 2999
-    assert commons.creditsAllow(USER, "metadata_generation") is False
-    balance["value"] = -1
-    with pytest.raises(commons.CreditsUnavailable):
-        commons.creditsAllow(USER, "metadata_generation")
-    plan.trialOrAbove = False
-    assert commons.creditsAllow(USER, "metadata_generation") is False
-
-    def unavailable(userId):
-        raise EntitlementUnavailableError("down")
-
-    monkeypatch.setattr(commons.subscriptionEntitlementService, "get", unavailable)
-    with pytest.raises(commons.CreditsUnavailable):
-        commons.creditsAllow(USER, "metadata_generation")
 
 
 MONGO = Source(kind="mongodb", connectionString="mongodb+srv://u:p@cluster.test", db="d")
@@ -728,36 +614,13 @@ def projectFiles(job):
     return sorted(key.rsplit("/", 1)[1] for key in job.storage.objects if key.startswith(f"AnalyticsHub/{PROJECT}/"))
 
 
-@pytest.mark.parametrize("rowDeleted", [True, False], ids=["deleted", "kept"])
-def test_metadataWrittenAfterTheProjectIsErasedIsRemoved(job, rowDeleted):
-    makeTables(job.engine, {"a": (1, 1)})
-    tables, jobId = startJob(job)
-
-    def describeAfterErasure(projectId, tableNames, userId=None):
-        eraseProject(job)  # the erasure completes while the model call runs
-        job.project.exists = not rowDeleted  # kept: only the Redis keys were lost
-        job.storage.putJson(PROJECT, "metadata.json", {"a": {}})
-        return {"a": {}}
-
-    job.metadata.side_effect = describeAfterErasure
-    batch(_FakeTask(), jobId, [list(t) for t in tables])
-
-    assert projectFiles(job) == ([] if rowDeleted else ["metadata.json"])
-    assert job.jobs.get(PROJECT) is None
-
-
-@pytest.mark.parametrize("step", ["batch", "kpis"])
-def test_importStartedAfterTheProjectIsDeletedWritesNothing(job, step):
+def test_importStartedAfterTheProjectIsDeletedWritesNothing(job):
     makeTables(job.engine, {"a": (1, 1)})
     tables, jobId = startJob(job)  # the route listed tables while the delete's own cleanup ran
     job.project.exists = False
     task = _FakeTask()
 
-    if step == "batch":
-        batch(task, jobId, [list(t) for t in tables])
-    else:
-        job.redis.set(f"import:{PROJECT}:next", f"{jobId}:kpis")
-        kpis(task, jobId)
+    batch(task, jobId, [list(t) for t in tables])
 
     assert projectFiles(job) == [] and task.sent == []
     assert not job.metadata.called and not job.insights.called
@@ -772,26 +635,8 @@ def test_projectCheckErrorLetsTheImportGoOn(job, monkeypatch):
 
     batch(task, jobId, [list(t) for t in tables])
 
-    assert job.jobs.get(PROJECT)["state"] == "running" and "a.parquet" in projectFiles(job)
-    assert task.sent[0][0] == "NubrixAI.importKpis"
-
-
-def test_kpisWrittenAfterADeleteThatKeptTheRecordAreRemoved(job):
-    jobId = job.jobs.start(PROJECT, [("a", "a")])
-    job.redis.set(f"import:{PROJECT}:next", f"{jobId}:kpis")
-    job.storage.putJson(PROJECT, "metadata.json", {"a": {}})
-
-    def insightsAfterDelete(projectId, userId=None):
-        # the route re-started the job between a delete's forget and its row delete
-        for key in [key for key in job.storage.objects if key.startswith(f"AnalyticsHub/{PROJECT}/")]:
-            del job.storage.objects[key]
-        job.project.exists = False
-        job.storage.putJson(PROJECT, "insights.json", [])
-
-    job.insights.side_effect = insightsAfterDelete
-    kpis(_FakeTask(), jobId)
-
-    assert projectFiles(job) == [] and job.redis.values == {}
+    assert job.jobs.get(PROJECT)["state"] == "done" and "a.parquet" in projectFiles(job)
+    assert task.sent == []
 
 
 @pytest.mark.parametrize("rows, exists", [([], False), ([{"projectId": PROJECT}], True)])
@@ -826,22 +671,6 @@ def test_deleteDuringTheLastProgressWriteLeavesNoKeys(job, monkeypatch):
     batch(task, jobId, [list(t) for t in tables])
 
     assert job.redis.values == {} and projectFiles(job) == [] and task.sent == []
-
-
-def test_kpisWrittenAfterTheProjectIsErasedAreRemoved(job, monkeypatch):
-    jobId = job.jobs.start(PROJECT, [("a", "a")])
-    job.redis.set(f"import:{PROJECT}:next", f"{jobId}:kpis")
-    job.storage.putJson(PROJECT, "metadata.json", {"a": {}})
-    monkeypatch.setattr(service, "creditsAllow", lambda *_: True)
-
-    def insightsAfterErasure(projectId, userId=None):
-        eraseProject(job)
-        job.storage.putJson(PROJECT, "insights.json", [])
-
-    job.insights.side_effect = insightsAfterErasure
-    kpis(_FakeTask(), jobId)
-
-    assert projectFiles(job) == [] and job.jobs.get(PROJECT) is None
 
 
 def test_forgottenJobStopsWithoutWritingMoreTables(job, monkeypatch):

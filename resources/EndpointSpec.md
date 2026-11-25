@@ -676,7 +676,7 @@ Also clears `latest_approved_artifact` on the transformation that produced the t
 
 ### 3.8 `POST /api/latest/dataLoader/importDatabase`
 
-Starts a background import of every table of a database connection, then describes each table with AI metadata and generates KPIs when the project has none. Needs `metadata_generation` credits and the project's owner. PostgreSQL system and managed-platform schemas (for example Supabase's `auth` and `storage`) and partitions of partitioned tables are skipped. Table names are stored sanitized, schema-qualified outside `public`, with `_2`, `_3`, ... when two map to the same name.
+Starts a background import of every table of a database connection. It only loads the tables; metadata and KPIs are a separate step. Needs `metadata_generation` credits and the project's owner. PostgreSQL system and managed-platform schemas (for example Supabase's `auth` and `storage`) and partitions of partitioned tables are skipped. Table names are stored sanitized, schema-qualified outside `public`, with `_2`, `_3`, ... when two map to the same name.
 
 **Request Body (MySQL / PostgreSQL):**
 ```json
@@ -715,7 +715,7 @@ Starts a background import of every table of a database connection, then describ
 
 ### 3.9 `GET /api/latest/dataLoader/importStatus/{projectId}`
 
-Progress record of the project's latest import, kept 7 days. `state` is `running`, `done` or `failed` (a job whose worker stopped is reported `failed`); table `status` is `pending`, `loading`, `loaded`, `skipped` or `failed` with a fixed `reason`; `kpis` is `waiting`, `running`, `done`, `skipped` or `failed`. The record never holds connection details.
+Progress record of the project's latest import, kept 7 days. `state` is `running`, `done` or `failed` (a job whose worker stopped is reported `failed`); table `status` is `pending`, `loading`, `loaded`, `skipped` or `failed` with a fixed `reason`. The record never holds connection details. The import only loads tables: once `state` is `done`, the client runs metadata and KPIs through `generateMetadata` and `generateKpis`, as for the other connectors.
 
 **Response (200):**
 ```json
@@ -725,8 +725,7 @@ Progress record of the project's latest import, kept 7 days. `state` is `running
   "tables": [
     {"name": "orders", "storedAs": "orders", "status": "loaded", "rows": 1200, "reason": null},
     {"name": "sales.orders", "storedAs": "sales_orders", "status": "pending", "rows": null, "reason": null}
-  ],
-  "kpis": "waiting"
+  ]
 }
 ```
 

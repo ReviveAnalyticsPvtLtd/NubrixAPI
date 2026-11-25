@@ -15,7 +15,6 @@ import redis
 _LOCK_SECONDS = 21600
 _RECORD_SECONDS = 604800
 _TABLE_STATUSES = {"pending", "loading", "loaded", "skipped", "failed"}
-_KPI_STATUSES = {"waiting", "running", "done", "skipped", "failed"}
 _FINAL_STATES = {"done", "failed"}
 # Only these fields can be written, so credentials cannot reach the record.
 _TABLE_FIELDS = {"status", "rows", "reason"}
@@ -90,7 +89,6 @@ class ImportJobs:
                     {"name": name, "storedAs": storedAs, "status": "pending", "rows": None, "reason": None}
                     for name, storedAs in tables
                 ],
-                "kpis": "waiting",
             }, existing=False)
         except Exception:
             self._redis.delete(self._lockKey(projectId))
@@ -104,8 +102,6 @@ class ImportJobs:
             record = self._read(projectId)  # a finish may have landed meanwhile
             if record and record["state"] == "running":
                 record["state"] = "failed"
-                if record["kpis"] in ("waiting", "running"):
-                    record["kpis"] = "failed"
         return record
 
     def setTable(self, projectId: str, jobId: str, storedAs: str, **fields) -> bool:
@@ -123,15 +119,6 @@ class ImportJobs:
                 break
         else:
             raise ValueError(f"unknown table: {storedAs!r}")
-        return self._write(projectId, record)
-
-    def setKpis(self, projectId: str, jobId: str, status: str) -> bool:
-        if status not in _KPI_STATUSES:
-            raise ValueError(f"unknown kpis status: {status!r}")
-        record = self._owned(projectId, jobId)
-        if record is None:
-            return False
-        record["kpis"] = status
         return self._write(projectId, record)
 
     def refreshLock(self, projectId: str, jobId: str) -> bool:

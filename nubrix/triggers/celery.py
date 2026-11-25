@@ -30,10 +30,8 @@ from nubrix.triggers.tasks.notificationReconciliationTask import NotificationRec
 from nubrix.triggers.tasks.notificationCleanupTask import NotificationCleanupTask
 from nubrix.triggers.tasks.databaseImportTask import (
     IMPORT_BATCH_TASK,
-    IMPORT_KPIS_TASK,
     IMPORT_TASK_OPTIONS,
     importBatch,
-    importKpis,
 )
 from celery.schedules import crontab
 from celery import Celery
@@ -126,14 +124,9 @@ def runNotificationCleanup():
 def runImportBatch(self, projectId: str, userId: str, jobId: str, sealed: str, tables: list, start: int):
     importBatch(self, projectId, userId, jobId, sealed, tables, start)
 
-@celeryApp.task(name=IMPORT_KPIS_TASK, **IMPORT_TASK_OPTIONS)
-def runImportKpis(self, projectId: str, userId: str, jobId: str, sealed: str):
-    importKpis(self, projectId, userId, jobId, sealed)
-
 # Imports have their own worker program (supervisord `celery-imports`), so they never hold the default queue's workers.
 celeryApp.conf.task_routes = {
     IMPORT_BATCH_TASK: {"queue": "imports"},
-    IMPORT_KPIS_TASK: {"queue": "imports"},
 }
 
 

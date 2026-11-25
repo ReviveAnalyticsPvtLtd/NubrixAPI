@@ -17,8 +17,6 @@ __all__ = [
     "requireTrialOrAbove",
     "requirePaidPlan",
     "requireCredits",
-    "creditsAllow",
-    "CreditsUnavailable",
     "requireWorkspaceOwner",
     "requireProjectOwner",
     "requireTriggerOwner",
@@ -379,30 +377,6 @@ def requireCredits(operationType: str):
         return user
 
     return _dependency
-
-
-class CreditsUnavailable(Exception):
-    """The plan or the credit balance could not be read; ask again later."""
-
-
-def creditsAllow(userId: str, operationType: str) -> bool:
-    """requireCredits' two checks for work outside a request: False on a definite no.
-
-    Raises CreditsUnavailable when the plan lookup fails or the balance is unreadable (-1).
-    """
-    from api.services.credits.creditService import creditService
-    from api.services.credits.creditConfig import getOperationMinimum
-
-    try:
-        entitlement = subscriptionEntitlementService.get(userId)
-    except EntitlementUnavailableError as e:
-        raise CreditsUnavailable() from e
-    if not entitlement.trialOrAbove:
-        return False
-    remaining = creditService.getRemainingTokens(userId)
-    if remaining == -1:
-        raise CreditsUnavailable()
-    return remaining >= getOperationMinimum(operationType)
 
 
 def giveTableNameBack(supabaseClient, projectId: str, transformationId: str, tableName: str, artifact: dict, fileStates: tuple) -> bool:

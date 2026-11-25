@@ -62,7 +62,7 @@ def test_startWritesPendingRecord():
     record = jobs.get("p1")
     assert record["jobId"] == jobId
     assert record["state"] == "running"
-    assert record["kpis"] == "waiting"
+    assert set(record) == {"jobId", "state", "tables"}
     assert record["tables"][1] == {
         "name": "Order Items", "storedAs": "order_items",
         "status": "pending", "rows": None, "reason": None,
@@ -92,17 +92,19 @@ def test_finishReleasesTheLockAndKeepsTheRecord7Days():
     assert jobs.start("p1", TABLES)
 
 
+def test_jobsHaveNoKpiStep():
+    assert not hasattr(make()[0], "setKpis")
+
+
 def test_recordHoldsTableProgress():
     jobs, redis = make()
     jobId = jobs.start("p1", TABLES)
     assert jobs.setTable("p1", jobId, "orders", status="loaded", rows=42) is True
     jobs.setTable("p1", jobId, "order_items", status="failed", reason="too large")
-    jobs.setKpis("p1", jobId, "running")
     record = jobs.get("p1")
     assert record["tables"][0]["status"] == "loaded"
     assert record["tables"][0]["rows"] == 42
     assert record["tables"][1]["reason"] == "too large"
-    assert record["kpis"] == "running"
     assert redis.ttls["import:p1"] == 604800
 
 
@@ -117,8 +119,6 @@ def test_onlyProgressFieldsAndKnownStatusesAreAccepted():
     with pytest.raises(ValueError):
         jobs.setTable("p1", jobId, "missing", status="loaded")
     with pytest.raises(ValueError):
-        jobs.setKpis("p1", jobId, "bogus")
-    with pytest.raises(ValueError):
         jobs.finish("p1", jobId, "running")
 
 
@@ -131,7 +131,6 @@ def test_staleJobCannotTouchANewerJob():
     redis.ttls["import:p1:running"] = 5
     before = dict(redis.values), dict(redis.ttls)
     assert jobs.setTable("p1", jobA, "orders", status="loaded", rows=1) is False
-    assert jobs.setKpis("p1", jobA, "done") is False
     assert jobs.refreshLock("p1", jobA) is False
     assert jobs.finish("p1", jobA, "failed") is False
     assert (dict(redis.values), dict(redis.ttls)) == before
@@ -143,7 +142,6 @@ def test_staleJobCannotTouchANewerJob():
 def test_missingRecordReturnsFalse():
     jobs, _ = make()
     assert jobs.setTable("p1", "j", "orders", status="loaded") is False
-    assert jobs.setKpis("p1", "j", "done") is False
     assert jobs.finish("p1", "j", "done") is False
     assert jobs.refreshLock("p1", "j") is False
 
@@ -156,24 +154,7 @@ def test_getReportsFailedWhenWorkerDiedAndLockExpired():
     assert json.loads(redis.values["import:p1"])["state"] == "running"
 
 
-@pytest.mark.parametrize("kpis, reported", [("waiting", "failed"), ("running", "failed"), ("done", "done"), ("skipped", "skipped")])
-def test_lockExpiredJobReportsUnfinishedKpisFailed(kpis, reported):
-    jobs, redis = make()
-    jobId = jobs.start("p1", TABLES)
-    jobs.setKpis("p1", jobId, kpis)
-    del redis.values["import:p1:running"]
-    assert (jobs.get("p1")["state"], jobs.get("p1")["kpis"]) == ("failed", reported)
-    assert json.loads(redis.values["import:p1"])["kpis"] == kpis
-
-
-def test_finishedJobKeepsItsKpis():
-    jobs, _ = make()
-    jobId = jobs.start("p1", TABLES)
-    jobs.finish("p1", jobId, "done")
-    assert jobs.get("p1")["kpis"] == "waiting"
-
-
-@pytest.mark.parametrize("write", ["setTable", "setKpis", "finish"])
+@pytest.mark.parametrize("write", ["setTable", "finish"])
 def test_forgottenRecordIsNotWrittenBack(monkeypatch, write):
     jobs, redis = make()
     jobId = jobs.start("p1", TABLES)
@@ -182,7 +163,6 @@ def test_forgottenRecordIsNotWrittenBack(monkeypatch, write):
     monkeypatch.setattr(jobs, "_owned", lambda projectId, jobId: stale)
 
     written = {"setTable": lambda: jobs.setTable("p1", jobId, "orders", status="loading"),
-               "setKpis": lambda: jobs.setKpis("p1", jobId, "running"),
                "finish": lambda: jobs.finish("p1", jobId, "done")}[write]()
 
     assert written is False and redis.values == {}

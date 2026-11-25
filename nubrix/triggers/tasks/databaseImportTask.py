@@ -14,7 +14,7 @@ The default worker, beat and the API import this module through nubrix/triggers/
 (and with it the AI stack) only inside the task bodies, which run on the imports worker alone.
 """
 
-__all__ = ["IMPORT_BATCH_TASK", "IMPORT_KPIS_TASK", "IMPORT_TASK_OPTIONS", "importBatch", "importKpis", "sendBatch"]
+__all__ = ["IMPORT_BATCH_TASK", "IMPORT_TASK_OPTIONS", "importBatch", "sendBatch"]
 
 import base64
 import dataclasses
@@ -27,19 +27,16 @@ from typing import TYPE_CHECKING
 from celery.exceptions import Retry
 from cryptography.fernet import Fernet
 
-from api.commons import CreditsUnavailable
 from utils.logger import logger
 
 if TYPE_CHECKING:
     from api.services.databaseSources import Source
 
 IMPORT_BATCH_TASK = "NubrixAI.importBatch"
-IMPORT_KPIS_TASK = "NubrixAI.importKpis"
-# acks_late with reject_on_worker_lost: a step whose worker died is delivered again and resumes from the record.
+# acks_late with reject_on_worker_lost: a batch whose worker died is delivered again and resumes from the record.
 IMPORT_TASK_OPTIONS = {"bind": True, "ignore_result": True, "acks_late": True, "reject_on_worker_lost": True}
 # Celery puts a repr of the args in each message's headers and in its events; a retry would otherwise rebuild it.
 _REDACTED = {"argsrepr": "(redacted)", "kwargsrepr": "{}"}
-_CREDIT_RETRIES, _CREDIT_RETRY_SECONDS = 3, 60
 # A dead delivery's marker runs out after 900 s, well within these 30 minutes.
 _BUSY_RETRIES, _BUSY_RETRY_SECONDS = 6, 300
 _KEY_DOMAIN = b"nubrix.import-source.v1"
@@ -86,22 +83,15 @@ def _fail(service, projectId: str, jobId: str, error: Exception) -> None:
 
 
 def importBatch(task, projectId: str, userId: str, jobId: str, sealed: str, tables: list[list], start: int) -> None:
-    """Run one batch, then enqueue the next one, or the KPI step after the last."""
+    """Run one batch, then enqueue the next one; the last batch ends the job."""
     from api.services import databaseImportService as service
     from api.services.databaseSources import Source
 
     try:
         (fields,) = _unseal(sealed, IMPORT_BATCH_TASK, projectId, userId, jobId, tables, start)
         source, sourceTables = Source(**fields), [tuple(t) for t in tables]
-        try:
-            nextStart = service.runBatch(projectId, userId, jobId, source, sourceTables, start)
-        except CreditsUnavailable:
-            _retry(task, _CREDIT_RETRIES, _CREDIT_RETRY_SECONDS)
-            nextStart = service.runBatch(projectId, userId, jobId, source, sourceTables, start, skipWith=service.CREDITS_UNCHECKED)
-        if nextStart is None:
-            kpis = [projectId, userId, jobId, _seal(IMPORT_KPIS_TASK, projectId, userId, jobId)]
-            task.app.send_task(IMPORT_KPIS_TASK, args=kpis, ignore_result=True, **_REDACTED)
-        else:
+        nextStart = service.runBatch(projectId, userId, jobId, source, sourceTables, start)
+        if nextStart is not None:
             sendBatch(task.app, projectId, userId, jobId, source, tables, nextStart)
         logger.info(f"Import job {jobId} in project {projectId}: batch from {start} done, next {nextStart}.")
     except Retry:
@@ -111,28 +101,5 @@ def importBatch(task, projectId: str, userId: str, jobId: str, sealed: str, tabl
         logger.info(f"Import job {jobId} in project {projectId}: batch from {start} is still held by a running delivery.")
     except service.JobStopped:
         logger.info(f"Import job {jobId} in project {projectId}: batch from {start} stopped, superseded or already done.")
-    except Exception as e:
-        _fail(service, projectId, jobId, e)
-
-
-def importKpis(task, projectId: str, userId: str, jobId: str, sealed: str) -> None:
-    """Generate KPIs if the project has none, and end the job."""
-    from api.services import databaseImportService as service
-
-    try:
-        _unseal(sealed, IMPORT_KPIS_TASK, projectId, userId, jobId)
-        try:
-            service.runKpis(projectId, userId, jobId)
-        except CreditsUnavailable:
-            _retry(task, _CREDIT_RETRIES, _CREDIT_RETRY_SECONDS)
-            service.runKpis(projectId, userId, jobId, skip=True)
-        logger.info(f"Import job {jobId} in project {projectId} done.")
-    except Retry:
-        raise
-    except service.BatchBusy:
-        _retry(task, _BUSY_RETRIES, _BUSY_RETRY_SECONDS)
-        logger.info(f"Import job {jobId} in project {projectId}: KPI step is still held by a running delivery.")
-    except service.JobStopped:
-        logger.info(f"Import job {jobId} in project {projectId}: KPI step stopped, the job has ended or was superseded.")
     except Exception as e:
         _fail(service, projectId, jobId, e)
