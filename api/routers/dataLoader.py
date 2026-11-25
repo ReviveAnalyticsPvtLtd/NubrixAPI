@@ -1,7 +1,8 @@
 """
 API router for data loading operations.
 
-This module provides endpoints for loading data from various sources (CSV, Excel, PDF, MySQL, PostgreSQL, MongoDB) and deleting tables.
+This module provides endpoints for loading CSV, Excel and PDF files, the three steps of a database import (list the
+tables of a MySQL, PostgreSQL or MongoDB connection, import the chosen ones, report progress) and deleting tables.
 """
 
 __version__ = "1.0.0"
