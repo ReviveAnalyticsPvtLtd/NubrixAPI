@@ -596,57 +596,50 @@ Multipart form upload.
 
 ### 3.4 `POST /api/latest/dataLoader/loadMySql`
 
+Step 1 of a database import: connects and lists the tables, so the user can choose which to import with `importDatabase` (3.8). Imports nothing, writes nothing and takes no credits; needs product access and the project's owner. Tables are listed in the order `importDatabase` uses, with the same skipped schemas and partitions. `name` is what the user sees (schema-qualified outside `public`), `storedAs` the name the table would be stored under. An older body that still sends `table` gets the list too; nothing is loaded.
+
 **Request Body:**
 ```json
 {
   "projectId": "effeaef7-...",
-  "user": "root",
-  "password": "password",
   "host": "db.example.com",
   "port": 3306,
-  "db": "sales_db",
-  "table": "transactions"
+  "user": "readonly",
+  "password": "password",
+  "db": "sales_db"
 }
 ```
 
 **Response (200):**
 ```json
 {
-  "status": "SUCCESS"
+  "tables": [
+    {"name": "orders", "storedAs": "orders"},
+    {"name": "sales.orders", "storedAs": "sales_orders"}
+  ]
 }
 ```
+
+**Errors:** `400` (missing field, blocked address or connection failure; never the driver's text), `404` (not the project's owner), `422` (no tables found, or a malformed body).
 
 ---
 
 ### 3.5 `POST /api/latest/dataLoader/loadPostgreSQL`
 
-**Request Body:** Same shape as `loadMySql`
-
-**Response (200):**
-```json
-{
-  "status": "SUCCESS"
-}
-```
+Step 1 for PostgreSQL: same body, answer and errors as `loadMySql` (3.4).
 
 ---
 
 ### 3.6 `POST /api/latest/dataLoader/loadMongoDB`
+
+Step 1 for MongoDB: lists the collections, with the same answer and errors as `loadMySql` (3.4).
 
 **Request Body:**
 ```json
 {
   "projectId": "effeaef7-...",
   "connectionString": "mongodb+srv://user:pass@cluster.mongodb.net",
-  "db": "analytics",
-  "collection": "events"
-}
-```
-
-**Response (200):**
-```json
-{
-  "status": "SUCCESS"
+  "db": "analytics"
 }
 ```
 
@@ -674,27 +667,9 @@ Also clears `latest_approved_artifact` on the transformation that produced the t
 
 ---
 
-### 3.8 `POST /api/latest/dataLoader/listDatabaseTables`
+### 3.8 `POST /api/latest/dataLoader/importDatabase`
 
-Step 1 of a database import: connects and lists the tables, so the user can choose which to import. Imports nothing, writes nothing and takes no credits; needs product access and the project's owner. The body is the same connection as `importDatabase` (3.9) without `tables`. Tables are listed in the order `importDatabase` uses, with the same skipped schemas and partitions. `name` is what the user sees (schema-qualified outside `public`), `storedAs` the name the table would be stored under.
-
-**Response (200):**
-```json
-{
-  "tables": [
-    {"name": "orders", "storedAs": "orders"},
-    {"name": "sales.orders", "storedAs": "sales_orders"}
-  ]
-}
-```
-
-**Errors:** `400` (missing field, blocked address or connection failure; never the driver's text), `404` (not the project's owner), `422` (no tables found).
-
----
-
-### 3.9 `POST /api/latest/dataLoader/importDatabase`
-
-Step 2 of a database import: starts a background import of the tables the user chose from `listDatabaseTables` (3.8). `tables` holds the chosen entries exactly as that route returned them; the tables are listed again and every entry must still match a table by both `name` and `storedAs`; if any entry does not, the whole import is refused with 400 and nothing is queued, so a table added since cannot take a chosen name. The import only loads the tables; metadata and KPIs are step 3. Needs the project's owner and a `metadata_generation` credit balance (a gate only: the import itself spends no credits). PostgreSQL system and managed-platform schemas (for example Supabase's `auth` and `storage`) and partitions of partitioned tables are skipped. Table names are stored sanitized, schema-qualified outside `public`, with `_2`, `_3`, ... when two map to the same name.
+Step 2 of a database import: starts a background import of the tables the user chose from the list `loadMySql`, `loadPostgreSQL` or `loadMongoDB` (3.4–3.6) returned. `source` names the database (`mysql`, `postgresql` or `mongodb`) and `tables` holds the chosen entries exactly as the loader returned them; the tables are listed again and every entry must still match a table by both `name` and `storedAs`; if any entry does not, the whole import is refused with 400 and nothing is queued, so a table added since cannot take a chosen name. The import only loads the tables; metadata and KPIs are step 3. Needs the project's owner and a `metadata_generation` credit balance (a gate only: the import itself spends no credits). PostgreSQL system and managed-platform schemas (for example Supabase's `auth` and `storage`) and partitions of partitioned tables are skipped. Table names are stored sanitized, schema-qualified outside `public`, with `_2`, `_3`, ... when two map to the same name.
 
 **Request Body (MySQL / PostgreSQL):**
 ```json
@@ -733,7 +708,7 @@ Step 2 of a database import: starts a background import of the tables the user c
 
 ---
 
-### 3.10 `GET /api/latest/dataLoader/importStatus/{projectId}`
+### 3.9 `GET /api/latest/dataLoader/importStatus/{projectId}`
 
 Progress record of the project's latest import, kept 7 days. `state` is `running`, `done` or `failed` (a job whose worker stopped is reported `failed`); table `status` is `pending`, `loading`, `loaded`, `skipped` or `failed` with a fixed `reason`. The record never holds connection details. The import only loads tables: once `state` is `done`, the client runs metadata and KPIs through `generateMetadata` and `generateKpis`, as for the other connectors.
 
