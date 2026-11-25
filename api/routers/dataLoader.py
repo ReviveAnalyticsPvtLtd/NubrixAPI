@@ -264,7 +264,8 @@ def _chosen(tables: list, stored: list[str], chosen: list[ChosenTable]) -> tuple
 async def importDatabase(body: ImportDatabase, user: UserContext = Depends(requireCredits("metadata_generation"))):
     """
     Start a background import of the chosen tables of a database connection. The client sends back entries from
-    listDatabaseTables; the tables are listed again and only matching entries are imported.
+    listDatabaseTables; the tables are listed again and every entry
+    must still match one by name and stored name, or the whole import is refused.
 
     Returns:
         ORJSONResponse: 202 with the jobId and the names the tables will be stored under.

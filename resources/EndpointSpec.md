@@ -694,7 +694,7 @@ Step 1 of a database import: connects and lists the tables, so the user can choo
 
 ### 3.9 `POST /api/latest/dataLoader/importDatabase`
 
-Step 2 of a database import: starts a background import of the tables the user chose from `listDatabaseTables` (3.8). `tables` holds the chosen entries exactly as that route returned them; the tables are listed again and an entry is imported only when its `name` and `storedAs` both still match, so a table added since cannot take a chosen name. The import only loads the tables; metadata and KPIs are step 3. Needs `metadata_generation` credits and the project's owner. PostgreSQL system and managed-platform schemas (for example Supabase's `auth` and `storage`) and partitions of partitioned tables are skipped. Table names are stored sanitized, schema-qualified outside `public`, with `_2`, `_3`, ... when two map to the same name.
+Step 2 of a database import: starts a background import of the tables the user chose from `listDatabaseTables` (3.8). `tables` holds the chosen entries exactly as that route returned them; the tables are listed again and every entry must still match a table by both `name` and `storedAs`; if any entry does not, the whole import is refused with 400 and nothing is queued, so a table added since cannot take a chosen name. The import only loads the tables; metadata and KPIs are step 3. Needs the project's owner and a `metadata_generation` credit balance (a gate only: the import itself spends no credits). PostgreSQL system and managed-platform schemas (for example Supabase's `auth` and `storage`) and partitions of partitioned tables are skipped. Table names are stored sanitized, schema-qualified outside `public`, with `_2`, `_3`, ... when two map to the same name.
 
 **Request Body (MySQL / PostgreSQL):**
 ```json
@@ -2596,7 +2596,6 @@ The following endpoints consume credits and return `402 Payment Required` when t
 | `POST /utils/getSpeechTranscript` | `speech_to_text` |
 | `POST /utils/getInsightsFromImage` | `image_to_insights` |
 | `POST /dataLoader/loadPdfData` | `pdf_extraction_per_page` |
-| `POST /dataLoader/importDatabase` | `metadata_generation` |
 
 ---
 
