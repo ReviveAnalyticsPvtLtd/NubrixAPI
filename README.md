@@ -36,10 +36,11 @@ The default Docker target is `runtime`, which installs locked runtime dependenci
 | Job | What it verifies |
 | --- | --- |
 | `unit` | Default pytest suite, with opt-in integration skips reported in JUnit |
-| `postgres` | Selected billing and subscription tests on disposable PostgreSQL 17, with zero skips required |
-| `sandbox-isolation` | Linux sandbox tests inside the built image, with skips limited to the two cases that require a non-root parent |
-| `backend-required` | Passes only when all three test jobs pass |
+| `integration` | Disposable PostgreSQL and Redis, including credit recovery, website visits, and the migration rehearsal. All selected cases must run. |
+| `sandbox-isolation` | Linux sandbox tests in the test image. The two cases that require a non-root parent can skip. |
+| `release-smoke` | Boots the release image and checks `/readyz`, the Celery worker, and Beat. |
+| `backend-required` | Shows whether all four jobs passed. Merge requirements are configured separately in GitHub. |
 
-Download `pytest-unit`, `pytest-postgres`, and `pytest-sandbox` from the workflow run to see the JUnit reports. `backend-required` is the stable job to select when configuring required checks on `main`.
+The integration, sandbox, and release smoke jobs use the same runner script as the local checks. Download `pytest-unit`, `pytest-integration`, and `pytest-sandbox` from the workflow run for the JUnit reports. The release smoke results appear in the job log.
 
 Celery Beat owns recurring subscription jobs. The [manual subscription expiry workflow](.github/workflows/subscriptionCron.yaml) uses service credentials and can update subscription records.
