@@ -10,7 +10,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
  && apt-get clean \
  && rm -rf /var/lib/apt/lists/*
 
-RUN pip install --no-cache-dir uv==0.10.7
+RUN pip install --no-cache-dir uv==0.13.10
 
 # Sandbox runs can't write bytecode, so without this they compile every package they import.
 ENV UV_COMPILE_BYTECODE=1 UV_LINK_MODE=copy UV_PYTHON_DOWNLOADS=never
