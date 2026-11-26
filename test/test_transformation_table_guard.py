@@ -1,6 +1,7 @@
 """Tests for the base-table guard on transformation output names."""
 
 import asyncio
+import threading
 import copy
 import hashlib
 import io
@@ -304,11 +305,11 @@ def _projectService(project):
 
 
 def _create(project, name):
-    return asyncio.run(_projectService(project).createTransformation("project_1", name, None))
+    return _runSync(_projectService(project).createTransformation("project_1", name, None))
 
 
 def _delete(project, transformationId="t1"):
-    return asyncio.run(_projectService(project).deleteTransformation("project_1", transformationId))
+    return _runSync(_projectService(project).deleteTransformation("project_1", transformationId))
 
 
 def _storageEntry(fileName, version=0, content=None):
@@ -568,11 +569,11 @@ def _approveAndApply(project, transformationId="t1"):
         await service.applyTransformation("project_1", transformationId, "m1")
 
     with mock.patch("api.services.managementService.managementService.generateMetadata", side_effect=registerTables):
-        asyncio.run(run())
+        _runSync(run())
 
 
 def _rename(project, newName, transformationId="t1"):
-    asyncio.run(_projectService(project).renameTransformation("project_1", transformationId, newName))
+    _runSync(_projectService(project).renameTransformation("project_1", transformationId, newName))
 
 
 def test_deletingADraftLeavesAnUploadOfTheSameName(projectStorage):
@@ -782,7 +783,7 @@ def test_rolledBackTransformationCanBeDeletedAndItsNameReused(projectStorage):
     service = _workspaceService(project)
     service.getMessages = mock.AsyncMock(return_value=[])
     with mock.patch("api.services.managementService.managementService.generateMetadata"):
-        asyncio.run(service.rollbackTransformation("project_1", "t1", "m0"))
+        _runSync(service.rollbackTransformation("project_1", "t1", "m0"))
     assert project.rows[0]["latest_approved_artifact"] is None
     assert "summary.parquet" not in project.fileNames
 
@@ -796,7 +797,7 @@ def _rollback(project, messageId="m0", transformationId="t1"):
     service = _workspaceService(project)
     service.getMessages = mock.AsyncMock(return_value=[])
     with mock.patch("api.services.managementService.managementService.generateMetadata"):
-        return asyncio.run(service.rollbackTransformation("project_1", transformationId, messageId))
+        return _runSync(service.rollbackTransformation("project_1", transformationId, messageId))
 
 
 def _rollbackToAfterTheApply(project):
@@ -805,12 +806,12 @@ def _rollbackToAfterTheApply(project):
 
 
 def _approve(project, transformationId="t1"):
-    asyncio.run(_workspaceService(project).approveMessage("project_1", transformationId, "m1"))
+    _runSync(_workspaceService(project).approveMessage("project_1", transformationId, "m1"))
 
 
 def _apply(project, transformationId="t1"):
     with mock.patch("api.services.managementService.managementService.generateMetadata"):
-        asyncio.run(_workspaceService(project).applyTransformation("project_1", transformationId, "m1"))
+        _runSync(_workspaceService(project).applyTransformation("project_1", transformationId, "m1"))
 
 
 def test_rollingBackADraftLeavesAnUploadOfTheSameName(projectStorage):
@@ -992,20 +993,36 @@ def _upload_file(name):
     return upload
 
 
-def _connection(table):
-    return mock.Mock(host="db.test", port=5432, user="reader", password="unused", db="shop", table=table, projectId="project_1")
+def _runSync(coroutine):
+    """Run a coroutine to the end, also from a hook that fires inside a running event loop (a load inside an apply, or the reverse)."""
+    outcome = {}
+
+    def run():
+        try:
+            outcome["value"] = asyncio.run(coroutine)
+        except BaseException as error:
+            outcome["error"] = error
+
+    # a daemon thread, so a deadlocked hook fails the test instead of hanging the run (a pool would be joined)
+    worker = threading.Thread(target=run, daemon=True)
+    worker.start()
+    worker.join(120)
+    assert not worker.is_alive(), "the coroutine did not finish within 120 s"
+    if "error" in outcome:
+        raise outcome["error"]
+    return outcome.get("value")
 
 
 def _loadVia(kind, service, tableName, pdfTables=1):
     """Run one load route so that it stores tableName."""
     amounts = pd.DataFrame({"amount": [1]})
     if kind == "csv":
-        asyncio.run(service.loadCsvData("project_1", [_upload_file(f"{tableName}.csv")]))
+        _runSync(service.loadCsvData("project_1", [_upload_file(f"{tableName}.csv")]))
     elif kind == "excel":
         base, _, sheet = tableName.rpartition("_")
         with mock.patch("api.services.dataLoadService.pd.read_excel", return_value={sheet: amounts}):
-            asyncio.run(service.loadExcelData("project_1", [_upload_file(f"{base}.xlsx")]))
-    elif kind == "pdf":
+            _runSync(service.loadExcelData("project_1", [_upload_file(f"{base}.xlsx")]))
+    else:  # pdf
         extractor = mock.Mock(dpi=100)
         extractor.extractPagesParallel = mock.AsyncMock(return_value=[{"table": mock.Mock(rows=[[1]])}] * pdfTables)
         extractor.planMerge.return_value = mock.Mock(groups=[mock.Mock(canonicalHeaders=["amount"], tableIndices=[index]) for index in range(pdfTables)])
@@ -1015,21 +1032,10 @@ def _loadVia(kind, service, tableName, pdfTables=1):
             mock.patch("api.services.dataLoadService.fitz.open", return_value=document),
             mock.patch("api.services.dataLoadService.PdfTableExtractor", return_value=extractor),
         ):
-            asyncio.run(service.loadPdfData("project_1", [_upload_file(f"{tableName.removesuffix('_table1')}.pdf")]))
-    elif kind in ("mysql", "postgresql"):
-        with (
-            mock.patch("api.services.dataLoadService.URL"),
-            mock.patch("api.services.dataLoadService.create_engine"),
-            mock.patch("api.services.dataLoadService.pd.read_sql", return_value=amounts),
-        ):
-            (service.loadMySql if kind == "mysql" else service.loadPostgreSQL)(_connection(tableName))
-    else:
-        with mock.patch("api.services.dataLoadService.MongoClient") as mongo:
-            mongo.return_value.__getitem__.return_value.__getitem__.return_value.find.return_value = [{"amount": 1}]
-            service.loadMongoDB(mock.Mock(connectionString="mongodb://db.test", db="shop", collection=tableName, projectId="project_1"))
+            _runSync(service.loadPdfData("project_1", [_upload_file(f"{tableName.removesuffix('_table1')}.pdf")]))
 
 
-def _load(project, tableName, beforeWrite=None, kind="mongo", parquetError=None, pdfTables=1):
+def _load(project, tableName, beforeWrite=None, kind="csv", parquetError=None, pdfTables=1):
     """Load a table through the real loader. beforeWrite runs after the name is accepted, before the file is written.
 
     parquetError makes the load fail after it accepts the name, while it prepares its file.
@@ -1053,7 +1059,7 @@ def _loadPdf(project, baseName="report"):
 
 def _applyWithoutRegistering(project):
     with mock.patch("api.services.managementService.managementService.generateMetadata", side_effect=RuntimeError("model unavailable")):
-        asyncio.run(_workspaceService(project).applyTransformation("project_1", "t1", "m1"))
+        _runSync(_workspaceService(project).applyTransformation("project_1", "t1", "m1"))
 
 
 @pytest.mark.parametrize("cleanUp", [_delete, _rollback], ids=["delete", "rollback"])
@@ -1272,7 +1278,7 @@ def test_retriedApplyIsRefusedOnceALoadAcceptsItsName(projectStorage):
     assert project.writers["summary.parquet"] == "upload"
 
 
-LOADS = {"csv": "sales", "excel": "sales_q1", "pdf": "sales_table1", "mysql": "sales", "postgresql": "sales", "mongo": "sales"}
+LOADS = {"csv": "sales", "excel": "sales_q1", "pdf": "sales_table1"}
 
 
 @pytest.mark.parametrize("kind", LOADS)
@@ -1349,9 +1355,9 @@ def _afterFirstCheck(service, action):
 def _run(service, operation):
     with mock.patch("api.services.managementService.managementService.generateMetadata"):
         if operation == "apply":
-            return asyncio.run(service.applyTransformation("project_1", "t1", "m1"))
+            return _runSync(service.applyTransformation("project_1", "t1", "m1"))
         service.getMessages = mock.AsyncMock(return_value=[])
-        return asyncio.run(service.rollbackTransformation("project_1", "t1", "m2"))
+        return _runSync(service.rollbackTransformation("project_1", "t1", "m2"))
 
 
 @pytest.mark.parametrize("operation", ["apply", "rollback"])
@@ -1519,7 +1525,7 @@ def test_csvThatCannotBeParsedGivesTheNameBack(projectStorage):
     emptyFile.read = mock.AsyncMock(return_value=b"")
 
     with mock.patch.object(managementService, "client", project), pytest.raises(CustomException):
-        asyncio.run(loader.loadCsvData("project_1", [emptyFile]))
+        _runSync(loader.loadCsvData("project_1", [emptyFile]))
 
     assert project.rows[0]["latest_approved_artifact"] == {"table_name": "sales", "table_file": _recordedFile("sales")}
 
@@ -1773,8 +1779,8 @@ def _cleanUp(project, operation, afterRowRead=None):
     service.getMessages = mock.AsyncMock(return_value=[])
     with mock.patch("api.services.managementService.managementService.generateMetadata"):
         if operation == "delete":
-            return asyncio.run(service.deleteTransformation("project_1", "t1"))
-        return asyncio.run(service.rollbackTransformation("project_1", "t1", "m0"))
+            return _runSync(service.deleteTransformation("project_1", "t1"))
+        return _runSync(service.rollbackTransformation("project_1", "t1", "m0"))
 
 
 def _cleanedUpRow(project, operation):
@@ -2170,7 +2176,7 @@ def test_listedTransformationsDoNotShowTheirFileRecord(projectStorage):
     project = projectStorage(_FakeProject(metadata={}, tables=("sales",), rows=[_appliedRow("sales", recorded=True), _draftRow("draft", transformationId="t2")]))
     project.rows[0]["latest_approved_artifact"]["mermaid_code"] = "graph"
 
-    listed = asyncio.run(_projectService(project).listTransformations("project_1"))
+    listed = _runSync(_projectService(project).listTransformations("project_1"))
 
     assert [row.get("latest_approved_artifact") for row in listed] == [{"table_name": "sales", "mermaid_code": "graph"}, None]
     assert project.rows[0]["latest_approved_artifact"]["table_file"] == _recordedFile("sales")

@@ -2,7 +2,9 @@ import argparse
 import os
 import unittest
 import sys
+import shutil
 import subprocess
+import tempfile
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import Mock, patch
@@ -110,12 +112,19 @@ class AdminProvisioningTests(unittest.TestCase):
             manage_admin.main(["add", "--email", "admin@example.com", "--name", "Admin Name", "--password", "secret"])
 
     def test_cli_help_runs_as_a_script(self):
-        result = subprocess.run(
-            [sys.executable, "scripts/manage_admin.py", "--help"],
-            cwd=Path(__file__).resolve().parents[1],
-            capture_output=True,
-            text=True,
-        )
+        # from a copy, so the script's own load_dotenv finds no .env of the checkout
+        root = Path(__file__).resolve().parents[1]
+        with tempfile.TemporaryDirectory() as folder:
+            (Path(folder) / "scripts").mkdir()
+            shutil.copy(root / "scripts" / "manage_admin.py", Path(folder) / "scripts")
+            env = {**os.environ, "PYTHONPATH": os.pathsep.join(filter(None, [str(root), os.environ.get("PYTHONPATH")]))}
+            result = subprocess.run(
+                [sys.executable, "scripts/manage_admin.py", "--help"],
+                cwd=folder,
+                env=env,
+                capture_output=True,
+                text=True,
+            )
         self.assertEqual(0, result.returncode, result.stderr)
         self.assertNotIn("--password", result.stdout)
 

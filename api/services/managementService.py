@@ -17,7 +17,7 @@ from api.services.credits.creditTrackingCallback import CreditTrackingCallback
 from utils.llmOutputParser import parseModelJsonOutput
 from api.commons import updateProjectModifiedAt
 from utils.exceptionHandler import CustomException
-from utils.storageListing import listProjectFiles
+from utils.storageListing import listProjectFiles, removeProjectFiles
 from api.services.authenticationService import DEFAULT_PROFILE_IMAGE
 from api.services.subscriptions.subscriptionFieldUtils import (
     CANONICAL_SUBSCRIPTION_SELECT,
@@ -35,6 +35,7 @@ from utils.projectStorage import StorageObjectNotFound, readJson, readTableBytes
 from utils.sandboxSlots import isBusy
 from utils.storedTables import storedTableInfo, tableReadException
 from utils.logger import logger
+from api.services.importJobs import importJobs
 from urllib.request import urlopen
 from api.commons import client
 from api.models import (
@@ -965,12 +966,13 @@ class ManagementService:
             CustomException: For any errors during deletion.
         """
         try:
+            # first, so a running import stops at its next write instead of writing into a deleted project
+            importJobs.forget(projectId)
+        except Exception as e:
+            logger.error(f"Import keys of project {projectId} could not be removed ({type(e).__name__}).")
+        try:
             _ = self.client.table("Projects").delete().eq("projectId", projectId).execute()
-            allFiles = listProjectFiles(self.client, projectId)
-            fileNames = [os.path.join(projectId, x.get("name")) for x in allFiles]
-            # Storage refuses more than 1000 paths in one remove.
-            for start in range(0, len(fileNames), 1000):
-                _ = self.client.storage.from_("AnalyticsHub").remove(fileNames[start : start + 1000])
+            removeProjectFiles(self.client, projectId)
             return
         except Exception as e:
             exception = CustomException(e)

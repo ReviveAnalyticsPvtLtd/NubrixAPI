@@ -1,23 +1,29 @@
 import os
 import unittest
+from urllib.parse import urlparse
 
-# Opt-in only: set RUN_REDIS_INTEGRATION=1 with a reachable Redis (REDIS_HOST/
-# REDIS_PORT/REDIS_PASSWORD) to exercise the real Lua scripts. Kept off by
+# Opt-in only: set RUN_REDIS_INTEGRATION=1 and MANUAL_BILLING_TEST_REDIS_URL (a disposable
+# loopback Redis, never the app's) to exercise the real Lua scripts. Kept off by
 # default so CI (which stubs the redis module) stays green.
-RUN_INTEGRATION = (
-    os.environ.get("RUN_REDIS_INTEGRATION") == "1"
-    and all(k in os.environ for k in ("REDIS_HOST", "REDIS_PORT", "REDIS_PASSWORD"))
-)
+RUN_INTEGRATION = os.environ.get("RUN_REDIS_INTEGRATION") == "1"
 
 _FALLBACK = 2678400
 
 
-@unittest.skipUnless(RUN_INTEGRATION, "Set RUN_REDIS_INTEGRATION=1 with Redis env to run")
+@unittest.skipUnless(RUN_INTEGRATION, "Set RUN_REDIS_INTEGRATION=1 and MANUAL_BILLING_TEST_REDIS_URL (a disposable loopback Redis) to run")
 class TestCreditLuaIntegration(unittest.TestCase):
     def setUp(self):
-        from api.services.credits.creditService import creditService
+        import redis
+        from api.services.credits.creditService import CreditService
 
-        self.svc = creditService
+        url = os.environ.get("MANUAL_BILLING_TEST_REDIS_URL", "")
+        parsed = urlparse(url)
+        assert parsed.scheme == "redis" and parsed.hostname in ("127.0.0.1", "localhost")
+        assert parsed.port not in (None, 6379), "Explicit disposable random Redis port required"
+        client = redis.Redis.from_url(url, decode_responses=True)
+        self.addCleanup(client.close)
+        self.svc = CreditService()
+        self.svc._redis = lambda: client
         self.key = self.svc._redisKey("lua_test_user")
         r = self.svc._redis()
         r.delete(self.key)

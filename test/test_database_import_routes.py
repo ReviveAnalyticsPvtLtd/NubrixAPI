@@ -1,0 +1,439 @@
+"""POST /loaders/loadMySql, /loadPostgreSQL, /loadMongoDB (step 1: list), POST /loaders/importDatabase and GET /loaders/importStatus."""
+import inspect
+import json
+import socket
+from unittest.mock import Mock
+
+from fastapi.exceptions import RequestValidationError
+
+import pytest
+from fastapi import FastAPI, HTTPException
+from fastapi.responses import JSONResponse
+from fastapi.routing import APIRoute
+from fastapi.testclient import TestClient
+from loguru import logger
+
+import api.commons as commons
+from api.commons import UserContext
+import main
+from api.routers import dataLoader
+from api.services import databaseSources
+from api.services.importJobs import ImportJobs
+from nubrix.triggers.tasks import databaseImportTask
+from test.test_import_jobs import FakeRedis
+from utils import connectionTargets, exceptionHandler
+from utils.connectionTargets import BLOCKED_ADDRESS_MESSAGE, BlockedAddressError
+
+OWNER = UserContext(userId="owner-user", email="owner@test.example", token="t")
+PROJECT = "owned-project"
+SECRET = "s3cret-pw"
+BODY = {"projectId": PROJECT, "source": "mysql", "host": "db.example.com", "port": 3306,
+        "user": "u", "password": SECRET, "db": "shop"}
+# every table the env fixture lists, as the loaders answer them
+CHOSEN = [{"name": "orders", "storedAs": "orders"}, {"name": "a b", "storedAs": "a_b"},
+          {"name": "a_b", "storedAs": "a_b_2"}, {"name": "sales.users", "storedAs": "sales_users"},
+          {"name": "t", "storedAs": "t"}]
+SEND_BATCH = databaseImportTask.sendBatch  # the env fixture mocks it
+CONNECT_FAILURE = "Unable to connect: check host/port/credentials."
+
+
+class Owners:
+    def __init__(self, owner=OWNER.userId):
+        self.owner = owner
+        self.calls = 0
+
+    def table(self, _):
+        return self
+
+    def select(self, *_):
+        return self
+
+    def eq(self, *_):
+        return self
+
+    def limit(self, *_):
+        return self
+
+    def execute(self):
+        self.calls += 1
+        return type("R", (), {"data": [{"ownerUserId": self.owner}]})()
+
+
+@pytest.fixture
+def env(monkeypatch):
+    # Other test files stub utils.logger at collection; both of these modules log on the routes' error paths.
+    for module in (dataLoader, exceptionHandler):
+        monkeypatch.setattr(module, "logger", logger)
+    owners = Owners()
+    monkeypatch.setattr(commons, "client", owners)
+    jobs = ImportJobs(FakeRedis())
+    monkeypatch.setattr(dataLoader, "importJobs", jobs)
+    send = Mock()
+    monkeypatch.setattr(databaseImportTask, "sendBatch", send)
+    tables = [("orders", None), ("a b", None), ("a_b", None), ("users", "sales"), ("t", "public")]
+    monkeypatch.setattr(dataLoader, "listTables", Mock(return_value=tables))
+    monkeypatch.setattr(databaseSources, "publicAddress", lambda host, port: "192.0.2.1")
+    toSource = Mock(wraps=databaseSources.toSource)
+    monkeypatch.setattr(dataLoader, "toSource", toSource)
+    app = FastAPI()
+    app.include_router(dataLoader.router, prefix="/loaders")
+    for route in dataLoader.router.routes:
+        if isinstance(route, APIRoute):
+            for dependency in route.dependant.dependencies:
+                app.dependency_overrides[dependency.call] = lambda: OWNER
+
+    app.add_exception_handler(RequestValidationError, main.request_validation_handler)
+
+    @app.exception_handler(HTTPException)
+    async def flat(_, error):
+        return JSONResponse(status_code=error.status_code, content=error.detail)
+
+    return type("Env", (), {"client": TestClient(app), "owners": owners, "jobs": jobs, "send": send, "toSource": toSource})
+
+
+def post(env, **changes):
+    return env.client.post("/loaders/importDatabase", json={**BODY, "tables": CHOSEN, **changes})
+
+
+IMPORT, LIST = "/loaders/importDatabase", "list"
+LOADERS = {"mysql": "/loaders/loadMySql", "postgresql": "/loaders/loadPostgreSQL", "mongodb": "/loaders/loadMongoDB"}
+SUCCESS = {IMPORT: 202, LIST: 200}
+
+
+@pytest.fixture(params=[IMPORT, LIST], ids=["import", "list"])
+def route(request):
+    """Both steps connect and list the same way, so every connection check runs against each."""
+    return request.param
+
+
+def send(env, route, body):
+    """POST a body as is: to importDatabase, or to the loader its `source` names (the loaders take no `source`)."""
+    if route == IMPORT:
+        return env.client.post(IMPORT, json=body)
+    body = dict(body)
+    return env.client.post(LOADERS[body.pop("source")], json=body)
+
+
+def call(env, route, **changes):
+    return post(env, **changes) if route == IMPORT else send(env, LIST, {**BODY, **changes})
+
+
+def listing(env, **changes):
+    return call(env, LIST, **changes)
+
+
+@pytest.mark.parametrize("source", ["mysql", "postgresql", "mongodb"])
+def test_eachLoaderBuildsItsOwnSource(env, monkeypatch, source):
+    monkeypatch.setattr(databaseSources, "checkMongoUri", lambda value: None)
+    response = listing(env, source=source, connectionString="mongodb://u:p@db.example.com/shop")
+    assert response.status_code == 200
+    assert env.toSource.call_args.args[0] == source
+
+
+@pytest.mark.parametrize("source,field", [("mysql", "table"), ("mongodb", "collection")])
+def test_oldSingleTableBodyOnlyLists(env, monkeypatch, source, field):
+    monkeypatch.setattr(databaseSources, "checkMongoUri", lambda value: None)
+    # older clients still send the one table or collection they meant to load
+    mongo = {"connectionString": "mongodb://u:p@db.example.com/shop"} if source == "mongodb" else {}
+    response = listing(env, source=source, **mongo, **{field: "orders"})
+    assert response.status_code == 200 and response.json() == {"tables": CHOSEN}
+    assert env.jobs.get(PROJECT) is None
+    env.send.assert_not_called()
+
+
+def test_listedPairsImportOnTheSameSource(env):
+    listed = listing(env, source="postgresql").json()["tables"]
+    response = post(env, source="postgresql", tables=listed)
+    assert response.status_code == 202 and response.json()["tables"] == [t["storedAs"] for t in listed]
+
+
+def _gates(path):
+    route = next(r for r in dataLoader.router.routes if isinstance(r, APIRoute) and r.path == path)
+    calls = [dependency.call for dependency in route.dependant.dependencies]
+    credits = [inspect.getclosurevars(c).nonlocals.get("operationType") for c in calls
+               if c.__name__ == "_dependency"]
+    return calls, credits
+
+
+@pytest.mark.parametrize("path", ["/loadMySql", "/loadPostgreSQL", "/loadMongoDB"])
+def test_loadersNeedProductAccessAndNoCredits(path):
+    calls, credits = _gates(path)
+    assert commons.requireProductAccess in calls and credits == []
+
+
+def test_importNeedsMetadataCredits():
+    calls, credits = _gates("/importDatabase")
+    assert credits == ["metadata_generation"]
+
+
+def test_listAnswersNamesAndStoredNames(env):
+    response = listing(env)
+    assert response.status_code == 200
+    assert response.json() == {"tables": CHOSEN}
+    assert env.jobs.get(PROJECT) is None
+    env.send.assert_not_called()
+
+
+def test_startsJobAndAnswers202(env):
+    response = post(env)
+    assert response.status_code == 202
+    body = response.json()
+    assert body["tables"] == ["orders", "a_b", "a_b_2", "sales_users", "t"]
+    record = env.jobs.get(PROJECT)
+    assert body["jobId"] == record["jobId"]
+    assert [(t["name"], t["storedAs"]) for t in record["tables"]] == [
+        ("orders", "orders"), ("a b", "a_b"), ("a_b", "a_b_2"), ("sales.users", "sales_users"), ("t", "t")]
+
+
+def test_enqueuesFirstBatchOnce(env):
+    post(env)
+    env.send.assert_called_once()
+    args = env.send.call_args.args
+    assert args[1:3] == (PROJECT, OWNER.userId)
+    assert args[5][2] == ["a_b", None, "a_b_2"]
+    assert env.send.call_args.kwargs["start"] == 0
+
+
+def test_answerNeverEchoesThePassword(env, route):
+    response = call(env, route)
+    assert SECRET not in response.text
+    assert SECRET not in str(env.jobs.get(PROJECT))
+
+
+def test_routeQueuesNoPlainTextCredentials(env, monkeypatch):
+    from nubrix.triggers.celery import celeryApp
+    monkeypatch.setattr(databaseImportTask, "sendBatch", SEND_BATCH)
+    queued = []
+    monkeypatch.setattr(celeryApp, "send_task", lambda name, args, **options: queued.append(json.dumps(args)))
+    assert post(env).status_code == 202
+    assert len(queued) == 1
+    for private in (SECRET, BODY["host"]):
+        assert private not in queued[0]
+
+
+def test_missingFieldIs400(env):
+    response = post(env, host=None)
+    assert response.status_code == 400
+    assert response.json()["message"] == "The host field is required."
+    env.send.assert_not_called()
+
+
+def test_importWithoutTablesIsRefused(env):
+    response = env.client.post("/loaders/importDatabase", json=BODY)
+    assert response.status_code == 422
+    assert response.json()["detail"][0]["loc"][-1] == "tables"
+    assert env.jobs.get(PROJECT) is None
+    env.send.assert_not_called()
+
+
+def test_importsOnlyChosenTablesInListOrder(env):
+    response = post(env, tables=[{"name": "t", "storedAs": "t"}, {"name": "orders", "storedAs": "orders"}])
+    assert response.status_code == 202 and response.json()["tables"] == ["orders", "t"]
+    assert [(t["name"], t["storedAs"]) for t in env.jobs.get(PROJECT)["tables"]] == [("orders", "orders"), ("t", "t")]
+    assert env.send.call_args.args[5] == [["orders", None, "orders"], ["t", "public", "t"]]
+
+
+def test_emptyChoiceIs400(env):
+    response = post(env, tables=[])
+    assert response.status_code == 400 and response.json()["message"] == "Choose at least one table."
+    assert env.jobs.get(PROJECT) is None and not env.send.called
+
+
+def test_unknownChoiceIs400WithoutTheName(env):
+    lines = []
+    sink = logger.add(lines.append)
+    try:
+        response = post(env, tables=[{"name": "orders", "storedAs": "orders"}, {"name": "secret_tbl", "storedAs": "secret_tbl"}])
+    finally:
+        logger.remove(sink)
+    assert response.status_code == 400
+    assert response.json()["message"] == "Some selected tables were not found. Connect again to refresh the list."
+    assert "secret_tbl" not in response.text and "secret_tbl" not in "".join(str(line) for line in lines)
+    assert env.jobs.get(PROJECT) is None and not env.send.called
+
+
+def test_mismatchedPairIs400(env):
+    # "a_b" is listed, but stored as "a_b_2": a table added between the two calls must not take a chosen name
+    response = post(env, tables=[{"name": "a_b", "storedAs": "a_b"}])
+    assert response.status_code == 400
+    assert env.jobs.get(PROJECT) is None and not env.send.called
+
+
+def test_duplicateChoiceImportsOnce(env):
+    response = post(env, tables=[{"name": "orders", "storedAs": "orders"}] * 2)
+    assert response.status_code == 202 and response.json()["tables"] == ["orders"]
+    assert [t["storedAs"] for t in env.jobs.get(PROJECT)["tables"]] == ["orders"]
+
+
+def test_blockedAddressIs400(env, route, monkeypatch):
+    def blocked(host, port):
+        raise BlockedAddressError("10.0.0.1")
+    monkeypatch.setattr(databaseSources, "publicAddress", blocked)
+    response = call(env, route)
+    assert (response.status_code, response.json()["message"]) == (400, BLOCKED_ADDRESS_MESSAGE)
+
+
+@pytest.mark.parametrize("failure", [RuntimeError(f"login failed for {SECRET}"), ConnectionError("x")])
+def test_listFailureIs400WithoutDriverText(env, route, monkeypatch, failure):
+    monkeypatch.setattr(dataLoader, "listTables", Mock(side_effect=failure))
+    response = call(env, route)
+    assert (response.status_code, response.json()["message"]) == (400, CONNECT_FAILURE)
+    assert SECRET not in response.text
+
+
+def test_unresolvableHostIs400(env, route, monkeypatch):
+    def gone(host, port):
+        raise socket.gaierror("nope")
+    monkeypatch.setattr(databaseSources, "publicAddress", gone)
+    response = call(env, route)
+    assert (response.status_code, response.json()["message"]) == (400, CONNECT_FAILURE)
+
+
+def test_unresolvableMongoHostIs400(env, route, monkeypatch):
+    def gone(*_args, **_kwargs):
+        raise socket.gaierror("nope")
+    monkeypatch.setattr(connectionTargets.socket, "getaddrinfo", gone)
+    response = call(env, route, source="mongodb", connectionString="mongodb://u:p@nowhere.example/shop")
+    assert (response.status_code, response.json()["message"]) == (400, CONNECT_FAILURE)
+    assert "nowhere.example" not in response.text
+
+
+def test_noTablesIs422(env, route, monkeypatch):
+    monkeypatch.setattr(dataLoader, "listTables", Mock(return_value=[]))
+    response = call(env, route)
+    assert (response.status_code, response.json()["message"]) == (422, "No tables found.")
+
+
+def test_runningImportIs409(env):
+    assert post(env).status_code == 202
+    response = post(env)
+    assert (response.status_code, response.json()["message"]) == (409, "An import is already running for this project.")
+    assert env.send.call_count == 1
+
+
+def test_nonOwnerNeverTouchesTheHost(env, route):
+    env.owners.owner = "someone-else"
+    response = call(env, route)
+    assert response.status_code == 404
+    dataLoader.listTables.assert_not_called()
+    env.toSource.assert_not_called()
+
+
+def test_statusReturnsRecord(env):
+    jobId = post(env).json()["jobId"]
+    response = env.client.get(f"/loaders/importStatus/{PROJECT}")
+    assert response.status_code == 200
+    assert response.json()["jobId"] == jobId
+
+
+def test_statusWithoutImportIs404(env):
+    response = env.client.get(f"/loaders/importStatus/{PROJECT}")
+    assert (response.status_code, response.json()["message"]) == (404, "No import found.")
+
+
+def test_statusChecksOwnerFirst(env):
+    env.owners.owner = "someone-else"
+    assert env.client.get(f"/loaders/importStatus/{PROJECT}").status_code == 404
+    assert env.owners.calls == 1
+
+
+def test_listTablesValueErrorDoesNotLeak(env, route, monkeypatch, caplog):
+    lines = []
+    sink = logger.add(lines.append)
+    monkeypatch.setattr(dataLoader, "listTables", Mock(side_effect=ValueError(f"'latin-1' codec can't encode {SECRET}")))
+    try:
+        response = call(env, route)
+    finally:
+        logger.remove(sink)
+    assert (response.status_code, response.json()["message"]) == (400, CONNECT_FAILURE)
+    assert SECRET not in response.text
+    logged = "".join(str(line) for line in lines)
+    assert "could not connect" in logged
+    assert SECRET not in logged
+
+
+def test_validationErrorDoesNotEchoThePassword(env, route):
+    body = {k: v for k, v in {**BODY, "tables": CHOSEN}.items() if k != "db"}
+    response = send(env, route, body)
+    assert response.status_code == 422
+    assert SECRET not in response.text
+    assert response.json()["detail"][0]["loc"][-1] == "db"
+
+
+def test_loaderValidationErrorDoesNotEchoThePassword(env):
+    response = env.client.post("/loaders/loadMySql", json={
+        "projectId": PROJECT, "host": "db.example.com", "port": "not-a-port", "user": "u", "password": SECRET, "db": "shop"})
+    assert response.status_code == 422
+    assert SECRET not in response.text
+
+
+def test_failedEnqueueFreesTheProject(env):
+    env.send.side_effect = [RuntimeError(f"broker down {SECRET}"), None]
+    response = post(env)
+    assert (response.status_code, response.json()["message"]) == (503, "The import could not be started. Please try again.")
+    assert SECRET not in response.text
+    assert env.jobs.get(PROJECT)["state"] == "failed"
+    assert post(env).status_code == 202
+
+
+def test_mongoBodyNeverEchoesTheConnectionString(env, route, monkeypatch):
+    uri = "mongodb://user:" + SECRET + "@db.example.com/shop"
+    monkeypatch.setattr(databaseSources, "checkMongoUri", lambda value: None)
+    response = send(env, route, {
+        "projectId": PROJECT, "source": "mongodb", "db": "shop", "connectionString": uri, "tables": CHOSEN})
+    assert response.status_code == SUCCESS[route]
+    assert SECRET not in response.text
+    assert SECRET not in str(env.jobs.get(PROJECT))
+
+
+CANARY = "hostcanary"
+
+
+def _private(*_args, **_kwargs):
+    return [(socket.AF_INET, socket.SOCK_STREAM, 6, "", ("10.0.0.1", 0))]
+
+
+@pytest.mark.parametrize("body", [
+    {"host": f"{CANARY}.internal"},
+    {"host": f"{CANARY}.example.com"},
+    {"source": "mongodb", "connectionString": f"mongodb://u:pw@{CANARY}.internal/shop"},
+    {"source": "mongodb", "connectionString": f"mongodb://u:pw@{CANARY}.example.com/shop"},
+    {"source": "mongodb", "connectionString": f"mongodb://u:pw@db.example.com/shop?maxPoolSize={CANARY}"},
+    {"source": "mongodb", "connectionString": f"mongodb://u:pw@db.example.com/shop?readPreference={CANARY}"},
+], ids=["sqlName", "sqlPrivate", "mongoName", "mongoPrivate", "mongoNumber", "mongoChoice"])
+def test_refusedConnectionNeverShowsItsHostOrOptions(env, route, monkeypatch, body):
+    from utils import connectionTargets
+    monkeypatch.setattr(databaseSources, "publicAddress", connectionTargets.publicAddress)  # the real checks
+    monkeypatch.setattr(connectionTargets.socket, "getaddrinfo", _private)
+    lines = []
+    sink = logger.add(lines.append)
+    try:
+        response = call(env, route, **body)
+    finally:
+        logger.remove(sink)
+    logged = "".join(str(line) for line in lines)
+    assert response.status_code == 400 and logged  # something was logged, and it was checked
+    assert CANARY not in response.text and CANARY not in logged
+
+
+def test_unencodableHostNeverShowsItsText(env, route, monkeypatch):
+    from utils import connectionTargets
+
+    def idna(host, *_args, **_kwargs):
+        raise UnicodeError(f"Invalid character {host!r}")  # Python's IDNA codec quotes the character it rejects
+
+    monkeypatch.setattr(databaseSources, "publicAddress", connectionTargets.publicAddress)
+    monkeypatch.setattr(connectionTargets.socket, "getaddrinfo", idna)
+    lines = []
+    sink = logger.add(lines.append)
+    try:
+        response = call(env, route, host=f"{CANARY}.example.com")
+    finally:
+        logger.remove(sink)
+    logged = "".join(str(line) for line in lines)
+    assert response.status_code == 400 and logged
+    assert CANARY not in response.text and CANARY not in logged
+
+
+def test_namesWithNoWordCharactersAreStoredAsTableAndKeptApart():
+    assert dataLoader._uniqueNames([("$$$", None), ("###", None), ("table", None)]) == ["table", "table_2", "table_3"]

@@ -84,10 +84,6 @@ def _assertMarked(loader, tableName: str):
     return stored
 
 
-def _connection(table: str):
-    return mock.Mock(host="db.test", port=3306, user="u", password="p", db="shop", table=table, projectId=PROJECT)
-
-
 def test_csvUploadStoresAMarkedTable(loader):
     asyncio.run(loader.loadCsvData(PROJECT, [_upload(b"amount,label\n1,a\n2,b\n")]))
 
@@ -101,28 +97,6 @@ def test_excelUploadStoresAMarkedTable(loader):
         asyncio.run(loader.loadExcelData(PROJECT, [_upload(b"x", "book.xlsx")]))
 
     _assertMarked(loader, "book_Q1")
-
-
-def test_sqlLoadsStoreAMarkedTable(loader):
-    with (
-        mock.patch("api.services.dataLoadService.URL"),
-        mock.patch("api.services.dataLoadService.create_engine"),
-        mock.patch("api.services.dataLoadService.pd.read_sql", return_value=pd.DataFrame({"amount": [1]})),
-    ):
-        loader.loadMySql(_connection("orders"))
-        loader.loadPostgreSQL(_connection("invoices"))
-
-    _assertMarked(loader, "orders")
-    _assertMarked(loader, "invoices")
-
-
-def test_mongoLoadStoresAMarkedTable(loader):
-    with mock.patch("api.services.dataLoadService.MongoClient") as mongo:
-        mongo.return_value.__getitem__.return_value.__getitem__.return_value.find.return_value = [{"_id": 1, "amount": 3}]
-        loader.loadMongoDB(mock.Mock(connectionString="mongodb://db.test", db="shop", collection="events", projectId=PROJECT))
-
-    stored = _assertMarked(loader, "events")
-    assert pd.read_parquet(io.BytesIO(stored)).columns.tolist() == ["amount"]
 
 
 def test_oversizedUploadIsRefusedWith413(loader, monkeypatch):
@@ -155,23 +129,6 @@ def test_excelWithAnOversizedSecondSheetGives413AndKeepsTheFirstTable(loader, mo
     assert list(loader.bucket.uploads) == [f"{PROJECT}/book_Q1.parquet"]
     loader._restoreClaims.assert_called_once_with(PROJECT, "book_Q2", CLAIMS)
     loader.metadata.assert_not_called()
-
-
-def test_oversizedImportIsRefusedWith413(loader, monkeypatch):
-    monkeypatch.setenv("STORED_TABLE_MAX_DECODED_BYTES", str(1024 * 1024))
-    big = pd.DataFrame({"a": np.arange(400_000, dtype="int64")})
-    with (
-        mock.patch("api.services.dataLoadService.URL"),
-        mock.patch("api.services.dataLoadService.create_engine"),
-        mock.patch("api.services.dataLoadService.pd.read_sql", return_value=big),
-        pytest.raises(CustomException) as caught,
-    ):
-        loader.loadMySql(_connection("orders"))
-
-    assert (caught.value.statusCode, caught.value.errorCode) == (413, "TABLE_TOO_LARGE")
-    assert caught.value.uiMessage == "This table is too large to load (over 1 MiB)."
-    assert "bytes decoded" not in caught.value.uiMessage
-    assert loader.bucket.uploads == {}
 
 
 def test_callbackRefusalRestoresClaimsAndReachesTheCallerAs413(loader):

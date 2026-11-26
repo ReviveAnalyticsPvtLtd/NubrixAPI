@@ -31,14 +31,16 @@ os.makedirs("logs", mode=0o700, exist_ok=True)
 logger.remove()
 
 _logtail_host = os.environ.get("LOGTAIL_HOST")
-logtailHandler = LogtailHandler(
-    source_token = os.environ.get("LOGTAIL_TOKEN"),
-    **( {"host": _logtail_host} if _logtail_host else {} )
-)
-logger.add(
-    logtailHandler,
-    level="INFO"
-)
+# without a token the shipper would still try to send, and retry, so nothing is shipped then
+if os.environ.get("LOGTAIL_TOKEN"):
+    logtailHandler = LogtailHandler(
+        source_token = os.environ.get("LOGTAIL_TOKEN"),
+        **( {"host": _logtail_host} if _logtail_host else {} )
+    )
+    logger.add(
+        logtailHandler,
+        level="INFO"
+    )
 logger.add(
     sys.stdout,
     colorize=True,
