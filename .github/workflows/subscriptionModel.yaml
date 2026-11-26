@@ -1,16 +1,18 @@
-name: subscription-model
+name: Backend CI
 
 on:
   pull_request:
     branches: [main, feature/subscription-model-expand, feature/subscription-lifecycle-unify]
+  push:
+    branches: [main]
   workflow_dispatch:
 
 permissions:
   contents: read
 
 concurrency:
-  group: subscription-model-${{ github.event.pull_request.number || github.ref }}
-  cancel-in-progress: true
+  group: backend-ci-${{ github.event_name }}-${{ github.event.pull_request.number || github.run_id }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
   unit:
@@ -18,33 +20,59 @@ jobs:
     timeout-minutes: 20
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
       - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
         with:
-          python-version: '3.12'
+          python-version-file: .python-version
       - uses: astral-sh/setup-uv@d0cc045d04ccac9d8b7881df0226f9e82c39688e # v6
         with:
           enable-cache: true
       - name: Install locked dependencies
-        run: uv sync --python 3.12 --frozen --group dev
-      - name: Unit and regression tests (integration skips remain unverified)
-        run: uv run --python 3.12 --frozen --group dev pytest -q
+        run: uv sync --locked --group dev
+      - name: Unit and regression tests
+        run: uv run --no-sync pytest -q --junitxml="$RUNNER_TEMP/unit.xml"
+      - name: Upload unit test report
+        if: ${{ !cancelled() }}
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: pytest-unit
+          path: ${{ runner.temp }}/unit.xml
+          retention-days: 14
 
   sandbox-isolation:
     runs-on: ubuntu-latest
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
       - name: Build the production image
         run: docker build -t nubrix-sandbox .
       - name: Sandbox tests as root in that image, where runs get their own uids
         run: |
-          docker run --rm nubrix-sandbox bash -c '
-            set -o pipefail
-            uv run --group dev pytest test/test_sandbox_storage_reads.py test/test_sandbox_run_limits.py test/test_sandbox_seccomp.py test/test_stored_tables.py -q -rs | tee /tmp/sandbox-tests.txt
-            status=$?
-            if grep -q "only a root parent" /tmp/sandbox-tests.txt; then echo "Separate-uid tests were skipped"; exit 1; fi
-            exit $status
-          '
+          mkdir -p "$RUNNER_TEMP/sandbox-results"
+          docker run --rm \
+            --volume "$RUNNER_TEMP/sandbox-results:/test-results" \
+            nubrix-sandbox bash -euc '
+              uv sync --locked --group dev
+              uv run --no-sync pytest -q -rs \
+                test/test_sandbox_storage_reads.py \
+                test/test_sandbox_run_limits.py \
+                test/test_sandbox_seccomp.py \
+                test/test_stored_tables.py \
+                --junitxml=/test-results/sandbox.xml
+              uv run --no-sync python scripts/check_ci_junit.py /test-results/sandbox.xml \
+                --allow-skip test.test_sandbox_storage_reads.test_sameUidRunsNeedAnExplicitOptIn \
+                --allow-skip test.test_sandbox_storage_reads.test_parentThatCantChangeUidRefusesToRunWhenTheImageRequiresIt
+            '
+      - name: Upload sandbox test report
+        if: ${{ !cancelled() }}
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: pytest-sandbox
+          path: ${{ runner.temp }}/sandbox-results/sandbox.xml
+          retention-days: 14
 
   postgres:
     runs-on: ubuntu-latest
@@ -69,17 +97,19 @@ jobs:
       SUBSCRIPTION_MODEL_TEST_DATABASE_URL: postgresql://postgres:disposable-ci-only@127.0.0.1:5432/manual_billing_test_subscription_expand
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
       - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
         with:
-          python-version: '3.12'
+          python-version-file: .python-version
       - uses: astral-sh/setup-uv@d0cc045d04ccac9d8b7881df0226f9e82c39688e # v6
         with:
           enable-cache: true
       - name: Install locked dependencies
-        run: uv sync --python 3.12 --frozen --group dev
-      - name: Create second disposable fixture database
+        run: uv sync --locked --group dev
+      - name: Create additional disposable fixture databases
         run: |
-          uv run --python 3.12 --frozen --group dev python - <<'PY'
+          uv run --no-sync python - <<'PY'
           import os
           from contextlib import closing
           import psycopg2
@@ -94,7 +124,7 @@ jobs:
           PY
       - name: PostgreSQL financial and current-shape regressions
         run: |
-          uv run --python 3.12 --frozen --group dev pytest -q \
+          uv run --no-sync pytest -q \
             test/test_manual_billing_postgres_integration.py \
             test/test_catalog_invoice_postgres.py \
             test/test_admin_credit_reset_postgres.py \
@@ -111,14 +141,29 @@ jobs:
             test/test_payment_replacement_postgres.py \
             test/test_capture_finalization_postgres.py \
             test/test_payment_fix_regressions_postgres.py \
-            --junitxml="$RUNNER_TEMP/subscription-postgres.xml"
+            --junitxml="$RUNNER_TEMP/postgres.xml"
       - name: Require executed PostgreSQL cases
+        run: uv run --no-sync python scripts/check_ci_junit.py "$RUNNER_TEMP/postgres.xml"
+      - name: Upload PostgreSQL test report
+        if: ${{ !cancelled() }}
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: pytest-postgres
+          path: ${{ runner.temp }}/postgres.xml
+          retention-days: 14
+
+  backend-required:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    needs: [unit, postgres, sandbox-isolation]
+    if: ${{ always() }}
+    steps:
+      - name: Require all backend jobs to pass
+        env:
+          UNIT_RESULT: ${{ needs.unit.result }}
+          POSTGRES_RESULT: ${{ needs.postgres.result }}
+          SANDBOX_RESULT: ${{ needs.sandbox-isolation.result }}
         run: |
-          uv run --python 3.12 --frozen --group dev python - <<'PY'
-          import os
-          import xml.etree.ElementTree as ET
-          root = ET.parse(os.path.join(os.environ['RUNNER_TEMP'], 'subscription-postgres.xml')).getroot()
-          cases = root.findall('.//testcase')
-          assert cases, 'PostgreSQL acceptance collected no cases'
-          assert not root.findall('.//skipped'), 'Skipped PostgreSQL cases are UNVERIFIED'
-          PY
+          printf 'unit=%s postgres=%s sandbox-isolation=%s\n' \
+            "$UNIT_RESULT" "$POSTGRES_RESULT" "$SANDBOX_RESULT"
+          [[ "$UNIT_RESULT" == success && "$POSTGRES_RESULT" == success && "$SANDBOX_RESULT" == success ]]
