@@ -20,10 +20,10 @@ def readiness():
         return JSONResponse({"status": "unavailable"}, status_code=503)
 
     try:
-        with closing(psycopg2.connect(
-            database_url, connect_timeout=2, options="-c statement_timeout=2000",
-        )) as connection, connection.cursor() as cursor:
-            cursor.execute("SELECT 1")
+        with closing(psycopg2.connect(database_url, connect_timeout=2)) as connection:
+            with connection, connection.cursor() as cursor:
+                cursor.execute("SET LOCAL statement_timeout = '2s'")
+                cursor.execute("SELECT 1")
 
         with redis.Redis(
             host=redis_host,

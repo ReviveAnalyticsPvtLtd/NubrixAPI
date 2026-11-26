@@ -1,5 +1,5 @@
 from contextlib import nullcontext
-from unittest.mock import Mock
+from unittest.mock import MagicMock, Mock, call
 
 import psycopg2
 import pytest
@@ -18,7 +18,7 @@ def readiness(monkeypatch):
     monkeypatch.setenv("REDIS_PASSWORD", "fixture")
 
     cursor = Mock()
-    connection = Mock()
+    connection = MagicMock()
     connection.cursor.return_value = nullcontext(cursor)
     postgres = Mock(return_value=connection)
     cache = Mock()
@@ -39,8 +39,11 @@ def test_ready_requires_postgres_and_redis(readiness):
 
     assert response.status_code == 200
     assert response.json() == {"status": "ready"}
-    assert postgres.call_args.kwargs["connect_timeout"] == 2
-    cursor.execute.assert_called_once_with("SELECT 1")
+    postgres.assert_called_once_with("postgresql://example/fixture", connect_timeout=2)
+    assert cursor.execute.call_args_list == [
+        call("SET LOCAL statement_timeout = '2s'"),
+        call("SELECT 1"),
+    ]
     connection.close.assert_called_once()
     assert redis_client.call_args.kwargs["socket_timeout"] == 2
     cache.ping.assert_called_once()
