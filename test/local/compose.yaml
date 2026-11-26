@@ -1,0 +1,99 @@
+x-test-build: &test-build
+  context: ../..
+  target: test
+
+services:
+  postgres:
+    image: postgres:17
+    environment:
+      POSTGRES_PASSWORD: disposable-ci-only
+    command: [postgres, -c, wal_level=logical]
+    volumes:
+      - ./init.sql:/docker-entrypoint-initdb.d/10-test-databases.sql:ro
+    healthcheck:
+      test: [CMD, pg_isready, -h, 127.0.0.1, -U, postgres, -d, smoke_test]
+      interval: 2s
+      timeout: 3s
+      retries: 30
+
+  redis:
+    image: redis:7.4-alpine
+    # Existing destructive integration fixtures accept loopback services only.
+    network_mode: service:postgres
+    depends_on:
+      postgres:
+        condition: service_healthy
+    command: [redis-server, --port, '16379', --save, '', --appendonly, 'no', --requirepass, disposable-ci-only]
+    environment:
+      REDISCLI_AUTH: disposable-ci-only
+    healthcheck:
+      test: [CMD, redis-cli, -p, '16379', ping]
+      interval: 2s
+      timeout: 3s
+      retries: 30
+
+  integration:
+    profiles: [checks]
+    build: *test-build
+    network_mode: service:postgres
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    command: [python, test/local/checks.py, integration]
+    environment:
+      MANUAL_BILLING_TEST_DATABASE_URL: postgresql://postgres:disposable-ci-only@127.0.0.1:5432/manual_billing_test_local
+      LIVE_SCHEMA_TEST_DATABASE_URL: postgresql://postgres:disposable-ci-only@127.0.0.1:5432/manual_billing_test_live_shape
+      SUBSCRIPTION_MODEL_TEST_DATABASE_URL: postgresql://postgres:disposable-ci-only@127.0.0.1:5432/manual_billing_test_subscription_model
+      PRICING_TEST_DATABASE_URL: postgresql://postgres:disposable-ci-only@127.0.0.1:5432/pricing_catalog_test_local
+      MIGRATION_REHEARSAL_TEST_DATABASE_URL: postgresql://postgres:disposable-ci-only@127.0.0.1:5432/migration_rehearsal_test
+      WEBSITE_VISIT_TEST_DATABASE_URL: postgresql://postgres:disposable-ci-only@127.0.0.1:5432/website_visit_test
+      WEBSITE_VISIT_MIGRATION_TEST_DATABASE_URL: postgresql://postgres:disposable-ci-only@127.0.0.1:5432/website_visit_migration_test
+      MANUAL_BILLING_TEST_REDIS_URL: redis://:disposable-ci-only@127.0.0.1:16379/0
+      REDIS_HOST: 127.0.0.1
+      REDIS_PORT: '16379'
+      REDIS_PASSWORD: disposable-ci-only
+
+  sandbox:
+    profiles: [checks]
+    build: *test-build
+    network_mode: none
+    command: [python, test/local/checks.py, sandbox]
+
+  app:
+    profiles: [smoke]
+    build:
+      context: ../..
+      target: runtime
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    environment:
+      DATABASE_URL: postgresql://postgres:disposable-ci-only@postgres:5432/smoke_test
+      REDIS_HOST: postgres
+      REDIS_PORT: '16379'
+      REDIS_PASSWORD: disposable-ci-only
+      SUPABASE_URL: http://127.0.0.1:1
+      SUPABASE_KEY: fixture-only
+      SECRET_KEY: fixture-only
+      RAZORPAY_KEY_ID: fixture-only
+      RAZORPAY_KEY_SECRET: fixture-only
+      RAZORPAY_WEBHOOK_SECRET: fixture-only
+      BREVO_API_KEY: fixture-only
+      GEMINI_API_KEY: fixture-only
+      GOOGLE_API_KEY: fixture-only
+      GROQ_API_KEY: fixture-only
+      WEB_WORKERS: '1'
+      CELERY_CONCURRENCY: '1'
+    healthcheck:
+      test: [CMD, python, -c, 'from urllib.request import urlopen; urlopen("http://127.0.0.1:7860/readyz", timeout=5).close()']
+      interval: 2s
+      timeout: 6s
+      retries: 45
+
+networks:
+  default:
+    internal: true

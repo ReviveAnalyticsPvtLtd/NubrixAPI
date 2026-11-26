@@ -30,15 +30,16 @@ os.makedirs("logs", mode=0o700, exist_ok=True)
 
 logger.remove()
 
-_logtail_host = os.environ.get("LOGTAIL_HOST")
-logtailHandler = LogtailHandler(
-    source_token = os.environ.get("LOGTAIL_TOKEN"),
-    **( {"host": _logtail_host} if _logtail_host else {} )
-)
-logger.add(
-    logtailHandler,
-    level="INFO"
-)
+_logtail_token = os.environ.get("LOGTAIL_TOKEN")
+if _logtail_token:
+    _logtail_host = os.environ.get("LOGTAIL_HOST")
+    logger.add(
+        LogtailHandler(
+            source_token=_logtail_token,
+            **({"host": _logtail_host} if _logtail_host else {}),
+        ),
+        level="INFO",
+    )
 logger.add(
     sys.stdout,
     colorize=True,

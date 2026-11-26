@@ -11,7 +11,23 @@ uv sync --locked --group dev
 uv run --no-sync pytest -q -rs
 ```
 
-The default suite uses test configuration and skips integrations that need explicitly configured services. Use disposable local services for integration tests.
+The default suite uses test configuration and skips integrations that need explicitly configured services.
+
+### Disposable integration and release checks
+
+Start a local Docker engine with Docker Compose v2. From the repository root, run
+
+```sh
+python scripts/run_local_checks.py
+```
+
+This runs the PostgreSQL billing and subscription tests, Redis credit tests, website-visit repository and ACL tests, the migration rehearsal, and Linux sandbox tests. It also boots the release image and checks `/readyz`, a Celery worker ping, and the Beat scheduler. `/readyz` returns 503 when PostgreSQL or Redis is unavailable.
+
+Use `integration`, `sandbox`, or `smoke` as the command argument to run one group. The command prints the JUnit output directory. Use `--reports <directory>` to retain reports at a specific path. Each run has a separate Docker project and removes its containers and volumes on exit. PostgreSQL and Redis use an internal Docker network without host ports, and the application uses fixture credentials supplied by Compose.
+
+The migration rehearsal starts from the synthetic legacy billing schema shared with the PostgreSQL integration tests. It applies the tracked SQL files in version order and checks the resulting tables, publication, and grants. The transaction rolls back when the test closes the connection. The release-only billing contract has its own prerequisite tests in the billing suite.
+
+The default Docker target is `runtime`, which installs locked runtime dependencies during the build. The `test` target shares those layers and adds the dev dependencies.
 
 ## GitHub Actions
 

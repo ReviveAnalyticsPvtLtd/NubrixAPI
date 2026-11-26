@@ -19,6 +19,7 @@ from api.routers import (
     credits,
     dashboard,
     dataLoader,
+    health,
     manager,
     reporting,
     subscriptions,
@@ -150,6 +151,7 @@ async def sweepSandboxRuns():
     threading.Thread(target=sweepOrphanedRuns, daemon=True).start()
 
 app.include_router(authentication.router, prefix = "/auth", tags = ["Authentication"])
+app.include_router(health.router)
 app.include_router(manager.router, prefix = "/projects", tags = ["Project Management"])
 app.include_router(dataLoader.router, prefix = "/loaders", tags = ["Data Loader"])
 app.include_router(blends.router, prefix = "/blends", tags = ["Blends"])
