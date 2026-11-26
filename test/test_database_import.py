@@ -446,7 +446,7 @@ def test_lastBatchEndsTheJobDone(job):
     assert all(t["status"] == "loaded" for t in record["tables"])
 
 
-def test_jobEndsDoneWhenEveryTableFailed(job, monkeypatch):
+def test_jobEndsFailedWhenEveryTableFailed(job, monkeypatch):
     makeTables(job.engine, {name: (1, 1) for name in "ab"})
     tables, jobId = startJob(job)
     monkeypatch.setattr(service, "readChunks", Mock(side_effect=RuntimeError("unreadable")))
@@ -454,8 +454,34 @@ def test_jobEndsDoneWhenEveryTableFailed(job, monkeypatch):
     assert service.runBatch(PROJECT, USER, jobId, MYSQL, tables, 0) is None
 
     record = job.jobs.get(PROJECT)
-    assert record["state"] == "done"
+    assert record["state"] == "failed"
     assert [(t["status"], t["reason"]) for t in record["tables"]] == [("failed", "Could not read this table")] * 2
+    assert not job.redis.exists(f"import:{PROJECT}:running")  # the project can import again
+
+
+def test_deliveryAfterADeathEndsAnAllFailedJobFailed(job):
+    makeTables(job.engine, {name: (1, 1) for name in "ab"})
+    tables, jobId = startJob(job)
+    for name in "ab":
+        job.jobs.setTable(PROJECT, jobId, name, status="failed", reason="Could not read this table")
+    job.redis.set(f"import:{PROJECT}:next", f"{jobId}:done")
+
+    batch(_FakeTask(retries=1), jobId, [list(t) for t in tables], 0)
+
+    assert job.jobs.get(PROJECT)["state"] == "failed"
+
+
+def test_jobEndsDoneWhenSomeTablesFailedOrWereSkipped(job, monkeypatch):
+    makeTables(job.engine, {name: (1, 1) for name in "ab"})
+    job.storage.putJson(PROJECT, "metadata.json", {"a": {"isActive": True}})
+    tables, jobId = startJob(job)
+    monkeypatch.setattr(service, "readChunks", Mock(side_effect=RuntimeError("unreadable")))
+
+    assert service.runBatch(PROJECT, USER, jobId, MYSQL, tables, 0) is None
+
+    record = job.jobs.get(PROJECT)
+    assert [t["status"] for t in record["tables"]] == ["skipped", "failed"]
+    assert record["state"] == "done"  # the skipped table is already in the project, so step 3 still has data
 
 
 def test_noModelCallDuringTheImport(job):

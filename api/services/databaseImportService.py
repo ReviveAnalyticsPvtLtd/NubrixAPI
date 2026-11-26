@@ -142,7 +142,7 @@ def _advance(projectId: str, jobId: str, step) -> None:
 
 def runBatch(projectId: str, userId: str, jobId: str, source: Source, tables: list[SourceTable], start: int) -> int | None:
     """Load the batch of tables from `start`; the next batch's start, or None once every table is done and the job
-    has ended as done.
+    has ended (failed when every table failed, else done).
 
     Raises JobStopped when the job was superseded or this batch is already done, and BatchBusy when another delivery
     holds it.
@@ -152,8 +152,8 @@ def runBatch(projectId: str, userId: str, jobId: str, source: Source, tables: li
         step = _nextStep(projectId, jobId)
         if step == _DONE:
             # every batch is done; the delivery that ran the last one may have died before ending the job
-            _record(projectId, jobId)  # only a job still running: a late duplicate leaves an ended one as it is
-            _check(importJobs.finish(projectId, jobId, "done"))
+            # _endState reads only a job still running: a late duplicate leaves an ended one as it is
+            _check(importJobs.finish(projectId, jobId, _endState(projectId, jobId)))
             return None
         if step > start:
             raise JobStopped()
@@ -161,8 +161,14 @@ def runBatch(projectId: str, userId: str, jobId: str, source: Source, tables: li
         # moved on before the marker is released, so a delivery waiting for it finds the batch done
         _advance(projectId, jobId, _DONE if nextStart is None else nextStart)
         if nextStart is None:
-            _check(importJobs.finish(projectId, jobId, "done"))
+            _check(importJobs.finish(projectId, jobId, _endState(projectId, jobId)))
         return nextStart
+
+
+def _endState(projectId: str, jobId: str) -> str:
+    """failed when every chosen table failed: nothing was stored, so there is nothing to describe in step 3."""
+    tables = _record(projectId, jobId)["tables"]
+    return "failed" if all(t["status"] == "failed" for t in tables) else "done"
 
 
 def _runBatch(projectId, jobId, source, tables, start, refreshMarker) -> int | None:
