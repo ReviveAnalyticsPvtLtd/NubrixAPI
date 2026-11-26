@@ -294,7 +294,15 @@ def test_collectHealthReturnsAggregateWithoutRecipientData():
     assert "count(*) filter" in query
     assert "email" not in query
     assert "next_attempt_at <= %s" in query
-    assert params == (NOW.isoformat(), NOW.isoformat(), NOW.isoformat())
+    assert "from public.billing_events" in query
+    assert "event_status = 'committed'" in query
+    assert '"unbridgedbillingintents"' in query
+    assert params == (
+        NOW.isoformat(),
+        NOW.isoformat(),
+        NOW.isoformat(),
+        "email.billing_intent.committed",
+    )
 
 
 def test_validateClaimCapabilityChecksFunctionAndExecutePrivilege():

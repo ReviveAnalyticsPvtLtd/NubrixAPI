@@ -210,6 +210,27 @@ class BillingMetricsService:
                 ),
             })
 
+        waiting = sum(
+            int(notification.get(key) or 0)
+            for key in ("pending", "retryPending", "unbridgedBillingIntents")
+        )
+        dispatchEnabled = (
+            os.environ.get("NOTIFICATION_DISPATCH_ENABLED", "false").strip().lower()
+            == "true"
+        )
+        if waiting and not dispatchEnabled:
+            alerts.append({
+                "alertType": "notification_dispatch_disabled",
+                "severity": "HIGH",
+                "threshold": 0,
+                "actualValue": waiting,
+                "message": (
+                    "Notification dispatch is switched off "
+                    "(NOTIFICATION_DISPATCH_ENABLED is not true) while "
+                    f"{waiting} emails wait to be sent"
+                ),
+            })
+
         acceptedUnresolved = int(
             notification.get("acceptedUnresolved") or 0
         )

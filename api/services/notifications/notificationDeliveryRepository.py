@@ -40,6 +40,9 @@ _BILLING_NOTIFICATION_TEMPLATE_VERSIONS = {
 }
 
 
+_BILLING_INTENT_EVENT = "email.billing_intent.committed"
+
+
 def _defaultConnection():
     databaseUrl = os.environ.get("DATABASE_URL")
     if not databaseUrl:
@@ -521,10 +524,17 @@ class NotificationDeliveryRepository:
                         ) filter (
                             where status in ('PENDING', 'RETRY_PENDING')
                               and next_attempt_at <= %s
-                        ), 0)::integer as "oldestPendingMinutes"
+                        ), 0)::integer as "oldestPendingMinutes",
+                        -- Committed billing intents wait here until dispatch bridges them.
+                        (
+                            select count(*)
+                            from public.billing_events
+                            where event_type = %s
+                              and event_status = 'COMMITTED'
+                        )::integer as "unbridgedBillingIntents"
                     from public.notification_deliveries
                     """,
-                    (now, now, now),
+                    (now, now, now, _BILLING_INTENT_EVENT),
                 )
                 row = cursor.fetchone()
                 return dict(row) if row is not None else {}
