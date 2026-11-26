@@ -3,7 +3,7 @@
 NubrixAI Analytics Hub API — FastAPI + Celery + LangChain monolith.
 
 ## Stack
-- Python 3.13 (pinned via `.python-version`). Use `uv` for deps; lockfile is `uv.lock`.
+- Python 3.12 (pinned via `.python-version`). Use `uv` for deps; lockfile is `uv.lock`.
 - FastAPI on gunicorn (uvicorn worker class), port 7860, mounted at `/api/latest`.
 - Celery worker + beat on Redis for billing/subscription/credit/cron jobs.
 - LangChain + LangGraph orchestrating LLM components (Gemini via Google GenAI, Groq, Cerebras, OpenAI via OpenRouter).
@@ -12,7 +12,7 @@ NubrixAI Analytics Hub API — FastAPI + Celery + LangChain monolith.
 
 ## Run / Build
 - Dev server: `uv run uvicorn main:app --reload --port 7860`. Swagger at `/api/latest/documentation/docs`.
-- Production (Docker): `uv sync` then `gunicorn main:app ...` (see `supervisord.conf`). `startup.sh` runs supervisord (fastapi + celery worker + celery beat).
+- Production (Docker): the `runtime` target installs locked dependencies at build time. `startup.sh` runs supervisord with FastAPI, the Celery worker, and Celery Beat from the installed environment.
 - Single celery task locally: `uv run celery -A nubrix.triggers.celery.celeryApp worker --loglevel=info --concurrency=2`.
 - Beat only: `uv run celery -A nubrix.triggers.celery.celeryApp beat --loglevel=info`.
 
@@ -36,10 +36,11 @@ NubrixAI Analytics Hub API — FastAPI + Celery + LangChain monolith.
 - Auth: JWT HS256 signed with `SECRET_KEY` env var; token must contain `email`. See `api/commons.py:_verifyTokenInternal`. Auth deps are **sync** (not async).
 - HTTPException detail can be a `dict` with `status`+`message` — main.py:40 flattens that into the response body instead of wrapping in `{"detail": ...}`. Use `raiseHttpException(...)` / `CustomException` from `utils/exceptionHandler.py` to get the flat shape.
 - Celery: beat schedule is in `nubrix/triggers/celery.py` (UTC). All times are UTC. `pastDueSuspension` and `entitlementBoundary` run every 30 min; `reconciliation` every 15 min; `creditReconciliation` hourly; billing/expiry sweeps are daily at 00:00–02:00 UTC. No queue split — single celery worker handles all tasks.
-- `pyproject.toml` has no `[tool.pytest]` / lint config and there is no test directory — there are no automated tests. CI is a single GitHub Actions workflow `.github/workflows/subscriptionCron.yaml` that runs `python nubrix/components/subscriptionManager.py` daily. Do not invent a test command.
+- Tests live in `test/`. Run `uv sync --locked --group dev` and `uv run --no-sync pytest -q -rs` from the repo root. Backend CI runs this suite alongside the shared integration, sandbox, and release smoke checks. See `README.md` for workflow and artifact details.
+- For disposable PostgreSQL, Redis, migration, sandbox, and release-image checks, run `python scripts/run_local_checks.py` with local Docker. See `README.md` for individual checks.
 - `prompts.yaml`, `codeTemplates.yaml`, `config.ini` are loaded by absolute path via `os.path.join(os.getcwd(), ...)` in `CodeGenerator` and friends — run from repo root.
 - `.env` is required and gitignored. Required keys: `SECRET_KEY`, `SUPABASE_URL`, `SUPABASE_KEY`, `DATABASE_URL`, `REDIS_HOST/PORT/PASSWORD`, plus provider keys (`GEMINI_API_KEY`/`GOOGLE_API_KEY`, `GROQ_API_KEY`, `CEREBRAS_API_KEY`, `OPENAI_API_KEY`, `LANGSMITH_*`, `LOGTAIL_*`, `RAZORPAY_*`, `BREVO_API_KEY`, `BREVO_SENDER_EMAIL`, `BREVO_SENDER_NAME`, `DASHBOARD_BASE_URL`, `LANGFUSE_*`). The forecast task also needs `FORECAST_DB_USER`, `FORECAST_DB_PASSWORD`, `FORECAST_DB_HOST`, `FORECAST_DB_PORT` and `FORECAST_DB_NAME`; it fails naming any that are missing when it starts, and the app and worker run without them.
-- `AGENTS.md` and `CLAUDE.md` are gitignored on purpose — this file is for the local agent, not for git.
+- This repository tracks `AGENTS.md`. Local `CLAUDE.md` is ignored.
 - `OPENBLAS_NUM_THREADS=2` is set in `.env` to throttle BLAS (numpy/scipy) in the container.
 
 ## Sandbox Execution

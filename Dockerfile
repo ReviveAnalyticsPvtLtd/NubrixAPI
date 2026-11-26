@@ -1,10 +1,8 @@
-FROM python:3.12-slim
+FROM python:3.12-slim AS base
 
 WORKDIR /app
 
-COPY . .
-
-RUN apt-get update && apt-get install -y \
+RUN apt-get update && apt-get install -y --no-install-recommends \
     supervisor \
     libgomp1 \
     coreutils \
@@ -12,12 +10,14 @@ RUN apt-get update && apt-get install -y \
  && apt-get clean \
  && rm -rf /var/lib/apt/lists/*
 
-RUN pip install uv
-
-RUN chmod +x /app/startup.sh
+RUN pip install --no-cache-dir uv==0.13.10
 
 # Sandbox runs can't write bytecode, so without this they compile every package they import.
-ENV UV_COMPILE_BYTECODE=1
+ENV UV_COMPILE_BYTECODE=1 UV_LINK_MODE=copy UV_PYTHON_DOWNLOADS=never
+
+COPY pyproject.toml uv.lock .python-version ./
+RUN --mount=type=cache,target=/root/.cache/uv uv sync --locked --no-dev --no-install-project
+ENV PATH="/app/.venv/bin:$PATH"
 
 # Sandbox runs live here. Setting this also makes a separate uid per run mandatory.
 ENV SANDBOX_RUN_ROOT=/var/sandbox-runs
@@ -32,3 +32,18 @@ RUN find / -xdev -perm /6000 -type f -exec chmod a-s {} +
 EXPOSE 7860
 
 CMD ["/app/startup.sh"]
+
+FROM base AS test
+
+# Cutover tests use Git to enumerate the source tree.
+RUN apt-get update && apt-get install -y --no-install-recommends git \
+ && rm -rf /var/lib/apt/lists/* \
+ && find / -xdev -perm /6000 -type f -exec chmod a-s {} +
+RUN --mount=type=cache,target=/root/.cache/uv uv sync --locked --group dev --no-install-project
+COPY . .
+RUN sed -i 's/\r$//' /app/startup.sh && chmod +x /app/startup.sh && git init --quiet
+
+FROM base AS runtime
+
+COPY . .
+RUN sed -i 's/\r$//' /app/startup.sh && chmod +x /app/startup.sh

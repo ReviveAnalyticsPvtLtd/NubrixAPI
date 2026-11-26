@@ -1,16 +1,18 @@
-name: subscription-model
+name: Backend CI
 
 on:
   pull_request:
     branches: [main, feature/subscription-model-expand, feature/subscription-lifecycle-unify]
+  push:
+    branches: [main]
   workflow_dispatch:
 
 permissions:
   contents: read
 
 concurrency:
-  group: subscription-model-${{ github.event.pull_request.number || github.ref }}
-  cancel-in-progress: true
+  group: backend-ci-${{ github.event_name }}-${{ github.event.pull_request.number || github.run_id }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
   unit:
@@ -18,107 +20,102 @@ jobs:
     timeout-minutes: 20
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
       - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
         with:
-          python-version: '3.12'
+          python-version-file: .python-version
       - uses: astral-sh/setup-uv@d0cc045d04ccac9d8b7881df0226f9e82c39688e # v6
         with:
           enable-cache: true
       - name: Install locked dependencies
-        run: uv sync --python 3.12 --frozen --group dev
-      - name: Unit and regression tests (integration skips remain unverified)
-        run: uv run --python 3.12 --frozen --group dev pytest -q
+        run: uv sync --locked --group dev
+      - name: Unit and regression tests
+        env:
+          COVERAGE_FILE: ${{ runner.temp }}/unit.coverage
+        run: uv run --no-sync coverage run --branch --source=api,nubrix,utils -m pytest -q --junitxml="$RUNNER_TEMP/unit.xml"
+      - name: Publish unit coverage baseline
+        env:
+          COVERAGE_FILE: ${{ runner.temp }}/unit.coverage
+        run: |
+          uv run --no-sync coverage xml -o "$RUNNER_TEMP/unit-coverage.xml"
+          uv run --no-sync python - "$RUNNER_TEMP/unit-coverage.xml" >> "$GITHUB_STEP_SUMMARY" <<'PY'
+          import sys
+          from xml.etree.ElementTree import parse
+
+          coverage = parse(sys.argv[1]).getroot()
+          print("### Unit and regression coverage")
+          print(f"- Lines: {float(coverage.attrib['line-rate']):.1%}")
+          print(f"- Branches: {float(coverage.attrib['branch-rate']):.1%}")
+          PY
+      - name: Upload unit test and coverage reports
+        if: ${{ !cancelled() }}
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: pytest-unit
+          path: |
+            ${{ runner.temp }}/unit.xml
+            ${{ runner.temp }}/unit-coverage.xml
+          retention-days: 14
+
+  integration:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+      - name: PostgreSQL, Redis, website-visit, and migration checks
+        run: python3 scripts/run_local_checks.py integration --reports "$RUNNER_TEMP/integration-results"
+      - name: Upload integration test reports
+        if: ${{ !cancelled() }}
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: pytest-integration
+          path: ${{ runner.temp }}/integration-results/*.xml
+          retention-days: 14
 
   sandbox-isolation:
     runs-on: ubuntu-latest
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
-      - name: Build the production image
-        run: docker build -t nubrix-sandbox .
-      - name: Sandbox tests as root in that image, where runs get their own uids
-        run: |
-          docker run --rm nubrix-sandbox bash -c '
-            set -o pipefail
-            uv run --group dev pytest test/test_sandbox_storage_reads.py test/test_sandbox_run_limits.py test/test_sandbox_seccomp.py test/test_stored_tables.py -q -rs | tee /tmp/sandbox-tests.txt
-            status=$?
-            if grep -q "only a root parent" /tmp/sandbox-tests.txt; then echo "Separate-uid tests were skipped"; exit 1; fi
-            exit $status
-          '
+        with:
+          persist-credentials: false
+      - name: Linux sandbox isolation tests
+        run: python3 scripts/run_local_checks.py sandbox --reports "$RUNNER_TEMP/sandbox-results"
+      - name: Upload sandbox test report
+        if: ${{ !cancelled() }}
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: pytest-sandbox
+          path: ${{ runner.temp }}/sandbox-results/sandbox.xml
+          retention-days: 14
 
-  postgres:
+  release-smoke:
     runs-on: ubuntu-latest
     timeout-minutes: 20
-    services:
-      postgres:
-        image: postgres:17
-        env:
-          POSTGRES_USER: postgres
-          POSTGRES_PASSWORD: disposable-ci-only
-          POSTGRES_DB: manual_billing_test_subscription_model
-        ports:
-          - 5432:5432
-        options: >-
-          --health-cmd "pg_isready -U postgres -d manual_billing_test_subscription_model"
-          --health-interval 5s --health-timeout 5s --health-retries 12
-    env:
-      RUN_MANUAL_BILLING_INTEGRATION: '1'
-      RUN_LIVE_SCHEMA_INTEGRATION: '1'
-      MANUAL_BILLING_TEST_DATABASE_URL: postgresql://postgres:disposable-ci-only@127.0.0.1:5432/manual_billing_test_subscription_model
-      LIVE_SCHEMA_TEST_DATABASE_URL: postgresql://postgres:disposable-ci-only@127.0.0.1:5432/manual_billing_test_live_shape
-      SUBSCRIPTION_MODEL_TEST_DATABASE_URL: postgresql://postgres:disposable-ci-only@127.0.0.1:5432/manual_billing_test_subscription_expand
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
-      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
         with:
-          python-version: '3.12'
-      - uses: astral-sh/setup-uv@d0cc045d04ccac9d8b7881df0226f9e82c39688e # v6
-        with:
-          enable-cache: true
-      - name: Install locked dependencies
-        run: uv sync --python 3.12 --frozen --group dev
-      - name: Create second disposable fixture database
+          persist-credentials: false
+      - name: Boot the release image and check the API, worker, and Beat
+        run: python3 scripts/run_local_checks.py smoke
+
+  backend-required:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    needs: [unit, integration, sandbox-isolation, release-smoke]
+    if: ${{ always() }}
+    steps:
+      - name: Report the overall backend result
+        env:
+          UNIT_RESULT: ${{ needs.unit.result }}
+          INTEGRATION_RESULT: ${{ needs.integration.result }}
+          SANDBOX_RESULT: ${{ needs.sandbox-isolation.result }}
+          RELEASE_SMOKE_RESULT: ${{ needs.release-smoke.result }}
         run: |
-          uv run --python 3.12 --frozen --group dev python - <<'PY'
-          import os
-          from contextlib import closing
-          import psycopg2
-          with closing(psycopg2.connect(os.environ['MANUAL_BILLING_TEST_DATABASE_URL'])) as connection:
-              connection.autocommit = True
-              with connection.cursor() as cursor:
-                  cursor.execute('CREATE DATABASE manual_billing_test_live_shape')
-                  cursor.execute('CREATE DATABASE manual_billing_test_subscription_expand')
-                  # Roles are cluster-wide. Both fixtures need Supabase's real
-                  # service-role bypass semantics, independent of module order.
-                  cursor.execute('CREATE ROLE service_role NOLOGIN BYPASSRLS')
-          PY
-      - name: PostgreSQL financial and current-shape regressions
-        run: |
-          uv run --python 3.12 --frozen --group dev pytest -q \
-            test/test_manual_billing_postgres_integration.py \
-            test/test_catalog_invoice_postgres.py \
-            test/test_admin_credit_reset_postgres.py \
-            test/test_gap_remediation_postgres.py \
-            test/test_live_billing_schema_postgres.py \
-            test/test_subscription_model_postgres.py \
-            test/test_subscription_model_repository.py \
-            test/test_subscription_model_finalization.py \
-            test/test_subscription_erasure_postgres.py \
-            test/test_subscription_model_cutover_postgres.py \
-            test/test_subscription_model_contract.py \
-            test/test_purchase_checkout_postgres.py \
-            test/test_payment_refunds_postgres.py \
-            test/test_payment_replacement_postgres.py \
-            test/test_capture_finalization_postgres.py \
-            test/test_payment_fix_regressions_postgres.py \
-            --junitxml="$RUNNER_TEMP/subscription-postgres.xml"
-      - name: Require executed PostgreSQL cases
-        run: |
-          uv run --python 3.12 --frozen --group dev python - <<'PY'
-          import os
-          import xml.etree.ElementTree as ET
-          root = ET.parse(os.path.join(os.environ['RUNNER_TEMP'], 'subscription-postgres.xml')).getroot()
-          cases = root.findall('.//testcase')
-          assert cases, 'PostgreSQL acceptance collected no cases'
-          assert not root.findall('.//skipped'), 'Skipped PostgreSQL cases are UNVERIFIED'
-          PY
+          printf 'unit=%s integration=%s sandbox-isolation=%s release-smoke=%s\n' \
+            "$UNIT_RESULT" "$INTEGRATION_RESULT" "$SANDBOX_RESULT" "$RELEASE_SMOKE_RESULT"
+          [[ "$UNIT_RESULT" == success && "$INTEGRATION_RESULT" == success &&
+             "$SANDBOX_RESULT" == success && "$RELEASE_SMOKE_RESULT" == success ]]
