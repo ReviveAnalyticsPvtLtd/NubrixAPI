@@ -1,0 +1,78 @@
+name: Backend Security
+
+on:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: backend-security-${{ github.event_name }}-${{ github.event.pull_request.number || github.run_id }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  trivy:
+    name: Trivy advisory scan
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    env:
+      RUNTIME_IMAGE: nubrix-ci:runtime
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+      - name: Install checksum-pinned Trivy
+        env:
+          TRIVY_VERSION: '0.76.2'
+          TRIVY_SHA256: bc0fc726e017b8927a62b2d3531d7a84ee01769daf5c99ed866dced54089fdbf
+        run: |
+          bin_dir="$RUNNER_TEMP/trivy-bin"
+          archive="$RUNNER_TEMP/trivy.tar.gz"
+          SCAN_REPORT_DIR="$RUNNER_TEMP/trivy-reports"
+          mkdir -p "$bin_dir" "$SCAN_REPORT_DIR"
+          printf 'TRIVY_CACHE_DIR=%s\nSCAN_REPORT_DIR=%s\n' "$RUNNER_TEMP/trivy-cache" "$SCAN_REPORT_DIR" >> "$GITHUB_ENV"
+          curl --fail --silent --show-error --location --retry 3 \
+            --proto '=https' --proto-redir '=https' \
+            --output "$archive" \
+            "https://github.com/aquasecurity/trivy/releases/download/v${TRIVY_VERSION}/trivy_${TRIVY_VERSION}_Linux-64bit.tar.gz"
+          printf '%s  %s\n' "$TRIVY_SHA256" "$archive" | sha256sum --check --strict
+          tar -xzf "$archive" -C "$bin_dir" trivy
+          "$bin_dir/trivy" --version
+          printf '%s\n' "$bin_dir" >> "$GITHUB_PATH"
+      - name: Audit repository dependencies and Dockerfile
+        run: |
+          trivy fs --scanners vuln,misconfig --include-dev-deps --skip-dirs .git --exit-code 0 \
+            --format json --output "$SCAN_REPORT_DIR/repository.json" .
+      - name: Build the backend runtime image
+        run: |
+          docker build --target runtime --tag "$RUNTIME_IMAGE" .
+          git rev-parse HEAD > "$SCAN_REPORT_DIR/commit.txt"
+          docker image inspect --format '{{.Id}}' "$RUNTIME_IMAGE" > "$SCAN_REPORT_DIR/image-id.txt"
+      - name: Scan the runtime image and generate its SBOM
+        run: |
+          trivy image --image-src docker --scanners vuln --exit-code 0 \
+            --format json --output "$SCAN_REPORT_DIR/runtime-image.json" "$RUNTIME_IMAGE"
+          trivy image --image-src docker --format cyclonedx \
+            --output "$SCAN_REPORT_DIR/runtime-image.cdx.json" "$RUNTIME_IMAGE"
+      - name: Summarize advisory findings
+        run: |
+          {
+            echo '### Trivy advisory scan'
+            for report in repository runtime-image; do
+              findings="$(jq -r '
+                [(.Results // [])[] | ((.Vulnerabilities // [])[], (.Misconfigurations // [])[]) | .Severity]
+                | group_by(.) | map("\(.[0]): \(length)")
+                | if length == 0 then "No findings" else join(", ") end
+              ' "$SCAN_REPORT_DIR/$report.json")"
+              printf -- '- %s: %s\n' "$report" "$findings"
+            done
+            echo 'The Trivy reports and runtime SBOM are in the workflow artifacts.'
+          } >> "$GITHUB_STEP_SUMMARY"
+      - name: Upload Trivy reports and SBOM
+        if: ${{ !cancelled() }}
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: trivy-reports
+          path: ${{ runner.temp }}/trivy-reports
+          retention-days: 14

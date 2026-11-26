@@ -12,6 +12,7 @@ POSTGRES = (
     "test_gap_remediation_postgres",
     "test_live_billing_schema_postgres",
     "test_pricing_catalog_postgres",
+    "test_pricing_catalog_repository",
     "test_subscription_model_postgres",
     "test_subscription_model_repository",
     "test_subscription_model_finalization",

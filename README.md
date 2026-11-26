@@ -35,12 +35,16 @@ The default Docker target is `runtime`, which installs locked runtime dependenci
 
 | Job | What it verifies |
 | --- | --- |
-| `unit` | Default pytest suite, with opt-in integration skips reported in JUnit |
-| `integration` | Disposable PostgreSQL and Redis, including credit recovery, website visits, and the migration rehearsal. All selected cases must run. |
+| `unit` | Default pytest suite with JUnit results and line and branch coverage for `api/`, `nubrix/`, and `utils/`. |
+| `integration` | Disposable PostgreSQL and Redis, including pricing catalog queries, credit recovery, website visits, and the migration rehearsal. All selected cases must run. |
 | `sandbox-isolation` | Linux sandbox tests in the test image. The two cases that require a non-root parent can skip. |
 | `release-smoke` | Boots the release image and checks `/readyz`, the Celery worker, and Beat. |
 | `backend-required` | Shows whether all four jobs passed. Merge requirements are configured separately in GitHub. |
 
 The integration, sandbox, and release smoke jobs use the same runner script as the local checks. Download `pytest-unit`, `pytest-integration`, and `pytest-sandbox` from the workflow run for the JUnit reports. The release smoke results appear in the job log.
+
+The unit job summary shows line and branch coverage from the pytest process. The `pytest-unit` artifact also contains `unit-coverage.xml`. This baseline has no minimum coverage threshold.
+
+[Backend Security](.github/workflows/backend-security.yaml) runs Trivy on pull requests and manual dispatch. It scans repository dependencies (including development dependencies) and configuration, then builds and scans the Dockerfile's `runtime` target in CI. The job summary shows counts by severity. The `trivy-reports` artifact includes both JSON reports, a CycloneDX software bill of materials, the scanned commit SHA, and the local image ID. Findings are advisory. Build and scanner errors fail the security job.
 
 Celery Beat owns recurring subscription jobs. The [manual subscription expiry workflow](.github/workflows/subscriptionCron.yaml) uses service credentials and can update subscription records.
