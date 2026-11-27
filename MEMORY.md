@@ -22,7 +22,7 @@ This file documents changes made to the NubrixAI Analytics Hub API codebase.
 - **`fetch_data()`**: Still returns `pd.DataFrame` (backward compat).
 - **Redis cache**: Arrow IPC bytes (smaller than parquet, faster deserialize).
 - **Cold path**: `readTableBytes` (authenticated `httpx.get`) + `decodeStoredTable` (`utils/storedTables.py`), which decodes a marked table in the worker and any other table in a reader child — PyArrow can't read HTTPS directly.
-- **Filter translation**: `_translate_to_pyarrow_filter()` maps filter dicts to PyArrow compute expressions.
+- **Filter translation**: `utils/runFilters.applyFilters()` turns filter dicts into one Arrow expression per table. A saved Python widget's sandbox child gets the dashboard filters in its run input (`use_run_filters`), and `fetch_data`, `fetch_data_pl` and `scan_data` apply them, together with any explicit `baseFilters`, once per table load.
 - **Size classification**: `classify_table_size(projectId, table)` buckets tables as `small|medium|large|massive` using cached Arrow `num_rows` (O(1)).
   - Buckets: `<10k=small`, `10k-100k=medium`, `100k-1M=large`, `>1M=massive`.
   - Env: `LAZY_FETCH_ROW_THRESHOLD` (default `1000000`).

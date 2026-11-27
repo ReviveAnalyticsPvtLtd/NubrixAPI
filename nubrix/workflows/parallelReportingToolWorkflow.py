@@ -17,6 +17,7 @@ from utils.codeExecutor import REPLManager, _remove_code_fences
 from typing_extensions import TypedDict
 from utils.logger import logger
 from utils.sandboxSlots import BUSY_MESSAGE, SandboxBusyError
+from utils.chartLabelUnits import cleanCode, labelEvidence
 from utils.mapPointLabels import ensureScatterMapPointLabels
 import json
 import os
@@ -91,6 +92,7 @@ class ParallelReportingToolWorkflow:
                 inner += ','
             return f'json.dumps({inner} default=serializer)'
         response = _re.sub(r'json\.dumps\(([^)]*)\)', _fix_dumps, response)
+        response = cleanCode(response, labelEvidence(state.get("inputQuery"), state.get("metadata")), ref=pid)
         return {
             "generatedCode": response,
         }
@@ -171,6 +173,7 @@ class ParallelReportingToolWorkflow:
         pid = state["projectId"]
         response = self._injectProjectId(response, pid)
         response = self._route_large_tables_to_scan(response, pid)
+        response = cleanCode(response, labelEvidence(state.get("inputQuery"), state.get("metadata")), ref=pid)
         return {
             "generatedCode": response,
             "debugAttempts": state.get("debugAttempts", 0) + 1,

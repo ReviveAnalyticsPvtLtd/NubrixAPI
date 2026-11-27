@@ -86,7 +86,7 @@ def test_parallel_reporting_saves_the_labeled_map(monkeypatch):
     service = object.__new__(ReportingService)
     service.client = fakeClient(bucket)
     service._getProjectMetadata = AsyncMock(return_value={})
-    monkeypatch.setattr("api.services.reportingService.initParallelWorkflow", lambda: None)
+    monkeypatch.setattr("api.services.reportingService.initParallelWorkflow", lambda mode=None: None)
     monkeypatch.setattr("api.services.reportingService.updateProjectModifiedAt", lambda *_: None)
 
     async def fetch_json(url):

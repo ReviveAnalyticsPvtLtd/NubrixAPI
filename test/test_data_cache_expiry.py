@@ -1,5 +1,6 @@
 """Tests for how long a deleted table can stay in the data caches."""
 
+import time
 from unittest import mock
 
 import pyarrow as pa
@@ -64,6 +65,7 @@ def test_limitCanBeRaisedFromTheEnvironment():
 
 def test_forgetTableClearsRedisAndThisWorker():
     redisClient = mock.Mock()
+    pipe = redisClient.pipeline.return_value
     otherTable = ("project_1", "orders")
     initMethods._cache_put(KEY, _table())
     initMethods._cache_put(otherTable, _table())
@@ -71,14 +73,19 @@ def test_forgetTableClearsRedisAndThisWorker():
     with mock.patch("utils.initMethods._redis_pool"), mock.patch("utils.initMethods.redis.Redis", return_value=redisClient):
         initMethods.forget_table("project_1", "sales")
 
-    redisClient.delete.assert_called_once_with("project_1::sales", "project_1::metadata.json", "project_1::metadata")
+    redisClient.pipeline.assert_called_once_with(transaction=True)
+    pipe.delete.assert_called_once_with("project_1::sales", "project_1::metadata.json", "project_1::metadata")
+    pipe.hdel.assert_called_once_with("project_1::schemas", "sales")
+    pipe.execute.assert_called_once_with()
+    redisClient.delete.assert_not_called()
+    redisClient.hdel.assert_not_called()
     assert initMethods._cache_get(KEY) is None
     assert initMethods._cache_get(otherTable) is not None
 
 
 def test_forgetTableReportsARedisFailure():
     redisClient = mock.Mock()
-    redisClient.delete.side_effect = ConnectionError("redis unavailable")
+    redisClient.pipeline.return_value.execute.side_effect = ConnectionError("redis unavailable")
 
     with (
         mock.patch("utils.initMethods._redis_pool"),
@@ -101,7 +108,7 @@ def test_emptyLimitFallsBackToTheDefault():
 
 def test_forgetTableClearsThisWorkerEvenIfRedisFails():
     redisClient = mock.Mock()
-    redisClient.delete.side_effect = ConnectionError("redis unavailable")
+    redisClient.pipeline.return_value.execute.side_effect = ConnectionError("redis unavailable")
     initMethods._cache_put(KEY, _table())
 
     with (
@@ -156,3 +163,12 @@ def test_redisMetadataWinsOverThisWorkersOldSizeClass():
 
     assert result["rows_estimate"] == 10
     assert result["size_class"] == initMethods._classify_rows(10)
+
+
+def test_invalidateWithAProjectRunsTheRealSchemaDropAndFailsFastWithoutRedis():
+    messages = []
+    started = time.monotonic()
+    with mock.patch("utils.tableSchemas.logger.warning", side_effect=lambda message, *a, **k: messages.append(message)):
+        initMethods.invalidate_data_cache("project_1", "sales")
+    assert time.monotonic() - started < 1.0
+    assert any("Table schema cache drop failed" in message for message in messages)

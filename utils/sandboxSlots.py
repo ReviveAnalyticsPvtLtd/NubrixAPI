@@ -4,8 +4,10 @@ The API is several processes (web workers and Celery), so the slots are files th
 a lock goes when its holder does, however it dies.
 """
 
+import json
 import os
 import stat
+import threading
 import time
 
 from utils.logger import logger
@@ -14,6 +16,10 @@ SLOT_POLL_SECONDS = 0.1
 SLOTS_FOLDER = "slots"
 BUSY_CODE = "SANDBOX_BUSY"
 BUSY_MESSAGE = "Too many analyses are running right now. Please try again in a moment."
+
+# A shadow needs at least 2 free slots, so a cap below 2 refuses every one. That is said once per process.
+_shadowDisabledWarned = False
+_shadowDisabledLock = threading.Lock()
 
 
 class SandboxBusyError(RuntimeError):
@@ -92,3 +98,54 @@ def releaseRunSlot(fd: int | None) -> None:
             os.close(fd)
         except OSError:
             pass
+
+
+def freeRunSlots(runRoot: str | None, maxRuns: int) -> int | None:
+    """How many of the `maxRuns` slots are free right now, or None where the cap is off or can't apply here.
+
+    Tries each slot's lock and lets it go at once, so every slot is left as it was found. The answer can be out of date by
+    the time it is used, which is fine for a caller that only wants to know whether the sandbox is clearly idle.
+    """
+    if not runRoot or maxRuns <= 0:
+        return None
+    try:
+        import fcntl
+    except ImportError:
+        return None
+    folder = _slotsFolder(runRoot)
+    free = 0
+    for number in range(maxRuns):
+        try:
+            fd = os.open(os.path.join(folder, str(number)), os.O_RDWR | os.O_CREAT | os.O_CLOEXEC, 0o600)
+        except OSError as e:
+            logger.error(f"Could not open sandbox slot {number}: {e}")
+            raise SandboxBusyError() from e
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            fcntl.flock(fd, fcntl.LOCK_UN)
+            free += 1
+        except BlockingIOError:  # Held by a run.
+            pass
+        except OSError as e:
+            logger.error(f"Could not lock sandbox slot {number}: {e}")
+            raise SandboxBusyError() from e
+        finally:
+            os.close(fd)
+    return free
+
+
+def requireHeadroom(runRoot: str | None, maxRuns: int) -> None:
+    """Raise SandboxBusyError unless at least `max(2, maxRuns // 2)` slots are free, so a shadow run leaves room for served ones.
+
+    Does nothing where the cap is off. It takes no slot: the caller takes its own afterwards. A cap below 2 refuses every
+    shadow; the first such refusal in a process logs one `chart_shadow_disabled` warning saying why.
+    """
+    global _shadowDisabledWarned
+    free = freeRunSlots(runRoot, maxRuns)
+    if free is not None and free < max(2, maxRuns // 2):
+        if maxRuns < 2:
+            with _shadowDisabledLock:
+                warn, _shadowDisabledWarned = not _shadowDisabledWarned, True
+            if warn:
+                logger.warning("chart_shadow_disabled " + json.dumps({"reason": "sandbox cap below 2"}))
+        raise SandboxBusyError()

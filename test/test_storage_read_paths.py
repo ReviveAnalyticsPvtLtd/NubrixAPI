@@ -287,7 +287,7 @@ def test_deleteTableRemovesItFromStoredMetadata(storage, client):
 def test_attributeInfoReadsTheParquetSchema(storage, client):
     storage.put(PROJECT, "sales.parquet", _parquet({"amount": [1, 2, 3]}))
 
-    info, shape = managementModule.managementService._attributeInfoFunc(PROJECT, "sales")
+    info, shape, _ = managementModule.managementService._attributeInfoFunc(PROJECT, "sales")
 
     assert shape == [3, 1] and "amount" in info
     _assertAuthenticated(storage, "sales.parquet")
@@ -301,7 +301,7 @@ def test_attributeInfoDecodesOneRowForItsSample(storage, client, monkeypatch):
 
     monkeypatch.setattr(pq.ParquetFile, "read_row_group", refuse)
 
-    info, _ = managementModule.managementService._attributeInfoFunc(PROJECT, "sales")
+    info, *_ = managementModule.managementService._attributeInfoFunc(PROJECT, "sales")
 
     assert "SAMPLE ROW:\n" in info
 
@@ -309,7 +309,7 @@ def test_attributeInfoDecodesOneRowForItsSample(storage, client, monkeypatch):
 def test_attributeInfoSaysSoWhenATableHasNoRows(storage, client):
     storage.put(PROJECT, "sales.parquet", _parquet({"amount": pl.Series([], dtype=pl.Int64)}))
 
-    info, shape = managementModule.managementService._attributeInfoFunc(PROJECT, "sales")
+    info, shape, _ = managementModule.managementService._attributeInfoFunc(PROJECT, "sales")
 
     assert shape == [0, 1]
     assert "SAMPLE ROW: (no rows)\n" in info

@@ -60,7 +60,7 @@ def test_all_columns_cover_every_table_in_a_large_folder():
 def test_full_metadata_scan_covers_every_table_in_a_large_folder():
     bucket = largeFolder()
     service = _management(bucket)
-    service._attributeInfoFunc = mock.Mock(return_value=("info", None))
+    service._attributeInfoFunc = mock.Mock(return_value=("info", None, {}))
     service.metadataGenerator = mock.Mock()
     service._parseModelJsonOutput = mock.Mock(return_value={})
 

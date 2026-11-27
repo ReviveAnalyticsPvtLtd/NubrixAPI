@@ -80,7 +80,7 @@ async def exportToDashboard(details: ExportToDashboard, user: UserContext = Depe
     """
     await asyncio.to_thread(requireProjectOwner, details.projectId, user)
     try:
-        widgetId = dashboardService.exportToDashboard(details = details)
+        widgetId = await asyncio.to_thread(dashboardService.exportToDashboard, details = details)
         return ORJSONResponse(status_code = 200, content = {"status": "SUCCESS", "widgetId": widgetId})
     except CustomException as e:
         raiseHttpException(e)
@@ -99,7 +99,7 @@ async def getData(details: GetData, user: UserContext = Depends(requireProductAc
     """
     await asyncio.to_thread(requireProjectOwner, details.projectId, user)
     try:
-        pageInfo = dashboardService.getData(details = details)
+        pageInfo = await asyncio.to_thread(dashboardService.getData, details = details)
         return ORJSONResponse(status_code = 200, content = {"status": "SUCCESS", "pageData": pageInfo})
     except CustomException as e:
         raiseHttpException(e)

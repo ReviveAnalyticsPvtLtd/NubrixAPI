@@ -54,6 +54,7 @@ from utils.sandbox_reaper import _SHARED_TEMP_FOLDERS
 from utils.sandboxLimits import RunLimits, currentRunLimits
 from utils.sandboxSeccomp import installFilter
 from utils.sandboxSlots import SLOTS_FOLDER, acquireRunSlot, releaseRunSlot
+from utils.sandboxSlots import requireHeadroom as checkSlotHeadroom
 from utils.sandboxWatchdog import RunWatchdog
 
 # Below 65536, the range a user namespace normally maps. The same number of uids above
@@ -97,6 +98,7 @@ _TRUSTED_LAUNCHERS: dict[str, str] = {
     "normalise_launcher.py": "utils/normalise_launcher.py",
     "table_reader_launcher.py": "utils/table_reader_launcher.py",
 }
+SQL_RESULT_CAP_BYTES = 32 * 1024 * 1024
 _TRUSTED_RESULT_NAME = "result"
 _TRUSTED_INPUT_NAME = "input"
 _INPUT_FILE_MODE = 0o640
@@ -494,11 +496,15 @@ def _runChild(launcherName: str, projectId: str, code: str, timeoutSeconds: int 
         return SandboxResult(_readOutput(stdout), _readOutput(stderr) + timeoutNote + stopNote, proc.returncode, resultBytes, previewBytes, stopped)
 
 
-def _inFreshRun(prepare: Callable[[int | None, str], None], run: Callable[[int | None, str, str, str, RunLimits], SandboxResult]) -> SandboxResult:
-    """Take a slot and a uid, give the run its folders and call `run`. `prepare` runs once the folders exist, before any child."""
+def _inFreshRun(prepare: Callable[[int | None, str], None], run: Callable[[int | None, str, str, str, RunLimits], SandboxResult], slotWaitSeconds: float | None = None) -> SandboxResult:
+    """Take a slot and a uid, give the run its folders and call `run`. `prepare` runs once the folders exist, before any child.
+
+    `slotWaitSeconds`, when given, replaces `limits.slotWaitSeconds` for the slot wait only.
+    """
     limits = currentRunLimits()
     # The slot comes first, so a run that waits holds no uid and no folder.
-    slot = acquireRunSlot(os.environ.get("SANDBOX_RUN_ROOT"), limits.maxConcurrentRuns, limits.slotWaitSeconds)
+    slotWait = limits.slotWaitSeconds if slotWaitSeconds is None else slotWaitSeconds
+    slot = acquireRunSlot(os.environ.get("SANDBOX_RUN_ROOT"), limits.maxConcurrentRuns, slotWait)
     try:
         runUid, runFolder, lock = _claimRun()
         uidIsClear = False
@@ -522,14 +528,35 @@ def _inFreshRun(prepare: Callable[[int | None, str], None], run: Callable[[int |
         releaseRunSlot(slot)
 
 
-def runSandbox(launcherName: str, projectId: str, code: str, timeoutSeconds: int | None, withResult: bool = False) -> SandboxResult:
+def runSandbox(launcherName: str, projectId: str, code: str, timeoutSeconds: int | None, withResult: bool = False, payload: dict | None = None, slotWaitSeconds: float | None = None) -> SandboxResult:
     """Run generated code in a launcher subprocess, serving its table reads from this process.
 
     Only a launcher that writes a result sets `withResult`: the file is the child's, so it isn't read otherwise.
+    `payload` is merged into the child's input, so a launcher can be given run input beyond the code.
+    `slotWaitSeconds` overrides the slot wait (0 tries once).
     """
+    kind = _RunKind(payload=payload)
     return _inFreshRun(
         lambda runUid, tablesFolder: None,
-        lambda runUid, runFolder, tablesFolder, workFolder, limits: _runChild(launcherName, projectId, code, timeoutSeconds, withResult, runUid, runFolder, tablesFolder, workFolder, limits),
+        lambda runUid, runFolder, tablesFolder, workFolder, limits: _runChild(launcherName, projectId, code, timeoutSeconds, withResult, runUid, runFolder, tablesFolder, workFolder, limits, kind),
+        slotWaitSeconds,
+    )
+
+
+def runSqlSandbox(projectId: str, request: dict, timeoutSeconds: int, slotWaitSeconds: float | None = None, requireHeadroom: bool = False) -> SandboxResult:
+    """Run one checked SQL query in `sql_launcher.py`, which writes an Arrow IPC file the parent reads up to the cap.
+
+    The child asks for its tables over the table channel. `slotWaitSeconds` overrides the slot wait (0 tries once).
+    `requireHeadroom` (a shadow run) also refuses unless the sandbox has slots to spare, before any slot is taken.
+    Raises SandboxBusyError when no slot is free and ResultTooLargeError when the result is over the cap.
+    """
+    if requireHeadroom:
+        checkSlotHeadroom(os.environ.get("SANDBOX_RUN_ROOT"), currentRunLimits().maxConcurrentRuns)
+    kind = _RunKind(resultName="result.arrow", resultCap=SQL_RESULT_CAP_BYTES, previewName=None, servesTables=True, payload={"request": request})
+    return _inFreshRun(
+        lambda runUid, tablesFolder: None,
+        lambda runUid, runFolder, tablesFolder, workFolder, limits: _runChild("sql_launcher.py", projectId, "", timeoutSeconds, True, runUid, runFolder, tablesFolder, workFolder, limits, kind),
+        slotWaitSeconds,
     )
 
 
@@ -550,7 +577,7 @@ def _writeInput(tablesFolder: str, inputBytes: bytes, runUid: int | None) -> str
     return path
 
 
-def runTrustedSandbox(launcherName: str, projectId: str, inputBytes: bytes, request: dict, timeoutSeconds: int, maxResultBytes: int, limits: RunLimits | None = None) -> SandboxResult:
+def runTrustedSandbox(launcherName: str, projectId: str, inputBytes: bytes, request: dict, timeoutSeconds: int, maxResultBytes: int, limits: RunLimits | None = None, leaveHeadroom: bool = False) -> SandboxResult:
     """Run one of our own launchers on bytes this process hands it, under every limit a code run has.
 
     The run is given no table access and no secret: `request` is the only thing besides the input that reaches it,
@@ -558,6 +585,7 @@ def runTrustedSandbox(launcherName: str, projectId: str, inputBytes: bytes, requ
     the file `work/result`, read through `readResult` up to `maxResultBytes`; a larger one raises ResultTooLargeError.
     The slot cap and the slot wait come from the environment (`currentRunLimits()`), not from `limits`.
     `request` must be a JSON-serialisable dict and `maxResultBytes` positive; both are checked before a slot is taken.
+    `leaveHeadroom` (a shadow run's read) takes the slot without waiting and only while the sandbox has slots to spare.
     Raises SandboxBusyError when no slot is free, as `runSandbox` does.
     """
     if not isinstance(request, dict):
@@ -581,7 +609,9 @@ def runTrustedSandbox(launcherName: str, projectId: str, inputBytes: bytes, requ
         )
         return _runChild(launcherName, projectId, "", timeoutSeconds, True, runUid, runFolder, tablesFolder, workFolder, limits or runLimits, kind)
 
-    return _inFreshRun(lambda runUid, tablesFolder: inputPath.append(_writeInput(tablesFolder, inputBytes, runUid)), runIt)
+    if leaveHeadroom:
+        checkSlotHeadroom(os.environ.get("SANDBOX_RUN_ROOT"), currentRunLimits().maxConcurrentRuns)
+    return _inFreshRun(lambda runUid, tablesFolder: inputPath.append(_writeInput(tablesFolder, inputBytes, runUid)), runIt, 0 if leaveHeadroom else None)
 
 
 def _withinHardLimit(wanted: int, hard: int) -> int:
@@ -634,6 +664,30 @@ def _lockDownChild(channel: dict) -> None:
         installFilter()
 
 
+_pathSource: list[Callable[[str], str] | None] = [None]
+
+
+def tablePath(tableName: str) -> str:
+    """Child side: ask the parent for a table and return the absolute path of the spooled file (`.parquet` or `.arrow`).
+
+    Raises RuntimeError outside a sandbox or when the parent answers with an error.
+    """
+    if _pathSource[0] is None:
+        raise RuntimeError("tablePath is only available inside a sandbox run.")
+    return _pathSource[0](tableName)
+
+
+def _askForPath(requests: IO[bytes], replies: IO[bytes], lock: threading.Lock, tablesFolder: str, tableName: str) -> str:
+    """Child side: send one table request to the parent and return the path of the file it spooled."""
+    with lock:
+        requests.write(json.dumps(tableName).encode("utf-8") + b"\n")
+        requests.flush()
+        reply = json.loads(replies.readline())
+    if "error" in reply:
+        raise RuntimeError(reply["error"])
+    return os.path.join(tablesFolder, reply["file"])
+
+
 def _connectTableChannel(channel: dict) -> None:
     """Child side: send every table read to the parent, which holds the credentials and the project."""
     import pyarrow as pa
@@ -648,17 +702,13 @@ def _connectTableChannel(channel: dict) -> None:
     lock = threading.Lock()
 
     def readTable(tableName: str) -> "pa.Table":
-        with lock:
-            requests.write(json.dumps(tableName).encode("utf-8") + b"\n")
-            requests.flush()
-            reply = json.loads(replies.readline())
-        if "error" in reply:
-            raise RuntimeError(reply["error"])
-        path = os.path.join(channel["tablesFolder"], reply["file"])
+        path = _askForPath(requests, replies, lock, channel["tablesFolder"], tableName)
         if path.endswith(".arrow"):
             return pa.ipc.open_stream(pa.memory_map(path)).read_all()
         return pq.read_table(path)
 
+    # The path source closes over the same pipes, so it asks exactly as readTable does.
+    _pathSource[0] = lambda tableName: _askForPath(requests, replies, lock, channel["tablesFolder"], tableName)
     use_table_source(readTable)
 
 
