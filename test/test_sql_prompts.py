@@ -846,6 +846,16 @@ def test_sqlRephrasersNameEveryChartType(key):
         assert f"`{chartType}`" in text, chartType
 
 
+@pytest.mark.parametrize("key", ["sqlQueryRephraserAgentPrompt", "parallelSqlQueryRephraserAgentPrompt"])
+def test_sqlRephrasersAddOtherToANamedSliceCountOnlyWhenAsked(key):
+    text = _prompts()[key]
+
+    assert (
+        "When the user names how many slices to show, plan only those; add 'Other' only when the user asks for the rest "
+        "(\"the top 5, then the rest as Other\")."
+    ) in text
+
+
 def test_rephraserTakesAPromptKey(monkeypatch):
     from nubrix.components import queryRephraser
 
@@ -954,6 +964,10 @@ EVALUATION_RULE_SENTENCES = {
     "perOrderTotalsBeforeAveraging": '"Average payment value per order" or "average order value" totals each order once, then averages those totals.',
     "carrySumAndCountThroughTheCte": "put SUM(x) AS x_sum and COUNT(x) AS x_count in the CTE instead of AVG(x), and divide at the end with SUM(x_sum) / NULLIF(SUM(x_count), 0)",
     "namedSliceCount": "keep that many named slices and put 'Other' after them: rn <= N OR n <= N + 1.",
+    "namedSliceCountAlone": (
+        "When it names how many and not the rest (\"the 6 categories with the most items\"), show only those N slices: "
+        "ORDER BY the measure DESC, then the label, LIMIT N, with no 'Other' slice."
+    ),
     "measureWhatTheQuestionNames": "aggregates that table by region, not only the rows that also match another table.",
     "countEveryEntity": "LEFT JOIN a table some of them lack (orders with no payment), so they still count.",
     "fixedLabelOrder": "DuckDB 1.3 refuses ORDER BY CASE <alias> ... together with GROUP BY ALL",
